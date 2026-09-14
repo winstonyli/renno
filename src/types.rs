@@ -12,13 +12,32 @@ pub enum Type {
     // Rc<Vec<Value>>), not itself expressed via `data`/Pattern -- but
     // `data` declarations (see parser::build_ctor_value) go the other way
     // around: a user-defined ADT desugars INTO a tagged List, rather than
-    // List becoming sugar over an ADT. No nominal Type for those: an ADT
-    // value's type is just whatever a tagged list's structural type
-    // synthesizes to (typically Dyn, since a tag Str and a field of some
-    // other type don't unify to one concrete element type).
+    // List becoming sugar over an ADT.
     List(Rc<Type>),
     // param, effect row (what calling this may perform), return type.
     Fun(Rc<Type>, EffectRow, Rc<Type>),
+    // A `data`-declared type, named. Every constructor parser::parser
+    // builds for one `data Name = ...` is annotated to return this (see
+    // parser::ctor_type), so `Some(5)` synthesizes Data("Option") instead
+    // of falling back to Dyn/[Dyn] -- two `data` types with the same
+    // constructor SHAPE (e.g. `data Celsius = Mk(Int)` and
+    // `data Fahrenheit = Mk(Int)`) are still statically distinguishable.
+    // Nominal, not structural: consistent() only accepts two Data with the
+    // EXACT SAME name, never by matching their fields' shapes.
+    //
+    // The runtime side of this is necessarily shallow, the same way Fun's
+    // matches_type is: a value is still just a tagged List (see
+    // value::Value), with no type name stamped into it anywhere, so a
+    // Dyn-origin value crossing into a Data(name)-annotated position can
+    // only be checked for "is this SOME tagged value" (value::matches_type),
+    // not "is this specifically a Name, as opposed to some other data type
+    // that happens to reuse one of its constructor tags." Fully verifying
+    // that would mean either stamping the type name into every constructed
+    // value, or wrapping the crossing in a per-access contract the way
+    // wrap_fun_contract does for Fun -- more machinery than this feature
+    // spends; the static side (rejecting a call/annotation mismatch between
+    // two KNOWN concrete Data types) is where the real value is.
+    Data(String),
 }
 
 // Closed effect row: an exact known set (Closed), "unknown, could be
@@ -123,6 +142,16 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         (Type::Fun(a1, r1, b1), Type::Fun(a2, r2, b2)) => {
             consistent(a1, a2) && consistent(b1, b2) && row_consistent(r1, r2)
         }
+        (Type::Data(a), Type::Data(b)) => a == b,
+        // Every Data(name) value IS, structurally, a List at runtime (see
+        // Type::Data's doc comment) -- a constructor's own VALUE
+        // expression elaborates structurally (e.g. `None`'s `["None"]`
+        // synthesizes List(Str), not Data("Option")), so this needs to
+        // hold for parser::ctor_type's annotation to coerce cleanly, with
+        // no runtime Check inserted (from isn't Dyn on either side). Two
+        // DIFFERENT Data names are still never consistent with each
+        // other, or with any of Int/Bool/Str/Fun -- only with List.
+        (Type::List(_), Type::Data(_)) | (Type::Data(_), Type::List(_)) => true,
         _ => false,
     }
 }
@@ -147,6 +176,7 @@ impl fmt::Display for Type {
             // (unannotated-row) Fun type exactly as before this existed.
             Type::Fun(a, EffectRow::Dyn, b) => write!(f, "({a} -> {b})"),
             Type::Fun(a, row, b) => write!(f, "({a} ->{row} {b})"),
+            Type::Data(name) => write!(f, "{name}"),
         }
     }
 }

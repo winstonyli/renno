@@ -84,7 +84,7 @@ fn free_row_vars(ty: &Type) -> BTreeSet<String> {
             vars
         }
         Type::List(elem) => free_row_vars(elem),
-        Type::Dyn | Type::Int | Type::Bool | Type::Str => BTreeSet::new(),
+        Type::Dyn | Type::Int | Type::Bool | Type::Str | Type::Data(_) => BTreeSet::new(),
     }
 }
 
@@ -144,18 +144,26 @@ fn any_fun() -> Type {
 // statically) and `to` is concrete. If both sides are concrete and
 // disagree, that's a real static error -- reject before running at all.
 // If `from` is already exactly consistent and concrete, no check needed:
-// zero overhead for fully-annotated code. The error, if any, points at `e`
-// -- the specific value whose type didn't match, always an ORIGINAL
-// (pre-elaboration) ExprRef here, so `spans[e]` is always a valid lookup.
+// zero overhead for fully-annotated code. The error, if any, points at
+// `span` -- the CALLER's job to have already looked up via the ORIGINAL
+// (pre-elaboration) ExprRef for the value in question, e.g. `spans[val]`
+// where `val` is a field straight off the un-elaborated node, NOT the
+// elaborated `e` this function receives to potentially wrap: elaborate_node
+// re-pushes almost every compound node it touches (App, BinOp, If, ...)
+// regardless of whether anything actually changed, so `e` itself is often
+// already a brand new ExprRef past the end of the parser-built SpanMap by
+// the time it reaches here -- indexing spans BY IT, not by the original,
+// was a latent bug (worked by coincidence whenever the mismatched value
+// happened to be a leaf that elaborate_node returns unchanged).
 //
 // Crossing into a Fun type is special: value::matches_type only confirms
 // "this is callable," not "callable with this exact signature" (a tag
 // check can't see inside a closure). So a Dyn value flowing into an
 // annotated Fun position gets wrapped in a real per-call contract instead
 // of a bare tag Check -- see wrap_fun_contract.
-fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, spans: &SpanMap) -> Result<ExprRef, TypeError> {
+fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span) -> Result<ExprRef, TypeError> {
     if !consistent(from, to) {
-        return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), spans[e]));
+        return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span));
     }
     if *from != Type::Dyn || *to == Type::Dyn {
         return Ok(e);
@@ -219,14 +227,19 @@ fn discharged_effect(arena: &Arena, handler: ExprRef) -> Option<String> {
 // The shallow type a pattern shape implies, used only to statically reject
 // a scrutinee that could never match it (e.g. an Int pattern against a
 // Bool scrutinee) -- not full pattern-based type refinement. Var matches
-// anything, so it's Dyn; List/Cons don't know the element type from the
-// pattern alone, so Dyn there too.
+// anything, so it's Dyn; a plain List/Cons pattern doesn't know the
+// element type from the pattern alone, so Dyn there too. A constructor
+// pattern (ctor_tag) is ALSO Dyn, not List(Dyn) -- it could belong to any
+// `data` type (pattern_type has no name-resolution pass to know which),
+// so it needs to stay consistent with a nominal Data(name) scrutinee too,
+// not just a structural List one.
 fn pattern_type(pat: &Pattern) -> Type {
     match pat {
         Pattern::Var(_) => Type::Dyn,
         Pattern::Int(_) => Type::Int,
         Pattern::Bool(_) => Type::Bool,
         Pattern::Str(_) => Type::Str,
+        _ if ctor_tag(pat).is_some() => Type::Dyn,
         Pattern::List(_) | Pattern::Cons(..) => Type::List(Rc::new(Type::Dyn)),
     }
 }
@@ -374,7 +387,7 @@ fn elaborate(
                 };
                 let (val_ty, val_row, val2) = elaborate(arena, val, &val_ctx, &cur_groups, spans)?;
                 let (bound_ty, val3) = match ann {
-                    Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t, spans)?),
+                    Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t, spans[val])?),
                     None => (val_ty, val2),
                 };
                 cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone());
@@ -480,7 +493,7 @@ fn elaborate_node(
             let (a_ty, a_row, a2) = elaborate(arena, a, ctx, groups, spans)?;
             let (call_row, ret_ty, app2) = match &f_ty {
                 Type::Fun(param_ty, call_row, ret_ty) => {
-                    let a3 = coerce(arena, a2, &a_ty, param_ty, spans)?;
+                    let a3 = coerce(arena, a2, &a_ty, param_ty, spans[a])?;
                     // If param_ty names a row variable (from an explicit
                     // `->{e}` annotation on the callee) and the argument's
                     // own inferred type reveals a concrete row in the
@@ -516,8 +529,8 @@ fn elaborate_node(
             match op {
                 // Arithmetic and ordering: both operands must be Int.
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Lt => {
-                    let l3 = coerce(arena, l2, &l_ty, &Type::Int, spans)?;
-                    let r3 = coerce(arena, r2, &r_ty, &Type::Int, spans)?;
+                    let l3 = coerce(arena, l2, &l_ty, &Type::Int, spans[l])?;
+                    let r3 = coerce(arena, r2, &r_ty, &Type::Int, spans[r])?;
                     let result_ty = if op == BinOp::Lt { Type::Bool } else { Type::Int };
                     Ok((result_ty, row, arena.push(Expr::BinOp(op, l3, r3))))
                 }
@@ -535,12 +548,12 @@ fn elaborate_node(
                         ));
                     }
                     let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
-                        coerce(arena, l2, &l_ty, &r_ty, spans)?
+                        coerce(arena, l2, &l_ty, &r_ty, spans[l])?
                     } else {
                         l2
                     };
                     let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
-                        coerce(arena, r2, &r_ty, &l_ty, spans)?
+                        coerce(arena, r2, &r_ty, &l_ty, spans[r])?
                     } else {
                         r2
                     };
@@ -573,12 +586,12 @@ fn elaborate_node(
                         }
                     };
                     let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
-                        coerce(arena, l2, &l_ty, &r_ty, spans)?
+                        coerce(arena, l2, &l_ty, &r_ty, spans[l])?
                     } else {
                         l2
                     };
                     let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
-                        coerce(arena, r2, &r_ty, &l_ty, spans)?
+                        coerce(arena, r2, &r_ty, &l_ty, spans[r])?
                     } else {
                         r2
                     };
@@ -589,7 +602,7 @@ fn elaborate_node(
 
         Expr::If(c, t, e) => {
             let (c_ty, c_row, c2) = elaborate(arena, c, ctx, groups, spans)?;
-            let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans)?;
+            let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans[c])?;
             let (t_ty, t_row, t2) = elaborate(arena, t, ctx, groups, spans)?;
             let (e_ty, e_row, e2) = elaborate(arena, e, ctx, groups, spans)?;
             // Branches with differing concrete types aren't an error here

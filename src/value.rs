@@ -123,6 +123,13 @@ impl Value {
             // Shallow, like Fun -- confirms "this is a list," not that its
             // elements match the declared element type.
             (Value::List(_), Type::List(_)) => true,
+            // Same shallowness, for the same reason: every `data` value IS
+            // a List (see types::Type::Data's doc comment), but nothing at
+            // runtime stamps WHICH data type it came from, so this can only
+            // confirm "this is some tagged/ADT-shaped value" -- a non-empty
+            // list, tag included -- not "specifically a Name, not some
+            // other data type reusing one of its constructor tags."
+            (Value::List(items), Type::Data(_)) => !items.is_empty(),
             (Value::Closure(..), Type::Fun(_, _, _)) => true,
             (Value::RecClosure(..), Type::Fun(_, _, _)) => true,
             (Value::Continuation(_), Type::Fun(_, _, _)) => true,

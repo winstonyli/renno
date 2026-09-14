@@ -4,10 +4,13 @@
 // pattern_matching.rn already uses, and constructors are curried like any
 // other multi-arg callable (fold, map): `Cons(1)(rest)`, not `Cons(1, rest)`.
 //
-// A recursive type (List referencing itself in Cons's own field list)
-// needs no forward declaration or special casing: an unmodeled field type
-// just resolves to Dyn, so naming your own type is no different from
-// naming any other type this checker doesn't track structurally.
+// Each constructor also gets a real NOMINAL type, Type::Data("List") --
+// e.g. Cons: (Int -> List -> List) -- so a recursive type (List
+// referencing itself in Cons's own field list) needs no forward
+// declaration: `List` there is just a name compared for equality, nothing
+// to resolve. Two `data` types with identically-shaped constructors (both
+// wrapping a single Int, say) still aren't interchangeable -- Data is
+// name-based, not structural.
 //
 // `data` also records this type's constructor set for exhaustiveness: the
 // match below needs no wildcard arm because { Nil, Cons } is exactly what

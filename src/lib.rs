@@ -448,6 +448,69 @@ mod tests {
         assert!(err.contains("uppercase"), "unexpected message: {err}");
     }
 
+    // --- nominal ADT typing ---
+
+    #[test]
+    fn distinct_data_types_with_identical_shape_are_not_interchangeable() {
+        // Celsius and Fahrenheit both wrap a single Int -- structurally
+        // identical, but Type::Data is nominal (name-compared), so passing
+        // one where the other is annotated is a static error.
+        let src = "data Celsius = MkC(Int) in\ndata Fahrenheit = MkF(Int) in\nlet f = fun x: Celsius -> x in\nf(MkF(100))";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected Celsius, found Fahrenheit"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn same_data_type_annotation_accepted() {
+        let src = "data Celsius = MkC(Int) in let f = fun x: Celsius -> x in f(MkC(100))";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[MkC, 100]");
+    }
+
+    #[test]
+    fn self_referential_field_gets_real_nominal_checking() {
+        // Cons's second field is typed List (its own enclosing data type,
+        // per parser::ctor_type/Type::Data) -- passing a non-List there is
+        // now a static error, not silently accepted as Dyn would allow.
+        let src = "data List = Nil | Cons(Int, List) in Cons(1)(5)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected List, found Int"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn self_referential_field_still_accepts_correct_recursive_structures() {
+        let src = r#"
+            data List = Nil | Cons(Int, List) in
+            let rec sum = fun l -> match l with | Nil -> 0 | Cons(h, t) -> h + sum(t) in
+            sum(Cons(1)(Cons(2)(Cons(3)(Nil))))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 6);
+    }
+
+    #[test]
+    fn dyn_sourced_value_flowing_into_a_data_annotation_gets_a_runtime_check() {
+        // Runtime check is necessarily shallow (see value::matches_type's
+        // Data arm): confirms "some tagged value", not "specifically this
+        // data type" -- a bare Int still fails it, which is the case that
+        // matters most (catching an obviously wrong value at the boundary).
+        let src = r#"
+            data Option = None | Some(Int) in
+            let f = fun x: Option -> x in
+            handle f(perform choose(0)) with handler choose(p, resume) -> resume(42)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            machine::run(&arena, elaborated, Env::prelude(), &spans)
+        }));
+        assert!(result.is_err(), "expected a panic: 42 doesn't match Data(\"Option\")'s shallow shape check");
+    }
+
     // --- match exhaustiveness ---
 
     #[test]

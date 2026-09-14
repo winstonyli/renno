@@ -34,8 +34,25 @@ enum PendingBinder {
     Fun { param: String, ann: Option<Type> },
     // `data Name = Ctor1(T, ...) | Ctor2 | ...` -- one pending item expands
     // to N nested Lets when folded back (one per constructor), not one.
-    // See build_ctor_value for what each constructor's bound value is.
-    Data { ctors: Vec<(String, Vec<Type>)> },
+    // See build_ctor_value for what each constructor's bound value is, and
+    // ctor_type for the nominal Type::Data(Name) annotation each one gets.
+    Data { type_name: String, ctors: Vec<(String, Vec<Type>)> },
+}
+
+// The nominal type a `data Name = ... | Ctor(T1, T2) | ...` constructor
+// gets: `T1 -> T2 -> ... -> Data(Name)`, curried the same way the
+// constructor's own VALUE is (build_ctor_value) -- Data(Name) is exactly
+// what lets two `data` types with identically-shaped constructors (e.g.
+// `data Celsius = Mk(Int)` and `data Fahrenheit = Mk(Int)`) stay
+// statically distinguishable, since consistent() only accepts two Data
+// with the exact same name. See types::Type::Data's own doc comment for
+// the runtime side's necessarily shallower story.
+fn ctor_type(type_name: &str, field_tys: &[Type]) -> Type {
+    let mut result = Type::Data(type_name.to_string());
+    for ty in field_tys.iter().rev() {
+        result = Type::Fun(Rc::new(ty.clone()), EffectRow::pure(), Rc::new(result));
+    }
+    result
 }
 
 impl<'a> Parser<'a> {
@@ -130,16 +147,15 @@ impl<'a> Parser<'a> {
                 Ok(t)
             }
             // A capitalized name that isn't one of the built-in type
-            // keywords: a reference to a `data`-declared type (see
-            // build_ctor_value). renno has no nominal Type for these --
-            // an ADT's own field-carrying constructors already synthesize
-            // Dyn-ish structural types (a tagged List), so a field typed
-            // as another data type just resolves to Dyn, same as any other
-            // unmodeled-statically position. This is also what makes a
-            // self-referential field (`Cons(Int, List)` inside `data List`
-            // itself) work with no special-casing: it's just Dyn, nothing
-            // to resolve.
-            Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => Ok(Type::Dyn),
+            // keywords: a reference to a `data`-declared type -- Type::Data
+            // is purely nominal (see its own doc comment), just a name
+            // compared for equality, so this needs no name-resolution pass
+            // to know whether "Option"/"List"/whatever was ever actually
+            // declared, or where. That's also what makes a self-referential
+            // field (`Cons(Int, List)` inside `data List` itself) work with
+            // no special-casing: `List` here is just the string "List",
+            // nothing to look up.
+            Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => Ok(Type::Data(name)),
             other => Err(self.err_at(self.span_before(), format!("expected a type, found {other:?}"))),
         }
     }
@@ -363,7 +379,7 @@ impl<'a> Parser<'a> {
                 Some(Token::Data) => {
                     let start = self.span_at().start;
                     self.bump();
-                    let type_name = self.ident()?; // not bound to anything -- see build_ctor_value
+                    let type_name = self.ident()?;
                     self.expect(&Token::Equals)?;
                     let mut ctors = Vec::new();
                     loop {
@@ -407,7 +423,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(&Token::In)?;
-                    pending.push((start, PendingBinder::Data { ctors }));
+                    pending.push((start, PendingBinder::Data { type_name, ctors }));
                 }
                 _ => break,
             }
@@ -427,12 +443,13 @@ impl<'a> Parser<'a> {
                     self.push_spanned(Expr::Let(var, ann, val, result, rec), span)
                 }
                 PendingBinder::Fun { param, ann } => self.push_spanned(Expr::Lambda(param, ann, result), span),
-                PendingBinder::Data { ctors } => {
+                PendingBinder::Data { type_name, ctors } => {
                     let tags: BTreeSet<String> = ctors.iter().map(|(name, _)| name.clone()).collect();
                     let mut body = result;
                     for (name, field_tys) in ctors.into_iter().rev() {
                         let val = self.build_ctor_value(&name, &field_tys, span);
-                        body = self.push_spanned(Expr::Let(name, None, val, body, false), span);
+                        let ty = Some(ctor_type(&type_name, &field_tys));
+                        body = self.push_spanned(Expr::Let(name, ty, val, body, false), span);
                     }
                     self.push_spanned(Expr::DataGroup(Rc::new(tags), body), span)
                 }
