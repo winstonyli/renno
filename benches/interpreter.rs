@@ -47,6 +47,30 @@ fn deep_chain_source(n: usize) -> String {
     format!("handle {src}{} with deep(handler choose(p, resume) -> resume(1))", sum.join(" + "))
 }
 
+// `let rec sum = fun n -> match n with | 0 -> 0 | _ -> n + sum(n - 1) in
+// sum(n)` -- a realistic recursive hot loop, using the two features that
+// have replaced hand-rolled recursion as renno's idiomatic style this
+// session (let rec, match) but had zero benchmark coverage before now.
+// Exercises Value::RecClosure's rebind-on-every-call path and
+// Frame::MatchArms's dispatch (match_pattern), n times each.
+fn recursive_match_source(n: i64) -> String {
+    format!("let rec sum = fun n -> match n with | 0 -> 0 | _ -> n + sum(n - 1) in sum({n})")
+}
+
+// Same shape, but each step also constructs a `data` value and reads two
+// fields back off it (Point(n)(n) -- a curried constructor call, elaborated
+// into nested Lambda/ListLit -- then p.x + p.y, each field access
+// desugared by typecheck into its own single-arm Match). Exercises
+// construction and FieldAccess's desugared-Match path together, since
+// ADTs/named fields also had zero benchmark coverage before now.
+fn adt_field_access_source(n: i64) -> String {
+    format!(
+        "data Point = Point(x: Int, y: Int) in \
+         let rec sum = fun n -> match n with | 0 -> 0 | _ -> (let p = Point(n)(n) in p.x + p.y) + sum(n - 1) in \
+         sum({n})"
+    )
+}
+
 fn full_pipeline(c: &mut Criterion) {
     let src = std::fs::read_to_string("examples/multi_shot.rn").expect("run from the repo root");
     c.bench_function("full_pipeline/multi_shot.rn", |b| {
@@ -87,5 +111,35 @@ fn deep_reinstall(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, full_pipeline, let_chain, multishot_resume, deep_reinstall);
+fn recursive_match(c: &mut Criterion) {
+    let mut group = c.benchmark_group("recursive_match");
+    for n in [10i64, 100, 1000] {
+        let src = recursive_match_source(n);
+        group.bench_with_input(BenchmarkId::from_parameter(n), &src, |b, src| {
+            b.iter(|| run_source(black_box(src)).unwrap())
+        });
+    }
+    group.finish();
+}
+
+fn adt_field_access(c: &mut Criterion) {
+    let mut group = c.benchmark_group("adt_field_access");
+    for n in [10i64, 100, 1000] {
+        let src = adt_field_access_source(n);
+        group.bench_with_input(BenchmarkId::from_parameter(n), &src, |b, src| {
+            b.iter(|| run_source(black_box(src)).unwrap())
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    full_pipeline,
+    let_chain,
+    multishot_resume,
+    deep_reinstall,
+    recursive_match,
+    adt_field_access
+);
 criterion_main!(benches);
