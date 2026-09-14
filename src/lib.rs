@@ -182,6 +182,43 @@ mod tests {
         assert_eq!(run_untyped("len([])").as_int(), 0);
     }
 
+    // --- map/fold: structural recursion over List without let rec ---
+
+    #[test]
+    fn map_transforms_each_element() {
+        assert_eq!(run_untyped("map(fun x -> x + 1)([1, 2, 3])").to_string(), "[2, 3, 4]");
+    }
+
+    #[test]
+    fn map_on_empty_list() {
+        assert_eq!(run_untyped("len(map(fun x -> x + 1)([]))").as_int(), 0);
+    }
+
+    #[test]
+    fn fold_sums_left_to_right() {
+        // f is curried (one renno arg at a time): fold applies f(acc)(item)
+        // via two native machine::apply calls per element.
+        assert_eq!(run_untyped("fold(fun acc -> fun x -> acc + x)(0)([1, 2, 3, 4])").as_int(), 10);
+    }
+
+    #[test]
+    fn fold_on_empty_list_returns_init_unchanged() {
+        assert_eq!(run_untyped("fold(fun acc -> fun x -> acc + x)(42)([])").as_int(), 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "unhandled effect: log")]
+    fn effect_inside_map_callback_cannot_reach_an_outer_handler() {
+        // Documented limitation: map/fold call their callback via
+        // machine::apply, which seeds a FRESH continuation -- an effect
+        // performed inside the callback can never reach a `handle` that
+        // lexically wraps the map/fold call itself. Expected shape for a
+        // native structural-recursion primitive (conventionally pure),
+        // not something this feature attempts to fix.
+        let src = "handle map(fun x -> perform log(x))([1, 2, 3]) with handler log(p, resume) -> resume(p)";
+        run_untyped(src);
+    }
+
     #[test]
     fn list_equality_is_structural() {
         assert!(run_untyped("[1, 2, 3] == [1, 2, 3]").as_bool());

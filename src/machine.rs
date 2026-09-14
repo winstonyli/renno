@@ -18,9 +18,29 @@ enum Control {
 // references through Control/Frame costs nothing beyond a plain integer
 // copy -- no Rc bump, unlike when this held Rc<Expr>.
 pub fn run(arena: &Arena, expr: ExprRef, env: Env) -> Value {
-    let mut control = Control::Eval(expr, env);
-    let mut cont = Cont::nil();
+    run_loop(arena, Control::Eval(expr, env), Cont::nil())
+}
 
+// Calls a renno function VALUE from native Rust code (used by fold/map's
+// Builtin dispatch below to invoke the callback once per element) by
+// seeding the same trampoline the AppArg frame's own dispatch already
+// implements, rather than duplicating that Closure/Continuation/Builtin
+// matching logic a second time.
+//
+// The seeded continuation is fresh (Cont::nil()), not the caller's real
+// one -- so an effect performed inside `func` can NEVER reach a `handle`
+// that lexically wraps the outer fold/map call; it always panics
+// "unhandled effect", regardless of what the calling program looks like.
+// Threading the real outer continuation through a native re-entrant call
+// like this is a substantially harder problem (effect handlers crossing
+// an FFI-like boundary) that this feature doesn't attempt. In practice
+// this is the expected shape for a structural-recursion primitive anyway
+// -- fold/map are conventionally pure transformations.
+pub fn apply(arena: &Arena, func: Value, arg: Value) -> Value {
+    run_loop(arena, Control::Apply(arg), Cont::cons(Frame::AppArg { func }, Cont::nil()))
+}
+
+fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont) -> Value {
     loop {
         match control {
             Control::Eval(expr, env) => match &arena[expr] {
@@ -127,20 +147,11 @@ pub fn run(arena: &Arena, expr: ExprRef, env: Env) -> Value {
                                     control = Control::Apply(value);
                                 }
                                 Value::Builtin(b) => {
-                                    // deep/shallow: clone the handler data,
-                                    // flip the `deep` bit, hand back a new
-                                    // handler value. No AST-level flag.
-                                    control = Control::Apply(match (b, value) {
-                                        (Builtin::Deep, Value::Handler(data)) => {
-                                            Value::Handler(Rc::new(HandlerData { deep: true, ..(*data).clone() }))
-                                        }
-                                        (Builtin::Shallow, Value::Handler(data)) => {
-                                            Value::Handler(Rc::new(HandlerData { deep: false, ..(*data).clone() }))
-                                        }
-                                        (Builtin::Len, Value::Str(s)) => Value::Int(s.chars().count() as i64),
-                                        (Builtin::Len, Value::List(items)) => Value::Int(items.len() as i64),
-                                        _ => panic!("invalid builtin application"),
-                                    });
+                                    control = Control::Apply(collect_builtin_arg(arena, b, Vec::new(), value));
+                                }
+                                Value::PartialBuiltin(b, prev_args) => {
+                                    let args = (*prev_args).clone();
+                                    control = Control::Apply(collect_builtin_arg(arena, b, args, value));
                                 }
                                 _ => panic!("attempt to call a non-function value"),
                             }
@@ -248,6 +259,62 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value) -> Value {
             }
             _ => panic!("++ expects two strings or two lists"),
         },
+    }
+}
+
+// Appends one argument to a builtin's collected-so-far list, dispatching
+// the real operation once `b`'s declared arity is reached, otherwise
+// handing back a PartialBuiltin waiting for the rest.
+fn collect_builtin_arg(arena: &Arena, b: Builtin, mut args: Vec<Value>, arg: Value) -> Value {
+    args.push(arg);
+    if args.len() == b.arity() {
+        dispatch_builtin(arena, b, args)
+    } else {
+        Value::PartialBuiltin(b, Rc::new(args))
+    }
+}
+
+fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>) -> Value {
+    match b {
+        // deep/shallow: clone the handler data, flip the `deep` bit, hand
+        // back a new handler value. No AST-level flag.
+        Builtin::Deep | Builtin::Shallow => match args.pop() {
+            Some(Value::Handler(data)) => {
+                Value::Handler(Rc::new(HandlerData { deep: b == Builtin::Deep, ..(*data).clone() }))
+            }
+            _ => panic!("deep/shallow expect a handler value"),
+        },
+        Builtin::Len => match args.pop() {
+            Some(Value::Str(s)) => Value::Int(s.chars().count() as i64),
+            Some(Value::List(items)) => Value::Int(items.len() as i64),
+            _ => panic!("len expects a string or list"),
+        },
+        Builtin::Map => {
+            let (list, f) = (args.pop(), args.pop());
+            match (f, list) {
+                (Some(f), Some(Value::List(items))) => {
+                    let mapped: Vec<Value> = items.iter().map(|v| apply(arena, f.clone(), v.clone())).collect();
+                    Value::List(Rc::new(mapped))
+                }
+                _ => panic!("map expects a function and a list"),
+            }
+        }
+        Builtin::Fold => {
+            let (list, init, f) = (args.pop(), args.pop(), args.pop());
+            match (f, init, list) {
+                (Some(f), Some(init), Some(Value::List(items))) => {
+                    let mut acc = init;
+                    for item in items.iter() {
+                        // f is curried (one renno-level argument at a
+                        // time): f(acc) yields a closure, applied to item.
+                        let partial = apply(arena, f.clone(), acc);
+                        acc = apply(arena, partial, item.clone());
+                    }
+                    acc
+                }
+                _ => panic!("fold expects a function, an initial value, and a list"),
+            }
+        }
     }
 }
 

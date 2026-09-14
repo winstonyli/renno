@@ -1,0 +1,6 @@
+// map/fold: native structural recursion over List, without renno needing
+// general recursion (no `let rec` yet -- see fold's doc comment in
+// value.rs). fold's callback is curried: fold(f)(init)(list) applies
+// f(acc)(item) once per element, left to right.
+let doubled = map(fun x -> x + x)([1, 2, 3, 4, 5]) in
+fold(fun acc -> fun x -> acc + x)(0)(doubled)

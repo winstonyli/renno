@@ -14,6 +14,8 @@ impl PList<Value> {
             .bind("deep", Value::Builtin(Builtin::Deep))
             .bind("shallow", Value::Builtin(Builtin::Shallow))
             .bind("len", Value::Builtin(Builtin::Len))
+            .bind("map", Value::Builtin(Builtin::Map))
+            .bind("fold", Value::Builtin(Builtin::Fold))
     }
 
     pub fn lookup(&self, name: &str) -> Value {

@@ -21,12 +21,34 @@ pub struct HandlerData {
     pub deep: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum Builtin {
     Deep,
     Shallow,
     // Str -> Int (character count) or List -> Int (element count).
     Len,
+    // (a -> b, [a]) -> [b]. Applies its callback via machine::apply --
+    // see that function's doc comment for the effect-handling caveat
+    // (the callback runs in a fresh continuation, so an effect it
+    // performs can never reach a `handle` wrapping the outer map call).
+    Map,
+    // (acc -> a -> acc, acc, [a]) -> acc, left to right. The structural
+    // eliminator for List: a native, Rust-loop-driven fold is how renno
+    // gets real list-consuming recursion without a general `let rec` --
+    // unconditionally terminating (bounded by the list's own length),
+    // no user-definable fixpoint needed. Same effect-handling caveat as
+    // Map.
+    Fold,
+}
+
+impl Builtin {
+    pub fn arity(self) -> usize {
+        match self {
+            Builtin::Deep | Builtin::Shallow | Builtin::Len => 1,
+            Builtin::Map => 2,
+            Builtin::Fold => 3,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -45,6 +67,10 @@ pub enum Value {
     Continuation(Cont),
     Handler(Rc<HandlerData>),
     Builtin(Builtin),
+    // A multi-arg Builtin (Map, Fold) with some but not all of its
+    // arguments collected so far. Applying it adds one more; once the
+    // count reaches `Builtin::arity`, the real operation dispatches.
+    PartialBuiltin(Builtin, Rc<Vec<Value>>),
 }
 
 impl Value {
@@ -90,6 +116,7 @@ impl Value {
             (Value::Closure(..), Type::Fun(_, _, _)) => true,
             (Value::Continuation(_), Type::Fun(_, _, _)) => true,
             (Value::Builtin(_), Type::Fun(_, _, _)) => true,
+            (Value::PartialBuiltin(..), Type::Fun(_, _, _)) => true,
             _ => false,
         }
     }
@@ -100,7 +127,7 @@ impl Value {
             Value::Bool(_) => "Bool",
             Value::Str(_) => "Str",
             Value::List(_) => "List",
-            Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) => "Fun",
+            Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => "Fun",
             Value::Handler(_) => "Handler",
         }
     }
@@ -122,7 +149,9 @@ impl fmt::Display for Value {
                 }
                 write!(f, "]")
             }
-            Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) => write!(f, "<function>"),
+            Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => {
+                write!(f, "<function>")
+            }
             Value::Handler(_) => write!(f, "<handler>"),
         }
     }
@@ -169,7 +198,9 @@ impl From<&Value> for Outcome {
             Value::Bool(b) => Outcome::Bool(*b),
             Value::Str(s) => Outcome::Str(s.to_string()),
             Value::List(items) => Outcome::List(items.iter().map(Outcome::from).collect()),
-            Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) => Outcome::Function,
+            Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => {
+                Outcome::Function
+            }
             Value::Handler(_) => Outcome::Handler,
         }
     }
