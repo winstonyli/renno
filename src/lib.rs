@@ -301,11 +301,20 @@ mod tests {
 
     #[test]
     fn deeply_nested_let_chain_does_not_overflow_the_stack() {
-        // Regression test: parser::parse / typecheck::elaborate are plain
-        // recursive descent, so a long enough chain of nested `let`s used
-        // to crash the process with STATUS_STACK_OVERFLOW well before this
-        // depth. run_source now runs the pipeline on a dedicated
-        // large-stack thread specifically to survive this.
+        // Regression test: a long enough chain of nested `let`s used to
+        // crash the process with STATUS_STACK_OVERFLOW. Three independent
+        // native-recursion sources contributed to that, and this fix
+        // addresses two of them directly (see the next test): parser::atom
+        // and typecheck::elaborate flatten a Let/Fun chain iteratively
+        // instead of recursing, and plist.rs's custom iterative Drop fixes
+        // the typecheck Ctx (and Env) teardown cost. The third -- dropping
+        // the resulting Expr tree itself -- is still open (Expr is a
+        // branching tree, not a linked list, so PList's fix doesn't
+        // transfer directly). run_source's large-stack thread is what
+        // covers that one, plus deeply nested App/BinOp/If/Handle (which
+        // branch rather than chain, so the flattening above doesn't apply
+        // to them either, though they're far less likely to reach this
+        // depth in realistic code).
         let n = 5000;
         let mut src = String::from("let x0 = 0 in ");
         for i in 1..n {
@@ -314,5 +323,44 @@ mod tests {
         src.push_str(&format!("x{}", n - 1));
         let result = run_source(&src).expect("should not crash or error");
         assert_eq!(result.as_int(), (n - 1) as i64);
+    }
+
+    #[test]
+    fn let_chain_construction_and_ctx_teardown_are_o1_stack() {
+        // Isolates two of the three native-recursion sources this fix
+        // touches from the third (still open -- see the comment below).
+        //
+        // 1) Construction: parser::atom's and elaborate's Let/Fun chain
+        //    flattening turned a long chain from O(depth) native
+        //    recursion into a loop.
+        // 2) Ctx teardown: elaborate() builds a deeply nested
+        //    PList<Type> internally while walking the chain (one `bind`
+        //    per level) -- Rust's default recursive Drop for that chain
+        //    was confirmed, independently of any parsing/typechecking, to
+        //    overflow the stack on its own at this depth. plist.rs's
+        //    custom iterative Drop (Rc::try_unwrap-based) fixed this for
+        //    both Env and Ctx, since they share PList<T>.
+        //
+        // Still open: dropping the elaborated Expr tree ITSELF is a
+        // third, separate native-recursion source (Expr's default Drop
+        // recurses through its own Rc<Expr> fields the same way) --
+        // confirmed independently to overflow on its own too, and not
+        // fixed here (Expr is a branching tree, not a linked list --
+        // fixing it needs an explicit worklist, not the single-parent-
+        // pointer trick that works for PList). std::mem::forget below
+        // deliberately skips that still-open drop so this test isolates
+        // exactly the two things this fix does cover. run_source's
+        // large-stack thread remains the real defense against Expr's
+        // teardown cost.
+        let n = 50_000;
+        let mut src = String::from("let x0 = 0 in ");
+        for i in 1..n {
+            src.push_str(&format!("let x{i} = x{} + 1 in ", i - 1));
+        }
+        src.push_str(&format!("x{}", n - 1));
+        let expr = parser::parse(&src).expect("parsing should not overflow the stack");
+        let elaborated = typecheck::check(&expr).expect("typechecking should not overflow the stack");
+        std::mem::forget(elaborated);
+        std::mem::forget(expr);
     }
 }

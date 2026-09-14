@@ -37,3 +37,33 @@ impl<T: Clone> PList<T> {
         }
     }
 }
+
+// Rust's default Drop for a struct wrapping Rc<PNode<T>> recurses through
+// `parent` one field-drop at a time -- for a chain built from a long
+// program (many sequential lets, or a deep typecheck Ctx built while
+// walking one) that's the same O(depth) native stack cost this whole
+// persistent-list design was meant to avoid, just moved from construction
+// to teardown (confirmed independently: building and dropping a 50000-
+// deep chain with no parser or typechecker involved at all overflows the
+// default stack). Unwind iteratively instead: take ownership of each
+// node in turn via Rc::try_unwrap, which only succeeds while we hold the
+// last reference to it. The moment some other clone of a node still
+// exists (an Env captured by a closure or continuation, e.g.), stop --
+// that node and everything under it stays alive and gets cleaned up
+// normally by whoever else holds it, so this never double-frees or
+// unwinds something still in use.
+impl<T> Drop for PList<T> {
+    fn drop(&mut self) {
+        let mut node = std::mem::replace(&mut self.0, Rc::new(PNode::Empty));
+        loop {
+            match Rc::try_unwrap(node) {
+                // `parent` has its own Drop impl (this one, recursively),
+                // so it can't be partially moved out of -- swap its inner
+                // Rc out first. `parent` then wraps Empty and drops
+                // trivially when this match arm ends.
+                Ok(PNode::Bind(_, _, mut parent)) => node = std::mem::replace(&mut parent.0, Rc::new(PNode::Empty)),
+                _ => break,
+            }
+        }
+    }
+}

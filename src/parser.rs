@@ -19,6 +19,14 @@ struct Parser {
     pos: usize,
 }
 
+// A `let`/`fun` prefix collected while flattening a chain of them (see
+// `atom`) -- deferred until the terminal body is parsed, then folded back
+// into nested Let/Lambda nodes in reverse.
+enum PendingBinder {
+    Let { var: String, ann: Option<Type>, val: Rc<Expr> },
+    Fun { param: String, ann: Option<Type> },
+}
+
 impl Parser {
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
@@ -135,30 +143,58 @@ impl Parser {
         Ok(e)
     }
 
+    // Peels off a run of leading `let ... in` / `fun ... ->` prefixes
+    // iteratively -- a token peek per iteration, not a recursive call --
+    // so a long chain of either (`let x1 = .. in let x2 = .. in ...`, or
+    // a deeply curried `fun a -> fun b -> fun c -> ...`) costs O(1)
+    // native stack instead of O(chain length). That chain shape is
+    // exactly what used to overflow the stack on deeply nested/generated
+    // source (see lib.rs's run_source). The terminal body/value once the
+    // chain ends is parsed with an ordinary self.expr() call, same as the
+    // original recursive version -- only the "is there another prefix"
+    // bookkeeping moved out of the call stack, not the grammar itself.
     fn atom(&mut self) -> Result<Expr, String> {
+        let mut pending = Vec::new();
+        loop {
+            match self.peek() {
+                Some(Token::Let) => {
+                    self.bump();
+                    let var = self.ident()?;
+                    let ann = self.opt_annotation()?;
+                    self.expect(&Token::Equals)?;
+                    let val = self.expr()?;
+                    self.expect(&Token::In)?;
+                    pending.push(PendingBinder::Let { var, ann, val: Rc::new(val) });
+                }
+                Some(Token::Fun) => {
+                    self.bump();
+                    let param = self.ident()?;
+                    let ann = self.opt_annotation()?;
+                    self.expect(&Token::Arrow)?;
+                    pending.push(PendingBinder::Fun { param, ann });
+                }
+                _ => break,
+            }
+        }
+
+        let mut result = if pending.is_empty() { self.atom_leaf()? } else { self.expr()? };
+        for binder in pending.into_iter().rev() {
+            result = match binder {
+                PendingBinder::Let { var, ann, val } => Expr::Let(var, ann, val, Rc::new(result)),
+                PendingBinder::Fun { param, ann } => Expr::Lambda(param, ann, Rc::new(result)),
+            };
+        }
+        Ok(result)
+    }
+
+    // Every atom form except `let`/`fun`, which `atom` handles iteratively
+    // above. Reached only once no more chain prefix remains.
+    fn atom_leaf(&mut self) -> Result<Expr, String> {
         match self.bump() {
             Some(Token::Int(n)) => Ok(Expr::Int(n)),
             Some(Token::True) => Ok(Expr::Bool(true)),
             Some(Token::False) => Ok(Expr::Bool(false)),
             Some(Token::Ident(name)) => Ok(Expr::Var(name)),
-
-            Some(Token::Fun) => {
-                let param = self.ident()?;
-                let ann = self.opt_annotation()?;
-                self.expect(&Token::Arrow)?;
-                let body = self.expr()?;
-                Ok(Expr::Lambda(param, ann, Rc::new(body)))
-            }
-
-            Some(Token::Let) => {
-                let var = self.ident()?;
-                let ann = self.opt_annotation()?;
-                self.expect(&Token::Equals)?;
-                let val = self.expr()?;
-                self.expect(&Token::In)?;
-                let body = self.expr()?;
-                Ok(Expr::Let(var, ann, Rc::new(val), Rc::new(body)))
-            }
 
             Some(Token::If) => {
                 let cond = self.expr()?;

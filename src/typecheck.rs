@@ -80,6 +80,15 @@ fn wrap_fun_contract(e: Rc<Expr>, param_ty: Rc<Type>, ret_ty: Rc<Type>) -> Rc<Ex
     ))
 }
 
+// A `let`/`fun` prefix collected while flattening a chain of them (see
+// `elaborate`) -- deferred until the terminal body is elaborated, then
+// folded back into nested Let/Lambda nodes (and their types/rows) in
+// reverse, in the exact shape their original per-node match arms produced.
+enum PendingElab {
+    Let { var: String, bound_ty: Type, val_row: EffectRow, val: Rc<Expr> },
+    Fun { param: String, param_ty: Type },
+}
+
 // Recognizes the handler-expression shapes this codebase actually
 // produces (MakeHandler, optionally wrapped in deep(...)/shallow(...))
 // well enough to know which effect name a `handle` discharges. Anything
@@ -114,22 +123,77 @@ fn discharged_effect(handler: &Expr) -> Option<&str> {
 // is never discharged, and stays silent (deferring to today's runtime
 // panic) whenever it can't prove either way.
 pub fn elaborate(expr: &Expr, ctx: &Ctx) -> Result<(Type, EffectRow, Rc<Expr>), TypeError> {
+    // Peels off a run of leading `let`/`fun` prefixes iteratively -- a
+    // match per iteration, not a recursive call -- so a long chain of
+    // either (sequential `let`s, or a deeply curried `fun a -> fun b ->
+    // ...`) costs O(1) native stack instead of O(chain length). This is
+    // the same idea, and fixes the same failure mode, as parser::atom's
+    // chain flattening: a long enough chain used to overflow the stack on
+    // deeply nested/generated source (see lib.rs's run_source). `val`
+    // itself is elaborated via an ordinary recursive call -- it's a
+    // separate subexpression, not part of this spine, so a chain nested
+    // in a `let`'s VALUE position (rather than its body) isn't flattened
+    // by this loop; that's a rarer pattern than the one that was observed
+    // to actually overflow.
+    let mut pending = Vec::new();
+    let mut cur_expr: &Expr = expr;
+    let mut cur_ctx: Ctx = ctx.clone();
+    loop {
+        match cur_expr {
+            Expr::Let(var, ann, val, body) => {
+                let (val_ty, val_row, val2) = elaborate(val, &cur_ctx)?;
+                let (bound_ty, val3) = match ann {
+                    Some(t) => (t.clone(), coerce(val2, &val_ty, t)?),
+                    None => (val_ty, val2),
+                };
+                cur_ctx = extend(&cur_ctx, var, bound_ty.clone());
+                pending.push(PendingElab::Let { var: var.clone(), bound_ty, val_row, val: val3 });
+                cur_expr = &**body;
+            }
+            Expr::Lambda(param, ann, body) => {
+                let param_ty = ann.clone().unwrap_or(Type::Dyn);
+                cur_ctx = extend(&cur_ctx, param, param_ty.clone());
+                pending.push(PendingElab::Fun { param: param.clone(), param_ty });
+                cur_expr = &**body;
+            }
+            _ => break,
+        }
+    }
+
+    let (mut result_ty, mut result_row, mut result_expr) = elaborate_node(cur_expr, &cur_ctx)?;
+
+    for frame in pending.into_iter().rev() {
+        match frame {
+            PendingElab::Let { var, bound_ty, val_row, val } => {
+                // Matches the original Let arm: body's type propagates
+                // through unchanged, row is the union of val's and body's.
+                result_row = EffectRow::union(&val_row, &result_row);
+                result_expr = Rc::new(Expr::Let(var, Some(bound_ty), val, result_expr));
+            }
+            PendingElab::Fun { param, param_ty } => {
+                // Matches the original Lambda arm: the body's row is
+                // embedded in the Fun type, not propagated -- evaluating
+                // the Lambda expression itself is always pure.
+                result_ty = Type::Fun(Rc::new(param_ty.clone()), result_row, Rc::new(result_ty));
+                result_row = EffectRow::pure();
+                result_expr = Rc::new(Expr::Lambda(param, Some(param_ty), result_expr));
+            }
+        }
+    }
+
+    Ok((result_ty, result_row, result_expr))
+}
+
+// Every Expr variant except Let/Lambda, which `elaborate` peels off
+// iteratively above -- reached only once no more chain prefix remains.
+fn elaborate_node(expr: &Expr, ctx: &Ctx) -> Result<(Type, EffectRow, Rc<Expr>), TypeError> {
     match expr {
         Expr::Int(n) => Ok((Type::Int, EffectRow::pure(), Rc::new(Expr::Int(*n)))),
         Expr::Bool(b) => Ok((Type::Bool, EffectRow::pure(), Rc::new(Expr::Bool(*b)))),
         Expr::Var(name) => Ok((lookup(ctx, name), EffectRow::pure(), Rc::new(Expr::Var(name.clone())))),
 
-        Expr::Lambda(param, ann, body) => {
-            let param_ty = ann.clone().unwrap_or(Type::Dyn);
-            let (body_ty, body_row, body2) = elaborate(body, &extend(ctx, param, param_ty.clone()))?;
-            // Evaluating the Lambda expression itself is pure -- the
-            // body's row only manifests when the resulting function is
-            // called, so it's embedded in the Fun type, not returned here.
-            Ok((
-                Type::Fun(Rc::new(param_ty.clone()), body_row, Rc::new(body_ty)),
-                EffectRow::pure(),
-                Rc::new(Expr::Lambda(param.clone(), Some(param_ty), body2)),
-            ))
+        Expr::Let(..) | Expr::Lambda(..) => {
+            unreachable!("Let/Lambda are peeled by elaborate's chain-flattening loop")
         }
 
         Expr::App(f, a) => {
@@ -154,17 +218,6 @@ pub fn elaborate(expr: &Expr, ctx: &Ctx) -> Result<(Type, EffectRow, Rc<Expr>), 
             let (call_row, ret_ty, app2) = called_row_and_ty_expr;
             let row = EffectRow::union(&EffectRow::union(&f_row, &a_row), &call_row);
             Ok((ret_ty, row, app2))
-        }
-
-        Expr::Let(var, ann, val, body) => {
-            let (val_ty, val_row, val2) = elaborate(val, ctx)?;
-            let (bound_ty, val3) = match ann {
-                Some(t) => (t.clone(), coerce(val2, &val_ty, t)?),
-                None => (val_ty, val2),
-            };
-            let (body_ty, body_row, body2) = elaborate(body, &extend(ctx, var, bound_ty.clone()))?;
-            let row = EffectRow::union(&val_row, &body_row);
-            Ok((body_ty, row, Rc::new(Expr::Let(var.clone(), Some(bound_ty), val3, body2))))
         }
 
         Expr::BinOp(op, l, r) => {
