@@ -46,10 +46,7 @@ pub fn run_source(src: &str) -> Result<Outcome, String> {
 
 fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
     let (mut arena, spans, root) = parser::parse(src)?;
-    let elaborated = typecheck::check(&mut arena, root, &spans).map_err(|e| {
-        let (line, col) = e.1.line_col(src);
-        format!("line {line}, column {col}: {}", e.0)
-    })?;
+    let elaborated = typecheck::check(&mut arena, root, &spans).map_err(|e| e.1.format_error(src, &e.0))?;
     std::panic::catch_unwind(|| machine::run(&arena, elaborated, Env::prelude()))
         .map_err(|_| "runtime error (see panic message above)".to_string())
 }

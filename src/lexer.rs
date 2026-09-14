@@ -124,10 +124,7 @@ pub fn tokenize(src: &str) -> Result<Vec<(Token, Span)>, String> {
         let span = Span { start: span.start, end: span.end };
         match result {
             Ok(tok) => tokens.push((tok, span)),
-            Err(_) => {
-                let (line, col) = span.line_col(src);
-                return Err(format!("line {line}, column {col}: lex error"));
-            }
+            Err(_) => return Err(span.format_error(src, "lex error")),
         }
     }
     Ok(tokens)

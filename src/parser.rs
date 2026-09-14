@@ -66,8 +66,7 @@ impl<'a> Parser<'a> {
     }
 
     fn err_at(&self, span: Span, msg: String) -> String {
-        let (line, col) = span.line_col(self.src);
-        format!("line {line}, column {col}: {msg}")
+        span.format_error(self.src, &msg)
     }
 
     // The only way an Expr node should ever be added to the arena --
