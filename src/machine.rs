@@ -112,12 +112,22 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     cont = Cont::cons(Frame::AppFunc { arg: *a, env: env.clone() }, cont);
                     control = Control::Eval(*f, env);
                 }
-                Expr::Let(var, _ann, val_expr, body, is_rec) => {
+                Expr::Let(var, _ann, val_expr, body) => {
+                    cont = Cont::cons(Frame::LetBody { var: var.clone(), body: *body, env: env.clone() }, cont);
+                    control = Control::Eval(*val_expr, env);
+                }
+                Expr::LetRec(bindings, body) => {
+                    let names: Rc<Vec<String>> = Rc::new(bindings.iter().map(|(n, _, _)| n.clone()).collect());
+                    // Reversed, same reason as ListLit: pop() (O(1))
+                    // instead of remove(0) as each binding finishes.
+                    let mut remaining: Vec<ExprRef> = bindings.iter().map(|(_, _, v)| *v).collect();
+                    remaining.reverse();
+                    let first = remaining.pop().unwrap(); // parser never emits an empty group
                     cont = Cont::cons(
-                        Frame::LetBody { var: var.clone(), body: *body, env: env.clone(), is_rec: *is_rec },
+                        Frame::LetRecBody { names, remaining, done: Vec::new(), body: *body, env: env.clone() },
                         cont,
                     );
-                    control = Control::Eval(*val_expr, env);
+                    control = Control::Eval(first, env);
                 }
                 Expr::BinOp(op, l, r) => {
                     cont = Cont::cons(Frame::BinOpL { op: *op, rhs: *r, env: env.clone() }, cont);
@@ -201,18 +211,26 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                 Value::Closure(param, body, closure_env) => {
                                     control = Control::Eval(body, closure_env.bind(param, value));
                                 }
-                                Value::RecClosure(self_name, param, body, closure_env) => {
-                                    // Rebind `self_name` to (a fresh copy
-                                    // of) this same RecClosure every call,
-                                    // not just once at construction --
-                                    // that's what makes a reference to
-                                    // `self_name` inside `body` resolve
-                                    // recursively, with Env's ordinary
-                                    // persistent bind/lookup doing all the
-                                    // work. No mutation, no AST rewriting.
-                                    let rec_val =
-                                        Value::RecClosure(self_name.clone(), param.clone(), body, closure_env.clone());
-                                    let env2 = closure_env.bind(self_name, rec_val).bind(param, value);
+                                Value::RecClosure(group, index, closure_env) => {
+                                    // Rebind EVERY name in the group to (a
+                                    // fresh copy of) its own RecClosure
+                                    // every call, not just once at
+                                    // construction -- that's what makes a
+                                    // reference to any sibling (including
+                                    // this one's own name) inside `body`
+                                    // resolve recursively, with Env's
+                                    // ordinary persistent bind/lookup doing
+                                    // all the work. No mutation, no AST
+                                    // rewriting. A plain single-function
+                                    // `let rec` is just the group.len()==1
+                                    // case -- same loop, one iteration.
+                                    let (_, param, body) = group[index].clone();
+                                    let mut env2 = closure_env.clone();
+                                    for i in 0..group.len() {
+                                        let (name, _, _) = group[i].clone();
+                                        env2 = env2.bind(name, Value::RecClosure(group.clone(), i, closure_env.clone()));
+                                    }
+                                    env2 = env2.bind(param, value);
                                     control = Control::Eval(body, env2);
                                 }
                                 Value::Continuation(k) => {
@@ -246,21 +264,70 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                 _ => panic!("handle: expected a handler value"),
                             }
                         }
-                        Frame::LetBody { var, body, env, is_rec } => {
-                            let (var, body, env, is_rec) = (var.clone(), *body, env.clone(), *is_rec);
+                        Frame::LetBody { var, body, env } => {
+                            let (var, body, env) = (var.clone(), *body, env.clone());
                             cont = rest;
-                            // `let rec`: if the bound value is a function,
-                            // wrap it so it can rebind its own name on
-                            // every call (see Value::RecClosure). A
-                            // non-function value under `rec` (meaningless,
-                            // but not an error) just binds normally.
-                            let bound = match (is_rec, value) {
-                                (true, Value::Closure(param, closure_body, closure_env)) => {
-                                    Value::RecClosure(var.clone(), param, closure_body, closure_env)
+                            control = Control::Eval(body, env.bind(var, value));
+                        }
+                        Frame::LetRecBody { names, remaining, done, body, env } => {
+                            let (names, mut remaining, mut done, body, env) =
+                                (names.clone(), remaining.clone(), done.clone(), *body, env.clone());
+                            done.push(value);
+                            cont = rest;
+                            match remaining.pop() {
+                                Some(next) => {
+                                    cont = Cont::cons(
+                                        Frame::LetRecBody { names, remaining, done, body, env: env.clone() },
+                                        cont,
+                                    );
+                                    control = Control::Eval(next, env);
                                 }
-                                (_, value) => value,
-                            };
-                            control = Control::Eval(body, env.bind(var, bound));
+                                None => {
+                                    // Every binding's value is in (`done`,
+                                    // same order as `names`). If they're
+                                    // ALL functions, wrap the whole group
+                                    // into mutually-referencing RecClosure
+                                    // values (see its own doc comment). A
+                                    // group with any non-function value is
+                                    // meaningless as `let rec` (same as the
+                                    // single-binding case) but not an
+                                    // error -- just bind everything as-is,
+                                    // no recursion magic.
+                                    let all_closures = done.iter().all(|v| matches!(v, Value::Closure(..)));
+                                    // Every RecClosure's own stored env is
+                                    // this ORIGINAL one -- fixed, never the
+                                    // progressively-growing `env2` below --
+                                    // so rebuilding the group on a call
+                                    // always starts from the same base,
+                                    // not one that already has some
+                                    // members bound from THIS construction.
+                                    let base_env = env;
+                                    let mut env2 = base_env.clone();
+                                    if all_closures {
+                                        let group: Rc<Vec<(String, String, ExprRef)>> = Rc::new(
+                                            names
+                                                .iter()
+                                                .zip(done.iter())
+                                                .map(|(name, v)| match v {
+                                                    Value::Closure(param, cbody, _) => {
+                                                        (name.clone(), param.clone(), *cbody)
+                                                    }
+                                                    _ => unreachable!("all_closures already checked"),
+                                                })
+                                                .collect(),
+                                        );
+                                        for (i, name) in names.iter().enumerate() {
+                                            env2 =
+                                                env2.bind(name.clone(), Value::RecClosure(group.clone(), i, base_env.clone()));
+                                        }
+                                    } else {
+                                        for (name, v) in names.iter().zip(done) {
+                                            env2 = env2.bind(name.clone(), v);
+                                        }
+                                    }
+                                    control = Control::Eval(body, env2);
+                                }
+                            }
                         }
                         Frame::MatchArms { arms, env } => {
                             let (arms, env) = (arms.clone(), env.clone());

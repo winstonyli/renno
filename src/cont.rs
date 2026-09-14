@@ -12,7 +12,14 @@ use crate::value::{HandlerData, Value};
 pub enum Frame {
     AppFunc { arg: ExprRef, env: Env },
     AppArg { func: Value },
-    LetBody { var: String, body: ExprRef, env: Env, is_rec: bool },
+    LetBody { var: String, body: ExprRef, env: Env },
+    // Evaluating one `let rec` group's binding values left to right
+    // (Lambdas in practice, but evaluated properly rather than assumed --
+    // see machine.rs's Eval arm for Expr::LetRec). `names` is the fixed,
+    // full list for the whole group (needed once every value is in, to
+    // build the mutually-referencing Value::RecClosure set); `remaining`/
+    // `done` mirror ListElems's own left-to-right accumulation shape.
+    LetRecBody { names: Rc<Vec<String>>, remaining: Vec<ExprRef>, done: Vec<Value>, body: ExprRef, env: Env },
     // Scrutinee has just been evaluated to `value` -- try `arms` in order.
     MatchArms { arms: Rc<Vec<(Pattern, ExprRef)>>, env: Env },
     BinOpL { op: BinOp, rhs: ExprRef, env: Env },

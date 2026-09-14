@@ -194,7 +194,7 @@ fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: 
     let call = arena.push(Expr::App(checked_fn, arg_var_ref));
     let checked_call = arena.push(Expr::Check((*ret_ty).clone(), call));
     let lambda = arena.push(Expr::Lambda(arg_var, Some((*param_ty).clone()), checked_call));
-    arena.push(Expr::Let(fn_var, None, e, lambda, false))
+    arena.push(Expr::Let(fn_var, None, e, lambda))
 }
 
 // A `let`/`fun` prefix collected while flattening a chain of them (see
@@ -202,7 +202,11 @@ fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: 
 // folded back into nested Let/Lambda nodes (and their types/rows) in
 // reverse, in the exact shape their original per-node match arms produced.
 enum PendingElab {
-    Let { var: String, bound_ty: Type, val_row: EffectRow, val: ExprRef, rec: bool },
+    Let { var: String, bound_ty: Type, val_row: EffectRow, val: ExprRef },
+    // One `let rec` group's elaborated bindings (each carrying its own
+    // inferred/annotated type, row, and elaborated value), folding back
+    // into a single Expr::LetRec.
+    LetRec { bindings: Vec<(String, Type, EffectRow, ExprRef)> },
     Fun { param: String, param_ty: Type },
 }
 
@@ -408,25 +412,47 @@ fn elaborate(
         // `arena` before the arm below needs to mutate it.
         let node = arena[cur_expr].clone();
         match node {
-            Expr::Let(var, ann, val, body, rec) => {
-                // `rec`: `var` needs to resolve to its own (eventual) type
-                // WHILE elaborating `val`, for a self-reference inside it
-                // to type-check precisely rather than falling back to Dyn.
-                // That's only possible if the type is already known, i.e.
-                // annotated -- an unannotated `let rec` still works (the
-                // self-reference is just Dyn, like any other unbound-at-
-                // this-point lookup), it's just not precisely typed.
-                let val_ctx = match (rec, &ann) {
-                    (true, Some(t)) => extend(&cur_ctx, &var, t.clone()),
-                    _ => cur_ctx.clone(),
-                };
-                let (val_ty, val_row, val2) = elaborate(arena, val, &val_ctx, &cur_fields, spans)?;
+            Expr::Let(var, ann, val, body) => {
+                let (val_ty, val_row, val2) = elaborate(arena, val, &cur_ctx, &cur_fields, spans)?;
                 let (bound_ty, val3) = match ann {
                     Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t, spans[val])?),
                     None => (val_ty, val2),
                 };
                 cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone());
-                pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3, rec });
+                pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3 });
+                cur_expr = body;
+            }
+            // Every binding needs to resolve to its own (eventual) type
+            // WHILE elaborating every value in the group (not just its
+            // own), so that a reference to any sibling -- including
+            // itself -- type-checks precisely rather than falling back to
+            // Dyn. That's only possible where a type is already known,
+            // i.e. annotated -- an unannotated binding still works (that
+            // one reference is just Dyn, like any other unbound-at-this-
+            // point lookup), it's just not precisely typed. All values
+            // are elaborated against this SAME pre-bound context (not a
+            // progressively-updated one): they're simultaneous, not
+            // sequential, so f seeing g's real inferred type (rather than
+            // just g's annotation-or-Dyn) would wrongly depend on
+            // which one happens to come first in the `and` chain.
+            Expr::LetRec(bindings, body) => {
+                let mut val_ctx = cur_ctx.clone();
+                for (name, ann, _) in bindings.iter() {
+                    val_ctx = extend(&val_ctx, name, ann.clone().unwrap_or(Type::Dyn));
+                }
+                let mut elaborated = Vec::with_capacity(bindings.len());
+                for (name, ann, val) in bindings.iter() {
+                    let (val_ty, val_row, val2) = elaborate(arena, *val, &val_ctx, &cur_fields, spans)?;
+                    let (bound_ty, val3) = match ann {
+                        Some(t) => (t.clone(), coerce(arena, val2, &val_ty, t, spans[*val])?),
+                        None => (val_ty, val2),
+                    };
+                    elaborated.push((name.clone(), bound_ty, val_row, val3));
+                }
+                for (name, bound_ty, _, _) in &elaborated {
+                    cur_ctx = extend_generalized(&cur_ctx, name, bound_ty.clone());
+                }
+                pending.push(PendingElab::LetRec { bindings: elaborated });
                 cur_expr = body;
             }
             Expr::Lambda(param, ann, body) => {
@@ -459,11 +485,22 @@ fn elaborate(
 
     for frame in pending.into_iter().rev() {
         match frame {
-            PendingElab::Let { var, bound_ty, val_row, val, rec } => {
+            PendingElab::Let { var, bound_ty, val_row, val } => {
                 // Matches the original Let arm: body's type propagates
                 // through unchanged, row is the union of val's and body's.
                 result_row = EffectRow::union(&val_row, &result_row);
-                result_expr = arena.push(Expr::Let(var, Some(bound_ty), val, result_expr, rec));
+                result_expr = arena.push(Expr::Let(var, Some(bound_ty), val, result_expr));
+            }
+            PendingElab::LetRec { bindings } => {
+                // Matches the original LetRec arm: body's type propagates
+                // through unchanged, row is the union of every binding's
+                // plus body's.
+                for (_, _, val_row, _) in &bindings {
+                    result_row = EffectRow::union(val_row, &result_row);
+                }
+                let group: Vec<(String, Option<Type>, ExprRef)> =
+                    bindings.into_iter().map(|(name, ty, _, val)| (name, Some(ty), val)).collect();
+                result_expr = arena.push(Expr::LetRec(Rc::new(group), result_expr));
             }
             PendingElab::Fun { param, param_ty } => {
                 // Matches the original Lambda arm: the body's row is
@@ -520,8 +557,8 @@ fn elaborate_node(
             Ok((list_ty, row, arena.push(Expr::ListLit(refs))))
         }
 
-        Expr::Let(..) | Expr::Lambda(..) | Expr::DataGroup(..) => {
-            unreachable!("Let/Lambda/DataGroup are peeled by elaborate's chain-flattening loop")
+        Expr::Let(..) | Expr::LetRec(..) | Expr::Lambda(..) | Expr::DataGroup(..) => {
+            unreachable!("Let/LetRec/Lambda/DataGroup are peeled by elaborate's chain-flattening loop")
         }
 
         Expr::App(f, a) => {

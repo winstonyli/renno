@@ -12,6 +12,8 @@ pub enum Token {
     Let,
     #[token("rec")]
     Rec,
+    #[token("and")]
+    And,
     #[token("data")]
     Data,
     #[token("in")]

@@ -29,7 +29,11 @@ struct Parser<'a> {
 // (see `atom`) -- deferred until the terminal body is parsed, then folded
 // back into nested Let/Lambda/DataGroup nodes in reverse.
 enum PendingBinder {
-    Let { var: String, ann: Option<Type>, rec: bool, val: ExprRef },
+    Let { var: String, ann: Option<Type>, val: ExprRef },
+    // `let rec f = val_f [and g = val_g ...] in ...` -- one or more
+    // simultaneously-recursive bindings folding back into a single
+    // Expr::LetRec (never Expr::Let, which is never recursive).
+    LetRec { bindings: Vec<(String, Option<Type>, ExprRef)> },
     Fun { param: String, ann: Option<Type> },
     // `data Name = Ctor1(T, ...) | Ctor2 | ...` -- one pending item expands
     // to N nested Lets when folded back (one per constructor), not one.
@@ -397,12 +401,28 @@ impl<'a> Parser<'a> {
                     if rec {
                         self.bump();
                     }
-                    let var = self.ident()?;
-                    let ann = self.opt_annotation()?;
-                    self.expect(&Token::Equals)?;
-                    let val = self.expr()?;
+                    // `and` only continues a `rec` group -- a plain `let`
+                    // is always exactly one binding.
+                    let mut bindings = Vec::new();
+                    loop {
+                        let var = self.ident()?;
+                        let ann = self.opt_annotation()?;
+                        self.expect(&Token::Equals)?;
+                        let val = self.expr()?;
+                        bindings.push((var, ann, val));
+                        if rec && matches!(self.peek(), Some(Token::And)) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
                     self.expect(&Token::In)?;
-                    pending.push((start, PendingBinder::Let { var, ann, rec, val }));
+                    if rec {
+                        pending.push((start, PendingBinder::LetRec { bindings }));
+                    } else {
+                        let (var, ann, val) = bindings.into_iter().next().unwrap();
+                        pending.push((start, PendingBinder::Let { var, ann, val }));
+                    }
                 }
                 Some(Token::Fun) => {
                     let start = self.span_at().start;
@@ -475,8 +495,9 @@ impl<'a> Parser<'a> {
         for (start, binder) in pending.into_iter().rev() {
             let span = Span { start, end };
             result = match binder {
-                PendingBinder::Let { var, ann, rec, val } => {
-                    self.push_spanned(Expr::Let(var, ann, val, result, rec), span)
+                PendingBinder::Let { var, ann, val } => self.push_spanned(Expr::Let(var, ann, val, result), span),
+                PendingBinder::LetRec { bindings } => {
+                    self.push_spanned(Expr::LetRec(Rc::new(bindings), result), span)
                 }
                 PendingBinder::Fun { param, ann } => self.push_spanned(Expr::Lambda(param, ann, result), span),
                 PendingBinder::Data { type_name, ctors } => {
@@ -504,7 +525,7 @@ impl<'a> Parser<'a> {
                     for (name, field_tys) in ctors.into_iter().rev() {
                         let val = self.build_ctor_value(&name, &field_tys, span);
                         let ty = Some(ctor_type(&type_name, &field_tys));
-                        body = self.push_spanned(Expr::Let(name, ty, val, body, false), span);
+                        body = self.push_spanned(Expr::Let(name, ty, val, body), span);
                     }
                     self.push_spanned(Expr::DataGroup(Rc::new(info), body), span)
                 }

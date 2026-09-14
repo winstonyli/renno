@@ -1,7 +1,9 @@
 // `let rec`: a self-referential let, for general (not just structural)
 // recursion. `fact` calls itself inside its own body -- ordinary `let`
 // can't do this, since the name it binds isn't in scope while its value
-// is being evaluated.
+// is being evaluated. (`let rec f = ... and g = ... in ...` generalizes
+// this to a whole group of MUTUALLY recursive functions -- see
+// mutual_recursion.rn -- this is just the one-function case of it.)
 let rec fact = fun n ->
   if n == 0 then 1 else n * fact(n - 1)
 in fact(10)

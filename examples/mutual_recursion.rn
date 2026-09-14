@@ -1,0 +1,8 @@
+// `let rec f = ... and g = ... in ...`: mutually recursive bindings,
+// generalizing self-recursive `let rec` (see let_rec.rn) to a whole GROUP
+// of functions that can all call each other -- including themselves --
+// by name. A plain `let rec` with no `and` is just the one-function case
+// of this same machinery, not a separate feature.
+let rec is_even = fun n -> if n == 0 then true else is_odd(n - 1)
+and is_odd = fun n -> if n == 0 then false else is_even(n - 1)
+in is_even(10)

@@ -94,7 +94,10 @@ mod tests {
             Expr::ListLit(items) => items.iter().any(|i| contains_check(arena, *i)),
             Expr::Lambda(_, _, body) => contains_check(arena, *body),
             Expr::App(f, a) => contains_check(arena, *f) || contains_check(arena, *a),
-            Expr::Let(_, _, val, body, _) => contains_check(arena, *val) || contains_check(arena, *body),
+            Expr::Let(_, _, val, body) => contains_check(arena, *val) || contains_check(arena, *body),
+            Expr::LetRec(bindings, body) => {
+                bindings.iter().any(|(_, _, val)| contains_check(arena, *val)) || contains_check(arena, *body)
+            }
             Expr::BinOp(_, l, r) => contains_check(arena, *l) || contains_check(arena, *r),
             Expr::If(c, t, e) => contains_check(arena, *c) || contains_check(arena, *t) || contains_check(arena, *e),
             Expr::Perform(_, payload) => contains_check(arena, *payload),
@@ -349,6 +352,55 @@ mod tests {
         // not just when called directly from the trampoline loop.
         let src = "map(fun n -> let rec loop = fun i -> if i < n then i + loop(i + 1) else 0 in loop(1))([3, 6])";
         assert_eq!(run_untyped(src).to_string(), "[3, 15]");
+    }
+
+    // --- mutual recursion (`let rec ... and ...`) ---
+
+    #[test]
+    fn mutual_recursion_even_odd() {
+        let src = "let rec is_even = fun n -> if n == 0 then true else is_odd(n - 1) \
+                    and is_odd = fun n -> if n == 0 then false else is_even(n - 1) \
+                    in is_even(10)";
+        assert!(run_untyped(src).as_bool());
+    }
+
+    #[test]
+    fn mutual_recursion_three_way_cycle() {
+        // a(9) -> b(8) -> c(7) -> ... -> a(0) = 1
+        let src = "let rec a = fun n -> if n == 0 then 1 else b(n - 1) \
+                    and b = fun n -> if n == 0 then 2 else c(n - 1) \
+                    and c = fun n -> if n == 0 then 3 else a(n - 1) \
+                    in a(9)";
+        assert_eq!(run_untyped(src).as_int(), 1);
+    }
+
+    #[test]
+    fn single_binding_let_rec_still_self_recurses() {
+        // Regression guard: plain `let rec` (no `and`) is the group.len()==1
+        // case of the same machinery -- not a separate code path.
+        let src = "let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in fact(5)";
+        assert_eq!(run_untyped(src).as_int(), 120);
+    }
+
+    #[test]
+    fn mutual_recursion_with_annotated_types_typechecks_and_runs() {
+        let src = "let rec is_even: (Int -> Bool) = fun n -> if n == 0 then true else is_odd(n - 1) \
+                    and is_odd: (Int -> Bool) = fun n -> if n == 0 then false else is_even(n - 1) \
+                    in is_even(7)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(!machine::run(&arena, elaborated, Env::prelude(), &spans).as_bool());
+    }
+
+    #[test]
+    fn mutual_recursion_composes_with_adt_and_match() {
+        let src = r#"
+            data List = Nil | Cons(Int, List) in
+            let rec sum = fun l -> match l with | Nil -> 0 | Cons(h, t) -> h + count(t)
+            and count = fun l -> match l with | Nil -> 0 | Cons(h, t) -> 1 + sum(t)
+            in sum(Cons(1)(Cons(2)(Cons(3)(Nil))))
+        "#;
+        assert_eq!(run_untyped(src).as_int(), 5);
     }
 
     // --- pattern matching ---

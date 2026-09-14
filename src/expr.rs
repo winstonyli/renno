@@ -84,12 +84,20 @@ pub enum Expr {
     // when the source has an explicit `: Type` annotation.
     Lambda(String, Option<Type>, ExprRef),
     App(ExprRef, ExprRef),
-    // Last field: `let rec` (true) vs plain `let` (false). Meaningful only
-    // when `val` evaluates to a function -- machine.rs wraps it into a
-    // Value::RecClosure so it can rebind its own name into scope each time
-    // it's called (see Value::RecClosure's doc comment for how that avoids
-    // needing mutation or an AST-rewriting Y-combinator encoding).
-    Let(String, Option<Type>, ExprRef, ExprRef, bool),
+    // Plain, non-recursive `let var = val in body` -- `var` is NOT in
+    // scope while `val` is being evaluated. See LetRec for `let rec`.
+    Let(String, Option<Type>, ExprRef, ExprRef),
+    // `let rec f = val_f [and g = val_g ...] in body` -- one or more
+    // SIMULTANEOUSLY recursive bindings, each visible to every other
+    // one's value (and its own), not just sequentially in scope like Let.
+    // Meaningful only when every value evaluates to a function -- machine.rs
+    // wraps the whole group into mutually-referencing Value::RecClosure
+    // values so each can call any sibling (including itself) by name (see
+    // Value::RecClosure's doc comment for how that avoids needing
+    // mutation or an AST-rewriting Y-combinator encoding). A single
+    // binding (`let rec f = ... in ...`, no `and`) is just the length-1
+    // case -- no separate representation for plain self-recursion.
+    LetRec(Rc<Vec<(String, Option<Type>, ExprRef)>>, ExprRef),
     BinOp(BinOp, ExprRef, ExprRef),
     // Runtime type check: produced only by typecheck::elaborate, never by
     // the parser directly. Verifies the inner expr's value matches `Type`
