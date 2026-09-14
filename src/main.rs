@@ -1,7 +1,9 @@
 mod cont;
 mod env;
 mod expr;
+mod lexer;
 mod machine;
+mod parser;
 mod value;
 
 use std::rc::Rc;
@@ -37,7 +39,14 @@ fn build_multi_shot_demo() -> Rc<Expr> {
 }
 
 fn main() {
-    let result = machine::run(build_multi_shot_demo(), Env::prelude());
+    let src = r#"
+        handle
+          let x = perform choose(0) in
+          x + 100
+        with handler choose(p, resume) -> resume(1) + resume(2)
+    "#;
+    let expr = parser::parse(src).expect("parse failed");
+    let result = machine::run(expr, Env::prelude());
     println!("result = {}", result.as_int());
     assert_eq!(result.as_int(), 203);
 }
@@ -96,5 +105,46 @@ mod tests {
     #[should_panic(expected = "unhandled effect: choose")]
     fn shallow_handler_does_not_catch_repeat_effect() {
         machine::run(two_sequential_performs(false), Env::prelude());
+    }
+
+    #[test]
+    fn parses_and_runs_multi_shot_demo() {
+        let src = r#"
+            handle
+              let x = perform choose(0) in
+              x + 100
+            with handler choose(p, resume) -> resume(1) + resume(2)
+        "#;
+        let expr = parser::parse(src).expect("parse failed");
+        let result = machine::run(expr, Env::prelude());
+        assert_eq!(result.as_int(), 203);
+    }
+
+    #[test]
+    fn parses_and_runs_deep_handler() {
+        let src = r#"
+            handle
+              let x = perform choose(0) in
+              let y = perform choose(0) in
+              x + y
+            with deep(handler choose(p, resume) -> resume(1))
+        "#;
+        let expr = parser::parse(src).expect("parse failed");
+        let result = machine::run(expr, Env::prelude());
+        assert_eq!(result.as_int(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "unhandled effect: choose")]
+    fn parses_and_runs_shallow_handler_panic() {
+        let src = r#"
+            handle
+              let x = perform choose(0) in
+              let y = perform choose(0) in
+              x + y
+            with handler choose(p, resume) -> resume(1)
+        "#;
+        let expr = parser::parse(src).expect("parse failed");
+        machine::run(expr, Env::prelude());
     }
 }
