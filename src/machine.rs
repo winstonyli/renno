@@ -150,6 +150,18 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                 // directly, so this still needs to evaluate straight
                 // through to `body`.
                 Expr::DataGroup(_, body) => control = Control::Eval(*body, env),
+                // Unlike DataGroup, a typechecked program never leaves one
+                // of these behind EITHER (typecheck::elaborate_node
+                // resolves it into an ordinary Match) -- but resolving it
+                // needs static type information (which `data` type does
+                // the target belong to, and which field index does `name`
+                // mean) that has nowhere to come from at runtime, so
+                // there's no sensible fallback the way DataGroup's plain
+                // passthrough is. The untyped path (e.g. tests'
+                // run_untyped) just can't use field access.
+                Expr::FieldAccess(_, field) => {
+                    panic!("field access `.{field}` requires typechecking (run through typecheck::check, not raw parser output)")
+                }
                 Expr::MakeHandler { effect, payload_var, resume_var, body } => {
                     control = Control::Apply(Value::Handler(Rc::new(HandlerData {
                         effect: effect.clone(),

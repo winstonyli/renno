@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
+use crate::expr::{Arena, BinOp, DataInfo, Expr, ExprRef, Pattern, SpanMap};
 use crate::plist::PList;
 use crate::span::Span;
 use crate::types::{consistent, EffectRow, Type};
@@ -321,7 +321,7 @@ fn first_unreachable(patterns: &[Pattern]) -> Option<usize> {
 // Anything else is reported as possibly non-exhaustive: Int/Str literals
 // with no catch-all, a List match using only fixed-length patterns, or an
 // ADT match that doesn't cover every constructor its `data` declared.
-fn missing_case(patterns: &[Pattern], groups: &[BTreeSet<String>]) -> Option<String> {
+fn missing_case(patterns: &[Pattern], fields: &[Rc<DataInfo>]) -> Option<String> {
     if patterns.iter().any(|p| matches!(p, Pattern::Var(_))) {
         return None;
     }
@@ -342,7 +342,11 @@ fn missing_case(patterns: &[Pattern], groups: &[BTreeSet<String>]) -> Option<Str
 
     let tags: Option<BTreeSet<String>> = patterns.iter().map(|p| ctor_tag(p).map(str::to_string)).collect();
     if let Some(tags) = &tags {
-        if groups.iter().any(|g| g == tags) {
+        let matches_some_data_type = fields.iter().any(|info| {
+            let its_tags: BTreeSet<String> = info.ctors.iter().map(|(name, _)| name.clone()).collect();
+            &its_tags == tags
+        });
+        if matches_some_data_type {
             return None;
         }
     }
@@ -379,7 +383,7 @@ fn elaborate(
     arena: &mut Arena,
     expr: ExprRef,
     ctx: &Ctx,
-    groups: &[BTreeSet<String>],
+    fields: &[Rc<DataInfo>],
     spans: &SpanMap,
 ) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     // Peels off a run of leading `let`/`fun` prefixes iteratively -- a
@@ -397,7 +401,7 @@ fn elaborate(
     let mut pending = Vec::new();
     let mut cur_expr = expr;
     let mut cur_ctx: Ctx = ctx.clone();
-    let mut cur_groups: Vec<BTreeSet<String>> = groups.to_vec();
+    let mut cur_fields: Vec<Rc<DataInfo>> = fields.to_vec();
     loop {
         // Expr is Clone and, now that its fields are ExprRef (Copy)
         // instead of Rc<Expr>, cheap to clone -- this ends the borrow on
@@ -416,7 +420,7 @@ fn elaborate(
                     (true, Some(t)) => extend(&cur_ctx, &var, t.clone()),
                     _ => cur_ctx.clone(),
                 };
-                let (val_ty, val_row, val2) = elaborate(arena, val, &val_ctx, &cur_groups, spans)?;
+                let (val_ty, val_row, val2) = elaborate(arena, val, &val_ctx, &cur_fields, spans)?;
                 let (bound_ty, val3) = match ann {
                     Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t, spans[val])?),
                     None => (val_ty, val2),
@@ -431,18 +435,19 @@ fn elaborate(
                 pending.push(PendingElab::Fun { param, param_ty });
                 cur_expr = body;
             }
-            // Transparent marker for a `data` declaration's constructor tag
-            // set (see parser::build_ctor_value) -- peeled here, not left
-            // as a plain elaborate_node case, for the same reason Let/
-            // Lambda are: a long chain of `data` blocks costs O(1) native
-            // stack, not O(chain length). Nothing folds back for it: the
+            // Transparent marker for a `data` declaration (see
+            // parser::build_ctor_value) -- peeled here, not left as a
+            // plain elaborate_node case, for the same reason Let/Lambda
+            // are: a long chain of `data` blocks costs O(1) native stack,
+            // not O(chain length). Nothing folds back for it: the
             // elaborated tree drops this node entirely -- machine.rs's own
             // passthrough arm only matters on the un-typechecked path
             // (e.g. tests' run_untyped). Its only job here is extending
-            // `cur_groups` so a later Match in `body` can check
-            // exhaustiveness against it (see missing_case).
-            Expr::DataGroup(tags, body) => {
-                cur_groups.push((*tags).clone());
+            // `cur_fields` so a later Match in `body` can check
+            // exhaustiveness against it (missing_case), and a later
+            // FieldAccess can resolve a `.field` against it.
+            Expr::DataGroup(info, body) => {
+                cur_fields.push(info);
                 cur_expr = body;
             }
             _ => break,
@@ -450,7 +455,7 @@ fn elaborate(
     }
 
     let (mut result_ty, mut result_row, mut result_expr) =
-        elaborate_node(arena, cur_expr, &cur_ctx, &cur_groups, spans)?;
+        elaborate_node(arena, cur_expr, &cur_ctx, &cur_fields, spans)?;
 
     for frame in pending.into_iter().rev() {
         match frame {
@@ -485,7 +490,7 @@ fn elaborate_node(
     arena: &mut Arena,
     expr: ExprRef,
     ctx: &Ctx,
-    groups: &[BTreeSet<String>],
+    fields: &[Rc<DataInfo>],
     spans: &SpanMap,
 ) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     let node = arena[expr].clone();
@@ -500,7 +505,7 @@ fn elaborate_node(
             let mut elem_ty: Option<Type> = None;
             let mut refs = Vec::with_capacity(items.len());
             for item in items {
-                let (item_ty, item_row, item2) = elaborate(arena, item, ctx, groups, spans)?;
+                let (item_ty, item_row, item2) = elaborate(arena, item, ctx, fields, spans)?;
                 row = EffectRow::union(&row, &item_row);
                 refs.push(item2);
                 // Same rule as If's branches: differing concrete element
@@ -520,8 +525,8 @@ fn elaborate_node(
         }
 
         Expr::App(f, a) => {
-            let (f_ty, f_row, f2) = elaborate(arena, f, ctx, groups, spans)?;
-            let (a_ty, a_row, a2) = elaborate(arena, a, ctx, groups, spans)?;
+            let (f_ty, f_row, f2) = elaborate(arena, f, ctx, fields, spans)?;
+            let (a_ty, a_row, a2) = elaborate(arena, a, ctx, fields, spans)?;
             let (call_row, ret_ty, app2) = match &f_ty {
                 Type::Fun(param_ty, call_row, ret_ty) => {
                     let a3 = coerce(arena, a2, &a_ty, param_ty, spans[a])?;
@@ -554,8 +559,8 @@ fn elaborate_node(
         }
 
         Expr::BinOp(op, l, r) => {
-            let (l_ty, l_row, l2) = elaborate(arena, l, ctx, groups, spans)?;
-            let (r_ty, r_row, r2) = elaborate(arena, r, ctx, groups, spans)?;
+            let (l_ty, l_row, l2) = elaborate(arena, l, ctx, fields, spans)?;
+            let (r_ty, r_row, r2) = elaborate(arena, r, ctx, fields, spans)?;
             let row = EffectRow::union(&l_row, &r_row);
             match op {
                 // Arithmetic and ordering: both operands must be Int.
@@ -632,10 +637,10 @@ fn elaborate_node(
         }
 
         Expr::If(c, t, e) => {
-            let (c_ty, c_row, c2) = elaborate(arena, c, ctx, groups, spans)?;
+            let (c_ty, c_row, c2) = elaborate(arena, c, ctx, fields, spans)?;
             let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans[c])?;
-            let (t_ty, t_row, t2) = elaborate(arena, t, ctx, groups, spans)?;
-            let (e_ty, e_row, e2) = elaborate(arena, e, ctx, groups, spans)?;
+            let (t_ty, t_row, t2) = elaborate(arena, t, ctx, fields, spans)?;
+            let (e_ty, e_row, e2) = elaborate(arena, e, ctx, fields, spans)?;
             // Branches with differing concrete types aren't an error here
             // (no union types) -- just widen to Dyn rather than reject.
             let result_ty = if t_ty == e_ty { t_ty } else { Type::Dyn };
@@ -646,7 +651,7 @@ fn elaborate_node(
         }
 
         Expr::Check(ty, inner) => {
-            let (_, row, inner2) = elaborate(arena, inner, ctx, groups, spans)?;
+            let (_, row, inner2) = elaborate(arena, inner, ctx, fields, spans)?;
             let ty_ret = ty.clone();
             Ok((ty_ret, row, arena.push(Expr::Check(ty, inner2))))
         }
@@ -654,14 +659,14 @@ fn elaborate_node(
         // The effect this specific operation performs, plus whatever the
         // payload expression itself might perform.
         Expr::Perform(effect, payload) => {
-            let (_, payload_row, payload2) = elaborate(arena, payload, ctx, groups, spans)?;
+            let (_, payload_row, payload2) = elaborate(arena, payload, ctx, fields, spans)?;
             let row = EffectRow::union(&payload_row, &EffectRow::single(&effect));
             Ok((Type::Dyn, row, arena.push(Expr::Perform(effect, payload2))))
         }
 
         Expr::Handle { body, handler } => {
-            let (_, body_row, body2) = elaborate(arena, body, ctx, groups, spans)?;
-            let (handler_ty, handler_row, handler2) = elaborate(arena, handler, ctx, groups, spans)?;
+            let (_, body_row, body2) = elaborate(arena, body, ctx, fields, spans)?;
+            let (handler_ty, handler_row, handler2) = elaborate(arena, handler, ctx, fields, spans)?;
             // types.rs has no Type::Handler -- but every handler-producing
             // expression (MakeHandler, or deep(...)/shallow(...) applied
             // to one, or a var bound from either) synthesizes Dyn by this
@@ -700,7 +705,7 @@ fn elaborate_node(
                 ));
             }
 
-            let (scrut_ty, scrut_row, scrutinee2) = elaborate(arena, scrutinee, ctx, groups, spans)?;
+            let (scrut_ty, scrut_row, scrutinee2) = elaborate(arena, scrutinee, ctx, fields, spans)?;
             let mut row = scrut_row;
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
@@ -713,7 +718,7 @@ fn elaborate_node(
                     ));
                 }
                 let arm_ctx = bind_pattern_vars(ctx, pat);
-                let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, groups, spans)?;
+                let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, fields, spans)?;
                 row = EffectRow::union(&row, &arm_row);
                 // Same widen-to-Dyn-on-disagreement rule as If's branches
                 // and ListLit's elements -- no union types.
@@ -724,7 +729,7 @@ fn elaborate_node(
                 });
                 new_arms.push((pat.clone(), body2));
             }
-            if let Some(missing) = missing_case(&pats, groups) {
+            if let Some(missing) = missing_case(&pats, fields) {
                 return Err(TypeError(format!("non-exhaustive match: {missing}"), spans[expr]));
             }
             Ok((result_ty.unwrap_or(Type::Dyn), row, arena.push(Expr::Match(scrutinee2, Rc::new(new_arms)))))
@@ -735,12 +740,71 @@ fn elaborate_node(
         // see the doc comment on `elaborate`.
         Expr::MakeHandler { effect, payload_var, resume_var, body } => {
             let inner_ctx = extend(&extend(ctx, &payload_var, Type::Dyn), &resume_var, Type::Dyn);
-            let (_, _, body2) = elaborate(arena, body, &inner_ctx, groups, spans)?;
+            let (_, _, body2) = elaborate(arena, body, &inner_ctx, fields, spans)?;
             Ok((
                 Type::Dyn,
                 EffectRow::pure(),
                 arena.push(Expr::MakeHandler { effect, payload_var, resume_var, body: body2 }),
             ))
+        }
+
+        // `target.field` -- only resolvable when target's type is
+        // concretely known as a nominal Data(name) whose `data` block
+        // named this field (see DataInfo) and has EXACTLY one
+        // constructor: with more than one, which constructor's field
+        // would `.field` even mean? Desugars into an ordinary Match
+        // against that sole constructor, with a Var at the target
+        // field's position and "_" everywhere else -- reuses existing
+        // pattern-matching machinery entirely, so machine.rs needs no new
+        // opcode and this Match is exhaustive/unambiguous by
+        // construction (skipping first_unreachable/missing_case, which
+        // are for programs a human wrote, not ones this function builds
+        // knowing they're already correct).
+        Expr::FieldAccess(target, field) => {
+            let (target_ty, target_row, target2) = elaborate(arena, target, ctx, fields, spans)?;
+            let type_name = match &target_ty {
+                Type::Data(name) => name.clone(),
+                other => {
+                    return Err(TypeError(
+                        format!("cannot access field `{field}` on a value of type {other} (expected a `data` type)"),
+                        spans[target],
+                    ))
+                }
+            };
+            let info = fields.iter().find(|f| f.type_name == type_name).ok_or_else(|| {
+                TypeError(format!("cannot access field `{field}`: no known fields for type {type_name}"), spans[target])
+            })?;
+            if info.ctors.len() != 1 {
+                return Err(TypeError(
+                    format!(
+                        "cannot access field `{field}` on {type_name}: field access needs a `data` type with exactly one constructor, but {type_name} has {}",
+                        info.ctors.len()
+                    ),
+                    spans[target],
+                ));
+            }
+            let (ctor_name, field_names) = &info.ctors[0];
+            if field_names.is_empty() {
+                return Err(TypeError(
+                    format!("cannot access field `{field}` on {type_name}: its constructor has no named fields"),
+                    spans[target],
+                ));
+            }
+            let idx = field_names.iter().position(|f| *f == field).ok_or_else(|| {
+                // Unlike the errors above (about the RECEIVER's type),
+                // this one's about the access itself, so it points at the
+                // whole `target.field`, not just `target`.
+                TypeError(format!("{type_name} has no field named `{field}`"), spans[expr])
+            })?;
+
+            let mut items = vec![Pattern::Str(ctor_name.clone())];
+            for i in 0..field_names.len() {
+                items.push(Pattern::Var(if i == idx { "__field".to_string() } else { "_".to_string() }));
+            }
+            let var_ref = arena.push(Expr::Var("__field".to_string()));
+            let arms = Rc::new(vec![(Pattern::List(items), var_ref)]);
+            let match_expr = arena.push(Expr::Match(target2, arms));
+            Ok((Type::Dyn, target_row, match_expr))
         }
     }
 }

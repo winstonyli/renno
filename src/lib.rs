@@ -104,6 +104,7 @@ mod tests {
                 contains_check(arena, *scrutinee) || arms.iter().any(|(_, body)| contains_check(arena, *body))
             }
             Expr::DataGroup(_, body) => contains_check(arena, *body),
+            Expr::FieldAccess(target, _) => contains_check(arena, *target),
         }
     }
 
@@ -509,6 +510,61 @@ mod tests {
             machine::run(&arena, elaborated, Env::prelude(), &spans)
         }));
         assert!(result.is_err(), "expected a panic: 42 doesn't match Data(\"Option\")'s shallow shape check");
+    }
+
+    // --- named-field access ---
+
+    #[test]
+    fn named_field_access_reads_the_right_field() {
+        let src = "data Point = Point(x: Int, y: Int) in let p = Point(1)(2) in p.x + p.y";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 3);
+    }
+
+    #[test]
+    fn named_field_access_on_three_field_record() {
+        let src = "data Point = Point(x: Int, y: Int, z: Int) in let p = Point(1)(2)(3) in p.z";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 3);
+    }
+
+    #[test]
+    fn unknown_field_name_rejected_statically() {
+        let src = "data Point = Point(x: Int, y: Int) in let p = Point(1)(2) in p.z";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("no field named `z`"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn field_access_on_multi_constructor_type_rejected_statically() {
+        let src = "data Option = None | Some(x: Int) in let p = Some(5) in p.x";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("exactly one constructor"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn field_access_on_unnamed_constructor_rejected_statically() {
+        let src = "data Pair = Pair(Int, Int) in let p = Pair(1)(2) in p.x";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("no named fields"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn field_access_on_non_data_type_rejected_statically() {
+        let (mut arena, spans, root) = parser::parse("5.x").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected a `data` type"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires typechecking")]
+    fn field_access_on_the_untyped_path_panics_clearly() {
+        run_untyped("data Point = Point(x: Int, y: Int) in Point(1)(2).x");
     }
 
     // --- match exhaustiveness ---

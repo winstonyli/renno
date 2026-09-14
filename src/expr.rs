@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use cranelift_entity::{entity_impl, PrimaryMap};
@@ -35,10 +34,12 @@ pub type Arena = PrimaryMap<ExprRef, Expr>;
 // typecheck::TypeError.
 pub type SpanMap = PrimaryMap<ExprRef, Span>;
 
-// No ADTs yet, so patterns only destructure the value shapes renno already
-// has natively: literals (matched by equality), List's two structural
-// forms (fixed-length and cons), and Var, which matches anything and binds
-// it -- "_" is just an ordinary (unused) Var name, not a special token.
+// Patterns destructure the value shapes renno has natively: literals
+// (matched by equality), List's two structural forms (fixed-length and
+// cons), and Var, which matches anything and binds it -- "_" is just an
+// ordinary (unused) Var name, not a special token. `data`-declared ADT
+// constructors (parser::pattern_atom) desugar into List/Str shapes too, so
+// there's no separate constructor-pattern variant here.
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Var(String),
@@ -120,11 +121,40 @@ pub enum Expr {
     // whole arm list on every resume.
     Match(ExprRef, Rc<Vec<(Pattern, ExprRef)>>),
     // Emitted only for a `data` declaration (see parser::build_ctor_value)
-    // -- purely a compile-time marker recording which constructor tags
-    // belong to one type, consumed by typecheck's Match exhaustiveness
-    // check (missing_case) and otherwise fully transparent: evaluates
-    // straight through to `body` (see machine.rs), and typecheck's own
-    // elaborate unwraps it -- doesn't re-emit it -- once the tag set has
-    // been recorded, so it never reaches an already-typechecked program.
-    DataGroup(Rc<BTreeSet<String>>, ExprRef),
+    // -- purely a compile-time marker recording one type's constructor
+    // tags and field names, consumed by typecheck's Match exhaustiveness
+    // check (missing_case) and field access (FieldAccess, below), and
+    // otherwise fully transparent: evaluates straight through to `body`
+    // (see machine.rs), and typecheck's own elaborate unwraps it --
+    // doesn't re-emit it -- once DataInfo has been recorded, so it never
+    // reaches an already-typechecked program.
+    DataGroup(Rc<DataInfo>, ExprRef),
+    // `target.field` -- ONLY meaningful once typechecked: elaborate_node
+    // resolves it (using the DataInfo for target's own Data(name) type)
+    // into an ordinary Match against that type's sole constructor,
+    // reusing existing pattern-matching machinery entirely rather than
+    // adding any new Value representation or machine.rs opcode. A
+    // typechecked program never has one of these left in it (same as
+    // DataGroup) -- machine.rs's own arm for it exists only to give the
+    // untyped path (e.g. tests' run_untyped) a clear error instead of a
+    // silently wrong one, since resolving this needs static type
+    // information that has nowhere to come from at runtime (see
+    // Type::Data's own doc comment on why field names aren't stamped into
+    // values themselves).
+    FieldAccess(ExprRef, String),
+}
+
+// What one `data Name = Ctor1(f1: T1, ...) | Ctor2(...) | ...` declared:
+// its own name, and each constructor's name plus field names (empty when
+// that constructor's fields are positional/unnamed -- `field_names.len()`
+// is either 0 or exactly that constructor's arity, never a partial list;
+// see parser::parse_ctor_field). Threaded through elaborate/elaborate_node
+// alongside Ctx, purely additively (see DataGroup) -- never mutated after
+// a `data` block is peeled, just consulted by missing_case (which only
+// needs the tag names) and FieldAccess's desugaring (which needs the
+// field names and the constructor's own arity too).
+#[derive(Debug, Clone)]
+pub struct DataInfo {
+    pub type_name: String,
+    pub ctors: Vec<(String, Vec<String>)>,
 }

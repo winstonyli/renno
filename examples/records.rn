@@ -1,0 +1,16 @@
+// Named-field access: `data Point = Point(x: Int, y: Int)` names each
+// field, and `p.x`/`p.y` reads it back -- but this is sugar, not a new
+// feature. `.field` only works when the target's type is a concretely
+// known Data(name) (see nominal typing) whose `data` block has EXACTLY
+// ONE constructor -- which constructor's field would it mean otherwise?
+// -- and typecheck desugars it into an ordinary Match against that sole
+// constructor (a Var at the target field's position, `_` everywhere
+// else), so machine.rs needs no new opcode for it at all.
+//
+// Construction stays positional and curried, same as any other
+// constructor (fold, map): `Point(1)(2)`, not `Point(x: 1, y: 2)`.
+data Point = Point(x: Int, y: Int) in
+
+let dist_from_origin_squared = fun p: Point -> p.x * p.x + p.y * p.y in
+
+dist_from_origin_squared(Point(3)(4))

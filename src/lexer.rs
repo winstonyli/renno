@@ -59,6 +59,8 @@ pub enum Token {
     RBrace,
     #[token(",")]
     Comma,
+    #[token(".")]
+    Dot,
     #[token(":")]
     Colon,
     // Cons pattern: `h :: t`, matches a non-empty list. Longer than Colon,

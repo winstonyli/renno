@@ -1,7 +1,6 @@
-use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
+use crate::expr::{Arena, BinOp, DataInfo, Expr, ExprRef, Pattern, SpanMap};
 use crate::lexer::{tokenize, Token};
 use crate::span::Span;
 use crate::types::{EffectRow, Type};
@@ -36,7 +35,12 @@ enum PendingBinder {
     // to N nested Lets when folded back (one per constructor), not one.
     // See build_ctor_value for what each constructor's bound value is, and
     // ctor_type for the nominal Type::Data(Name) annotation each one gets.
-    Data { type_name: String, ctors: Vec<(String, Vec<Type>)> },
+    // Each field is optionally named (parse_ctor_field) -- `field: Int`
+    // instead of a bare `Int` -- for FieldAccess's `.field` desugaring;
+    // unnamed by default, and not required to be uniform within one `data`
+    // block (a constructor whose fields are only PARTLY named still just
+    // has no field-name entry built for it -- see the Data fold-back arm).
+    Data { type_name: String, ctors: Vec<(String, Vec<(Option<String>, Type)>)> },
 }
 
 // The nominal type a `data Name = ... | Ctor(T1, T2) | ...` constructor
@@ -47,9 +51,9 @@ enum PendingBinder {
 // statically distinguishable, since consistent() only accepts two Data
 // with the exact same name. See types::Type::Data's own doc comment for
 // the runtime side's necessarily shallower story.
-fn ctor_type(type_name: &str, field_tys: &[Type]) -> Type {
+fn ctor_type(type_name: &str, field_tys: &[(Option<String>, Type)]) -> Type {
     let mut result = Type::Data(type_name.to_string());
-    for ty in field_tys.iter().rev() {
+    for (_, ty) in field_tys.iter().rev() {
         result = Type::Fun(Rc::new(ty.clone()), EffectRow::pure(), Rc::new(result));
     }
     result
@@ -185,6 +189,25 @@ impl<'a> Parser<'a> {
         } else {
             Ok(atom)
         }
+    }
+
+    // One field inside a `data` constructor's parens: `field: Type`, or a
+    // bare `Type` (no name -- positional, no `.field` access possible for
+    // it later). No lookahead needed to disambiguate: a bare type can
+    // never itself START with a lowercase identifier (parse_type's
+    // uppercase-Ident fallback requires an uppercase first letter, and no
+    // other type-starting token is a lowercase-starting Ident), so seeing
+    // one unambiguously means "field name, then `:`".
+    fn parse_ctor_field(&mut self) -> Result<(Option<String>, Type), String> {
+        if let Some(Token::Ident(name)) = self.peek() {
+            if name.chars().next().is_some_and(char::is_lowercase) {
+                let name = name.clone();
+                self.bump();
+                self.expect(&Token::Colon)?;
+                return Ok((Some(name), self.parse_fun_type()?));
+            }
+        }
+        Ok((None, self.parse_fun_type()?))
     }
 
     // pattern := pattern_atom ("::" pattern)?  (right-assoc, `h :: t`)
@@ -327,16 +350,29 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // postfix := atom ("(" expr ")")*  -- supports curried calls f(a)(b)
+    // postfix := atom (("(" expr ")") | ("." ident))*  -- curried calls
+    // f(a)(b), and field access p.x (only meaningful once typechecked --
+    // see Expr::FieldAccess's own doc comment).
     fn postfix(&mut self) -> Result<ExprRef, String> {
         let start = self.span_at().start;
         let mut e = self.atom()?;
-        while matches!(self.peek(), Some(Token::LParen)) {
-            self.bump();
-            let arg = self.expr()?;
-            self.expect(&Token::RParen)?;
-            let span = Span { start, end: self.span_before().end };
-            e = self.push_spanned(Expr::App(e, arg), span);
+        loop {
+            match self.peek() {
+                Some(Token::LParen) => {
+                    self.bump();
+                    let arg = self.expr()?;
+                    self.expect(&Token::RParen)?;
+                    let span = Span { start, end: self.span_before().end };
+                    e = self.push_spanned(Expr::App(e, arg), span);
+                }
+                Some(Token::Dot) => {
+                    self.bump();
+                    let field = self.ident()?;
+                    let span = Span { start, end: self.span_before().end };
+                    e = self.push_spanned(Expr::FieldAccess(e, field), span);
+                }
+                _ => break,
+            }
         }
         Ok(e)
     }
@@ -404,10 +440,10 @@ impl<'a> Parser<'a> {
                             self.bump();
                             let mut tys = Vec::new();
                             if !matches!(self.peek(), Some(Token::RParen)) {
-                                tys.push(self.parse_fun_type()?);
+                                tys.push(self.parse_ctor_field()?);
                                 while matches!(self.peek(), Some(Token::Comma)) {
                                     self.bump();
-                                    tys.push(self.parse_fun_type()?);
+                                    tys.push(self.parse_ctor_field()?);
                                 }
                             }
                             self.expect(&Token::RParen)?;
@@ -444,14 +480,33 @@ impl<'a> Parser<'a> {
                 }
                 PendingBinder::Fun { param, ann } => self.push_spanned(Expr::Lambda(param, ann, result), span),
                 PendingBinder::Data { type_name, ctors } => {
-                    let tags: BTreeSet<String> = ctors.iter().map(|(name, _)| name.clone()).collect();
+                    // A constructor's fields count as "named" only when
+                    // EVERY one of them has a name -- a partially-named
+                    // constructor (mixing `field: Int` with a bare `Int`)
+                    // just gets no entry here, so FieldAccess later
+                    // reports "no such field" for it rather than guessing
+                    // which position an unnamed field occupies.
+                    let info = DataInfo {
+                        type_name: type_name.clone(),
+                        ctors: ctors
+                            .iter()
+                            .map(|(name, fields)| {
+                                let field_names = if fields.iter().all(|(n, _)| n.is_some()) {
+                                    fields.iter().map(|(n, _)| n.clone().unwrap()).collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                (name.clone(), field_names)
+                            })
+                            .collect(),
+                    };
                     let mut body = result;
                     for (name, field_tys) in ctors.into_iter().rev() {
                         let val = self.build_ctor_value(&name, &field_tys, span);
                         let ty = Some(ctor_type(&type_name, &field_tys));
                         body = self.push_spanned(Expr::Let(name, ty, val, body, false), span);
                     }
-                    self.push_spanned(Expr::DataGroup(Rc::new(tags), body), span)
+                    self.push_spanned(Expr::DataGroup(Rc::new(info), body), span)
                 }
             };
         }
@@ -471,7 +526,7 @@ impl<'a> Parser<'a> {
     // These nodes are entirely synthesized (no distinct source text of
     // their own), so they all just inherit the enclosing `data` block's
     // own span rather than getting a more precise one.
-    fn build_ctor_value(&mut self, name: &str, field_tys: &[Type], span: Span) -> ExprRef {
+    fn build_ctor_value(&mut self, name: &str, field_tys: &[(Option<String>, Type)], span: Span) -> ExprRef {
         let tag = self.push_spanned(Expr::Str(name.to_string()), span);
         let mut items = vec![tag];
         let params: Vec<String> = (0..field_tys.len()).map(|i| format!("_{i}")).collect();
@@ -479,7 +534,7 @@ impl<'a> Parser<'a> {
             items.push(self.push_spanned(Expr::Var(p.clone()), span));
         }
         let mut value = self.push_spanned(Expr::ListLit(items), span);
-        for (p, ty) in params.iter().zip(field_tys.iter()).rev() {
+        for (p, (_, ty)) in params.iter().zip(field_tys.iter()).rev() {
             value = self.push_spanned(Expr::Lambda(p.clone(), Some(ty.clone()), value), span);
         }
         value
