@@ -765,18 +765,69 @@ mod tests {
         let src = "data Meters = Mk(Int, opaque) in let f = fun x: Meters -> x in f(Mk(100))";
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[Mk, 100]");
+        match machine::run(&arena, elaborated, Env::prelude(), &spans) {
+            Value::List(items) => {
+                assert_eq!(items.len(), 3, "expected tag + field + hidden brand");
+                assert_eq!(items[0].to_string(), "Mk");
+                assert_eq!(items[1].as_int(), 100);
+            }
+            other => panic!("expected a list, got {other}"),
+        }
     }
 
     #[test]
-    fn opaque_field_adds_no_runtime_representation() {
-        // `opaque` is a compile-time-only marker: a branded constructor's
-        // VALUE is identical to what an unbranded one with the same real
-        // fields would build -- no hidden extra list element.
-        assert_eq!(
-            run_untyped("data Meters = Mk(Int, opaque) in Mk(5)").to_string(),
-            run_untyped("data Meters2 = Mk2(Int) in Mk2(5)").to_string().replace("Mk2", "Mk")
-        );
+    fn opaque_field_adds_a_hidden_runtime_tag() {
+        // `opaque` is a REAL hidden field now, not a purely static marker:
+        // a branded constructor's value carries one more trailing element
+        // (the brand id) than an unbranded one with the same real fields.
+        // This is what lets construct/destructure actually enforce "must
+        // be the corresponding declaration" at runtime -- see
+        // opaque_pattern_rejects_a_value_from_a_shadowing_redeclaration.
+        let branded = run_untyped("data Meters = Mk(Int, opaque) in Mk(5)");
+        let plain = run_untyped("data Meters2 = Mk2(Int) in Mk2(5)");
+        match (branded, plain) {
+            (Value::List(b), Value::List(p)) => assert_eq!(b.len(), p.len() + 1),
+            (b, p) => panic!("expected two lists, got {b} and {p}"),
+        }
+    }
+
+    #[test]
+    fn opaque_must_appear_in_every_constructor_or_none() {
+        let err = parser::parse("data Shape = Circle(Int) | Square(Int, opaque) in Circle(1)").unwrap_err();
+        assert!(err.contains("opaque"), "unexpected message: {err}");
+        assert!(err.contains("Square"), "unexpected message: {err}");
+        assert!(err.contains("Circle"), "unexpected message: {err}");
+    }
+
+    #[test]
+    #[should_panic(expected = "match failed")]
+    fn opaque_pattern_rejects_a_value_from_a_shadowing_redeclaration() {
+        // `a` is built by the FIRST Foo's Mk -- carrying the first
+        // declaration's own brand id. By the time the match runs, `Mk(x)`
+        // resolves (via Parser::branded_ctors) against the SECOND Foo's
+        // brand id instead (ordinary lexical shadowing), so the pattern's
+        // hidden tag doesn't match `a`'s -- machine.rs's exact-length List
+        // match fails, same as any other non-matching pattern.
+        let src = r#"
+            data Foo = Mk(Int, opaque) in
+            let a = Mk(1) in
+            data Foo = Mk(Int, opaque) in
+            match a with | Mk(x) -> x
+        "#;
+        run_untyped(src);
+    }
+
+    #[test]
+    fn opaque_named_field_pattern_and_access_still_work_on_a_branded_type() {
+        let src = r#"
+            data Point = Point(x: Int, y: Int, opaque) in
+            let p = Point { x: 3, y: 4 } in
+            let sum = match p with | Point { y: b, x: a } -> a + b in
+            sum + p.x
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 10);
     }
 
     #[test]

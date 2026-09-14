@@ -14,7 +14,7 @@ let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in fact(10)
 - **Closed and row-polymorphic effect typing**: `check()` statically rejects a program if it can prove an effect is never handled. Row-polymorphic function types (`(Dyn ->{e} Dyn)`) let effect-safety survive through higher-order calls.
 - **`let rec` and mutual recursion**: `let rec f = ... and g = ... in ...` — any function in the group can call any sibling (including itself) by name.
 - **Pattern matching**: literals, lists (`[]`, `[a, b]`, `h :: t`), and ADT constructors, with static exhaustiveness and reachability checking wherever those are cheaply provable.
-- **ADTs**: `data Option = None | Some(Int) in ...`, desugared entirely into tagged lists and ordinary pattern matching — no new runtime representation. Constructors get real types (`Type::Data`), **structural by default** — two differently-named types with the same constructor names and field types unify — with an opt-in `opaque` field to make a type nominal (never interchangeable with anything but itself) when that's the point.
+- **ADTs**: `data Option = None | Some(Int) in ...`, desugared entirely into tagged lists and ordinary pattern matching — no new runtime representation for the common case. Constructors get real types (`Type::Data`), **structural by default** — two differently-named types with the same constructor names and field types unify — with an opt-in `opaque` field to make a type nominal: a hidden per-declaration tag, checked both statically and at every construct/destructure, so it's never interchangeable with anything but itself.
 - **Named fields**: `data Point = Point(x: Int, y: Int) in ...` supports `p.x` access, `Point { x: 1, y: 2 }` construction (any order), and `Point { x: a, y: b }` patterns (any order) — all sugar over ordinary positional construction and pattern matching, for any `data` type with exactly one constructor.
 - **Diagnostics**: every parse error, type error, and runtime panic reports a `line, column` location with a source snippet and a caret, not just a bare message.
 - **Multi-line REPL**: `let`/`match`/`data` blocks spanning multiple lines can be typed directly at the prompt.
@@ -128,13 +128,15 @@ data Seconds = Mk(Int) in
 let f = fun x: Meters -> x in f(Mk(5))   -- accepted: Seconds's Mk(5) satisfies a Meters annotation
 ```
 
-Add an `opaque` field to opt a type out of that — it contributes no value at runtime, just brands its `data` block as nominal:
+Add an `opaque` field (required on every constructor of the block, or none) to opt a type out of that. It's a real hidden field, not just a static marker: every constructor stamps one invisible tag — unique to that `data` block's own source position — into its value, and every pattern that can match it carries the same tag, so a value only ever destructures against the exact declaration that produced it:
 
 ```
 data Meters = Mk(Int, opaque) in
 data Seconds = Mk(Int, opaque) in
 let f = fun x: Meters -> x in f(Mk(5))   -- static error: each `opaque` type is only consistent with itself
 ```
+
+That static check is only half the story — the hidden tag also means a value that somehow reaches a branded type's pattern from the wrong declaration (e.g. crossing a `Dyn` boundary, or a shadowed same-named `data` redeclaration) fails to *match* at runtime instead of silently behaving like the wrong type.
 
 ### Effects
 
@@ -190,7 +192,7 @@ More complete examples for every feature above live in [`examples/`](examples/).
 ## Known limitations
 
 - Effect-row inference doesn't look inside a handler clause's own body — what a handler does when it resumes isn't modeled.
-- A runtime type check at a `Dyn`-to-`Data(name)` boundary can only confirm "this is some tagged value," not "specifically this data type" (or "specifically this `opaque` brand") — no type identity is stamped into values at runtime. Structural vs. nominal ADT typing is entirely a static-side distinction.
+- A runtime type check at a `Dyn`-to-`Data(name)` boundary can only confirm "this is some tagged value," not "specifically this data type" — no type name is stamped into an UNBRANDED value at runtime (an `opaque`-branded one does carry a hidden tag, but it's only ever checked by actually pattern-matching/field-accessing the value, not by a bare type annotation or `Dyn` boundary check). Two separately-declared `data` blocks that reuse the same type name (shadowing) still statically unify regardless of brand — the runtime tag bounds the damage (a mismatched value fails to destructure) but doesn't close the static gap.
 - Match exhaustiveness and reachability are checked only where cheaply provable (see the doc comments on `missing_case`/`first_unreachable` in `typecheck.rs`); anything past that silently falls back to a runtime panic.
 - A runtime panic's reported location is the last expression *evaluated*, not necessarily the exact sub-expression at fault a few steps later.
 - `where` refinement predicates are limited to what `<`/`<=`/`>`/`>=`/`==`/`!=`, `&&`/`||`/`!`, and arithmetic can express. Proving is attempted only when the bound value reduces to a closed Int constant at parse time (`try_eval_closed_int`); a Lambda parameter's refinement is never proven statically, since its actual value is unknown until a caller supplies one.

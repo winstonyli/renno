@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::expr::{Arena, BinOp, DataInfo, Expr, ExprRef, Pattern, SpanMap};
@@ -7,7 +8,15 @@ use crate::types::{EffectRow, Type};
 
 pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
     let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
-    let mut p = Parser { tokens, tok_spans, pos: 0, arena: Arena::new(), expr_spans: SpanMap::new(), src };
+    let mut p = Parser {
+        tokens,
+        tok_spans,
+        pos: 0,
+        arena: Arena::new(),
+        expr_spans: SpanMap::new(),
+        src,
+        branded_ctors: HashMap::new(),
+    };
     let root = p.expr()?;
     if p.pos != p.tokens.len() {
         let span = p.span_at();
@@ -23,6 +32,17 @@ struct Parser<'a> {
     arena: Arena,
     expr_spans: SpanMap,
     src: &'a str,
+    // Ctor name -> brand id, for every `data` block parsed SO FAR whose
+    // constructors carry a hidden `opaque` runtime tag (see
+    // build_ctor_value/pattern_atom). Patterns are built at parse time
+    // with no type information available, so this is how a positional
+    // constructor pattern (`Mk(x)`) learns it needs the same hidden
+    // trailing tag its ctor's VALUE carries. Updated as each `data` block
+    // finishes parsing its constructor list (before its body is parsed,
+    // so it's visible to every pattern the body can contain) -- a later
+    // `data` block reusing a ctor name always overwrites (or clears) the
+    // entry, modeling ordinary lexical shadowing.
+    branded_ctors: HashMap<String, u64>,
 }
 
 // A `let`/`fun`/`data` prefix collected while flattening a chain of them
@@ -313,17 +333,18 @@ impl<'a> Parser<'a> {
     // One item in a `data` constructor's field list, which may be an
     // ordinary field (see parse_ctor_field) OR a bare `opaque` marker --
     // consuming no field slot (no param, no name, no type; None here means
-    // "not a real field, push nothing"), but recording a brand id (this
-    // token's own byte offset -- unique enough, since two tokens can't
-    // start at the same position) into `brand` for the WHOLE enclosing
-    // `data` block, shared across every one of its constructors regardless
-    // of which one actually wrote `opaque` (get_or_insert: the first one
-    // wins if it appears more than once). See DataInfo::brand.
-    fn parse_ctor_field_or_opaque(&mut self, brand: &mut Option<u64>) -> Result<Option<(Option<String>, Type)>, String> {
+    // "not a real field, push nothing"). `saw_opaque` is THIS constructor's
+    // own flag (the caller enforces every constructor in a block has one,
+    // or none -- see the `data` arm) -- the actual brand id is derived
+    // once for the whole block from the block's own `data` keyword
+    // position, not from where `opaque` itself was written. See
+    // DataInfo::brand and build_ctor_value/pattern_atom for where that id
+    // ends up: stamped into (and matched against) every constructor's
+    // runtime representation.
+    fn parse_ctor_field_or_opaque(&mut self, saw_opaque: &mut bool) -> Result<Option<(Option<String>, Type)>, String> {
         if matches!(self.peek(), Some(Token::Opaque)) {
-            let id = self.span_at().start as u64;
             self.bump();
-            brand.get_or_insert(id);
+            *saw_opaque = true;
             Ok(None)
         } else {
             Ok(Some(self.parse_ctor_field()?))
@@ -376,6 +397,13 @@ impl<'a> Parser<'a> {
                     self.expect(&Token::RBrace)?;
                     return Ok(Pattern::NamedCtor(name, fields));
                 }
+                // Looked up before `name` moves into the tag below -- Some
+                // iff this ctor's `data` block is branded (see
+                // Parser::branded_ctors), in which case the matching
+                // hidden trailing element (appended by build_ctor_value)
+                // must be accounted for here too, or this pattern's length
+                // would never match its own ctor's real values.
+                let brand_id = self.branded_ctors.get(&name).copied();
                 let mut items = vec![Pattern::Str(name)];
                 if matches!(self.peek(), Some(Token::LParen)) {
                     self.bump();
@@ -387,6 +415,9 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(&Token::RParen)?;
+                }
+                if let Some(id) = brand_id {
+                    items.push(Pattern::Int(id as i64));
                 }
                 Ok(Pattern::List(items))
             }
@@ -698,11 +729,10 @@ impl<'a> Parser<'a> {
                     let type_name = self.ident()?;
                     self.expect(&Token::Equals)?;
                     let mut ctors = Vec::new();
-                    // Set if ANY constructor in this block writes an
-                    // `opaque` field -- brands the WHOLE type (one id,
-                    // shared by every one of its constructors), not just
-                    // the one constructor that happened to write it.
-                    let mut brand = None;
+                    // Whether EACH constructor (same order/length as
+                    // `ctors`) wrote an `opaque` field -- checked for
+                    // all-or-nothing once the whole block is parsed, below.
+                    let mut ctor_has_opaque = Vec::new();
                     loop {
                         let ctor_span = self.span_at();
                         let name = self.ident()?;
@@ -721,16 +751,17 @@ impl<'a> Parser<'a> {
                                 ),
                             ));
                         }
+                        let mut saw_opaque = false;
                         let field_tys = if matches!(self.peek(), Some(Token::LParen)) {
                             self.bump();
                             let mut tys = Vec::new();
                             if !matches!(self.peek(), Some(Token::RParen)) {
-                                if let Some(f) = self.parse_ctor_field_or_opaque(&mut brand)? {
+                                if let Some(f) = self.parse_ctor_field_or_opaque(&mut saw_opaque)? {
                                     tys.push(f);
                                 }
                                 while matches!(self.peek(), Some(Token::Comma)) {
                                     self.bump();
-                                    if let Some(f) = self.parse_ctor_field_or_opaque(&mut brand)? {
+                                    if let Some(f) = self.parse_ctor_field_or_opaque(&mut saw_opaque)? {
                                         tys.push(f);
                                     }
                                 }
@@ -741,6 +772,7 @@ impl<'a> Parser<'a> {
                             Vec::new()
                         };
                         ctors.push((name, field_tys));
+                        ctor_has_opaque.push(saw_opaque);
                         if matches!(self.peek(), Some(Token::Pipe)) {
                             self.bump();
                         } else {
@@ -748,6 +780,49 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(&Token::In)?;
+
+                    // `opaque` is a whole-TYPE brand (see DataInfo::brand),
+                    // but written per-constructor -- require it on every
+                    // constructor, or none, so that scope is never a
+                    // silent surprise (unlike named fields, which degrade
+                    // quietly when only partially used: brand is safety-
+                    // relevant, named fields are cosmetic).
+                    let any_opaque = ctor_has_opaque.iter().any(|&b| b);
+                    if any_opaque {
+                        if let Some(missing) =
+                            ctors.iter().zip(&ctor_has_opaque).find(|&(_, &has)| !has).map(|((n, _), _)| n.clone())
+                        {
+                            let branded = ctors
+                                .iter()
+                                .zip(&ctor_has_opaque)
+                                .find(|&(_, &has)| has)
+                                .map(|((n, _), _)| n.clone())
+                                .unwrap();
+                            return Err(self.err_at(
+                                Span { start, end: self.span_before().end },
+                                format!(
+                                    "data {type_name}: `opaque` must appear in every constructor or none -- found on {branded}, missing on {missing}"
+                                ),
+                            ));
+                        }
+                    }
+                    // One id for the whole block (its own `data` keyword's
+                    // position), not the `opaque` token's -- every
+                    // constructor shares it. See build_ctor_value and
+                    // pattern_atom for where this id is actually stamped
+                    // into (and matched against) runtime values.
+                    let brand = any_opaque.then_some(start as u64);
+                    for (name, _) in &ctors {
+                        match brand {
+                            Some(id) => {
+                                self.branded_ctors.insert(name.clone(), id);
+                            }
+                            None => {
+                                self.branded_ctors.remove(name.as_str());
+                            }
+                        }
+                    }
+
                     pending.push((start, PendingBinder::Data { type_name, ctors, brand }));
                 }
                 _ => break,
@@ -811,7 +886,7 @@ impl<'a> Parser<'a> {
                     };
                     let mut body = result;
                     for (name, field_tys) in ctors.into_iter().rev() {
-                        let val = self.build_ctor_value(&name, &field_tys, span);
+                        let val = self.build_ctor_value(&name, &field_tys, brand, span);
                         let ty = Some(ctor_type(&type_name, &field_tys));
                         body = self.push_spanned(Expr::Let(name, ty, val, body), span);
                     }
@@ -835,12 +910,25 @@ impl<'a> Parser<'a> {
     // These nodes are entirely synthesized (no distinct source text of
     // their own), so they all just inherit the enclosing `data` block's
     // own span rather than getting a more precise one.
-    fn build_ctor_value(&mut self, name: &str, field_tys: &[(Option<String>, Type)], span: Span) -> ExprRef {
+    //
+    // `brand`, when Some, appends ONE more trailing element -- the block's
+    // hidden runtime tag (see DataInfo::brand) -- after every visible
+    // field. Every pattern that can ever match this constructor's value
+    // (positional, via pattern_atom's `branded_ctors` lookup; named, via
+    // typecheck::resolve_pattern; FieldAccess's own synthetic pattern)
+    // gets the identical trailing element appended, so machine.rs's
+    // ordinary exact-length List matching (unchanged) naturally rejects a
+    // value whose hidden tag doesn't match -- including one from an
+    // unrelated `data` block that merely shares this one's name and shape.
+    fn build_ctor_value(&mut self, name: &str, field_tys: &[(Option<String>, Type)], brand: Option<u64>, span: Span) -> ExprRef {
         let tag = self.push_spanned(Expr::Str(name.to_string()), span);
         let mut items = vec![tag];
         let params: Vec<String> = (0..field_tys.len()).map(|i| format!("_{i}")).collect();
         for p in &params {
             items.push(self.push_spanned(Expr::Var(p.clone()), span));
+        }
+        if let Some(id) = brand {
+            items.push(self.push_spanned(Expr::Int(id as i64), span));
         }
         let mut value = self.push_spanned(Expr::ListLit(items), span);
         for (p, (_, ty)) in params.iter().zip(field_tys.iter()).rev() {

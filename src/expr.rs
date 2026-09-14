@@ -199,13 +199,26 @@ pub struct DataInfo {
     // (String, Vec<String>) destructure of `ctors` -- named-field
     // resolution, exhaustiveness's tag sets -- needed no changes.
     pub ctor_types: Vec<(String, Vec<Type>)>,
-    // Some(id), unique per `data` declaration, if ANY constructor in this
-    // block wrote an `opaque` field -- opts the whole type OUT of
-    // structural consistency (renno's default for `data` types) and into
-    // nominal: consistent() then accepts this type only when compared with
-    // itself, never with another type of identical shape. None (the
-    // default) means fully structural: two `data` types with the same set
-    // of constructor names and field types unify, regardless of their own
-    // names, the way two structurally-identical List/Fun types always have.
+    // Some(id), unique per `data` declaration (its own `data` keyword's
+    // source byte offset), if ANY constructor in this block wrote an
+    // `opaque` field -- parser.rs requires it on EVERY constructor once
+    // any one has it, so this is a whole-TYPE property, not a per-
+    // constructor one. Two effects, one real value:
+    //   - static: consistent() rejects this type against every other
+    //     Data type except itself (types::consistent_inner), opting out
+    //     of the default structural comparison.
+    //   - runtime: `id` is genuinely stamped into every constructor's
+    //     built value as a hidden trailing List element (see
+    //     parser::build_ctor_value), and into every pattern that can
+    //     match it (positional via Parser::branded_ctors, named via
+    //     typecheck::resolve_pattern, FieldAccess's own synthetic
+    //     pattern) -- so a value only ever successfully destructures
+    //     against the EXACT declaration that produced it, not merely one
+    //     with the same name and shape (see types::Type::Data's doc
+    //     comment for the shadowing case this does and doesn't cover).
+    // None (the default) means fully structural and zero runtime
+    // footprint: two `data` types with the same set of constructor names
+    // and field types unify, regardless of their own names, the way two
+    // structurally-identical List/Fun types always have.
     pub brand: Option<u64>,
 }

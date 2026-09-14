@@ -335,6 +335,15 @@ fn resolve_pattern(pat: &Pattern, fields: &[Rc<DataInfo>], span: Span) -> Result
                     .ok_or_else(|| TypeError(format!("missing field `{fname}` in `{tag}` pattern"), span))?;
                 items.push(resolve_pattern(p, fields, span)?);
             }
+            // Branded types stamp one hidden trailing element into every
+            // constructed value (see DataInfo::brand, build_ctor_value) --
+            // match it here too, strictly, so a named-field pattern for
+            // this type only ever matches a value this EXACT `data` block
+            // produced, the same defense positional patterns get via
+            // Parser::branded_ctors.
+            if let Some(id) = info.brand {
+                items.push(Pattern::Int(id as i64));
+            }
             Ok(Pattern::List(items))
         }
     }
@@ -930,6 +939,15 @@ fn elaborate_node(
             let mut items = vec![Pattern::Str(ctor_name.clone())];
             for i in 0..field_names.len() {
                 items.push(Pattern::Var(if i == idx { "__field".to_string() } else { "_".to_string() }));
+            }
+            // Strict, not a wildcard, for the same defense-in-depth reason
+            // resolve_pattern's NamedCtor arm is strict: `target`'s type
+            // is already known statically, but a Dyn-sourced value could
+            // still reach here having slipped past a shallow runtime
+            // Check -- matching the exact brand catches that instead of
+            // silently reading a field off the wrong declaration's value.
+            if let Some(id) = info.brand {
+                items.push(Pattern::Int(id as i64));
             }
             let var_ref = arena.push(Expr::Var("__field".to_string()));
             let arms = Rc::new(vec![(Pattern::List(items), var_ref)]);

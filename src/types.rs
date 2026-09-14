@@ -24,26 +24,27 @@ pub enum Type {
     // of falling back to Dyn/[Dyn].
     //
     // Structural by default: consistent() looks up both names' recorded
-    // constructor shapes (DataInfo::ctor_types) and accepts two Data types
-    // with the same NAME as different from each other -- so `data Celsius
-    // = Mk(Int)` and `data Fahrenheit = Mk(Int)` DO unify, the same way two
-    // structurally-identical List or Fun types always have. Opt a type OUT
-    // of that (real nominal distinctness, e.g. so Celsius and Fahrenheit
-    // can never be swapped for each other) by giving one of its
-    // constructors an `opaque` field -- see DataInfo::brand.
+    // constructor shapes (DataInfo::ctor_types) and accepts two
+    // DIFFERENTLY-named Data types as consistent when those shapes match --
+    // so `data Celsius = Mk(Int)` and `data Fahrenheit = Mk(Int)` DO unify,
+    // the same way two structurally-identical List or Fun types always
+    // have. Opt a type OUT of that (real nominal distinctness, e.g. so
+    // Celsius and Fahrenheit can never be swapped for each other) by
+    // giving one of its constructors an `opaque` field -- see
+    // DataInfo::brand.
     //
-    // The runtime side is necessarily shallow, the same way Fun's
-    // matches_type is: a value is still just a tagged List (see
-    // value::Value), with no type name (or brand) stamped into it anywhere,
-    // so a Dyn-origin value crossing into a Data(name)-annotated position
-    // can only be checked for "is this SOME tagged value"
-    // (value::matches_type), never "specifically a Name" or "specifically
-    // branded." Fully verifying that would mean stamping identity into
-    // every constructed value, or a per-access contract the way
-    // wrap_fun_contract does for Fun -- more machinery than this feature
-    // spends; the static side (rejecting a mismatch between two KNOWN
-    // concrete Data types, structurally or by brand) is where the real
-    // value is, same tradeoff this type made from the start.
+    // `opaque` is enforced at RUNTIME too, not just statically: every
+    // constructor of a branded type stamps one hidden trailing tag into
+    // its value (parser::build_ctor_value), and every pattern that can
+    // match it -- positional, named, or FieldAccess's own synthetic one --
+    // carries the identical tag, so an unrelated value (or one from a
+    // SHADOWED same-named `data` redeclaration -- see consistent_inner's
+    // own doc comment on that gap) simply fails to pattern-match rather
+    // than being silently accepted as this type. matches_type's own
+    // Dyn-boundary check stays shallow regardless (a value is still just a
+    // tagged List, with no way to inspect its hidden tag from a bare type
+    // annotation without evaluating a pattern against it) -- the brand's
+    // real enforcement point is construction/destructuring, not that check.
     Data(String),
 }
 
@@ -180,6 +181,19 @@ fn consistent_inner(a: &Type, b: &Type, fields: &[Rc<DataInfo>], seen: &mut BTre
         // name failing to resolve in `fields` (shouldn't happen once
         // `fields` is the real registry elaborate builds) conservatively
         // rejects rather than guesses.
+        //
+        // Known gap: `a_name == b_name` short-circuits below with NO brand
+        // lookup at all, so two SEPARATELY-declared `data Foo` blocks
+        // (shadowing -- one branded, one not, or both branded differently)
+        // are still statically treated as the same type. Type::Data is
+        // name-only, with no notion of "which declaration"; fixing this
+        // properly would mean giving every `data` block a real identity
+        // baked into Type::Data itself, touched everywhere a type is
+        // looked up by name. Not fixed here -- but the runtime brand
+        // (Type::Data's own doc comment) bounds the damage: a value from
+        // the wrong declaration still fails to pattern-match/field-access
+        // once actually used, rather than silently behaving as the wrong
+        // type forever.
         (Type::Data(a_name), Type::Data(b_name)) => {
             if a_name == b_name {
                 return true;
@@ -215,7 +229,18 @@ fn consistent_inner(a: &Type, b: &Type, fields: &[Rc<DataInfo>], seen: &mut BTre
         // synthesizes List(Str), not Data("Option")), so this needs to
         // hold for parser::ctor_type's annotation to coerce cleanly, with
         // no runtime Check inserted (from isn't Dyn on either side).
-        (Type::List(_), Type::Data(_)) | (Type::Data(_), Type::List(_)) => true,
+        //
+        // Narrowed to Str/Dyn element types, not "any List": provably
+        // exactly the set a ctor body's own inferred list type can ever
+        // be (the tag is always Str; any field of a different type widens
+        // the WHOLE list to Dyn, which then stays Dyn -- see ListLit's
+        // elaboration). A concretely-typed list like `[Int]` was never a
+        // legitimate ctor body, so it's no longer accepted here either --
+        // closes a real gap where an arbitrary `[Int]` value satisfied any
+        // Data-annotated parameter with zero runtime check.
+        (Type::List(elem), Type::Data(_)) | (Type::Data(_), Type::List(elem)) => {
+            matches!(**elem, Type::Str | Type::Dyn)
+        }
         _ => false,
     }
 }
