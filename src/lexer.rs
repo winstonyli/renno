@@ -71,6 +71,8 @@ pub enum Token {
     PlusPlus,
     #[token("+")]
     Plus,
+    #[token("-")]
+    Minus,
     #[token("==")]
     EqEq,
     #[token("<")]

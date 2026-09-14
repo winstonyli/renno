@@ -284,6 +284,7 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont) -> Value {
 fn apply_binop(op: BinOp, lhs: Value, rhs: Value) -> Value {
     match op {
         BinOp::Add => Value::Int(lhs.as_int() + rhs.as_int()),
+        BinOp::Sub => Value::Int(lhs.as_int() - rhs.as_int()),
         BinOp::Lt => Value::Bool(lhs.as_int() < rhs.as_int()),
         BinOp::Eq => Value::Bool(value_eq(&lhs, &rhs)),
         BinOp::Concat => match (lhs, rhs) {

@@ -181,20 +181,36 @@ impl Parser {
         }
     }
 
-    // add := postfix (("+" | "++") postfix)*  (left-associative)
+    // add := unary (("+" | "-" | "++") unary)*  (left-associative)
     fn add(&mut self) -> Result<ExprRef, String> {
-        let mut lhs = self.postfix()?;
+        let mut lhs = self.unary()?;
         loop {
             let op = match self.peek() {
                 Some(Token::Plus) => BinOp::Add,
+                Some(Token::Minus) => BinOp::Sub,
                 Some(Token::PlusPlus) => BinOp::Concat,
                 _ => break,
             };
             self.bump();
-            let rhs = self.postfix()?;
+            let rhs = self.unary()?;
             lhs = self.arena.push(Expr::BinOp(op, lhs, rhs));
         }
         Ok(lhs)
+    }
+
+    // unary := "-"? postfix -- prefix negation, desugared to `0 - x` at
+    // parse time rather than a new AST node (Sub already exists, and this
+    // is the only user). Right-recursive (`unary` not `postfix` on the
+    // operand) so `- -x` parses too, for whatever that's worth.
+    fn unary(&mut self) -> Result<ExprRef, String> {
+        if matches!(self.peek(), Some(Token::Minus)) {
+            self.bump();
+            let operand = self.unary()?;
+            let zero = self.arena.push(Expr::Int(0));
+            Ok(self.arena.push(Expr::BinOp(BinOp::Sub, zero, operand)))
+        } else {
+            self.postfix()
+        }
     }
 
     // postfix := atom ("(" expr ")")*  -- supports curried calls f(a)(b)

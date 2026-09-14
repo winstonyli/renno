@@ -158,6 +158,29 @@ mod tests {
         assert!(!machine::run(&arena, elaborated, Env::prelude()).as_bool());
     }
 
+    #[test]
+    fn binary_minus() {
+        assert_eq!(run_untyped("5 - 3").as_int(), 2);
+    }
+
+    #[test]
+    fn unary_minus_desugars_to_zero_minus_operand() {
+        assert_eq!(run_untyped("-5 + 10").as_int(), 5);
+    }
+
+    #[test]
+    fn minus_enables_decrementing_recursion() {
+        let src = "let rec sum_down = fun n -> if n == 0 then 0 else n + sum_down(n - 1) in sum_down(5)";
+        assert_eq!(run_untyped(src).as_int(), 15);
+    }
+
+    #[test]
+    fn minus_rejects_non_int_operand_statically() {
+        let (mut arena, root) = parser::parse("true - 1").unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
+        assert!(err.0.contains("expected Int, found Bool"), "unexpected message: {}", err.0);
+    }
+
     // --- String/List primitives ---
 
     #[test]
@@ -245,9 +268,10 @@ mod tests {
 
     #[test]
     fn let_rec_self_reference_recurses() {
-        // Sums 1..5 by counting UP (no `-` operator exists yet) -- proves
-        // `loop` inside its own body resolves to itself, not an unbound
-        // Var lookup.
+        // Sums 1..5 by counting up -- proves `loop` inside its own body
+        // resolves to itself, not an unbound Var lookup. (Predates the `-`
+        // operator; minus_enables_decrementing_recursion above covers the
+        // more natural counting-down shape.)
         let src = "let rec loop = fun i -> if i < 6 then i + loop(i + 1) else 0 in loop(1)";
         assert_eq!(run_untyped(src).as_int(), 15);
     }

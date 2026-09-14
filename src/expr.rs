@@ -43,6 +43,7 @@ pub enum Pattern {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOp {
     Add,
+    Sub,
     Eq,
     Lt,
     // `++`: Str++Str or List++List. Kept separate from Add rather than

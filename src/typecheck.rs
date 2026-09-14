@@ -400,10 +400,10 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
             let row = EffectRow::union(&l_row, &r_row);
             match op {
                 // Arithmetic and ordering: both operands must be Int.
-                BinOp::Add | BinOp::Lt => {
+                BinOp::Add | BinOp::Sub | BinOp::Lt => {
                     let l3 = coerce(arena, l2, &l_ty, &Type::Int)?;
                     let r3 = coerce(arena, r2, &r_ty, &Type::Int)?;
-                    let result_ty = if op == BinOp::Add { Type::Int } else { Type::Bool };
+                    let result_ty = if op == BinOp::Lt { Type::Bool } else { Type::Int };
                     Ok((result_ty, row, arena.push(Expr::BinOp(op, l3, r3))))
                 }
                 // Equality: operands just need to be consistent with EACH
