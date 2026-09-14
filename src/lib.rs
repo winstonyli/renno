@@ -576,6 +576,38 @@ mod tests {
         assert!(typecheck::check(&mut arena, root, &spans).is_ok());
     }
 
+    // --- match reachability ---
+
+    #[test]
+    fn arm_after_a_wildcard_is_unreachable() {
+        let (mut arena, spans, root) = parser::parse("match 5 with | _ -> 1 | 1 -> 2").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("unreachable match arm"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn duplicate_literal_arm_is_unreachable() {
+        let (mut arena, spans, root) = parser::parse(r#"match 5 with | 1 -> "a" | 1 -> "b" | _ -> "c""#).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("unreachable match arm"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn wildcard_as_the_last_arm_is_fine() {
+        let src = r#"match 5 with | 1 -> "a" | 2 -> "b" | _ -> "c""#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root, &spans).is_ok());
+    }
+
+    #[test]
+    fn distinct_literals_are_all_reachable() {
+        // Regression guard: dominates() must not over-fire -- different
+        // Int literals must never be reported as unreachable.
+        let src = r#"match 5 with | 1 -> "a" | 2 -> "b" | 3 -> "c" | _ -> "d""#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root, &spans).is_ok());
+    }
+
     // --- source spans ---
 
     #[test]

@@ -272,6 +272,37 @@ fn ctor_tag(pat: &Pattern) -> Option<&str> {
     }
 }
 
+// Reachability: does `earlier` already cover every value `later` could
+// ever match, making `later` dead code if it comes after `earlier`? Only
+// two cheaply-provable shapes are recognized, the same "prove what's
+// cheap, stay silent otherwise" stance as missing_case (there's no
+// runtime signal for an unreachable arm to fall back on -- it just
+// silently never runs, so this is the only place that can ever catch it):
+//   - Var (including "_") dominates everything -- it matches any value.
+//   - a literal (Int/Bool/Str) dominates an identical literal -- an exact
+//     duplicate can never be reached, match_pattern already took the
+//     earlier one.
+// List/Cons/constructor patterns are NOT compared for subsumption here
+// (e.g. an earlier unconstrained `h :: t` making a later `1 :: t`
+// unreachable) -- a real but more nuanced case than this function
+// attempts; a redundant arm of that shape is silently allowed, same as
+// any other question this checker can't cheaply answer.
+fn dominates(earlier: &Pattern, later: &Pattern) -> bool {
+    match earlier {
+        Pattern::Var(_) => true,
+        Pattern::Int(n) => matches!(later, Pattern::Int(m) if m == n),
+        Pattern::Bool(b) => matches!(later, Pattern::Bool(c) if c == b),
+        Pattern::Str(s) => matches!(later, Pattern::Str(t) if t == s),
+        _ => false,
+    }
+}
+
+// The index of the first arm some EARLIER arm already fully dominates, if
+// any -- reported as unreachable (dead code).
+fn first_unreachable(patterns: &[Pattern]) -> Option<usize> {
+    (0..patterns.len()).find(|&i| (0..i).any(|j| dominates(&patterns[j], &patterns[i])))
+}
+
 // Exhaustiveness is checked only where it's cheaply provable -- same stance
 // as everywhere else in this checker (effect rows, list-length arity):
 // stay silent and defer to match_pattern's own runtime panic rather than
@@ -656,11 +687,19 @@ fn elaborate_node(
 
         // Tried top to bottom at runtime, but statically each arm is just
         // elaborated independently under its own pattern-bound context.
-        // Reachability isn't checked (an arm after a wildcard is dead code,
-        // silently) -- only exhaustiveness (missing_case), and only where
-        // that's cheaply provable; see missing_case's own doc comment for
-        // exactly which shapes it can prove complete.
+        // Checked before any of that: reachability (first_unreachable) --
+        // a dead arm has no runtime signal to fall back on, it just
+        // silently never runs, so this is the only chance to catch it, and
+        // there's no point elaborating a body that can't run anyway.
         Expr::Match(scrutinee, arms) => {
+            let pats: Vec<Pattern> = arms.iter().map(|(p, _)| p.clone()).collect();
+            if let Some(i) = first_unreachable(&pats) {
+                return Err(TypeError(
+                    "unreachable match arm: an earlier arm already covers everything it matches".to_string(),
+                    spans[arms[i].1],
+                ));
+            }
+
             let (scrut_ty, scrut_row, scrutinee2) = elaborate(arena, scrutinee, ctx, groups, spans)?;
             let mut row = scrut_row;
             let mut result_ty: Option<Type> = None;
@@ -685,7 +724,7 @@ fn elaborate_node(
                 });
                 new_arms.push((pat.clone(), body2));
             }
-            if let Some(missing) = missing_case(&arms.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), groups) {
+            if let Some(missing) = missing_case(&pats, groups) {
                 return Err(TypeError(format!("non-exhaustive match: {missing}"), spans[expr]));
             }
             Ok((result_ty.unwrap_or(Type::Dyn), row, arena.push(Expr::Match(scrutinee2, Rc::new(new_arms)))))
