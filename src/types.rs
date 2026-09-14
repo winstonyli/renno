@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
 
+use crate::expr::DataInfo;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Dyn,
@@ -19,24 +21,29 @@ pub enum Type {
     // A `data`-declared type, named. Every constructor parser::parser
     // builds for one `data Name = ...` is annotated to return this (see
     // parser::ctor_type), so `Some(5)` synthesizes Data("Option") instead
-    // of falling back to Dyn/[Dyn] -- two `data` types with the same
-    // constructor SHAPE (e.g. `data Celsius = Mk(Int)` and
-    // `data Fahrenheit = Mk(Int)`) are still statically distinguishable.
-    // Nominal, not structural: consistent() only accepts two Data with the
-    // EXACT SAME name, never by matching their fields' shapes.
+    // of falling back to Dyn/[Dyn].
     //
-    // The runtime side of this is necessarily shallow, the same way Fun's
+    // Structural by default: consistent() looks up both names' recorded
+    // constructor shapes (DataInfo::ctor_types) and accepts two Data types
+    // with the same NAME as different from each other -- so `data Celsius
+    // = Mk(Int)` and `data Fahrenheit = Mk(Int)` DO unify, the same way two
+    // structurally-identical List or Fun types always have. Opt a type OUT
+    // of that (real nominal distinctness, e.g. so Celsius and Fahrenheit
+    // can never be swapped for each other) by giving one of its
+    // constructors an `opaque` field -- see DataInfo::brand.
+    //
+    // The runtime side is necessarily shallow, the same way Fun's
     // matches_type is: a value is still just a tagged List (see
-    // value::Value), with no type name stamped into it anywhere, so a
-    // Dyn-origin value crossing into a Data(name)-annotated position can
-    // only be checked for "is this SOME tagged value" (value::matches_type),
-    // not "is this specifically a Name, as opposed to some other data type
-    // that happens to reuse one of its constructor tags." Fully verifying
-    // that would mean either stamping the type name into every constructed
-    // value, or wrapping the crossing in a per-access contract the way
+    // value::Value), with no type name (or brand) stamped into it anywhere,
+    // so a Dyn-origin value crossing into a Data(name)-annotated position
+    // can only be checked for "is this SOME tagged value"
+    // (value::matches_type), never "specifically a Name" or "specifically
+    // branded." Fully verifying that would mean stamping identity into
+    // every constructed value, or a per-access contract the way
     // wrap_fun_contract does for Fun -- more machinery than this feature
-    // spends; the static side (rejecting a call/annotation mismatch between
-    // two KNOWN concrete Data types) is where the real value is.
+    // spends; the static side (rejecting a mismatch between two KNOWN
+    // concrete Data types, structurally or by brand) is where the real
+    // value is, same tradeoff this type made from the start.
     Data(String),
 }
 
@@ -132,25 +139,82 @@ impl fmt::Display for EffectRow {
 // BOTH sides are concretely known and disagree. Effect rows follow the
 // same rule: Dyn row is consistent with any row, two Closed rows must
 // match exactly (no row subtyping/variance modeled yet).
-pub fn consistent(a: &Type, b: &Type) -> bool {
+//
+// `fields` is the same registry elaborate/elaborate_node thread everywhere
+// (every `data` block seen so far) -- needed only to look up a Data type's
+// recorded shape when two DIFFERENT names meet (see the Data arm below);
+// every other case ignores it.
+pub fn consistent(a: &Type, b: &Type, fields: &[Rc<DataInfo>]) -> bool {
+    consistent_inner(a, b, fields, &mut BTreeSet::new())
+}
+
+// `seen` tracks the (name, name) pairs currently being compared -- assumed
+// consistent, coinductively, if re-encountered before this comparison
+// finishes. Without it, two mutually-recursive differently-named types
+// (`data ListA = NilA | ConsA(Int, ListA)` vs `data ListB = NilB |
+// ConsB(Int, ListB)`) would recurse forever: comparing them structurally
+// means comparing ConsA's Int field (fine) and its ListA field against
+// ListB -- which is exactly the top-level comparison again. Standard
+// technique for recursive-type equivalence (the same idea as the "Amber
+// rules"): assume a pair equal while still verifying it, and only that
+// assumption lets a genuinely-cyclic proof terminate instead of looping.
+fn consistent_inner(a: &Type, b: &Type, fields: &[Rc<DataInfo>], seen: &mut BTreeSet<(String, String)>) -> bool {
     match (a, b) {
         (Type::Dyn, _) | (_, Type::Dyn) => true,
         (Type::Int, Type::Int) => true,
         (Type::Bool, Type::Bool) => true,
         (Type::Str, Type::Str) => true,
-        (Type::List(a), Type::List(b)) => consistent(a, b),
+        (Type::List(a), Type::List(b)) => consistent_inner(a, b, fields, seen),
         (Type::Fun(a1, r1, b1), Type::Fun(a2, r2, b2)) => {
-            consistent(a1, a2) && consistent(b1, b2) && row_consistent(r1, r2)
+            consistent_inner(a1, a2, fields, seen) && consistent_inner(b1, b2, fields, seen) && row_consistent(r1, r2)
         }
-        (Type::Data(a), Type::Data(b)) => a == b,
+        // Same name: always consistent (a type is always consistent with
+        // itself, brand or no brand) -- also what lets an ordinary
+        // self-referential `data` type (`Cons(Int, List)` inside `data
+        // List` itself) compare cheaply with no lookup at all. Different
+        // names: structural by default -- same set of constructor names,
+        // each with pairwise-consistent field types -- UNLESS either side
+        // opted into nominal distinctness via an `opaque` field
+        // (DataInfo::brand), which makes two differently-named types never
+        // consistent no matter how identical their shapes are. Either
+        // name failing to resolve in `fields` (shouldn't happen once
+        // `fields` is the real registry elaborate builds) conservatively
+        // rejects rather than guesses.
+        (Type::Data(a_name), Type::Data(b_name)) => {
+            if a_name == b_name {
+                return true;
+            }
+            let key =
+                if a_name < b_name { (a_name.clone(), b_name.clone()) } else { (b_name.clone(), a_name.clone()) };
+            if !seen.insert(key.clone()) {
+                return true;
+            }
+            let result = (|| {
+                let a_info = fields.iter().find(|f| &f.type_name == a_name)?;
+                let b_info = fields.iter().find(|f| &f.type_name == b_name)?;
+                if a_info.brand.is_some() || b_info.brand.is_some() {
+                    return Some(false);
+                }
+                if a_info.ctor_types.len() != b_info.ctor_types.len() {
+                    return Some(false);
+                }
+                Some(a_info.ctor_types.iter().all(|(cname, ctys)| {
+                    b_info.ctor_types.iter().find(|(n, _)| n == cname).is_some_and(|(_, ctys2)| {
+                        ctys.len() == ctys2.len()
+                            && ctys.iter().zip(ctys2).all(|(t1, t2)| consistent_inner(t1, t2, fields, seen))
+                    })
+                }))
+            })()
+            .unwrap_or(false);
+            seen.remove(&key);
+            result
+        }
         // Every Data(name) value IS, structurally, a List at runtime (see
         // Type::Data's doc comment) -- a constructor's own VALUE
         // expression elaborates structurally (e.g. `None`'s `["None"]`
         // synthesizes List(Str), not Data("Option")), so this needs to
         // hold for parser::ctor_type's annotation to coerce cleanly, with
-        // no runtime Check inserted (from isn't Dyn on either side). Two
-        // DIFFERENT Data names are still never consistent with each
-        // other, or with any of Int/Bool/Str/Fun -- only with List.
+        // no runtime Check inserted (from isn't Dyn on either side).
         (Type::List(_), Type::Data(_)) | (Type::Data(_), Type::List(_)) => true,
         _ => false,
     }

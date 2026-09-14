@@ -185,10 +185,27 @@ pub enum Expr {
 // see parser::parse_ctor_field). Threaded through elaborate/elaborate_node
 // alongside Ctx, purely additively (see DataGroup) -- never mutated after
 // a `data` block is peeled, just consulted by missing_case (which only
-// needs the tag names) and FieldAccess's desugaring (which needs the
-// field names and the constructor's own arity too).
+// needs the tag names), FieldAccess's desugaring (which needs the field
+// names and the constructor's own arity too), and types::consistent's
+// structural comparison (ctor_types, brand -- see their own doc comments).
 #[derive(Debug, Clone)]
 pub struct DataInfo {
     pub type_name: String,
     pub ctors: Vec<(String, Vec<String>)>,
+    // Parallel to `ctors` (same names, same order) but field TYPES instead
+    // of field NAMES -- what types::consistent compares two differently-
+    // named Data types' shapes with when deciding structural equivalence.
+    // Kept separate from `ctors` rather than folded in so every existing
+    // (String, Vec<String>) destructure of `ctors` -- named-field
+    // resolution, exhaustiveness's tag sets -- needed no changes.
+    pub ctor_types: Vec<(String, Vec<Type>)>,
+    // Some(id), unique per `data` declaration, if ANY constructor in this
+    // block wrote an `opaque` field -- opts the whole type OUT of
+    // structural consistency (renno's default for `data` types) and into
+    // nominal: consistent() then accepts this type only when compared with
+    // itself, never with another type of identical shape. None (the
+    // default) means fully structural: two `data` types with the same set
+    // of constructor names and field types unify, regardless of their own
+    // names, the way two structurally-identical List/Fun types always have.
+    pub brand: Option<u64>,
 }

@@ -49,23 +49,24 @@ enum PendingBinder {
     // `data Name = Ctor1(T, ...) | Ctor2 | ...` -- one pending item expands
     // to N nested Lets when folded back (one per constructor), not one.
     // See build_ctor_value for what each constructor's bound value is, and
-    // ctor_type for the nominal Type::Data(Name) annotation each one gets.
+    // ctor_type for the Type::Data(Name) annotation each one gets.
     // Each field is optionally named (parse_ctor_field) -- `field: Int`
     // instead of a bare `Int` -- for FieldAccess's `.field` desugaring;
     // unnamed by default, and not required to be uniform within one `data`
     // block (a constructor whose fields are only PARTLY named still just
     // has no field-name entry built for it -- see the Data fold-back arm).
-    Data { type_name: String, ctors: Vec<(String, Vec<(Option<String>, Type)>)> },
+    // `brand`: Some(id), unique to this `data` block's own source position,
+    // if any constructor wrote an `opaque` field -- see DataInfo::brand.
+    Data { type_name: String, ctors: Vec<(String, Vec<(Option<String>, Type)>)>, brand: Option<u64> },
 }
 
-// The nominal type a `data Name = ... | Ctor(T1, T2) | ...` constructor
-// gets: `T1 -> T2 -> ... -> Data(Name)`, curried the same way the
-// constructor's own VALUE is (build_ctor_value) -- Data(Name) is exactly
-// what lets two `data` types with identically-shaped constructors (e.g.
-// `data Celsius = Mk(Int)` and `data Fahrenheit = Mk(Int)`) stay
-// statically distinguishable, since consistent() only accepts two Data
-// with the exact same name. See types::Type::Data's own doc comment for
-// the runtime side's necessarily shallower story.
+// The type a `data Name = ... | Ctor(T1, T2) | ...` constructor gets:
+// `T1 -> T2 -> ... -> Data(Name)`, curried the same way the constructor's
+// own VALUE is (build_ctor_value). Two `data` types with identically-
+// shaped constructors (e.g. `data Celsius = Mk(Int)` and `data Fahrenheit
+// = Mk(Int)`) are consistent with each other by default (structural, see
+// types::consistent) -- add an `opaque` field to either if they should
+// NOT be interchangeable. See types::Type::Data's own doc comment.
 fn ctor_type(type_name: &str, field_tys: &[(Option<String>, Type)]) -> Type {
     let mut result = Type::Data(type_name.to_string());
     for (_, ty) in field_tys.iter().rev() {
@@ -307,6 +308,26 @@ impl<'a> Parser<'a> {
             }
         }
         Ok((None, self.parse_fun_type()?))
+    }
+
+    // One item in a `data` constructor's field list, which may be an
+    // ordinary field (see parse_ctor_field) OR a bare `opaque` marker --
+    // consuming no field slot (no param, no name, no type; None here means
+    // "not a real field, push nothing"), but recording a brand id (this
+    // token's own byte offset -- unique enough, since two tokens can't
+    // start at the same position) into `brand` for the WHOLE enclosing
+    // `data` block, shared across every one of its constructors regardless
+    // of which one actually wrote `opaque` (get_or_insert: the first one
+    // wins if it appears more than once). See DataInfo::brand.
+    fn parse_ctor_field_or_opaque(&mut self, brand: &mut Option<u64>) -> Result<Option<(Option<String>, Type)>, String> {
+        if matches!(self.peek(), Some(Token::Opaque)) {
+            let id = self.span_at().start as u64;
+            self.bump();
+            brand.get_or_insert(id);
+            Ok(None)
+        } else {
+            Ok(Some(self.parse_ctor_field()?))
+        }
     }
 
     // pattern := pattern_atom ("::" pattern)?  (right-assoc, `h :: t`)
@@ -677,6 +698,11 @@ impl<'a> Parser<'a> {
                     let type_name = self.ident()?;
                     self.expect(&Token::Equals)?;
                     let mut ctors = Vec::new();
+                    // Set if ANY constructor in this block writes an
+                    // `opaque` field -- brands the WHOLE type (one id,
+                    // shared by every one of its constructors), not just
+                    // the one constructor that happened to write it.
+                    let mut brand = None;
                     loop {
                         let ctor_span = self.span_at();
                         let name = self.ident()?;
@@ -699,10 +725,14 @@ impl<'a> Parser<'a> {
                             self.bump();
                             let mut tys = Vec::new();
                             if !matches!(self.peek(), Some(Token::RParen)) {
-                                tys.push(self.parse_ctor_field()?);
+                                if let Some(f) = self.parse_ctor_field_or_opaque(&mut brand)? {
+                                    tys.push(f);
+                                }
                                 while matches!(self.peek(), Some(Token::Comma)) {
                                     self.bump();
-                                    tys.push(self.parse_ctor_field()?);
+                                    if let Some(f) = self.parse_ctor_field_or_opaque(&mut brand)? {
+                                        tys.push(f);
+                                    }
                                 }
                             }
                             self.expect(&Token::RParen)?;
@@ -718,7 +748,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(&Token::In)?;
-                    pending.push((start, PendingBinder::Data { type_name, ctors }));
+                    pending.push((start, PendingBinder::Data { type_name, ctors, brand }));
                 }
                 _ => break,
             }
@@ -753,7 +783,7 @@ impl<'a> Parser<'a> {
                     };
                     self.push_spanned(Expr::Lambda(param, ann, body), span)
                 }
-                PendingBinder::Data { type_name, ctors } => {
+                PendingBinder::Data { type_name, ctors, brand } => {
                     // A constructor's fields count as "named" only when
                     // EVERY one of them has a name -- a partially-named
                     // constructor (mixing `field: Int` with a bare `Int`)
@@ -773,6 +803,11 @@ impl<'a> Parser<'a> {
                                 (name.clone(), field_names)
                             })
                             .collect(),
+                        ctor_types: ctors
+                            .iter()
+                            .map(|(name, fields)| (name.clone(), fields.iter().map(|(_, ty)| ty.clone()).collect()))
+                            .collect(),
+                        brand,
                     };
                     let mut body = result;
                     for (name, field_tys) in ctors.into_iter().rev() {

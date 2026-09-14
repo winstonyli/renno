@@ -14,7 +14,7 @@ let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in fact(10)
 - **Closed and row-polymorphic effect typing**: `check()` statically rejects a program if it can prove an effect is never handled. Row-polymorphic function types (`(Dyn ->{e} Dyn)`) let effect-safety survive through higher-order calls.
 - **`let rec` and mutual recursion**: `let rec f = ... and g = ... in ...` — any function in the group can call any sibling (including itself) by name.
 - **Pattern matching**: literals, lists (`[]`, `[a, b]`, `h :: t`), and ADT constructors, with static exhaustiveness and reachability checking wherever those are cheaply provable.
-- **ADTs**: `data Option = None | Some(Int) in ...`, desugared entirely into tagged lists and ordinary pattern matching — no new runtime representation. Constructors get real nominal types (`Type::Data`), so two differently-named types with identical shapes aren't interchangeable.
+- **ADTs**: `data Option = None | Some(Int) in ...`, desugared entirely into tagged lists and ordinary pattern matching — no new runtime representation. Constructors get real types (`Type::Data`), **structural by default** — two differently-named types with the same constructor names and field types unify — with an opt-in `opaque` field to make a type nominal (never interchangeable with anything but itself) when that's the point.
 - **Named fields**: `data Point = Point(x: Int, y: Int) in ...` supports `p.x` access, `Point { x: 1, y: 2 }` construction (any order), and `Point { x: a, y: b }` patterns (any order) — all sugar over ordinary positional construction and pattern matching, for any `data` type with exactly one constructor.
 - **Diagnostics**: every parse error, type error, and runtime panic reports a `line, column` location with a source snippet and a caret, not just a bare message.
 - **Multi-line REPL**: `let`/`match`/`data` blocks spanning multiple lines can be typed directly at the prompt.
@@ -120,6 +120,22 @@ match p with
 
 Positional construction and patterns (`Point(3)(4)`, `Point { x, y }` written `Point(x, y)`) still work and freely mix with the named forms above — named fields are an alternative notation, not a replacement. Constructors are curried like any other multi-argument callable (`Point(3)(4)`, not `Point(3, 4)`).
 
+`data` types are structural: two differently-named types with the same constructor names and field types are interchangeable, same as List or Fun.
+
+```
+data Meters = Mk(Int) in
+data Seconds = Mk(Int) in
+let f = fun x: Meters -> x in f(Mk(5))   -- accepted: Seconds's Mk(5) satisfies a Meters annotation
+```
+
+Add an `opaque` field to opt a type out of that — it contributes no value at runtime, just brands its `data` block as nominal:
+
+```
+data Meters = Mk(Int, opaque) in
+data Seconds = Mk(Int, opaque) in
+let f = fun x: Meters -> x in f(Mk(5))   -- static error: each `opaque` type is only consistent with itself
+```
+
 ### Effects
 
 ```
@@ -174,7 +190,7 @@ More complete examples for every feature above live in [`examples/`](examples/).
 ## Known limitations
 
 - Effect-row inference doesn't look inside a handler clause's own body — what a handler does when it resumes isn't modeled.
-- A runtime type check at a `Dyn`-to-`Data(name)` boundary can only confirm "this is some tagged value," not "specifically this data type" — no type name is stamped into values at runtime.
+- A runtime type check at a `Dyn`-to-`Data(name)` boundary can only confirm "this is some tagged value," not "specifically this data type" (or "specifically this `opaque` brand") — no type identity is stamped into values at runtime. Structural vs. nominal ADT typing is entirely a static-side distinction.
 - Match exhaustiveness and reachability are checked only where cheaply provable (see the doc comments on `missing_case`/`first_unreachable` in `typecheck.rs`); anything past that silently falls back to a runtime panic.
 - A runtime panic's reported location is the last expression *evaluated*, not necessarily the exact sub-expression at fault a few steps later.
 - `where` refinement predicates are limited to what `<`/`<=`/`>`/`>=`/`==`/`!=`, `&&`/`||`/`!`, and arithmetic can express. Proving is attempted only when the bound value reduces to a closed Int constant at parse time (`try_eval_closed_int`); a Lambda parameter's refinement is never proven statically, since its actual value is unknown until a caller supplies one.

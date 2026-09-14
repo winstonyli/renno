@@ -18,6 +18,13 @@ pub enum Token {
     Where,
     #[token("data")]
     Data,
+    // A constructor field that carries no value and can't be supplied by
+    // a caller -- see parser.rs's `data` field-list parsing. Writing one
+    // anywhere in a `data` block opts that TYPE out of structural
+    // consistency (the default) and into nominal: never consistent with
+    // any other type, however identically shaped, only with itself.
+    #[token("opaque")]
+    Opaque,
     #[token("in")]
     In,
     #[token("if")]

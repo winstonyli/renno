@@ -715,17 +715,86 @@ mod tests {
         assert!(err.contains("uppercase"), "unexpected message: {err}");
     }
 
-    // --- nominal ADT typing ---
+    // --- ADT typing: structural by default, nominal opt-in via `opaque` ---
 
     #[test]
-    fn distinct_data_types_with_identical_shape_are_not_interchangeable() {
-        // Celsius and Fahrenheit both wrap a single Int -- structurally
-        // identical, but Type::Data is nominal (name-compared), so passing
-        // one where the other is annotated is a static error.
+    fn distinct_ctor_names_are_not_interchangeable_even_with_identical_field_shapes() {
+        // Celsius and Fahrenheit both wrap a single Int, but their
+        // constructors are named DIFFERENTLY (MkC vs MkF) -- structural
+        // comparison matches constructors by name, so these still don't
+        // unify, the same way two records with differently-named fields
+        // wouldn't. See distinct_data_types_with_identical_shape_and_ctor_name_ARE_interchangeable
+        // for the case that actually exercises structural equivalence.
         let src = "data Celsius = MkC(Int) in\ndata Fahrenheit = MkF(Int) in\nlet f = fun x: Celsius -> x in\nf(MkF(100))";
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("expected Celsius, found Fahrenheit"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn distinct_data_types_with_identical_shape_and_ctor_name_are_interchangeable() {
+        // Meters and Seconds both wrap a single Int under a constructor
+        // named `Mk` -- structurally identical AND same ctor name, so
+        // (unlike Celsius/Fahrenheit above) these DO unify: a Seconds
+        // value satisfies a `Meters`-annotated parameter. `Mk` here
+        // resolves to Seconds's own constructor (the most recently
+        // declared `Mk` in scope) -- it's the VALUE's inferred type
+        // (Seconds) crossing into the Meters annotation that's under test,
+        // not which `Mk` gets called.
+        let src = "data Meters = Mk(Int) in\ndata Seconds = Mk(Int) in\nlet f = fun x: Meters -> x in\nf(Mk(100))";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[Mk, 100]");
+    }
+
+    #[test]
+    fn opaque_field_makes_an_otherwise_identical_type_nominal() {
+        // Same shape, same ctor name, as the interchangeable case above --
+        // but both types now carry an `opaque` field, opting them OUT of
+        // structural matching. Two DIFFERENT `data` blocks each get their
+        // own brand id (even with identical spelling), so they're never
+        // consistent with each other, only with themselves.
+        let src = "data Meters = Mk(Int, opaque) in\ndata Seconds = Mk(Int, opaque) in\nlet f = fun x: Meters -> x in\nf(Mk(100))";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected Meters, found Seconds"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn opaque_field_still_accepts_its_own_type() {
+        let src = "data Meters = Mk(Int, opaque) in let f = fun x: Meters -> x in f(Mk(100))";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[Mk, 100]");
+    }
+
+    #[test]
+    fn opaque_field_adds_no_runtime_representation() {
+        // `opaque` is a compile-time-only marker: a branded constructor's
+        // VALUE is identical to what an unbranded one with the same real
+        // fields would build -- no hidden extra list element.
+        assert_eq!(
+            run_untyped("data Meters = Mk(Int, opaque) in Mk(5)").to_string(),
+            run_untyped("data Meters2 = Mk2(Int) in Mk2(5)").to_string().replace("Mk2", "Mk")
+        );
+    }
+
+    #[test]
+    fn structurally_equivalent_recursive_types_with_different_names_unify() {
+        // ListA and ListB are mutually-shaped recursive types with
+        // different NAMES but the same ctor names/arities -- comparing
+        // them structurally means comparing Cons's own recursive field,
+        // which is comparing ListA against ListB all over again. Without
+        // the cycle-breaking `seen` set in consistent_inner, this would
+        // recurse forever; with it, it terminates and accepts.
+        let src = r#"
+            data ListA = Nil | Cons(Int, ListA) in
+            data ListB = Nil | Cons(Int, ListB) in
+            let f = fun x: ListA -> x in
+            f(Cons(1)(Nil))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root, &spans).is_ok());
     }
 
     #[test]

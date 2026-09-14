@@ -1,0 +1,42 @@
+// `data` types are STRUCTURAL by default: two DIFFERENTLY-named types with
+// the same constructor names and field types unify, the same way two
+// structurally-identical List or Fun types always have. Meters and Seconds
+// below are both just `Mk(Int)` -- so a Seconds value satisfies a
+// Meters-annotated parameter, no cast or conversion needed.
+data Meters = Mk(value: Int) in
+data Seconds = Mk(value: Int) in
+
+let identity_meters = fun x: Meters -> x in
+let five = identity_meters(Mk(5)) in   // Mk here is Seconds's own constructor
+
+// Opt a type OUT of structural matching with an `opaque` field: it
+// contributes no value, no parameter, nothing at runtime (a branded
+// constructor builds the exact same List a plain one would) -- purely a
+// compile-time marker that gives its `data` block its own unique brand.
+// Meters2/Seconds2 below have identical shape AND ctor name, but each
+// `opaque` field brands its own declaration distinctly, so they're never
+// consistent with each other, only with themselves.
+data Meters2 = Mk2(Int, opaque) in
+data Seconds2 = Mk2(Int, opaque) in
+
+let identity_meters2 = fun x: Meters2 -> x in
+// identity_meters2(Mk2(5)) -- would be a static type error: Mk2(5) here
+// is a Seconds2 value, and Seconds2 no longer unifies with Meters2.
+
+// Structural comparison matches CONSTRUCTORS by name too, not just field
+// types -- so two multi-constructor types only unify when every
+// constructor tag lines up. ListA and ListB are shaped identically and
+// recursively (each constructor refers back to its own enclosing type by
+// name), which is exactly the case that needs cycle detection to
+// terminate: comparing them means comparing Cons's own recursive field,
+// which is comparing ListA against ListB all over again.
+data ListA = Nil | Cons(Int, ListA) in
+data ListB = Nil | Cons(Int, ListB) in
+
+let rec sum = fun l: ListA ->
+  match l with
+  | Nil -> 0
+  | Cons(h, t) -> h + sum(t)
+in
+
+five.value + sum(Cons(1)(Cons(2)(Cons(3)(Nil))))   // 5 + 6 = 11

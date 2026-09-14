@@ -161,8 +161,15 @@ fn any_fun() -> Type {
 // check can't see inside a closure). So a Dyn value flowing into an
 // annotated Fun position gets wrapped in a real per-call contract instead
 // of a bare tag Check -- see wrap_fun_contract.
-fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span) -> Result<ExprRef, TypeError> {
-    if !consistent(from, to) {
+fn coerce(
+    arena: &mut Arena,
+    e: ExprRef,
+    from: &Type,
+    to: &Type,
+    span: Span,
+    fields: &[Rc<DataInfo>],
+) -> Result<ExprRef, TypeError> {
+    if !consistent(from, to, fields) {
         return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span));
     }
     if *from != Type::Dyn || *to == Type::Dyn {
@@ -472,7 +479,7 @@ fn elaborate(
             Expr::Let(var, ann, val, body) => {
                 let (val_ty, val_row, val2) = elaborate(arena, val, &cur_ctx, &cur_fields, spans)?;
                 let (bound_ty, val3) = match ann {
-                    Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t, spans[val])?),
+                    Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t, spans[val], &cur_fields)?),
                     None => (val_ty, val2),
                 };
                 cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone());
@@ -501,7 +508,7 @@ fn elaborate(
                 for (name, ann, val) in bindings.iter() {
                     let (val_ty, val_row, val2) = elaborate(arena, *val, &val_ctx, &cur_fields, spans)?;
                     let (bound_ty, val3) = match ann {
-                        Some(t) => (t.clone(), coerce(arena, val2, &val_ty, t, spans[*val])?),
+                        Some(t) => (t.clone(), coerce(arena, val2, &val_ty, t, spans[*val], &cur_fields)?),
                         None => (val_ty, val2),
                     };
                     elaborated.push((name.clone(), bound_ty, val_row, val3));
@@ -623,7 +630,7 @@ fn elaborate_node(
             let (a_ty, a_row, a2) = elaborate(arena, a, ctx, fields, spans)?;
             let (call_row, ret_ty, app2) = match &f_ty {
                 Type::Fun(param_ty, call_row, ret_ty) => {
-                    let a3 = coerce(arena, a2, &a_ty, param_ty, spans[a])?;
+                    let a3 = coerce(arena, a2, &a_ty, param_ty, spans[a], fields)?;
                     // If param_ty names a row variable (from an explicit
                     // `->{e}` annotation on the callee) and the argument's
                     // own inferred type reveals a concrete row in the
@@ -659,8 +666,8 @@ fn elaborate_node(
             match op {
                 // Arithmetic and ordering: both operands must be Int.
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Lt => {
-                    let l3 = coerce(arena, l2, &l_ty, &Type::Int, spans[l])?;
-                    let r3 = coerce(arena, r2, &r_ty, &Type::Int, spans[r])?;
+                    let l3 = coerce(arena, l2, &l_ty, &Type::Int, spans[l], fields)?;
+                    let r3 = coerce(arena, r2, &r_ty, &Type::Int, spans[r], fields)?;
                     let result_ty = if op == BinOp::Lt { Type::Bool } else { Type::Int };
                     Ok((result_ty, row, arena.push(Expr::BinOp(op, l3, r3))))
                 }
@@ -671,19 +678,19 @@ fn elaborate_node(
                 // type so the runtime value at least has a known tag;
                 // apply_binop compares by matching Value variants.
                 BinOp::Eq => {
-                    if !consistent(&l_ty, &r_ty) {
+                    if !consistent(&l_ty, &r_ty, fields) {
                         return Err(TypeError(
                             format!("type mismatch: cannot compare {l_ty} with {r_ty}"),
                             spans[expr],
                         ));
                     }
                     let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
-                        coerce(arena, l2, &l_ty, &r_ty, spans[l])?
+                        coerce(arena, l2, &l_ty, &r_ty, spans[l], fields)?
                     } else {
                         l2
                     };
                     let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
-                        coerce(arena, r2, &r_ty, &l_ty, spans[r])?
+                        coerce(arena, r2, &r_ty, &l_ty, spans[r], fields)?
                     } else {
                         r2
                     };
@@ -695,7 +702,7 @@ fn elaborate_node(
                 // consistent types). Result type: whichever side is
                 // concretely known; Dyn if neither is.
                 BinOp::Concat => {
-                    if !consistent(&l_ty, &r_ty) {
+                    if !consistent(&l_ty, &r_ty, fields) {
                         return Err(TypeError(
                             format!("type mismatch: cannot concat {l_ty} with {r_ty}"),
                             spans[expr],
@@ -716,12 +723,12 @@ fn elaborate_node(
                         }
                     };
                     let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
-                        coerce(arena, l2, &l_ty, &r_ty, spans[l])?
+                        coerce(arena, l2, &l_ty, &r_ty, spans[l], fields)?
                     } else {
                         l2
                     };
                     let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
-                        coerce(arena, r2, &r_ty, &l_ty, spans[r])?
+                        coerce(arena, r2, &r_ty, &l_ty, spans[r], fields)?
                     } else {
                         r2
                     };
@@ -738,7 +745,7 @@ fn elaborate_node(
                 // `h`'s type and `t`'s element type actually agree.
                 BinOp::Cons => {
                     let list_of_dyn = Type::List(Rc::new(Type::Dyn));
-                    if !consistent(&r_ty, &list_of_dyn) {
+                    if !consistent(&r_ty, &list_of_dyn, fields) {
                         return Err(TypeError(
                             format!("type mismatch: expected a list, found {r_ty}"),
                             spans[r],
@@ -755,7 +762,7 @@ fn elaborate_node(
 
         Expr::If(c, t, e) => {
             let (c_ty, c_row, c2) = elaborate(arena, c, ctx, fields, spans)?;
-            let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans[c])?;
+            let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans[c], fields)?;
             let (t_ty, t_row, t2) = elaborate(arena, t, ctx, fields, spans)?;
             let (e_ty, e_row, e2) = elaborate(arena, e, ctx, fields, spans)?;
             // Branches with differing concrete types aren't an error here
@@ -834,7 +841,7 @@ fn elaborate_node(
             let mut new_arms = Vec::with_capacity(arms.len());
             for (pat, (_, body)) in pats.iter().zip(arms.iter()) {
                 let pat_ty = pattern_type(pat);
-                if !consistent(&scrut_ty, &pat_ty) {
+                if !consistent(&scrut_ty, &pat_ty, fields) {
                     return Err(TypeError(
                         format!("match: pattern of type {pat_ty} can never match scrutinee of type {scrut_ty}"),
                         spans[expr],
@@ -998,7 +1005,7 @@ fn elaborate_node(
                     .get(fname.as_str())
                     .ok_or_else(|| TypeError(format!("missing field `{fname}` in {type_name} construction"), spans[expr]))?;
                 let (a_ty, a_row, a2) = elaborate(arena, val, ctx, fields, spans)?;
-                let a3 = coerce(arena, a2, &a_ty, param_ty, spans[val])?;
+                let a3 = coerce(arena, a2, &a_ty, param_ty, spans[val], fields)?;
                 row = EffectRow::union(&row, &a_row);
                 result = arena.push(Expr::App(result, a3));
             }
