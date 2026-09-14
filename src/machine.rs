@@ -1,0 +1,168 @@
+use std::rc::Rc;
+
+use crate::cont::{Cont, ContNode, Frame};
+use crate::env::Env;
+use crate::expr::Expr;
+use crate::value::Value;
+
+enum Control {
+    Eval(Rc<Expr>, Env),
+    Apply(Value),
+    Perform(String, Value),
+}
+
+// Trampolined CEK-style step loop -- no native recursion, so no stack
+// overflow risk from deep programs or from resuming captured continuations.
+pub fn run(expr: Rc<Expr>, env: Env) -> Value {
+    let mut control = Control::Eval(expr, env);
+    let mut cont = Cont::nil();
+
+    loop {
+        match control {
+            Control::Eval(expr, env) => match &*expr {
+                Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
+                Expr::Var(name) => control = Control::Apply(env.lookup(name)),
+                Expr::Lambda(param, body) => {
+                    control = Control::Apply(Value::Closure(param.clone(), body.clone(), env));
+                }
+                Expr::App(f, a) => {
+                    cont = Cont::cons(Frame::AppFunc { arg: a.clone(), env: env.clone() }, cont);
+                    control = Control::Eval(f.clone(), env);
+                }
+                Expr::Let(var, val_expr, body) => {
+                    cont = Cont::cons(
+                        Frame::LetBody { var: var.clone(), body: body.clone(), env: env.clone() },
+                        cont,
+                    );
+                    control = Control::Eval(val_expr.clone(), env);
+                }
+                Expr::Add(l, r) => {
+                    cont = Cont::cons(Frame::AddL { rhs: r.clone(), env: env.clone() }, cont);
+                    control = Control::Eval(l.clone(), env);
+                }
+                Expr::If0(c, t, e) => {
+                    cont = Cont::cons(
+                        Frame::If0 { then_: t.clone(), else_: e.clone(), env: env.clone() },
+                        cont,
+                    );
+                    control = Control::Eval(c.clone(), env);
+                }
+                Expr::Perform(effect, payload) => {
+                    cont = Cont::cons(Frame::PerformPayload { effect: effect.clone() }, cont);
+                    control = Control::Eval(payload.clone(), env);
+                }
+                Expr::Handle { body, effect, payload_var, resume_var, handler } => {
+                    cont = Cont::cons(
+                        Frame::HandlerMark {
+                            effect: effect.clone(),
+                            payload_var: payload_var.clone(),
+                            resume_var: resume_var.clone(),
+                            handler_body: handler.clone(),
+                            env: env.clone(),
+                        },
+                        cont,
+                    );
+                    control = Control::Eval(body.clone(), env);
+                }
+            },
+
+            Control::Apply(value) => match &*cont.0 {
+                ContNode::Nil => return value,
+                ContNode::Frame(frame, rest) => {
+                    let rest = rest.clone();
+                    match frame.clone() {
+                        Frame::AppFunc { arg, env } => {
+                            cont = Cont::cons(Frame::AppArg { func: value }, rest);
+                            control = Control::Eval(arg, env);
+                        }
+                        Frame::AppArg { func } => {
+                            cont = rest;
+                            match func {
+                                Value::Closure(param, body, closure_env) => {
+                                    control = Control::Eval(body, closure_env.bind(param, value));
+                                }
+                                Value::Continuation(k) => {
+                                    // resume(value): splice the captured
+                                    // continuation back in front of whatever
+                                    // comes after this call. Cloning k here
+                                    // (each time resume is invoked) is just
+                                    // an Rc clone -- multi-shot is calling
+                                    // this arm more than once with the same k.
+                                    cont = Cont::append(&k, &cont);
+                                    control = Control::Apply(value);
+                                }
+                                _ => panic!("attempt to call a non-function value"),
+                            }
+                        }
+                        Frame::LetBody { var, body, env } => {
+                            cont = rest;
+                            control = Control::Eval(body, env.bind(var, value));
+                        }
+                        Frame::AddL { rhs, env } => {
+                            cont = Cont::cons(Frame::AddR { lhs: value }, rest);
+                            control = Control::Eval(rhs, env);
+                        }
+                        Frame::AddR { lhs } => {
+                            cont = rest;
+                            control = Control::Apply(Value::Int(lhs.as_int() + value.as_int()));
+                        }
+                        Frame::If0 { then_, else_, env } => {
+                            cont = rest;
+                            control = Control::Eval(
+                                if value.as_int() == 0 { then_ } else { else_ },
+                                env,
+                            );
+                        }
+                        Frame::PerformPayload { effect } => {
+                            cont = rest;
+                            control = Control::Perform(effect, value);
+                        }
+                        Frame::HandlerMark { .. } => {
+                            // Handled body finished normally (no pending
+                            // effect reached this mark) -- identity return
+                            // clause: just pass the value through.
+                            cont = rest;
+                            control = Control::Apply(value);
+                        }
+                    }
+                }
+            },
+
+            Control::Perform(effect, payload) => {
+                control = perform(&mut cont, &effect, payload);
+            }
+        }
+    }
+}
+
+// Search outward through `cont` for a matching HandlerMark, capturing every
+// frame passed along the way into `k`. `k` becomes the first-class
+// `resume` value bound in the handler body -- a persistent Cont, so the
+// handler can apply it zero, one, or many times.
+fn perform(cont: &mut Cont, effect: &str, payload: Value) -> Control {
+    let mut captured = Vec::new();
+    let mut node = cont.clone();
+
+    loop {
+        match &*node.0 {
+            ContNode::Nil => panic!("unhandled effect: {effect}"),
+            ContNode::Frame(frame, rest) => {
+                if let Frame::HandlerMark { effect: e, payload_var, resume_var, handler_body, env } = frame {
+                    if e == effect {
+                        let mut k = Cont::nil();
+                        for f in captured.into_iter().rev() {
+                            k = Cont::cons(f, k);
+                        }
+                        let handler_env = env
+                            .bind(payload_var.clone(), payload)
+                            .bind(resume_var.clone(), Value::Continuation(k));
+                        *cont = rest.clone();
+                        return Control::Eval(handler_body.clone(), handler_env);
+                    }
+                }
+                captured.push(frame.clone());
+                node = rest.clone();
+            }
+        }
+    }
+}
