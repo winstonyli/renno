@@ -102,8 +102,16 @@ pub enum Token {
     Slash,
     #[token("==")]
     EqEq,
+    #[token("!=")]
+    BangEq,
     #[token("<")]
     Lt,
+    #[token("<=")]
+    LtEq,
+    #[token(">")]
+    Gt,
+    #[token(">=")]
+    GtEq,
 
     #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
     Int(i64),

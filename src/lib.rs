@@ -381,6 +381,52 @@ mod tests {
         assert!(run_untyped("1 < 2 && 3 < 4").as_bool());
     }
 
+    // --- comparison operators (>, <=, >=, !=), sugar over </== ---
+
+    #[test]
+    fn greater_than() {
+        assert!(run_untyped("5 > 3").as_bool());
+        assert!(!run_untyped("3 > 5").as_bool());
+    }
+
+    #[test]
+    fn less_or_equal() {
+        assert!(run_untyped("5 <= 5").as_bool());
+        assert!(run_untyped("4 <= 5").as_bool());
+        assert!(!run_untyped("6 <= 5").as_bool());
+    }
+
+    #[test]
+    fn greater_or_equal() {
+        assert!(run_untyped("5 >= 5").as_bool());
+        assert!(!run_untyped("5 >= 6").as_bool());
+    }
+
+    #[test]
+    fn not_equal() {
+        assert!(run_untyped("5 != 6").as_bool());
+        assert!(!run_untyped("5 != 5").as_bool());
+    }
+
+    #[test]
+    fn arrow_token_unaffected_by_gt_lexing() {
+        // `->` (Arrow) is a distinct two-char token from bare `>` (Gt) --
+        // regression guard that adding Gt didn't disturb Arrow's own
+        // lexing (logos matches the longest token, so "->" always wins
+        // over treating '-' and '>' as separate tokens).
+        assert_eq!(run_untyped("let f = fun x: Int -> x + 1 in f(5)").as_int(), 6);
+    }
+
+    #[test]
+    fn comparison_operators_are_provable_in_refinements() {
+        // `>=` desugars into the same If shape `&&`/`||`/`!` do
+        // (negate(Lt(...))), so try_eval_bool's existing If arm proves it
+        // for free -- no extra work needed for these four operators to
+        // compose with gradual verification's prover.
+        let err = parser::parse("let n: Int where n >= 100 = 5 in n").unwrap_err();
+        assert!(err.contains("refinement violated"), "unexpected message: {err}");
+    }
+
     #[test]
     fn and_short_circuits() {
         // No handler for `choose` at all -- if `&&` evaluated the RHS

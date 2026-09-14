@@ -54,6 +54,7 @@ cargo bench
 "a" ++ "b"       -- "ab"
 [1, 2] ++ [3]    -- [1, 2, 3]
 true == false    -- false
+5 > 3   5 <= 5   5 >= 6   5 != 6   -- true, true, false, true
 true && false || true    -- true (&& binds tighter than ||), both short-circuiting
 !true                     -- false
 1 :: 2 :: [3]             -- [1, 2, 3]
@@ -176,4 +177,4 @@ More complete examples for every feature above live in [`examples/`](examples/).
 - A runtime type check at a `Dyn`-to-`Data(name)` boundary can only confirm "this is some tagged value," not "specifically this data type" — no type name is stamped into values at runtime.
 - Match exhaustiveness and reachability are checked only where cheaply provable (see the doc comments on `missing_case`/`first_unreachable` in `typecheck.rs`); anything past that silently falls back to a runtime panic.
 - A runtime panic's reported location is the last expression *evaluated*, not necessarily the exact sub-expression at fault a few steps later.
-- `where` refinement predicates are limited to what `<`/`==`, `&&`/`||`/`!`, and arithmetic can express — no `>`/`<=`/`>=`/`!=` yet. Proving is attempted only when the bound value reduces to a closed Int constant at parse time (`try_eval_closed_int`); a Lambda parameter's refinement is never proven statically, since its actual value is unknown until a caller supplies one.
+- `where` refinement predicates are limited to what `<`/`<=`/`>`/`>=`/`==`/`!=`, `&&`/`||`/`!`, and arithmetic can express. Proving is attempted only when the bound value reduces to a closed Int constant at parse time (`try_eval_closed_int`); a Lambda parameter's refinement is never proven statically, since its actual value is unknown until a caller supplies one.

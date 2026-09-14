@@ -438,20 +438,56 @@ impl<'a> Parser<'a> {
     fn cmp(&mut self) -> Result<ExprRef, String> {
         let start = self.span_at().start;
         let lhs = self.cons()?;
-        let op = match self.peek() {
-            Some(Token::EqEq) => Some(BinOp::Eq),
-            Some(Token::Lt) => Some(BinOp::Lt),
+        let tok = match self.peek() {
+            Some(Token::EqEq | Token::Lt | Token::Gt | Token::LtEq | Token::GtEq | Token::BangEq) => {
+                self.peek().cloned()
+            }
             _ => None,
         };
-        match op {
-            Some(op) => {
+        match tok {
+            Some(tok) => {
                 self.bump();
                 let rhs = self.cons()?;
                 let span = Span { start, end: self.span_before().end };
-                Ok(self.push_spanned(Expr::BinOp(op, lhs, rhs), span))
+                // Only `==`/`<` are real BinOps -- `>`/`<=`/`>=`/`!=` are
+                // sugar over them (flipped operands, or negated), same
+                // "reuse what exists" approach as `&&`/`||`/`!`
+                // desugaring into If rather than adding new opcodes.
+                let node = match tok {
+                    Token::EqEq => self.push_spanned(Expr::BinOp(BinOp::Eq, lhs, rhs), span),
+                    Token::Lt => self.push_spanned(Expr::BinOp(BinOp::Lt, lhs, rhs), span),
+                    // a > b  ==  b < a
+                    Token::Gt => self.push_spanned(Expr::BinOp(BinOp::Lt, rhs, lhs), span),
+                    // a <= b  ==  !(b < a)
+                    Token::LtEq => {
+                        let lt = self.push_spanned(Expr::BinOp(BinOp::Lt, rhs, lhs), span);
+                        self.negate(lt, span)
+                    }
+                    // a >= b  ==  !(a < b)
+                    Token::GtEq => {
+                        let lt = self.push_spanned(Expr::BinOp(BinOp::Lt, lhs, rhs), span);
+                        self.negate(lt, span)
+                    }
+                    // a != b  ==  !(a == b)
+                    Token::BangEq => {
+                        let eq = self.push_spanned(Expr::BinOp(BinOp::Eq, lhs, rhs), span);
+                        self.negate(eq, span)
+                    }
+                    _ => unreachable!(),
+                };
+                Ok(node)
             }
             None => Ok(lhs),
         }
+    }
+
+    // `if operand then false else true` -- the same desugaring `!` uses in
+    // `unary`, shared here so `<=`/`>=`/`!=` (each "not the flipped/direct
+    // comparison") don't duplicate it.
+    fn negate(&mut self, operand: ExprRef, span: Span) -> ExprRef {
+        let f = self.push_spanned(Expr::Bool(false), span);
+        let t = self.push_spanned(Expr::Bool(true), span);
+        self.push_spanned(Expr::If(operand, f, t), span)
     }
 
     // cons := add ("::" cons)?  (right-associative, via right recursion
@@ -533,9 +569,7 @@ impl<'a> Parser<'a> {
             self.bump();
             let operand = self.unary()?;
             let span = Span { start, end: self.span_before().end };
-            let f = self.push_spanned(Expr::Bool(false), span);
-            let t = self.push_spanned(Expr::Bool(true), span);
-            Ok(self.push_spanned(Expr::If(operand, f, t), span))
+            Ok(self.negate(operand, span))
         } else {
             self.postfix()
         }
