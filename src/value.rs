@@ -93,3 +93,57 @@ impl fmt::Display for Value {
         }
     }
 }
+
+// A Send-safe summary of a Value. Value itself is built entirely on Rc
+// (Env/Cont/Expr all use it) -- deliberately, since the interpreter never
+// needs real concurrency and Rc avoids Arc's atomic refcount overhead on
+// every clone in the hot evaluation loop. That makes Value itself !Send,
+// which matters at exactly one seam: run_source (lib.rs) runs the
+// parser/typechecker on a dedicated large-stack thread to avoid a native
+// stack overflow on deeply nested source, and the result has to cross
+// back over a thread boundary. Outcome is what crosses it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Outcome {
+    Int(i64),
+    Bool(bool),
+    Function,
+    Handler,
+}
+
+impl Outcome {
+    pub fn as_int(&self) -> i64 {
+        match self {
+            Outcome::Int(n) => *n,
+            _ => panic!("expected int"),
+        }
+    }
+
+    pub fn as_bool(&self) -> bool {
+        match self {
+            Outcome::Bool(b) => *b,
+            _ => panic!("expected bool"),
+        }
+    }
+}
+
+impl From<&Value> for Outcome {
+    fn from(v: &Value) -> Outcome {
+        match v {
+            Value::Int(n) => Outcome::Int(*n),
+            Value::Bool(b) => Outcome::Bool(*b),
+            Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) => Outcome::Function,
+            Value::Handler(_) => Outcome::Handler,
+        }
+    }
+}
+
+impl fmt::Display for Outcome {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Outcome::Int(n) => write!(f, "{n}"),
+            Outcome::Bool(b) => write!(f, "{b}"),
+            Outcome::Function => write!(f, "<function>"),
+            Outcome::Handler => write!(f, "<handler>"),
+        }
+    }
+}

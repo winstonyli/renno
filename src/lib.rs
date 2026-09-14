@@ -10,12 +10,40 @@ pub mod types;
 pub mod value;
 
 use env::Env;
-use value::Value;
+use value::{Outcome, Value};
 
-// parse -> typecheck -> run, catching runtime panics as errors so a bad
-// line in the REPL (or a bad program passed on the command line) reports
-// cleanly instead of taking the whole process down.
-pub fn run_source(src: &str) -> Result<Value, String> {
+// Default OS thread stacks (~1-8 MiB) aren't enough for pathologically
+// deep source: parser::parse and typecheck::elaborate are plain recursive
+// descent over native Rust stack frames -- machine::run is trampolined
+// and has no such limit, but the front end does. A chain of ~1000 nested
+// `let`s is enough to overflow the default stack. Rather than trying to
+// bound "how deep is too deep" (fragile, and the real limit depends on
+// build settings), run the whole pipeline on a dedicated thread with a
+// much larger stack -- the standard fix for recursive-descent parsers
+// (rustc does the same for deeply nested expressions).
+const WORKER_STACK_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
+
+// parse -> typecheck -> run, catching panics (including a stack overflow
+// were one to still occur, or a runtime type-check panic) as errors so a
+// bad line in the REPL, or a bad program passed on the command line,
+// reports cleanly instead of taking the whole process down.
+//
+// Returns Outcome, not Value: Value is Rc-based throughout (Env/Cont/Expr
+// too) and so isn't Send, but the worker thread's result has to cross
+// back to the caller's thread. Outcome is the Send-safe summary that
+// makes that crossing possible without making the whole interpreter pay
+// Arc's atomic-refcount cost just for this one seam.
+pub fn run_source(src: &str) -> Result<Outcome, String> {
+    let src = src.to_string();
+    std::thread::Builder::new()
+        .stack_size(WORKER_STACK_SIZE)
+        .spawn(move || run_source_on_this_thread(&src).map(|v| Outcome::from(&v)))
+        .expect("failed to spawn interpreter worker thread")
+        .join()
+        .unwrap_or_else(|_| Err("internal error: interpreter worker thread panicked".to_string()))
+}
+
+fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
     let expr = parser::parse(src)?;
     let elaborated = typecheck::check(&expr).map_err(|e| e.0)?;
     std::panic::catch_unwind(|| machine::run(elaborated, Env::prelude()))
@@ -269,5 +297,22 @@ mod tests {
             machine::run(elaborated, Env::prelude())
         }));
         assert!(result.is_err(), "expected the runtime unhandled-effect panic as a fallback");
+    }
+
+    #[test]
+    fn deeply_nested_let_chain_does_not_overflow_the_stack() {
+        // Regression test: parser::parse / typecheck::elaborate are plain
+        // recursive descent, so a long enough chain of nested `let`s used
+        // to crash the process with STATUS_STACK_OVERFLOW well before this
+        // depth. run_source now runs the pipeline on a dedicated
+        // large-stack thread specifically to survive this.
+        let n = 5000;
+        let mut src = String::from("let x0 = 0 in ");
+        for i in 1..n {
+            src.push_str(&format!("let x{i} = x{} + 1 in ", i - 1));
+        }
+        src.push_str(&format!("x{}", n - 1));
+        let result = run_source(&src).expect("should not crash or error");
+        assert_eq!(result.as_int(), (n - 1) as i64);
     }
 }

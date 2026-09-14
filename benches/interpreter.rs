@@ -7,12 +7,13 @@ use renno::run_source;
 // direct proof that a chain of n bindings costs O(n), not the O(n^2) the
 // old Vec-cloning Ctx used to cost before that fix.
 //
-// Keep n well under ~1000: unlike machine::run (trampolined, stack-safe
-// at any depth), the parser and typecheck::elaborate are plain recursive
-// descent over native Rust stack frames -- a long enough chain overflows
-// it (confirmed: n=1000 crashes with STATUS_STACK_OVERFLOW). That's a
-// real scalability limit of the front end, not something to paper over
-// by silently raising the thread stack size here.
+// n=1000 used to crash the process here with STATUS_STACK_OVERFLOW:
+// unlike machine::run (trampolined, stack-safe at any depth), the parser
+// and typecheck::elaborate are plain recursive descent over native Rust
+// stack frames. run_source (lib.rs) now runs the whole pipeline on a
+// dedicated large-stack thread specifically to survive this -- n=1000 is
+// kept here as a direct regression check on that fix, not because it was
+// ever close to the real ceiling.
 fn let_chain_source(n: usize) -> String {
     let mut src = String::from("let x0 = 0 in ");
     for i in 1..n {
@@ -55,7 +56,7 @@ fn full_pipeline(c: &mut Criterion) {
 
 fn let_chain(c: &mut Criterion) {
     let mut group = c.benchmark_group("let_chain");
-    for n in [10usize, 100, 300] {
+    for n in [10usize, 100, 1000] {
         let src = let_chain_source(n);
         group.bench_with_input(BenchmarkId::from_parameter(n), &src, |b, src| {
             b.iter(|| run_source(black_box(src)).unwrap())
@@ -77,7 +78,7 @@ fn multishot_resume(c: &mut Criterion) {
 
 fn deep_reinstall(c: &mut Criterion) {
     let mut group = c.benchmark_group("deep_reinstall");
-    for n in [10usize, 100, 300] {
+    for n in [10usize, 100, 1000] {
         let src = deep_chain_source(n);
         group.bench_with_input(BenchmarkId::from_parameter(n), &src, |b, src| {
             b.iter(|| run_source(black_box(src)).unwrap())
