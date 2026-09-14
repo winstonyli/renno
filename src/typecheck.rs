@@ -1,28 +1,29 @@
 use std::rc::Rc;
 
 use crate::expr::{BinOp, Expr};
+use crate::plist::PList;
 use crate::types::{consistent, Type};
 
 #[derive(Debug)]
 pub struct TypeError(pub String);
 
-type Ctx = Vec<(String, Type)>;
+type Ctx = PList<Type>;
 
 fn lookup(ctx: &Ctx, name: &str) -> Type {
-    for (n, t) in ctx.iter().rev() {
-        if n == name {
-            return t.clone();
-        }
-    }
     // Unbound at typecheck time: don't error here, machine::run's own
     // `unbound variable` panic at runtime is the right place for that.
-    Type::Dyn
+    ctx.get(name).unwrap_or(Type::Dyn)
 }
 
 fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
-    let mut c = ctx.clone();
-    c.push((name.to_string(), ty));
-    c
+    ctx.bind(name, ty)
+}
+
+// "must be callable" -- the shape used wherever we need to check a value is
+// applicable at all without knowing its exact signature (an unannotated
+// Dyn-typed callee, or the innermost check inside a function contract).
+fn any_fun() -> Type {
+    Type::Fun(Rc::new(Type::Dyn), Rc::new(Type::Dyn))
 }
 
 // The only place a runtime Check gets inserted: `from` is Dyn (unknown
@@ -30,21 +31,60 @@ fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // disagree, that's a real static error -- reject before running at all.
 // If `from` is already exactly consistent and concrete, no check needed:
 // zero overhead for fully-annotated code.
+//
+// Crossing into a Fun type is special: value::matches_type only confirms
+// "this is callable," not "callable with this exact signature" (a tag
+// check can't see inside a closure). So a Dyn value flowing into an
+// annotated Fun position gets wrapped in a real per-call contract instead
+// of a bare tag Check -- see wrap_fun_contract.
 fn coerce(e: Rc<Expr>, from: &Type, to: &Type) -> Result<Rc<Expr>, TypeError> {
     if !consistent(from, to) {
         return Err(TypeError(format!("type mismatch: expected {to}, found {from}")));
     }
-    if *from == Type::Dyn && *to != Type::Dyn {
-        Ok(Rc::new(Expr::Check(to.clone(), e)))
-    } else {
-        Ok(e)
+    if *from != Type::Dyn || *to == Type::Dyn {
+        return Ok(e);
+    }
+    match to {
+        Type::Fun(param_ty, ret_ty) => Ok(wrap_fun_contract(e, param_ty.clone(), ret_ty.clone())),
+        _ => Ok(Rc::new(Expr::Check(to.clone(), e))),
     }
 }
 
+// Wraps a Dyn-origin value in a fresh closure that, on every call: checks
+// the argument matches param_ty (via the wrapper's own declared param type
+// -- ordinary App-site coercion at the wrapper's call sites handles that),
+// confirms the wrapped value is actually callable, applies it, then checks
+// the result against ret_ty. This is a real higher-order contract (each
+// call re-validated), not a one-time tag check -- a value that merely
+// looks like a function can't smuggle a wrong return type through it.
+// Built entirely from existing Expr nodes (Let/Lambda/Check/App/Var), no
+// new Value representation needed.
+fn wrap_fun_contract(e: Rc<Expr>, param_ty: Rc<Type>, ret_ty: Rc<Type>) -> Rc<Expr> {
+    let fn_var = "__contract_fn".to_string();
+    let arg_var = "__contract_arg".to_string();
+    Rc::new(Expr::Let(
+        fn_var.clone(),
+        None,
+        e,
+        Rc::new(Expr::Lambda(
+            arg_var.clone(),
+            Some((*param_ty).clone()),
+            Rc::new(Expr::Check(
+                (*ret_ty).clone(),
+                Rc::new(Expr::App(
+                    Rc::new(Expr::Check(any_fun(), Rc::new(Expr::Var(fn_var)))),
+                    Rc::new(Expr::Var(arg_var)),
+                )),
+            )),
+        )),
+    ))
+}
+
 // Bidirectional-lite synthesis: walks the tree once, producing both the
-// inferred Type and an elaborated Expr (same shape, with Check nodes
-// spliced in at Dyn-to-concrete boundaries). Effects stay untyped (Dyn) --
-// that's a separate, later phase (effect typing), not this one.
+// inferred Type and an elaborated Expr (same shape, with Check nodes --
+// or, at Fun boundaries, full contracts -- spliced in at Dyn-to-concrete
+// crossings). Effects stay untyped (Dyn) -- that's a separate, later
+// phase (effect typing), not this one.
 pub fn elaborate(expr: &Expr, ctx: &Ctx) -> Result<(Type, Rc<Expr>), TypeError> {
     match expr {
         Expr::Int(n) => Ok((Type::Int, Rc::new(Expr::Int(*n)))),
@@ -68,7 +108,14 @@ pub fn elaborate(expr: &Expr, ctx: &Ctx) -> Result<(Type, Rc<Expr>), TypeError> 
                     let a3 = coerce(a2, &a_ty, &param_ty)?;
                     Ok(((*ret_ty).clone(), Rc::new(Expr::App(f2, a3))))
                 }
-                Type::Dyn => Ok((Type::Dyn, Rc::new(Expr::App(f2, a2)))),
+                Type::Dyn => {
+                    // Unknown callee: still route "is this even callable"
+                    // through the same Check mechanism everything else
+                    // uses, rather than leaving it to a differently-worded
+                    // panic in machine.rs.
+                    let f3 = Rc::new(Expr::Check(any_fun(), f2));
+                    Ok((Type::Dyn, Rc::new(Expr::App(f3, a2))))
+                }
                 other => Err(TypeError(format!("cannot call a value of type {other}"))),
             }
         }
@@ -86,13 +133,39 @@ pub fn elaborate(expr: &Expr, ctx: &Ctx) -> Result<(Type, Rc<Expr>), TypeError> 
         Expr::BinOp(op, l, r) => {
             let (l_ty, l2) = elaborate(l, ctx)?;
             let (r_ty, r2) = elaborate(r, ctx)?;
-            let l3 = coerce(l2, &l_ty, &Type::Int)?;
-            let r3 = coerce(r2, &r_ty, &Type::Int)?;
-            let result_ty = match op {
-                BinOp::Add => Type::Int,
-                BinOp::Eq | BinOp::Lt => Type::Bool,
-            };
-            Ok((result_ty, Rc::new(Expr::BinOp(*op, l3, r3))))
+            match op {
+                // Arithmetic and ordering: both operands must be Int.
+                BinOp::Add | BinOp::Lt => {
+                    let l3 = coerce(l2, &l_ty, &Type::Int)?;
+                    let r3 = coerce(r2, &r_ty, &Type::Int)?;
+                    let result_ty = if *op == BinOp::Add { Type::Int } else { Type::Bool };
+                    Ok((result_ty, Rc::new(Expr::BinOp(*op, l3, r3))))
+                }
+                // Equality: operands just need to be consistent with EACH
+                // OTHER, not both forced to Int -- `true == false` is a
+                // real comparison. If one side is Dyn and the other
+                // concrete, coerce the Dyn side to the concrete side's
+                // type so the runtime value at least has a known tag;
+                // apply_binop compares by matching Value variants.
+                BinOp::Eq => {
+                    if !consistent(&l_ty, &r_ty) {
+                        return Err(TypeError(format!(
+                            "type mismatch: cannot compare {l_ty} with {r_ty}"
+                        )));
+                    }
+                    let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
+                        coerce(l2, &l_ty, &r_ty)?
+                    } else {
+                        l2
+                    };
+                    let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
+                        coerce(r2, &r_ty, &l_ty)?
+                    } else {
+                        r2
+                    };
+                    Ok((Type::Bool, Rc::new(Expr::BinOp(*op, l3, r3))))
+                }
+            }
         }
 
         Expr::If(c, t, e) => {
@@ -118,7 +191,18 @@ pub fn elaborate(expr: &Expr, ctx: &Ctx) -> Result<(Type, Rc<Expr>), TypeError> 
         }
         Expr::Handle { body, handler } => {
             let (_, body2) = elaborate(body, ctx)?;
-            let (_, handler2) = elaborate(handler, ctx)?;
+            let (handler_ty, handler2) = elaborate(handler, ctx)?;
+            // types.rs has no Type::Handler -- but every handler-producing
+            // expression (MakeHandler, or deep(...)/shallow(...) applied
+            // to one, or a var bound from either) synthesizes Dyn by this
+            // same convention, so a concretely-typed handler expression
+            // (Int, Bool, Fun) can never legitimately be one. Reject it
+            // statically instead of letting it reach machine.rs's panic.
+            if handler_ty != Type::Dyn {
+                return Err(TypeError(format!(
+                    "handle: expected a handler value, found expression of type {handler_ty}"
+                )));
+            }
             Ok((Type::Dyn, Rc::new(Expr::Handle { body: body2, handler: handler2 })))
         }
         Expr::MakeHandler { effect, payload_var, resume_var, body } => {
@@ -138,5 +222,5 @@ pub fn elaborate(expr: &Expr, ctx: &Ctx) -> Result<(Type, Rc<Expr>), TypeError> 
 }
 
 pub fn check(expr: &Rc<Expr>) -> Result<Rc<Expr>, TypeError> {
-    elaborate(expr, &Vec::new()).map(|(_, e)| e)
+    elaborate(expr, &Ctx::empty()).map(|(_, e)| e)
 }

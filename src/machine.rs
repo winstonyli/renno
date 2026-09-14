@@ -75,16 +75,27 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                 }
             },
 
+            // Matches on `frame` by reference: each arm clones only the
+            // specific fields it actually moves elsewhere, instead of
+            // eagerly cloning the whole frame (most fields on most arms
+            // would otherwise be cloned and immediately discarded).
             Control::Apply(value) => match &*cont.0 {
                 ContNode::Nil => return value,
                 ContNode::Frame(frame, rest) => {
                     let rest = rest.clone();
-                    match frame.clone() {
+                    // Each arm clones the specific fields it needs into
+                    // owned locals FIRST (ending frame's borrow there),
+                    // then reassigns `cont`/`control` -- reassigning `cont`
+                    // while still reading through the old borrow doesn't
+                    // typecheck, even though it would be sound.
+                    match frame {
                         Frame::AppFunc { arg, env } => {
+                            let (arg, env) = (arg.clone(), env.clone());
                             cont = Cont::cons(Frame::AppArg { func: value }, rest);
                             control = Control::Eval(arg, env);
                         }
                         Frame::AppArg { func } => {
+                            let func = func.clone();
                             cont = rest;
                             match func {
                                 Value::Closure(param, body, closure_env) => {
@@ -118,45 +129,38 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                             }
                         }
                         Frame::InstallHandler { body, env } => {
+                            let (body, env) = (body.clone(), env.clone());
                             cont = rest;
                             match value {
                                 Value::Handler(data) => {
-                                    cont = Cont::cons(
-                                        Frame::HandlerMark {
-                                            effect: data.effect.clone(),
-                                            payload_var: data.payload_var.clone(),
-                                            resume_var: data.resume_var.clone(),
-                                            handler_body: data.body.clone(),
-                                            env: data.env.clone(),
-                                            deep: data.deep,
-                                        },
-                                        cont,
-                                    );
+                                    cont = Cont::cons(Frame::HandlerMark(data), cont);
                                     control = Control::Eval(body, env);
                                 }
                                 _ => panic!("handle: expected a handler value"),
                             }
                         }
                         Frame::LetBody { var, body, env } => {
+                            let (var, body, env) = (var.clone(), body.clone(), env.clone());
                             cont = rest;
                             control = Control::Eval(body, env.bind(var, value));
                         }
                         Frame::BinOpL { op, rhs, env } => {
+                            let (op, rhs, env) = (*op, rhs.clone(), env.clone());
                             cont = Cont::cons(Frame::BinOpR { op, lhs: value }, rest);
                             control = Control::Eval(rhs, env);
                         }
                         Frame::BinOpR { op, lhs } => {
+                            let (op, lhs) = (*op, lhs.clone());
                             cont = rest;
                             control = Control::Apply(apply_binop(op, lhs, value));
                         }
                         Frame::If { then_, else_, env } => {
+                            let (then_, else_, env) = (then_.clone(), else_.clone(), env.clone());
                             cont = rest;
-                            control = Control::Eval(
-                                if value.as_bool() { then_ } else { else_ },
-                                env,
-                            );
+                            control = Control::Eval(if value.as_bool() { then_ } else { else_ }, env);
                         }
                         Frame::CheckFrame { ty } => {
+                            let ty = ty.clone();
                             cont = rest;
                             if value.matches_type(&ty) {
                                 control = Control::Apply(value);
@@ -165,13 +169,16 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                             }
                         }
                         Frame::PerformPayload { effect } => {
+                            let effect = effect.clone();
                             cont = rest;
                             control = Control::Perform(effect, value);
                         }
-                        Frame::HandlerMark { .. } => {
+                        Frame::HandlerMark(_) => {
                             // Handled body finished normally (no pending
                             // effect reached this mark) -- identity return
-                            // clause: just pass the value through.
+                            // clause: just pass the value through. Nothing
+                            // in the HandlerData is needed here, so nothing
+                            // gets cloned.
                             cont = rest;
                             control = Control::Apply(value);
                         }
@@ -186,13 +193,24 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
     }
 }
 
-// Int-only for now; comparisons producing Bool. No mixed-type coercion --
-// wrong operand type panics via as_int(), matching the rest of the runtime.
+// Add/Lt are Int-only -- wrong operand type panics via as_int(). Eq is
+// structural: it compares whatever tags the two values actually carry
+// (typecheck.rs only requires the two operand types to be consistent with
+// each other, not both Int), so it dispatches on Value directly instead of
+// projecting through as_int().
 fn apply_binop(op: BinOp, lhs: Value, rhs: Value) -> Value {
     match op {
         BinOp::Add => Value::Int(lhs.as_int() + rhs.as_int()),
-        BinOp::Eq => Value::Bool(lhs.as_int() == rhs.as_int()),
         BinOp::Lt => Value::Bool(lhs.as_int() < rhs.as_int()),
+        BinOp::Eq => Value::Bool(value_eq(&lhs, &rhs)),
+    }
+}
+
+fn value_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        _ => false,
     }
 }
 
@@ -208,27 +226,22 @@ fn perform(cont: &mut Cont, effect: &str, payload: Value) -> Control {
         match &*node.0 {
             ContNode::Nil => panic!("unhandled effect: {effect}"),
             ContNode::Frame(frame, rest) => {
-                if let Frame::HandlerMark { effect: e, payload_var, resume_var, handler_body, env, deep } = frame {
-                    if e == effect {
+                if let Frame::HandlerMark(data) = frame {
+                    if data.effect == effect {
                         // deep: reinstall this same HandlerMark at the far
                         // end of k, exactly where it originally sat, so an
                         // effect performed while running the resumed
                         // continuation is caught by this handler again.
                         // shallow: k ends bare -- a repeat occurrence
                         // escapes to whatever handler sits further out.
-                        let mut k = if *deep {
-                            Cont::cons(frame.clone(), Cont::nil())
-                        } else {
-                            Cont::nil()
-                        };
-                        for f in captured.into_iter().rev() {
-                            k = Cont::cons(f, k);
-                        }
-                        let handler_env = env
-                            .bind(payload_var.clone(), payload)
-                            .bind(resume_var.clone(), Value::Continuation(k));
+                        let base = if data.deep { Cont::cons(frame.clone(), Cont::nil()) } else { Cont::nil() };
+                        let k = Cont::from_frames(captured, base);
+                        let handler_env = data
+                            .env
+                            .bind(data.payload_var.clone(), payload)
+                            .bind(data.resume_var.clone(), Value::Continuation(k));
                         *cont = rest.clone();
-                        return Control::Eval(handler_body.clone(), handler_env);
+                        return Control::Eval(data.body.clone(), handler_env);
                     }
                 }
                 captured.push(frame.clone());

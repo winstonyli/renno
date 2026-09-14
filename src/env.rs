@@ -1,23 +1,11 @@
-use std::rc::Rc;
-
+use crate::plist::PList;
 use crate::value::{Builtin, Value};
 
 // Persistent environment: extending never mutates the parent, so any Env
-// captured by a closure or continuation stays valid forever. Lookup is O(n)
-// linear scan for now -- fine for a skeleton, swap to resolved indices later.
-#[derive(Clone)]
-pub struct Env(pub Rc<EnvNode>);
+// captured by a closure or continuation stays valid forever.
+pub type Env = PList<Value>;
 
-pub enum EnvNode {
-    Empty,
-    Bind(String, Value, Env),
-}
-
-impl Env {
-    pub fn empty() -> Env {
-        Env(Rc::new(EnvNode::Empty))
-    }
-
+impl PList<Value> {
     // `deep`/`shallow` bound as ordinary values -- functions that take a
     // handler value and return a new one with the reinstall bit flipped.
     // Nothing else in the core language knows about deep vs shallow.
@@ -27,22 +15,7 @@ impl Env {
             .bind("shallow", Value::Builtin(Builtin::Shallow))
     }
 
-    pub fn bind(&self, name: impl Into<String>, value: Value) -> Env {
-        Env(Rc::new(EnvNode::Bind(name.into(), value, self.clone())))
-    }
-
     pub fn lookup(&self, name: &str) -> Value {
-        let mut node = self.clone();
-        loop {
-            match &*node.0 {
-                EnvNode::Empty => panic!("unbound variable: {name}"),
-                EnvNode::Bind(n, v, parent) => {
-                    if n == name {
-                        return v.clone();
-                    }
-                    node = parent.clone();
-                }
-            }
-        }
+        self.get(name).unwrap_or_else(|| panic!("unbound variable: {name}"))
     }
 }

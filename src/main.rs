@@ -4,43 +4,12 @@ mod expr;
 mod lexer;
 mod machine;
 mod parser;
+mod plist;
 mod typecheck;
 mod types;
 mod value;
 
-use std::rc::Rc;
-
 use env::Env;
-use expr::{BinOp, Expr};
-
-// handle {
-//   let x = perform choose 0 in
-//   x + 100
-// } with (fun p resume -> resume(1) + resume(2)) tagged for "choose"
-//
-// Multi-shot proof: `resume` is called twice from the handler body.
-// Each call replays the captured continuation (`x + 100`) with a
-// different x, independently -- expect (1+100) + (2+100) = 203.
-fn build_multi_shot_demo() -> Rc<Expr> {
-    Rc::new(Expr::Handle {
-        body: Rc::new(Expr::Let(
-            "x".into(),
-            None,
-            Rc::new(Expr::Perform("choose".into(), Rc::new(Expr::Int(0)))),
-            Rc::new(Expr::BinOp(BinOp::Add, Rc::new(Expr::Var("x".into())), Rc::new(Expr::Int(100)))),
-        )),
-        handler: Rc::new(Expr::MakeHandler {
-            effect: "choose".into(),
-            payload_var: "_ignored".into(),
-            resume_var: "resume".into(),
-            body: Rc::new(Expr::BinOp(
-                BinOp::Add,
-                Rc::new(Expr::App(Rc::new(Expr::Var("resume".into())), Rc::new(Expr::Int(1)))),
-                Rc::new(Expr::App(Rc::new(Expr::Var("resume".into())), Rc::new(Expr::Int(2)))),
-            )),
-        }),
-    })
-}
 
 fn main() {
     let src = r#"
@@ -60,64 +29,16 @@ fn main() {
     assert_eq!(result.as_int(), 203);
 }
 
-// handle { let x = perform choose 0 in let y = perform choose 0 in x + y }
-// with choose(_, resume) -> resume(1)
-//
-// Two *sequential* occurrences of the same effect (not multi-shot -- each
-// is resumed once). deep(handler): the reinstalled handler catches the
-// second occurrence too -> x=1, y=1 -> 2. Plain (shallow default): handler
-// is consumed by the first occurrence, the second escapes unhandled ->
-// panics.
-fn two_sequential_performs(deep: bool) -> Rc<Expr> {
-    let base_handler = Rc::new(Expr::MakeHandler {
-        effect: "choose".into(),
-        payload_var: "_ignored".into(),
-        resume_var: "resume".into(),
-        body: Rc::new(Expr::App(Rc::new(Expr::Var("resume".into())), Rc::new(Expr::Int(1)))),
-    });
-    let handler = if deep {
-        Rc::new(Expr::App(Rc::new(Expr::Var("deep".into())), base_handler))
-    } else {
-        base_handler
-    };
-    Rc::new(Expr::Handle {
-        body: Rc::new(Expr::Let(
-            "x".into(),
-            None,
-            Rc::new(Expr::Perform("choose".into(), Rc::new(Expr::Int(0)))),
-            Rc::new(Expr::Let(
-                "y".into(),
-                None,
-                Rc::new(Expr::Perform("choose".into(), Rc::new(Expr::Int(0)))),
-                Rc::new(Expr::BinOp(BinOp::Add, Rc::new(Expr::Var("x".into())), Rc::new(Expr::Var("y".into())))),
-            )),
-        )),
-        handler,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn multi_shot_resume_replays_independently() {
-        let result = machine::run(build_multi_shot_demo(), Env::prelude());
-        assert_eq!(result.as_int(), 203);
-    }
-
-    #[test]
-    fn deep_handler_catches_repeat_effect() {
-        let result = machine::run(two_sequential_performs(true), Env::prelude());
-        assert_eq!(result.as_int(), 2);
-    }
-
-    #[test]
-    #[should_panic(expected = "unhandled effect: choose")]
-    fn shallow_handler_does_not_catch_repeat_effect() {
-        machine::run(two_sequential_performs(false), Env::prelude());
-    }
-
+    // handle { let x = perform choose(0) in x + 100 } with
+    // handler choose(p, resume) -> resume(1) + resume(2)
+    //
+    // Multi-shot proof: `resume` is called twice from the handler body.
+    // Each call replays the captured continuation (`x + 100`) with a
+    // different x, independently -- expect (1+100) + (2+100) = 203.
     #[test]
     fn parses_and_runs_multi_shot_demo() {
         let src = r#"
@@ -131,6 +52,9 @@ mod tests {
         assert_eq!(result.as_int(), 203);
     }
 
+    // Two *sequential* occurrences of the same effect (not multi-shot --
+    // each is resumed once). deep(handler): the reinstalled handler
+    // catches the second occurrence too -> x=1, y=1 -> 2.
     #[test]
     fn parses_and_runs_deep_handler() {
         let src = r#"
@@ -145,6 +69,8 @@ mod tests {
         assert_eq!(result.as_int(), 2);
     }
 
+    // Same shape, no deep(...) -- shallow (the MakeHandler default) is
+    // consumed by the first occurrence; the second escapes unhandled.
     #[test]
     #[should_panic(expected = "unhandled effect: choose")]
     fn parses_and_runs_shallow_handler_panic() {
@@ -175,6 +101,22 @@ mod tests {
     fn eq_and_bool_literals() {
         let expr = parser::parse("if 3 == 3 then true else false").unwrap();
         assert!(machine::run(expr, Env::prelude()).as_bool());
+    }
+
+    #[test]
+    fn eq_compares_bools_directly() {
+        // Regression test: Eq used to force both operands through Int,
+        // rejecting this at typecheck time even though it's a valid
+        // comparison.
+        let expr = parser::parse("true == false").unwrap();
+        let elaborated = typecheck::check(&expr).unwrap();
+        assert!(!machine::run(elaborated, Env::prelude()).as_bool());
+    }
+
+    #[test]
+    fn handler_rejects_duplicate_binder_names() {
+        let err = parser::parse("handler choose(x, x) -> x").unwrap_err();
+        assert!(err.contains("different names"), "unexpected message: {err}");
     }
 
     // --- gradual typing ---
@@ -233,5 +175,35 @@ mod tests {
         let expr = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&expr).unwrap();
         machine::run(elaborated, Env::prelude());
+    }
+
+    #[test]
+    fn dyn_to_fun_boundary_rejects_closure_with_wrong_return_type() {
+        // Regression test: matches_type used to accept ANY callable for
+        // Type::Fun regardless of its actual signature, so a Dyn-origin
+        // closure with the wrong return type would silently pass the
+        // boundary check and only fail later with an unrelated panic (or
+        // not at all). wrap_fun_contract now re-checks the result of every
+        // call through the boundary, so this fails right at the call site.
+        let src = r#"
+            handle
+              let f = perform choose(0) in
+              let g: (Int -> Int) = f in
+              g(5) + 1
+            with handler choose(p, resume) -> resume(fun x -> true)
+        "#;
+        let expr = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&expr).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            machine::run(elaborated, Env::prelude())
+        }));
+        assert!(result.is_err(), "expected a panic from the return-type contract check");
+    }
+
+    #[test]
+    fn handle_with_non_handler_value_rejected_statically() {
+        let expr = parser::parse("handle 1 with 5").unwrap();
+        let err = typecheck::check(&expr).unwrap_err();
+        assert!(err.0.contains("expected a handler value"), "unexpected message: {}", err.0);
     }
 }

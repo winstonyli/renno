@@ -34,7 +34,6 @@ pub enum Value {
     Continuation(Cont),
     Handler(Rc<HandlerData>),
     Builtin(Builtin),
-    Unit,
 }
 
 impl Value {
@@ -55,7 +54,12 @@ impl Value {
     // Runtime side of gradual typing: does this value's tag match the
     // static Type it's being checked against? Fun matches any callable
     // representation (Closure/Continuation/Builtin) -- Handler isn't
-    // callable via App, so it doesn't match Fun.
+    // callable via App, so it doesn't match Fun. This is deliberately a
+    // shallow "is it callable at all" check, not "does it have this exact
+    // signature" -- typecheck::coerce wraps Dyn-to-Fun crossings in a real
+    // per-call contract (checking each argument/result) instead of relying
+    // on this alone; this stays the innermost callability primitive that
+    // contract bottoms out on, the same role Int/Bool tag-checks play.
     pub fn matches_type(&self, t: &Type) -> bool {
         match (self, t) {
             (_, Type::Dyn) => true,
@@ -74,7 +78,6 @@ impl Value {
             Value::Bool(_) => "Bool",
             Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) => "Fun",
             Value::Handler(_) => "Handler",
-            Value::Unit => "Unit",
         }
     }
 }

@@ -189,6 +189,16 @@ impl Parser {
                 let payload_var = self.ident()?;
                 self.expect(&Token::Comma)?;
                 let resume_var = self.ident()?;
+                if payload_var == resume_var {
+                    // Env::bind prepends, so identical names would make
+                    // resume_var silently shadow payload_var -- the payload
+                    // becomes unreachable with no error. Reject at parse
+                    // time instead of leaving that footgun for the handler
+                    // author to discover by reading machine.rs.
+                    return Err(format!(
+                        "handler {effect}: payload and resume binders must have different names, both named {payload_var:?}"
+                    ));
+                }
                 self.expect(&Token::RParen)?;
                 self.expect(&Token::Arrow)?;
                 let body = self.expr()?;

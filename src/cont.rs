@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::env::Env;
 use crate::expr::{BinOp, Expr};
 use crate::types::Type;
-use crate::value::Value;
+use crate::value::{HandlerData, Value};
 
 // One step of "what's left to do", defunctionalized so it can live as data
 // (not the native Rust call stack). This is what makes multi-shot resume
@@ -21,14 +21,10 @@ pub enum Frame {
     // `handle body with handler_expr`: handler_expr has just evaluated to a
     // Value::Handler -- next step installs it as a HandlerMark and evals body.
     InstallHandler { body: Rc<Expr>, env: Env },
-    HandlerMark {
-        effect: String,
-        payload_var: String,
-        resume_var: String,
-        handler_body: Rc<Expr>,
-        env: Env,
-        deep: bool,
-    },
+    // Wraps the same HandlerData a Value::Handler carries -- an Rc clone
+    // (one pointer bump) instead of six separately-cloned fields, and one
+    // definition instead of two structurally-identical ones to keep in sync.
+    HandlerMark(Rc<HandlerData>),
 }
 
 // Persistent, Nil-terminated linked stack of frames. Cloning a Cont is an
@@ -51,6 +47,18 @@ impl Cont {
         Cont(Rc::new(ContNode::Frame(frame, rest)))
     }
 
+    // Fold `frames` onto `tail`, frames[0] ending up closest to the top
+    // (the next one popped). Shared by `append` below and by
+    // `machine::perform`, which captures frames while searching for a
+    // handler and needs this exact same rebuild -- one fold, not two.
+    pub fn from_frames(frames: Vec<Frame>, tail: Cont) -> Cont {
+        let mut acc = tail;
+        for f in frames.into_iter().rev() {
+            acc = Cont::cons(f, acc);
+        }
+        acc
+    }
+
     // Splice `k` (a captured continuation) in front of `tail`. O(len(k)):
     // rebuilds k's frames onto tail since a singly-linked persistent list
     // has no O(1) append. Fine at skeleton scale; revisit if profiling
@@ -67,10 +75,6 @@ impl Cont {
                 }
             }
         }
-        let mut acc = tail.clone();
-        for f in frames.into_iter().rev() {
-            acc = Cont::cons(f, acc);
-        }
-        acc
+        Cont::from_frames(frames, tail.clone())
     }
 }
