@@ -4,6 +4,8 @@ mod expr;
 mod lexer;
 mod machine;
 mod parser;
+mod typecheck;
+mod types;
 mod value;
 
 use std::rc::Rc;
@@ -23,6 +25,7 @@ fn build_multi_shot_demo() -> Rc<Expr> {
     Rc::new(Expr::Handle {
         body: Rc::new(Expr::Let(
             "x".into(),
+            None,
             Rc::new(Expr::Perform("choose".into(), Rc::new(Expr::Int(0)))),
             Rc::new(Expr::BinOp(BinOp::Add, Rc::new(Expr::Var("x".into())), Rc::new(Expr::Int(100)))),
         )),
@@ -47,7 +50,12 @@ fn main() {
         with handler choose(p, resume) -> resume(1) + resume(2)
     "#;
     let expr = parser::parse(src).expect("parse failed");
-    let result = machine::run(expr, Env::prelude());
+    // `x` is Dyn (bound from perform's result -- effects stay untyped for
+    // now), but flows into `x + 100`, which expects Int: elaboration
+    // inserts a runtime Check(Int, x) there. Passes since the handler
+    // resumes with real ints.
+    let elaborated = typecheck::check(&expr).unwrap_or_else(|e| panic!("type error: {}", e.0));
+    let result = machine::run(elaborated, Env::prelude());
     println!("result = {}", result.as_int());
     assert_eq!(result.as_int(), 203);
 }
@@ -75,9 +83,11 @@ fn two_sequential_performs(deep: bool) -> Rc<Expr> {
     Rc::new(Expr::Handle {
         body: Rc::new(Expr::Let(
             "x".into(),
+            None,
             Rc::new(Expr::Perform("choose".into(), Rc::new(Expr::Int(0)))),
             Rc::new(Expr::Let(
                 "y".into(),
+                None,
                 Rc::new(Expr::Perform("choose".into(), Rc::new(Expr::Int(0)))),
                 Rc::new(Expr::BinOp(BinOp::Add, Rc::new(Expr::Var("x".into())), Rc::new(Expr::Var("y".into())))),
             )),
@@ -165,5 +175,63 @@ mod tests {
     fn eq_and_bool_literals() {
         let expr = parser::parse("if 3 == 3 then true else false").unwrap();
         assert!(machine::run(expr, Env::prelude()).as_bool());
+    }
+
+    // --- gradual typing ---
+
+    #[test]
+    fn fully_annotated_code_has_no_check_nodes() {
+        // Both sides concrete and consistent -- coerce() should insert
+        // nothing. Confirms fully-typed code pays zero runtime-check cost.
+        let expr = parser::parse("let f = fun x: Int -> x + 1 in f(41)").unwrap();
+        let elaborated = typecheck::check(&expr).unwrap();
+        assert!(!format!("{elaborated:?}").contains("Check"));
+        let result = machine::run(elaborated, Env::prelude());
+        assert_eq!(result.as_int(), 42);
+    }
+
+    #[test]
+    fn static_type_error_rejected_before_running() {
+        // Both sides concrete and inconsistent -- rejected by the checker,
+        // never reaches machine::run at all.
+        let expr = parser::parse("(fun x: Int -> x + 1)(true)").unwrap();
+        let err = typecheck::check(&expr).unwrap_err();
+        assert!(err.0.contains("expected Int"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn dyn_argument_passes_runtime_check_when_value_matches() {
+        // Effects stay untyped (Dyn) -- perform's result type is unknown
+        // statically. Passing it to the Int-annotated `f` inserts a runtime
+        // Check(Int, y); passes here since the handler resumes with an Int.
+        let src = r#"
+            handle
+              let y = perform choose(0) in
+              let f = fun x: Int -> x + 1 in
+              f(y)
+            with handler choose(p, resume) -> resume(41)
+        "#;
+        let expr = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&expr).unwrap();
+        assert!(format!("{elaborated:?}").contains("Check"));
+        let result = machine::run(elaborated, Env::prelude());
+        assert_eq!(result.as_int(), 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "type error: expected Int, found Bool")]
+    fn dyn_argument_fails_runtime_check_when_value_mismatches() {
+        // Same shape, but the handler resumes with a Bool -- the inserted
+        // Check catches the mismatch at the effect/typed-code boundary.
+        let src = r#"
+            handle
+              let y = perform choose(0) in
+              let f = fun x: Int -> x + 1 in
+              f(y)
+            with handler choose(p, resume) -> resume(true)
+        "#;
+        let expr = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&expr).unwrap();
+        machine::run(elaborated, Env::prelude());
     }
 }

@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use crate::expr::{BinOp, Expr};
 use crate::lexer::{tokenize, Token};
+use crate::types::Type;
 
 pub fn parse(src: &str) -> Result<Rc<Expr>, String> {
     let tokens = tokenize(src)?;
@@ -40,6 +41,48 @@ impl Parser {
         match self.bump() {
             Some(Token::Ident(s)) => Ok(s),
             other => Err(format!("expected identifier, found {other:?}")),
+        }
+    }
+
+    // Optional `: Type` annotation, e.g. after a param name or a let binder.
+    fn opt_annotation(&mut self) -> Result<Option<Type>, String> {
+        if matches!(self.peek(), Some(Token::Colon)) {
+            self.bump();
+            Ok(Some(self.parse_type()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // Bare, atom-only: "Int" | "Bool" | "(" fun_type ")". Deliberately does
+    // NOT chain "->" at this level -- an annotation site (`fun x: T ->`,
+    // `let x: T =`) is always immediately followed by its own "->"/"="
+    // token, so a bare trailing arrow here would be ambiguous between
+    // "this type continues" and "the annotation just ended". A function
+    // type must be parenthesized to disambiguate: `fun f: (Int -> Int) -> ...`.
+    fn parse_type(&mut self) -> Result<Type, String> {
+        match self.bump() {
+            Some(Token::TyInt) => Ok(Type::Int),
+            Some(Token::TyBool) => Ok(Type::Bool),
+            Some(Token::LParen) => {
+                let t = self.parse_fun_type()?;
+                self.expect(&Token::RParen)?;
+                Ok(t)
+            }
+            other => Err(format!("expected a type, found {other:?}")),
+        }
+    }
+
+    // fun_type := type ("->" fun_type)?  (right-associative) -- only
+    // reachable from inside parens, where ")" unambiguously ends it.
+    fn parse_fun_type(&mut self) -> Result<Type, String> {
+        let atom = self.parse_type()?;
+        if matches!(self.peek(), Some(Token::Arrow)) {
+            self.bump();
+            let ret = self.parse_fun_type()?;
+            Ok(Type::Fun(Rc::new(atom), Rc::new(ret)))
+        } else {
+            Ok(atom)
         }
     }
 
@@ -98,18 +141,20 @@ impl Parser {
 
             Some(Token::Fun) => {
                 let param = self.ident()?;
+                let ann = self.opt_annotation()?;
                 self.expect(&Token::Arrow)?;
                 let body = self.expr()?;
-                Ok(Expr::Lambda(param, Rc::new(body)))
+                Ok(Expr::Lambda(param, ann, Rc::new(body)))
             }
 
             Some(Token::Let) => {
                 let var = self.ident()?;
+                let ann = self.opt_annotation()?;
                 self.expect(&Token::Equals)?;
                 let val = self.expr()?;
                 self.expect(&Token::In)?;
                 let body = self.expr()?;
-                Ok(Expr::Let(var, Rc::new(val), Rc::new(body)))
+                Ok(Expr::Let(var, ann, Rc::new(val), Rc::new(body)))
             }
 
             Some(Token::If) => {

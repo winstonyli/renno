@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use crate::env::Env;
 use crate::expr::{BinOp, Expr};
+use crate::types::Type;
 use crate::value::Value;
 
 // One step of "what's left to do", defunctionalized so it can live as data
@@ -15,6 +16,7 @@ pub enum Frame {
     BinOpL { op: BinOp, rhs: Rc<Expr>, env: Env },
     BinOpR { op: BinOp, lhs: Value },
     If { then_: Rc<Expr>, else_: Rc<Expr>, env: Env },
+    CheckFrame { ty: Type },
     PerformPayload { effect: String },
     // `handle body with handler_expr`: handler_expr has just evaluated to a
     // Value::Handler -- next step installs it as a HandlerMark and evals body.

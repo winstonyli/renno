@@ -23,14 +23,14 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
                 Expr::Var(name) => control = Control::Apply(env.lookup(name)),
-                Expr::Lambda(param, body) => {
+                Expr::Lambda(param, _ann, body) => {
                     control = Control::Apply(Value::Closure(param.clone(), body.clone(), env));
                 }
                 Expr::App(f, a) => {
                     cont = Cont::cons(Frame::AppFunc { arg: a.clone(), env: env.clone() }, cont);
                     control = Control::Eval(f.clone(), env);
                 }
-                Expr::Let(var, val_expr, body) => {
+                Expr::Let(var, _ann, val_expr, body) => {
                     cont = Cont::cons(
                         Frame::LetBody { var: var.clone(), body: body.clone(), env: env.clone() },
                         cont,
@@ -47,6 +47,10 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                         cont,
                     );
                     control = Control::Eval(c.clone(), env);
+                }
+                Expr::Check(ty, inner) => {
+                    cont = Cont::cons(Frame::CheckFrame { ty: ty.clone() }, cont);
+                    control = Control::Eval(inner.clone(), env);
                 }
                 Expr::Perform(effect, payload) => {
                     cont = Cont::cons(Frame::PerformPayload { effect: effect.clone() }, cont);
@@ -151,6 +155,14 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                                 if value.as_bool() { then_ } else { else_ },
                                 env,
                             );
+                        }
+                        Frame::CheckFrame { ty } => {
+                            cont = rest;
+                            if value.matches_type(&ty) {
+                                control = Control::Apply(value);
+                            } else {
+                                panic!("type error: expected {ty}, found {}", value.type_name());
+                            }
                         }
                         Frame::PerformPayload { effect } => {
                             cont = rest;

@@ -28,6 +28,10 @@ pub enum Token {
     With,
     #[token("handler")]
     HandlerKw,
+    #[token("Int")]
+    TyInt,
+    #[token("Bool")]
+    TyBool,
 
     #[token("(")]
     LParen,
@@ -35,6 +39,8 @@ pub enum Token {
     RParen,
     #[token(",")]
     Comma,
+    #[token(":")]
+    Colon,
     #[token("->")]
     Arrow,
     #[token("=")]
