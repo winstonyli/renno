@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use crate::env::Env;
-use crate::expr::{BinOp, ExprRef};
+use crate::expr::{BinOp, ExprRef, Pattern};
 use crate::types::Type;
 use crate::value::{HandlerData, Value};
 
@@ -13,6 +13,8 @@ pub enum Frame {
     AppFunc { arg: ExprRef, env: Env },
     AppArg { func: Value },
     LetBody { var: String, body: ExprRef, env: Env, is_rec: bool },
+    // Scrutinee has just been evaluated to `value` -- try `arms` in order.
+    MatchArms { arms: Rc<Vec<(Pattern, ExprRef)>>, env: Env },
     BinOpL { op: BinOp, rhs: ExprRef, env: Env },
     BinOpR { op: BinOp, lhs: Value },
     If { then_: ExprRef, else_: ExprRef, env: Env },

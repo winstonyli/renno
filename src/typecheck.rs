@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::expr::{Arena, BinOp, Expr, ExprRef};
+use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern};
 use crate::plist::PList;
 use crate::types::{consistent, EffectRow, Type};
 
@@ -201,6 +201,34 @@ fn discharged_effect(arena: &Arena, handler: ExprRef) -> Option<String> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+// The shallow type a pattern shape implies, used only to statically reject
+// a scrutinee that could never match it (e.g. an Int pattern against a
+// Bool scrutinee) -- not full pattern-based type refinement. Var matches
+// anything, so it's Dyn; List/Cons don't know the element type from the
+// pattern alone, so Dyn there too.
+fn pattern_type(pat: &Pattern) -> Type {
+    match pat {
+        Pattern::Var(_) => Type::Dyn,
+        Pattern::Int(_) => Type::Int,
+        Pattern::Bool(_) => Type::Bool,
+        Pattern::Str(_) => Type::Str,
+        Pattern::List(_) | Pattern::Cons(..) => Type::List(Rc::new(Type::Dyn)),
+    }
+}
+
+// Extends `ctx` with every Var this pattern binds, each as Dyn (renno has
+// no pattern-driven type refinement -- e.g. a List pattern's element
+// bindings don't learn the list's element type). "_" is just an ordinary
+// Var name here, bound like any other.
+fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern) -> Ctx {
+    match pat {
+        Pattern::Var(name) => extend(ctx, name, Type::Dyn),
+        Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => ctx.clone(),
+        Pattern::List(pats) => pats.iter().fold(ctx.clone(), |c, p| bind_pattern_vars(&c, p)),
+        Pattern::Cons(head, tail) => bind_pattern_vars(&bind_pattern_vars(ctx, head), tail),
     }
 }
 
@@ -490,6 +518,38 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
             };
             let row = EffectRow::union(&row, &handler_row);
             Ok((Type::Dyn, row, arena.push(Expr::Handle { body: body2, handler: handler2 })))
+        }
+
+        // Tried top to bottom at runtime, but statically each arm is just
+        // elaborated independently under its own pattern-bound context --
+        // renno does no exhaustiveness or reachability checking, matching
+        // its general stance of leaving what it can't prove to a runtime
+        // panic (here, match_pattern finding no arm at all).
+        Expr::Match(scrutinee, arms) => {
+            let (scrut_ty, scrut_row, scrutinee2) = elaborate(arena, scrutinee, ctx)?;
+            let mut row = scrut_row;
+            let mut result_ty: Option<Type> = None;
+            let mut new_arms = Vec::with_capacity(arms.len());
+            for (pat, body) in arms.iter() {
+                let pat_ty = pattern_type(pat);
+                if !consistent(&scrut_ty, &pat_ty) {
+                    return Err(TypeError(format!(
+                        "match: pattern of type {pat_ty} can never match scrutinee of type {scrut_ty}"
+                    )));
+                }
+                let arm_ctx = bind_pattern_vars(ctx, pat);
+                let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx)?;
+                row = EffectRow::union(&row, &arm_row);
+                // Same widen-to-Dyn-on-disagreement rule as If's branches
+                // and ListLit's elements -- no union types.
+                result_ty = Some(match result_ty {
+                    None => arm_ty,
+                    Some(t) if t == arm_ty => t,
+                    Some(_) => Type::Dyn,
+                });
+                new_arms.push((pat.clone(), body2));
+            }
+            Ok((result_ty.unwrap_or(Type::Dyn), row, arena.push(Expr::Match(scrutinee2, Rc::new(new_arms)))))
         }
 
         // Constructing the handler value is pure -- the clause body's own

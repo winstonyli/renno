@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use cranelift_entity::{entity_impl, PrimaryMap};
 
 use crate::types::Type;
@@ -21,6 +23,22 @@ pub struct ExprRef(u32);
 entity_impl!(ExprRef, "expr");
 
 pub type Arena = PrimaryMap<ExprRef, Expr>;
+
+// No ADTs yet, so patterns only destructure the value shapes renno already
+// has natively: literals (matched by equality), List's two structural
+// forms (fixed-length and cons), and Var, which matches anything and binds
+// it -- "_" is just an ordinary (unused) Var name, not a special token.
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    Var(String),
+    Int(i64),
+    Bool(bool),
+    Str(String),
+    // [], [p1, p2, ...] -- matches only a list of exactly this length.
+    List(Vec<Pattern>),
+    // `head :: tail` -- matches a non-empty list of any length.
+    Cons(Box<Pattern>, Box<Pattern>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOp {
@@ -78,4 +96,10 @@ pub enum Expr {
         resume_var: String,
         body: ExprRef,
     },
+    // `match scrutinee with | p1 -> e1 | p2 -> e2 ...`, tried top to bottom,
+    // first match wins. Arms in Rc (not a plain Vec, unlike ListLit) since
+    // a captured continuation can carry a MatchArms frame (see cont.rs) --
+    // resuming it more than once (multi-shot) would otherwise reclone the
+    // whole arm list on every resume.
+    Match(ExprRef, Rc<Vec<(Pattern, ExprRef)>>),
 }

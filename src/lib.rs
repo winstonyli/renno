@@ -80,6 +80,9 @@ mod tests {
             Expr::Perform(_, payload) => contains_check(arena, *payload),
             Expr::Handle { body, handler } => contains_check(arena, *body) || contains_check(arena, *handler),
             Expr::MakeHandler { body, .. } => contains_check(arena, *body),
+            Expr::Match(scrutinee, arms) => {
+                contains_check(arena, *scrutinee) || arms.iter().any(|(_, body)| contains_check(arena, *body))
+            }
         }
     }
 
@@ -274,6 +277,61 @@ mod tests {
         // not just when called directly from the trampoline loop.
         let src = "map(fun n -> let rec loop = fun i -> if i < n then i + loop(i + 1) else 0 in loop(1))([3, 6])";
         assert_eq!(run_untyped(src).to_string(), "[3, 15]");
+    }
+
+    // --- pattern matching ---
+
+    #[test]
+    fn match_literal_picks_matching_arm() {
+        let src = r#"match 2 with | 1 -> "one" | 2 -> "two" | _ -> "many""#;
+        assert_eq!(run_untyped(src).as_str(), "two");
+    }
+
+    #[test]
+    fn match_wildcard_arm_is_fallback() {
+        let src = r#"match 99 with | 1 -> "one" | _ -> "many""#;
+        assert_eq!(run_untyped(src).as_str(), "many");
+    }
+
+    #[test]
+    fn match_nil_and_cons_recurses_over_a_list() {
+        let src = "let rec sum = fun xs -> match xs with | [] -> 0 | h :: t -> h + sum(t) in sum([1, 2, 3, 4])";
+        assert_eq!(run_untyped(src).as_int(), 10);
+    }
+
+    #[test]
+    fn match_fixed_length_list_pattern_binds_each_element() {
+        assert_eq!(run_untyped("match [1, 2] with | [a, b] -> a + b | _ -> 0").as_int(), 3);
+    }
+
+    #[test]
+    fn match_fixed_length_list_pattern_requires_exact_length() {
+        // [a, b] must NOT match a 3-element list -- falls through to the
+        // wildcard arm instead of binding a/b partially.
+        assert_eq!(run_untyped(r#"match [1, 2, 3] with | [a, b] -> "two" | _ -> "other""#).as_str(), "other");
+    }
+
+    #[test]
+    #[should_panic(expected = "match failed: no pattern matched the value")]
+    fn match_with_no_matching_arm_panics() {
+        run_untyped(r#"match 5 with | 1 -> "x""#);
+    }
+
+    #[test]
+    fn match_result_type_check() {
+        // Every arm's body is Int -- confirms the elaborated Match's result
+        // type is Int (not Dyn), same widen-only-on-disagreement rule as If.
+        let (mut arena, root) = parser::parse("let f = fun x: Int -> x + 1 in f(match 1 with | 1 -> 10 | _ -> 20)").unwrap();
+        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        assert!(!contains_check(&arena, elaborated), "Int arms should need no runtime Check at the Int-annotated call");
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude()).as_int(), 11);
+    }
+
+    #[test]
+    fn match_rejects_impossible_pattern_statically() {
+        let (mut arena, root) = parser::parse("match 5 with | true -> 1 | _ -> 2").unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
+        assert!(err.0.contains("can never match"), "unexpected message: {}", err.0);
     }
 
     // --- row polymorphism ---

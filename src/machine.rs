@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::Env;
-use crate::expr::{Arena, BinOp, Expr, ExprRef};
+use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern};
 use crate::value::{Builtin, HandlerData, Value};
 
 enum Control {
@@ -97,6 +97,10 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont) -> Value {
                 Expr::Handle { body, handler } => {
                     cont = Cont::cons(Frame::InstallHandler { body: *body, env: env.clone() }, cont);
                     control = Control::Eval(*handler, env);
+                }
+                Expr::Match(scrutinee, arms) => {
+                    cont = Cont::cons(Frame::MatchArms { arms: arms.clone(), env: env.clone() }, cont);
+                    control = Control::Eval(*scrutinee, env);
                 }
                 Expr::MakeHandler { effect, payload_var, resume_var, body } => {
                     control = Control::Apply(Value::Handler(Rc::new(HandlerData {
@@ -196,6 +200,14 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont) -> Value {
                                 (_, value) => value,
                             };
                             control = Control::Eval(body, env.bind(var, bound));
+                        }
+                        Frame::MatchArms { arms, env } => {
+                            let (arms, env) = (arms.clone(), env.clone());
+                            cont = rest;
+                            match first_match(&arms, &value, &env) {
+                                Some((body, matched_env)) => control = Control::Eval(body, matched_env),
+                                None => panic!("match failed: no pattern matched the value"),
+                            }
                         }
                         Frame::BinOpL { op, rhs, env } => {
                             let (op, rhs, env) = (*op, *rhs, env.clone());
@@ -340,6 +352,43 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>) -> Value {
                 _ => panic!("fold expects a function, an initial value, and a list"),
             }
         }
+    }
+}
+
+// Tries `arms` in order, returning the first one whose pattern matches
+// `value`, together with `env` extended by whatever that pattern bound.
+fn first_match(arms: &[(Pattern, ExprRef)], value: &Value, env: &Env) -> Option<(ExprRef, Env)> {
+    arms.iter().find_map(|(pat, body)| match_pattern(pat, value, env.clone()).map(|env2| (*body, env2)))
+}
+
+// Native recursion here is bounded by the PATTERN's own size (as written
+// in source), not by the data it's matched against -- a Cons/List pattern
+// can only nest as deep as the program text does, so this can't overflow
+// the way recursing over arbitrary runtime data would.
+fn match_pattern(pat: &Pattern, value: &Value, env: Env) -> Option<Env> {
+    match pat {
+        Pattern::Var(name) => Some(env.bind(name.clone(), value.clone())),
+        Pattern::Int(n) => matches!(value, Value::Int(v) if v == n).then_some(env),
+        Pattern::Bool(b) => matches!(value, Value::Bool(v) if v == b).then_some(env),
+        Pattern::Str(s) => matches!(value, Value::Str(v) if &**v == s.as_str()).then_some(env),
+        Pattern::List(pats) => match value {
+            Value::List(items) if items.len() == pats.len() => {
+                let mut env = env;
+                for (p, v) in pats.iter().zip(items.iter()) {
+                    env = match_pattern(p, v, env)?;
+                }
+                Some(env)
+            }
+            _ => None,
+        },
+        Pattern::Cons(head, tail) => match value {
+            Value::List(items) if !items.is_empty() => {
+                let tail_val = Value::List(Rc::new(items[1..].to_vec()));
+                let env = match_pattern(head, &items[0], env)?;
+                match_pattern(tail, &tail_val, env)
+            }
+            _ => None,
+        },
     }
 }
 

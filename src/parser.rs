@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::expr::{Arena, BinOp, Expr, ExprRef};
+use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern};
 use crate::lexer::{tokenize, Token};
 use crate::types::{EffectRow, Type};
 
@@ -116,6 +116,45 @@ impl Parser {
             Ok(Type::Fun(Rc::new(atom), row, Rc::new(ret)))
         } else {
             Ok(atom)
+        }
+    }
+
+    // pattern := pattern_atom ("::" pattern)?  (right-assoc, `h :: t`)
+    fn pattern(&mut self) -> Result<Pattern, String> {
+        let head = self.pattern_atom()?;
+        if matches!(self.peek(), Some(Token::ColonColon)) {
+            self.bump();
+            let tail = self.pattern()?;
+            Ok(Pattern::Cons(Box::new(head), Box::new(tail)))
+        } else {
+            Ok(head)
+        }
+    }
+
+    // pattern_atom := Int | true | false | Str | ident | "[" (pattern ("," pattern)*)? "]"
+    // No parens for grouping yet -- every pattern shape renno currently
+    // needs (literals, Var, fixed-length list, cons) is expressible without
+    // them; add if a real program needs `(h :: t) :: rest`-style nesting.
+    fn pattern_atom(&mut self) -> Result<Pattern, String> {
+        match self.bump() {
+            Some(Token::Int(n)) => Ok(Pattern::Int(n)),
+            Some(Token::True) => Ok(Pattern::Bool(true)),
+            Some(Token::False) => Ok(Pattern::Bool(false)),
+            Some(Token::Str(s)) => Ok(Pattern::Str(s)),
+            Some(Token::Ident(name)) => Ok(Pattern::Var(name)),
+            Some(Token::LBracket) => {
+                let mut items = Vec::new();
+                if !matches!(self.peek(), Some(Token::RBracket)) {
+                    items.push(self.pattern()?);
+                    while matches!(self.peek(), Some(Token::Comma)) {
+                        self.bump();
+                        items.push(self.pattern()?);
+                    }
+                }
+                self.expect(&Token::RBracket)?;
+                Ok(Pattern::List(items))
+            }
+            other => Err(format!("expected a pattern, found {other:?}")),
         }
     }
 
@@ -294,6 +333,30 @@ impl Parser {
                 let e = self.expr()?;
                 self.expect(&Token::RParen)?;
                 Ok(e)
+            }
+
+            // match <scrutinee> with (| pattern -> expr)+  -- the first "|"
+            // before the first arm is optional (OCaml-style), every one
+            // after it is required to separate arms.
+            Some(Token::Match) => {
+                let scrutinee = self.expr()?;
+                self.expect(&Token::With)?;
+                if matches!(self.peek(), Some(Token::Pipe)) {
+                    self.bump();
+                }
+                let mut arms = Vec::new();
+                loop {
+                    let pat = self.pattern()?;
+                    self.expect(&Token::Arrow)?;
+                    let body = self.expr()?;
+                    arms.push((pat, body));
+                    if matches!(self.peek(), Some(Token::Pipe)) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                Ok(self.arena.push(Expr::Match(scrutinee, Rc::new(arms))))
             }
 
             other => Err(format!("unexpected token: {other:?}")),

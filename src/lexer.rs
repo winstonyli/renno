@@ -30,6 +30,8 @@ pub enum Token {
     With,
     #[token("handler")]
     HandlerKw,
+    #[token("match")]
+    Match,
     #[token("Int")]
     TyInt,
     #[token("Bool")]
@@ -55,6 +57,12 @@ pub enum Token {
     Comma,
     #[token(":")]
     Colon,
+    // Cons pattern: `h :: t`, matches a non-empty list. Longer than Colon,
+    // so logos's longest-match rule prefers this over `:` `:` on "::".
+    #[token("::")]
+    ColonColon,
+    #[token("|")]
+    Pipe,
     #[token("->")]
     Arrow,
     #[token("=")]
