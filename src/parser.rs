@@ -1,29 +1,34 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern};
+use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
 use crate::lexer::{tokenize, Token};
+use crate::span::Span;
 use crate::types::{EffectRow, Type};
 
-pub fn parse(src: &str) -> Result<(Arena, ExprRef), String> {
-    let tokens = tokenize(src)?;
-    let mut p = Parser { tokens, pos: 0, arena: Arena::new() };
+pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
+    let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
+    let mut p = Parser { tokens, tok_spans, pos: 0, arena: Arena::new(), expr_spans: SpanMap::new(), src };
     let root = p.expr()?;
     if p.pos != p.tokens.len() {
-        return Err(format!("trailing tokens after expression: {:?}", &p.tokens[p.pos..]));
+        let span = p.span_at();
+        return Err(p.err_at(span, format!("trailing tokens after expression: {:?}", &p.tokens[p.pos..])));
     }
-    Ok((p.arena, root))
+    Ok((p.arena, p.expr_spans, root))
 }
 
-struct Parser {
+struct Parser<'a> {
     tokens: Vec<Token>,
+    tok_spans: Vec<Span>,
     pos: usize,
     arena: Arena,
+    expr_spans: SpanMap,
+    src: &'a str,
 }
 
-// A `let`/`fun` prefix collected while flattening a chain of them (see
-// `atom`) -- deferred until the terminal body is parsed, then folded back
-// into nested Let/Lambda nodes in reverse.
+// A `let`/`fun`/`data` prefix collected while flattening a chain of them
+// (see `atom`) -- deferred until the terminal body is parsed, then folded
+// back into nested Let/Lambda/DataGroup nodes in reverse.
 enum PendingBinder {
     Let { var: String, ann: Option<Type>, rec: bool, val: ExprRef },
     Fun { param: String, ann: Option<Type> },
@@ -33,7 +38,7 @@ enum PendingBinder {
     Data { ctors: Vec<(String, Vec<Type>)> },
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
     }
@@ -44,17 +49,49 @@ impl Parser {
         t
     }
 
+    // Span of the token at the current (not yet consumed) position, or an
+    // empty span at end-of-input if none remain.
+    fn span_at(&self) -> Span {
+        self.tok_spans.get(self.pos).copied().unwrap_or(Span { start: self.src.len(), end: self.src.len() })
+    }
+
+    // Span of the token bump() most recently consumed -- what an "expected
+    // X, found Y" error is actually complaining about, and the natural
+    // "end" position when closing off a multi-token construct.
+    fn span_before(&self) -> Span {
+        self.tok_spans
+            .get(self.pos.saturating_sub(1))
+            .copied()
+            .unwrap_or(Span { start: self.src.len(), end: self.src.len() })
+    }
+
+    fn err_at(&self, span: Span, msg: String) -> String {
+        let (line, col) = span.line_col(self.src);
+        format!("line {line}, column {col}: {msg}")
+    }
+
+    // The only way an Expr node should ever be added to the arena --
+    // keeps expr_spans in lockstep with it (same ExprRef, pushed in the
+    // same call), which is what lets typecheck later look up any
+    // original (pre-elaboration) node's source span with a plain index.
+    fn push_spanned(&mut self, e: Expr, span: Span) -> ExprRef {
+        let r = self.arena.push(e);
+        let r2 = self.expr_spans.push(span);
+        debug_assert_eq!(r, r2, "arena and expr_spans desynced -- an Expr was pushed without push_spanned");
+        r
+    }
+
     fn expect(&mut self, want: &Token) -> Result<(), String> {
         match self.bump() {
             Some(ref t) if t == want => Ok(()),
-            other => Err(format!("expected {want:?}, found {other:?}")),
+            other => Err(self.err_at(self.span_before(), format!("expected {want:?}, found {other:?}"))),
         }
     }
 
     fn ident(&mut self) -> Result<String, String> {
         match self.bump() {
             Some(Token::Ident(s)) => Ok(s),
-            other => Err(format!("expected identifier, found {other:?}")),
+            other => Err(self.err_at(self.span_before(), format!("expected identifier, found {other:?}"))),
         }
     }
 
@@ -104,7 +141,7 @@ impl Parser {
             // itself) work with no special-casing: it's just Dyn, nothing
             // to resolve.
             Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => Ok(Type::Dyn),
-            other => Err(format!("expected a type, found {other:?}")),
+            other => Err(self.err_at(self.span_before(), format!("expected a type, found {other:?}"))),
         }
     }
 
@@ -191,7 +228,7 @@ impl Parser {
                 self.expect(&Token::RBracket)?;
                 Ok(Pattern::List(items))
             }
-            other => Err(format!("expected a pattern, found {other:?}")),
+            other => Err(self.err_at(self.span_before(), format!("expected a pattern, found {other:?}"))),
         }
     }
 
@@ -202,6 +239,7 @@ impl Parser {
 
     // cmp := add (("==" | "<") add)?  -- non-associative, one comparison
     fn cmp(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
         let lhs = self.add()?;
         let op = match self.peek() {
             Some(Token::EqEq) => Some(BinOp::Eq),
@@ -212,7 +250,8 @@ impl Parser {
             Some(op) => {
                 self.bump();
                 let rhs = self.add()?;
-                Ok(self.arena.push(Expr::BinOp(op, lhs, rhs)))
+                let span = Span { start, end: self.span_before().end };
+                Ok(self.push_spanned(Expr::BinOp(op, lhs, rhs), span))
             }
             None => Ok(lhs),
         }
@@ -220,6 +259,7 @@ impl Parser {
 
     // add := unary (("+" | "-" | "++") unary)*  (left-associative)
     fn add(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
         let mut lhs = self.unary()?;
         loop {
             let op = match self.peek() {
@@ -230,7 +270,8 @@ impl Parser {
             };
             self.bump();
             let rhs = self.unary()?;
-            lhs = self.arena.push(Expr::BinOp(op, lhs, rhs));
+            let span = Span { start, end: self.span_before().end };
+            lhs = self.push_spanned(Expr::BinOp(op, lhs, rhs), span);
         }
         Ok(lhs)
     }
@@ -241,10 +282,12 @@ impl Parser {
     // operand) so `- -x` parses too, for whatever that's worth.
     fn unary(&mut self) -> Result<ExprRef, String> {
         if matches!(self.peek(), Some(Token::Minus)) {
+            let start = self.span_at().start;
             self.bump();
             let operand = self.unary()?;
-            let zero = self.arena.push(Expr::Int(0));
-            Ok(self.arena.push(Expr::BinOp(BinOp::Sub, zero, operand)))
+            let span = Span { start, end: self.span_before().end };
+            let zero = self.push_spanned(Expr::Int(0), span);
+            Ok(self.push_spanned(Expr::BinOp(BinOp::Sub, zero, operand), span))
         } else {
             self.postfix()
         }
@@ -252,31 +295,33 @@ impl Parser {
 
     // postfix := atom ("(" expr ")")*  -- supports curried calls f(a)(b)
     fn postfix(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
         let mut e = self.atom()?;
         while matches!(self.peek(), Some(Token::LParen)) {
             self.bump();
             let arg = self.expr()?;
             self.expect(&Token::RParen)?;
-            e = self.arena.push(Expr::App(e, arg));
+            let span = Span { start, end: self.span_before().end };
+            e = self.push_spanned(Expr::App(e, arg), span);
         }
         Ok(e)
     }
 
-    // Peels off a run of leading `let ... in` / `fun ... ->` prefixes
-    // iteratively -- a token peek per iteration, not a recursive call --
-    // so a long chain of either (`let x1 = .. in let x2 = .. in ...`, or
-    // a deeply curried `fun a -> fun b -> fun c -> ...`) costs O(1)
-    // native stack instead of O(chain length). That chain shape is
-    // exactly what used to overflow the stack on deeply nested/generated
-    // source (see lib.rs's run_source). The terminal body/value once the
-    // chain ends is parsed with an ordinary self.expr() call, same as the
-    // original recursive version -- only the "is there another prefix"
-    // bookkeeping moved out of the call stack, not the grammar itself.
+    // Peels off a run of leading `let ... in` / `fun ... ->` / `data ...
+    // in` prefixes iteratively -- a token peek per iteration, not a
+    // recursive call -- so a long chain of any of them costs O(1) native
+    // stack instead of O(chain length). That chain shape is exactly what
+    // used to overflow the stack on deeply nested/generated source (see
+    // lib.rs's run_source). The terminal body/value once the chain ends is
+    // parsed with an ordinary self.expr() call, same as the original
+    // recursive version -- only the "is there another prefix" bookkeeping
+    // moved out of the call stack, not the grammar itself.
     fn atom(&mut self) -> Result<ExprRef, String> {
-        let mut pending = Vec::new();
+        let mut pending: Vec<(usize, PendingBinder)> = Vec::new();
         loop {
             match self.peek() {
                 Some(Token::Let) => {
+                    let start = self.span_at().start;
                     self.bump();
                     let rec = matches!(self.peek(), Some(Token::Rec));
                     if rec {
@@ -287,21 +332,24 @@ impl Parser {
                     self.expect(&Token::Equals)?;
                     let val = self.expr()?;
                     self.expect(&Token::In)?;
-                    pending.push(PendingBinder::Let { var, ann, rec, val });
+                    pending.push((start, PendingBinder::Let { var, ann, rec, val }));
                 }
                 Some(Token::Fun) => {
+                    let start = self.span_at().start;
                     self.bump();
                     let param = self.ident()?;
                     let ann = self.opt_annotation()?;
                     self.expect(&Token::Arrow)?;
-                    pending.push(PendingBinder::Fun { param, ann });
+                    pending.push((start, PendingBinder::Fun { param, ann }));
                 }
                 Some(Token::Data) => {
+                    let start = self.span_at().start;
                     self.bump();
-                    let _type_name = self.ident()?; // not bound to anything -- see build_ctor_value
+                    let type_name = self.ident()?; // not bound to anything -- see build_ctor_value
                     self.expect(&Token::Equals)?;
                     let mut ctors = Vec::new();
                     loop {
+                        let ctor_span = self.span_at();
                         let name = self.ident()?;
                         if !name.chars().next().is_some_and(char::is_uppercase) {
                             // Pattern parsing (see pattern_atom) uses case
@@ -311,8 +359,11 @@ impl Parser {
                             // (always parsed as Var, never as this ctor's
                             // tag), so reject it here rather than let that
                             // surprise show up later.
-                            return Err(format!(
-                                "data {_type_name}: constructor names must start with an uppercase letter, found {name:?}"
+                            return Err(self.err_at(
+                                ctor_span,
+                                format!(
+                                    "data {type_name}: constructor names must start with an uppercase letter, found {name:?}"
+                                ),
                             ));
                         }
                         let field_tys = if matches!(self.peek(), Some(Token::LParen)) {
@@ -338,25 +389,34 @@ impl Parser {
                         }
                     }
                     self.expect(&Token::In)?;
-                    pending.push(PendingBinder::Data { ctors });
+                    pending.push((start, PendingBinder::Data { ctors }));
                 }
                 _ => break,
             }
         }
 
         let mut result = if pending.is_empty() { self.atom_leaf()? } else { self.expr()? };
-        for binder in pending.into_iter().rev() {
+        // Every wrapping binder shares this same END position (the
+        // terminal body's own end) -- only its START differs (where its
+        // own `let`/`fun`/`data` keyword began). `let x = 1 in let y = 2
+        // in body`'s outer Let spans `[first "let", end of body]`; the
+        // inner one spans `[second "let", end of body]`.
+        let end = self.expr_spans[result].end;
+        for (start, binder) in pending.into_iter().rev() {
+            let span = Span { start, end };
             result = match binder {
-                PendingBinder::Let { var, ann, rec, val } => self.arena.push(Expr::Let(var, ann, val, result, rec)),
-                PendingBinder::Fun { param, ann } => self.arena.push(Expr::Lambda(param, ann, result)),
+                PendingBinder::Let { var, ann, rec, val } => {
+                    self.push_spanned(Expr::Let(var, ann, val, result, rec), span)
+                }
+                PendingBinder::Fun { param, ann } => self.push_spanned(Expr::Lambda(param, ann, result), span),
                 PendingBinder::Data { ctors } => {
                     let tags: BTreeSet<String> = ctors.iter().map(|(name, _)| name.clone()).collect();
                     let mut body = result;
                     for (name, field_tys) in ctors.into_iter().rev() {
-                        let val = self.build_ctor_value(&name, &field_tys);
-                        body = self.arena.push(Expr::Let(name, None, val, body, false));
+                        let val = self.build_ctor_value(&name, &field_tys, span);
+                        body = self.push_spanned(Expr::Let(name, None, val, body, false), span);
                     }
-                    self.arena.push(Expr::DataGroup(Rc::new(tags), body))
+                    self.push_spanned(Expr::DataGroup(Rc::new(tags), body), span)
                 }
             };
         }
@@ -368,34 +428,44 @@ impl Parser {
     // and whose remaining elements are the fields -- e.g. `Some(5)` is
     // `["Some", 5]`, `None` is `["None"]`. That's a plain value with no new
     // Value representation, and it's exactly the shape pattern_atom's
-    // constructor-pattern case (below) already expects, so match "just
+    // constructor-pattern case (above) already expects, so match "just
     // works" with zero changes to typecheck.rs or machine.rs. A 0-arity
     // constructor is that List literal directly; an n-arity one is a chain
     // of n curried Lambdas (annotated with the declared field types, so
     // e.g. `Some("x")` is rejected statically) ending in the List literal.
-    fn build_ctor_value(&mut self, name: &str, field_tys: &[Type]) -> ExprRef {
-        let tag = self.arena.push(Expr::Str(name.to_string()));
+    // These nodes are entirely synthesized (no distinct source text of
+    // their own), so they all just inherit the enclosing `data` block's
+    // own span rather than getting a more precise one.
+    fn build_ctor_value(&mut self, name: &str, field_tys: &[Type], span: Span) -> ExprRef {
+        let tag = self.push_spanned(Expr::Str(name.to_string()), span);
         let mut items = vec![tag];
         let params: Vec<String> = (0..field_tys.len()).map(|i| format!("_{i}")).collect();
         for p in &params {
-            items.push(self.arena.push(Expr::Var(p.clone())));
+            items.push(self.push_spanned(Expr::Var(p.clone()), span));
         }
-        let mut value = self.arena.push(Expr::ListLit(items));
+        let mut value = self.push_spanned(Expr::ListLit(items), span);
         for (p, ty) in params.iter().zip(field_tys.iter()).rev() {
-            value = self.arena.push(Expr::Lambda(p.clone(), Some(ty.clone()), value));
+            value = self.push_spanned(Expr::Lambda(p.clone(), Some(ty.clone()), value), span);
         }
         value
     }
 
-    // Every atom form except `let`/`fun`, which `atom` handles iteratively
-    // above. Reached only once no more chain prefix remains.
+    // Every atom form except `let`/`fun`/`data`, which `atom` handles
+    // iteratively above. Reached only once no more chain prefix remains.
     fn atom_leaf(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
         match self.bump() {
-            Some(Token::Int(n)) => Ok(self.arena.push(Expr::Int(n))),
-            Some(Token::True) => Ok(self.arena.push(Expr::Bool(true))),
-            Some(Token::False) => Ok(self.arena.push(Expr::Bool(false))),
-            Some(Token::Str(s)) => Ok(self.arena.push(Expr::Str(s))),
-            Some(Token::Ident(name)) => Ok(self.arena.push(Expr::Var(name))),
+            Some(Token::Int(n)) => Ok(self.push_spanned(Expr::Int(n), Span { start, end: self.span_before().end })),
+            Some(Token::True) => {
+                Ok(self.push_spanned(Expr::Bool(true), Span { start, end: self.span_before().end }))
+            }
+            Some(Token::False) => {
+                Ok(self.push_spanned(Expr::Bool(false), Span { start, end: self.span_before().end }))
+            }
+            Some(Token::Str(s)) => Ok(self.push_spanned(Expr::Str(s), Span { start, end: self.span_before().end })),
+            Some(Token::Ident(name)) => {
+                Ok(self.push_spanned(Expr::Var(name), Span { start, end: self.span_before().end }))
+            }
 
             // [e1, e2, ...] -- no trailing comma, no empty-element gaps.
             Some(Token::LBracket) => {
@@ -408,7 +478,7 @@ impl Parser {
                     }
                 }
                 self.expect(&Token::RBracket)?;
-                Ok(self.arena.push(Expr::ListLit(items)))
+                Ok(self.push_spanned(Expr::ListLit(items), Span { start, end: self.span_before().end }))
             }
 
             Some(Token::If) => {
@@ -417,7 +487,7 @@ impl Parser {
                 let then_ = self.expr()?;
                 self.expect(&Token::Else)?;
                 let else_ = self.expr()?;
-                Ok(self.arena.push(Expr::If(cond, then_, else_)))
+                Ok(self.push_spanned(Expr::If(cond, then_, else_), Span { start, end: self.span_before().end }))
             }
 
             Some(Token::Perform) => {
@@ -425,7 +495,7 @@ impl Parser {
                 self.expect(&Token::LParen)?;
                 let payload = self.expr()?;
                 self.expect(&Token::RParen)?;
-                Ok(self.arena.push(Expr::Perform(effect, payload)))
+                Ok(self.push_spanned(Expr::Perform(effect, payload), Span { start, end: self.span_before().end }))
             }
 
             // handle <body> with <handler-expr>
@@ -433,7 +503,7 @@ impl Parser {
                 let body = self.expr()?;
                 self.expect(&Token::With)?;
                 let handler = self.expr()?;
-                Ok(self.arena.push(Expr::Handle { body, handler }))
+                Ok(self.push_spanned(Expr::Handle { body, handler }, Span { start, end: self.span_before().end }))
             }
 
             // handler <effect>(<payload_var>, <resume_var>) -> <body>
@@ -449,14 +519,20 @@ impl Parser {
                     // becomes unreachable with no error. Reject at parse
                     // time instead of leaving that footgun for the handler
                     // author to discover by reading machine.rs.
-                    return Err(format!(
-                        "handler {effect}: payload and resume binders must have different names, both named {payload_var:?}"
+                    return Err(self.err_at(
+                        self.span_before(),
+                        format!(
+                            "handler {effect}: payload and resume binders must have different names, both named {payload_var:?}"
+                        ),
                     ));
                 }
                 self.expect(&Token::RParen)?;
                 self.expect(&Token::Arrow)?;
                 let body = self.expr()?;
-                Ok(self.arena.push(Expr::MakeHandler { effect, payload_var, resume_var, body }))
+                Ok(self.push_spanned(
+                    Expr::MakeHandler { effect, payload_var, resume_var, body },
+                    Span { start, end: self.span_before().end },
+                ))
             }
 
             Some(Token::LParen) => {
@@ -486,10 +562,10 @@ impl Parser {
                         break;
                     }
                 }
-                Ok(self.arena.push(Expr::Match(scrutinee, Rc::new(arms))))
+                Ok(self.push_spanned(Expr::Match(scrutinee, Rc::new(arms)), Span { start, end: self.span_before().end }))
             }
 
-            other => Err(format!("unexpected token: {other:?}")),
+            other => Err(self.err_at(self.span_before(), format!("unexpected token: {other:?}"))),
         }
     }
 }

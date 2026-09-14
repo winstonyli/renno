@@ -5,6 +5,7 @@ pub mod lexer;
 pub mod machine;
 pub mod parser;
 pub mod plist;
+pub mod span;
 pub mod typecheck;
 pub mod types;
 pub mod value;
@@ -44,8 +45,11 @@ pub fn run_source(src: &str) -> Result<Outcome, String> {
 }
 
 fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
-    let (mut arena, root) = parser::parse(src)?;
-    let elaborated = typecheck::check(&mut arena, root).map_err(|e| e.0)?;
+    let (mut arena, spans, root) = parser::parse(src)?;
+    let elaborated = typecheck::check(&mut arena, root, &spans).map_err(|e| {
+        let (line, col) = e.1.line_col(src);
+        format!("line {line}, column {col}: {}", e.0)
+    })?;
     std::panic::catch_unwind(|| machine::run(&arena, elaborated, Env::prelude()))
         .map_err(|_| "runtime error (see panic message above)".to_string())
 }
@@ -58,7 +62,7 @@ mod tests {
     // semantics (multi-shot, deep/shallow, arithmetic) independent of the
     // typechecker.
     fn run_untyped(src: &str) -> Value {
-        let (arena, root) = parser::parse(src).expect("parse failed");
+        let (arena, _spans, root) = parser::parse(src).expect("parse failed");
         machine::run(&arena, root, Env::prelude())
     }
 
@@ -154,8 +158,8 @@ mod tests {
         // Regression test: Eq used to force both operands through Int,
         // rejecting this at typecheck time even though it's a valid
         // comparison.
-        let (mut arena, root) = parser::parse("true == false").unwrap();
-        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        let (mut arena, spans, root) = parser::parse("true == false").unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert!(!machine::run(&arena, elaborated, Env::prelude()).as_bool());
     }
 
@@ -177,8 +181,8 @@ mod tests {
 
     #[test]
     fn minus_rejects_non_int_operand_statically() {
-        let (mut arena, root) = parser::parse("true - 1").unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse("true - 1").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("expected Int, found Bool"), "unexpected message: {}", err.0);
     }
 
@@ -260,8 +264,8 @@ mod tests {
 
     #[test]
     fn concat_rejects_mismatched_types_statically() {
-        let (mut arena, root) = parser::parse(r#"1 ++ "a""#).unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse(r#"1 ++ "a""#).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("cannot concat"), "unexpected message: {}", err.0);
     }
 
@@ -290,8 +294,8 @@ mod tests {
     #[test]
     fn let_rec_with_annotated_function_type_typechecks_and_runs() {
         let src = "let rec loop: (Int -> Int) = fun i -> if i < 6 then i + loop(i + 1) else 0 in loop(1)";
-        let (mut arena, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert_eq!(machine::run(&arena, elaborated, Env::prelude()).as_int(), 15);
     }
 
@@ -346,16 +350,16 @@ mod tests {
     fn match_result_type_check() {
         // Every arm's body is Int -- confirms the elaborated Match's result
         // type is Int (not Dyn), same widen-only-on-disagreement rule as If.
-        let (mut arena, root) = parser::parse("let f = fun x: Int -> x + 1 in f(match 1 with | 1 -> 10 | _ -> 20)").unwrap();
-        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        let (mut arena, spans, root) = parser::parse("let f = fun x: Int -> x + 1 in f(match 1 with | 1 -> 10 | _ -> 20)").unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert!(!contains_check(&arena, elaborated), "Int arms should need no runtime Check at the Int-annotated call");
         assert_eq!(machine::run(&arena, elaborated, Env::prelude()).as_int(), 11);
     }
 
     #[test]
     fn match_rejects_impossible_pattern_statically() {
-        let (mut arena, root) = parser::parse("match 5 with | true -> 1 | _ -> 2").unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse("match 5 with | true -> 1 | _ -> 2").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("can never match"), "unexpected message: {}", err.0);
     }
 
@@ -391,8 +395,8 @@ mod tests {
     #[test]
     fn adt_constructor_argument_is_type_checked_statically() {
         let src = r#"data Option = None | Some(Int) in Some("x")"#;
-        let (mut arena, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("expected Int, found Str"), "unexpected message: {}", err.0);
     }
 
@@ -407,14 +411,14 @@ mod tests {
     #[test]
     fn exhaustive_bool_match_typechecks() {
         let src = "match 1 < 2 with | true -> 1 | false -> 0";
-        let (mut arena, root) = parser::parse(src).unwrap();
-        assert!(typecheck::check(&mut arena, root).is_ok());
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root, &spans).is_ok());
     }
 
     #[test]
     fn non_exhaustive_bool_match_rejected_statically() {
-        let (mut arena, root) = parser::parse("match 1 < 2 with | true -> 1").unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse("match 1 < 2 with | true -> 1").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
     }
 
@@ -424,14 +428,14 @@ mod tests {
         // the PATTERN shapes present ([] + unconstrained h :: t), not from
         // the scrutinee's own static type, so this still needs no wildcard.
         let src = "let rec f = fun xs -> match xs with | [] -> 0 | h :: t -> h in f([1, 2])";
-        let (mut arena, root) = parser::parse(src).unwrap();
-        assert!(typecheck::check(&mut arena, root).is_ok());
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root, &spans).is_ok());
     }
 
     #[test]
     fn non_exhaustive_list_match_rejected_statically() {
-        let (mut arena, root) = parser::parse("match [1, 2] with | [] -> 0").unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse("match [1, 2] with | [] -> 0").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
     }
 
@@ -440,31 +444,66 @@ mod tests {
         // `1 :: t` only covers non-empty lists whose head is 1 -- NOT
         // every non-empty list -- so this must still be rejected even
         // though a Cons pattern is present.
-        let (mut arena, root) = parser::parse("match [2, 3] with | [] -> 0 | 1 :: t -> 1").unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse("match [2, 3] with | [] -> 0 | 1 :: t -> 1").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
     }
 
     #[test]
     fn exhaustive_adt_match_typechecks() {
         let src = "data Option = None | Some(Int) in match Some(5) with | None -> 0 | Some(x) -> x";
-        let (mut arena, root) = parser::parse(src).unwrap();
-        assert!(typecheck::check(&mut arena, root).is_ok());
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root, &spans).is_ok());
     }
 
     #[test]
     fn non_exhaustive_adt_match_rejected_statically() {
         let src = "data Option = None | Some(Int) in match Some(5) with | None -> 0";
-        let (mut arena, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
     }
 
     #[test]
     fn wildcard_arm_always_makes_a_match_exhaustive() {
         let src = r#"match 5 with | 1 -> "a" | _ -> "b""#;
-        let (mut arena, root) = parser::parse(src).unwrap();
-        assert!(typecheck::check(&mut arena, root).is_ok());
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root, &spans).is_ok());
+    }
+
+    // --- source spans ---
+
+    #[test]
+    fn parse_error_reports_line_and_column() {
+        // "in" missing after the let's value -- error should point at the
+        // token actually found in its place (line 2, where "y" starts).
+        let src = "let x = 1 in\nlet y = 2\ny";
+        let err = run_source(src).unwrap_err();
+        assert!(err.starts_with("line 3, column 1:"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn lex_error_reports_line_and_column() {
+        let src = "let x = 1 in\nx @ 2";
+        let err = run_source(src).unwrap_err();
+        assert!(err.starts_with("line 2, column 3:"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn type_error_reports_the_offending_arguments_line_and_column() {
+        // The mismatch is `true`, on line 2 -- not the whole call, and not
+        // line 1 where the function itself is defined.
+        let src = "let f = fun x: Int -> x + 1 in\nf(true)";
+        let err = run_source(src).unwrap_err();
+        assert!(err.starts_with("line 2, column 3:"), "unexpected message: {err}");
+        assert!(err.contains("expected Int, found Bool"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn non_exhaustive_match_error_reports_the_matchs_own_line() {
+        let src = "let f = fun n ->\n  match n < 5 with\n  | true -> 1\nin f(3)";
+        let err = run_source(src).unwrap_err();
+        assert!(err.starts_with("line 2, column 3:"), "unexpected message: {err}");
     }
 
     // --- row polymorphism ---
@@ -479,8 +518,8 @@ mod tests {
     #[test]
     fn row_polymorphism_catches_unhandled_effect_through_higher_order_call() {
         let src = format!("{APPLY_TWICE_ROW_POLY} apply_twice(fun y -> perform choose(y))(5)");
-        let (mut arena, root) = parser::parse(&src).unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse(&src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("unhandled effect") && err.0.contains("choose"), "unexpected message: {}", err.0);
     }
 
@@ -495,8 +534,8 @@ mod tests {
         // reproducing what already happened.
         let src = "let apply_twice = fun f: (Dyn -> Dyn) -> fun x: Dyn -> f(f(x)) in \
                     apply_twice(fun y -> perform choose(y))(5)";
-        let (mut arena, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root).expect("should typecheck (falls back to Dyn)");
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).expect("should typecheck (falls back to Dyn)");
         machine::run(&arena, elaborated, Env::prelude());
     }
 
@@ -555,8 +594,8 @@ mod tests {
     fn fully_annotated_code_has_no_check_nodes() {
         // Both sides concrete and consistent -- coerce() should insert
         // nothing. Confirms fully-typed code pays zero runtime-check cost.
-        let (mut arena, root) = parser::parse("let f = fun x: Int -> x + 1 in f(41)").unwrap();
-        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        let (mut arena, spans, root) = parser::parse("let f = fun x: Int -> x + 1 in f(41)").unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert!(!contains_check(&arena, elaborated));
         let result = machine::run(&arena, elaborated, Env::prelude());
         assert_eq!(result.as_int(), 42);
@@ -566,8 +605,8 @@ mod tests {
     fn static_type_error_rejected_before_running() {
         // Both sides concrete and inconsistent -- rejected by the checker,
         // never reaches machine::run at all.
-        let (mut arena, root) = parser::parse("(fun x: Int -> x + 1)(true)").unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse("(fun x: Int -> x + 1)(true)").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("expected Int"), "unexpected message: {}", err.0);
     }
 
@@ -583,8 +622,8 @@ mod tests {
               f(y)
             with handler choose(p, resume) -> resume(41)
         "#;
-        let (mut arena, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert!(contains_check(&arena, elaborated));
         let result = machine::run(&arena, elaborated, Env::prelude());
         assert_eq!(result.as_int(), 42);
@@ -602,8 +641,8 @@ mod tests {
               f(y)
             with handler choose(p, resume) -> resume(true)
         "#;
-        let (mut arena, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         machine::run(&arena, elaborated, Env::prelude());
     }
 
@@ -622,8 +661,8 @@ mod tests {
               g(5) + 1
             with handler choose(p, resume) -> resume(fun x -> true)
         "#;
-        let (mut arena, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             machine::run(&arena, elaborated, Env::prelude())
         }));
@@ -632,8 +671,8 @@ mod tests {
 
     #[test]
     fn handle_with_non_handler_value_rejected_statically() {
-        let (mut arena, root) = parser::parse("handle 1 with 5").unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse("handle 1 with 5").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("expected a handler value"), "unexpected message: {}", err.0);
     }
 
@@ -644,8 +683,8 @@ mod tests {
         // No `handle` anywhere -- previously this would only fail at
         // runtime, inside machine::run, via perform()'s own panic. Now
         // caught by typecheck::check before anything executes.
-        let (mut arena, root) = parser::parse("perform choose(0)").unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse("perform choose(0)").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("unhandled effect") && err.0.contains("choose"), "unexpected message: {}", err.0);
     }
 
@@ -657,8 +696,8 @@ mod tests {
               x + 100
             with handler choose(p, resume) -> resume(1) + resume(2)
         "#;
-        let (mut arena, root) = parser::parse(src).unwrap();
-        assert!(typecheck::check(&mut arena, root).is_ok());
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root, &spans).is_ok());
     }
 
     #[test]
@@ -671,8 +710,8 @@ mod tests {
               with handler log(p, resume) -> resume(0)
             with handler choose(p, resume) -> resume(1)
         "#;
-        let (mut arena, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root).expect("both effects are handled, should typecheck");
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).expect("both effects are handled, should typecheck");
         machine::run(&arena, elaborated, Env::prelude());
     }
 
@@ -686,8 +725,8 @@ mod tests {
               perform log(x)
             with handler choose(p, resume) -> resume(1)
         "#;
-        let (mut arena, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root).unwrap_err();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("log"), "unexpected message: {}", err.0);
         assert!(!err.0.contains("choose"), "handled effect wrongly reported: {}", err.0);
     }
@@ -700,9 +739,9 @@ mod tests {
         // set. Static check can't reject it, but the real unhandled effect
         // still panics at runtime exactly as before this feature existed.
         let src = "(fun f -> f(0))(fun x -> perform mystery(x))";
-        let (mut arena, root) = parser::parse(src).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated =
-            typecheck::check(&mut arena, root).expect("Dyn-sourced call should not be statically rejected");
+            typecheck::check(&mut arena, root, &spans).expect("Dyn-sourced call should not be statically rejected");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             machine::run(&arena, elaborated, Env::prelude())
         }));
@@ -750,8 +789,8 @@ mod tests {
             src.push_str(&format!("let x{i} = x{} + 1 in ", i - 1));
         }
         src.push_str(&format!("x{}", n - 1));
-        let (mut arena, root) = parser::parse(&src).expect("parsing should not overflow the stack");
-        let elaborated = typecheck::check(&mut arena, root).expect("typechecking should not overflow the stack");
+        let (mut arena, spans, root) = parser::parse(&src).expect("parsing should not overflow the stack");
+        let elaborated = typecheck::check(&mut arena, root, &spans).expect("typechecking should not overflow the stack");
         let result = machine::run(&arena, elaborated, Env::prelude());
         assert_eq!(result.as_int(), (n - 1) as i64);
         // arena, and everything in it, drops normally here.

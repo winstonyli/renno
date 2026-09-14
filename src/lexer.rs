@@ -1,5 +1,7 @@
 use logos::Logos;
 
+use crate::span::Span;
+
 #[derive(Logos, Debug, Clone, PartialEq)]
 #[logos(skip r"[ \t\r\n]+")]
 #[logos(skip(r"//[^\n]*", allow_greedy = true))]
@@ -114,8 +116,19 @@ fn unescape(raw: &str) -> Option<String> {
     Some(out)
 }
 
-pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
-    Token::lexer(src)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "lex error".to_string())
+pub fn tokenize(src: &str) -> Result<Vec<(Token, Span)>, String> {
+    let mut lexer = Token::lexer(src);
+    let mut tokens = Vec::new();
+    while let Some(result) = lexer.next() {
+        let span = lexer.span();
+        let span = Span { start: span.start, end: span.end };
+        match result {
+            Ok(tok) => tokens.push((tok, span)),
+            Err(_) => {
+                let (line, col) = span.line_col(src);
+                return Err(format!("line {line}, column {col}: lex error"));
+            }
+        }
+    }
+    Ok(tokens)
 }

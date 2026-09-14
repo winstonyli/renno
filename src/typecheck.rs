@@ -2,12 +2,20 @@ use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern};
+use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
 use crate::plist::PList;
+use crate::span::Span;
 use crate::types::{consistent, EffectRow, Type};
 
+// The Span is always an ORIGINAL (pre-elaboration) node's -- the one whose
+// type was being checked when the error fired, always already in scope
+// (elaborate_node's own `expr` parameter, or a child ExprRef it destructured
+// from that same original node) at the point of construction. typecheck
+// never needs to invent a span for a node IT synthesizes (a Check, a
+// wrap_fun_contract chain): every error path returns before any such node
+// is built.
 #[derive(Debug)]
-pub struct TypeError(pub String);
+pub struct TypeError(pub String, pub Span);
 
 // A binding's type, plus the row-variable names (from explicit `->{e}`
 // annotations reachable in it) that are generalized -- quantified fresh at
@@ -136,16 +144,18 @@ fn any_fun() -> Type {
 // statically) and `to` is concrete. If both sides are concrete and
 // disagree, that's a real static error -- reject before running at all.
 // If `from` is already exactly consistent and concrete, no check needed:
-// zero overhead for fully-annotated code.
+// zero overhead for fully-annotated code. The error, if any, points at `e`
+// -- the specific value whose type didn't match, always an ORIGINAL
+// (pre-elaboration) ExprRef here, so `spans[e]` is always a valid lookup.
 //
 // Crossing into a Fun type is special: value::matches_type only confirms
 // "this is callable," not "callable with this exact signature" (a tag
 // check can't see inside a closure). So a Dyn value flowing into an
 // annotated Fun position gets wrapped in a real per-call contract instead
 // of a bare tag Check -- see wrap_fun_contract.
-fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type) -> Result<ExprRef, TypeError> {
+fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, spans: &SpanMap) -> Result<ExprRef, TypeError> {
     if !consistent(from, to) {
-        return Err(TypeError(format!("type mismatch: expected {to}, found {from}")));
+        return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), spans[e]));
     }
     if *from != Type::Dyn || *to == Type::Dyn {
         return Ok(e);
@@ -164,7 +174,9 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type) -> Result<ExprR
 // call re-validated), not a one-time tag check -- a value that merely
 // looks like a function can't smuggle a wrong return type through it.
 // Built entirely from existing Expr nodes (Let/Lambda/Check/App/Var), no
-// new Value representation needed.
+// new Value representation needed. No span bookkeeping here: these nodes
+// are synthesized, not sourced from the program text, and typecheck never
+// looks up a span for them (see TypeError's doc comment).
 fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: Rc<Type>) -> ExprRef {
     let fn_var = "__contract_fn".to_string();
     let arg_var = "__contract_arg".to_string();
@@ -324,6 +336,7 @@ fn elaborate(
     expr: ExprRef,
     ctx: &Ctx,
     groups: &[BTreeSet<String>],
+    spans: &SpanMap,
 ) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     // Peels off a run of leading `let`/`fun` prefixes iteratively -- a
     // match per iteration, not a recursive call -- so a long chain of
@@ -359,9 +372,9 @@ fn elaborate(
                     (true, Some(t)) => extend(&cur_ctx, &var, t.clone()),
                     _ => cur_ctx.clone(),
                 };
-                let (val_ty, val_row, val2) = elaborate(arena, val, &val_ctx, &cur_groups)?;
+                let (val_ty, val_row, val2) = elaborate(arena, val, &val_ctx, &cur_groups, spans)?;
                 let (bound_ty, val3) = match ann {
-                    Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t)?),
+                    Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t, spans)?),
                     None => (val_ty, val2),
                 };
                 cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone());
@@ -392,7 +405,8 @@ fn elaborate(
         }
     }
 
-    let (mut result_ty, mut result_row, mut result_expr) = elaborate_node(arena, cur_expr, &cur_ctx, &cur_groups)?;
+    let (mut result_ty, mut result_row, mut result_expr) =
+        elaborate_node(arena, cur_expr, &cur_ctx, &cur_groups, spans)?;
 
     for frame in pending.into_iter().rev() {
         match frame {
@@ -418,11 +432,17 @@ fn elaborate(
 
 // Every Expr variant except Let/Lambda/DataGroup, which `elaborate` peels
 // off iteratively above -- reached only once no more chain prefix remains.
+// `expr` (this function's own parameter) is always the ORIGINAL,
+// pre-elaboration ExprRef for whatever's currently being checked, so
+// `spans[expr]` is a valid, always-available "point at this whole
+// construct" location for any error an arm below doesn't have a more
+// specific sub-expression to blame instead.
 fn elaborate_node(
     arena: &mut Arena,
     expr: ExprRef,
     ctx: &Ctx,
     groups: &[BTreeSet<String>],
+    spans: &SpanMap,
 ) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     let node = arena[expr].clone();
     match node {
@@ -436,7 +456,7 @@ fn elaborate_node(
             let mut elem_ty: Option<Type> = None;
             let mut refs = Vec::with_capacity(items.len());
             for item in items {
-                let (item_ty, item_row, item2) = elaborate(arena, item, ctx, groups)?;
+                let (item_ty, item_row, item2) = elaborate(arena, item, ctx, groups, spans)?;
                 row = EffectRow::union(&row, &item_row);
                 refs.push(item2);
                 // Same rule as If's branches: differing concrete element
@@ -456,11 +476,11 @@ fn elaborate_node(
         }
 
         Expr::App(f, a) => {
-            let (f_ty, f_row, f2) = elaborate(arena, f, ctx, groups)?;
-            let (a_ty, a_row, a2) = elaborate(arena, a, ctx, groups)?;
+            let (f_ty, f_row, f2) = elaborate(arena, f, ctx, groups, spans)?;
+            let (a_ty, a_row, a2) = elaborate(arena, a, ctx, groups, spans)?;
             let (call_row, ret_ty, app2) = match &f_ty {
                 Type::Fun(param_ty, call_row, ret_ty) => {
-                    let a3 = coerce(arena, a2, &a_ty, param_ty)?;
+                    let a3 = coerce(arena, a2, &a_ty, param_ty, spans)?;
                     // If param_ty names a row variable (from an explicit
                     // `->{e}` annotation on the callee) and the argument's
                     // own inferred type reveals a concrete row in the
@@ -483,21 +503,21 @@ fn elaborate_node(
                     let f3 = arena.push(Expr::Check(any_fun(), f2));
                     (EffectRow::Dyn, Type::Dyn, arena.push(Expr::App(f3, a2)))
                 }
-                other => return Err(TypeError(format!("cannot call a value of type {other}"))),
+                other => return Err(TypeError(format!("cannot call a value of type {other}"), spans[f])),
             };
             let row = EffectRow::union(&EffectRow::union(&f_row, &a_row), &call_row);
             Ok((ret_ty, row, app2))
         }
 
         Expr::BinOp(op, l, r) => {
-            let (l_ty, l_row, l2) = elaborate(arena, l, ctx, groups)?;
-            let (r_ty, r_row, r2) = elaborate(arena, r, ctx, groups)?;
+            let (l_ty, l_row, l2) = elaborate(arena, l, ctx, groups, spans)?;
+            let (r_ty, r_row, r2) = elaborate(arena, r, ctx, groups, spans)?;
             let row = EffectRow::union(&l_row, &r_row);
             match op {
                 // Arithmetic and ordering: both operands must be Int.
                 BinOp::Add | BinOp::Sub | BinOp::Lt => {
-                    let l3 = coerce(arena, l2, &l_ty, &Type::Int)?;
-                    let r3 = coerce(arena, r2, &r_ty, &Type::Int)?;
+                    let l3 = coerce(arena, l2, &l_ty, &Type::Int, spans)?;
+                    let r3 = coerce(arena, r2, &r_ty, &Type::Int, spans)?;
                     let result_ty = if op == BinOp::Lt { Type::Bool } else { Type::Int };
                     Ok((result_ty, row, arena.push(Expr::BinOp(op, l3, r3))))
                 }
@@ -509,17 +529,18 @@ fn elaborate_node(
                 // apply_binop compares by matching Value variants.
                 BinOp::Eq => {
                     if !consistent(&l_ty, &r_ty) {
-                        return Err(TypeError(format!(
-                            "type mismatch: cannot compare {l_ty} with {r_ty}"
-                        )));
+                        return Err(TypeError(
+                            format!("type mismatch: cannot compare {l_ty} with {r_ty}"),
+                            spans[expr],
+                        ));
                     }
                     let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
-                        coerce(arena, l2, &l_ty, &r_ty)?
+                        coerce(arena, l2, &l_ty, &r_ty, spans)?
                     } else {
                         l2
                     };
                     let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
-                        coerce(arena, r2, &r_ty, &l_ty)?
+                        coerce(arena, r2, &r_ty, &l_ty, spans)?
                     } else {
                         r2
                     };
@@ -532,9 +553,10 @@ fn elaborate_node(
                 // concretely known; Dyn if neither is.
                 BinOp::Concat => {
                     if !consistent(&l_ty, &r_ty) {
-                        return Err(TypeError(format!(
-                            "type mismatch: cannot concat {l_ty} with {r_ty}"
-                        )));
+                        return Err(TypeError(
+                            format!("type mismatch: cannot concat {l_ty} with {r_ty}"),
+                            spans[expr],
+                        ));
                     }
                     let result_ty = match (&l_ty, &r_ty) {
                         (Type::Dyn, Type::Dyn) => Type::Dyn,
@@ -542,18 +564,21 @@ fn elaborate_node(
                         (Type::Str, Type::Str) => Type::Str,
                         (Type::List(_), Type::List(_)) => l_ty.clone(),
                         _ => {
-                            return Err(TypeError(format!(
-                                "type mismatch: cannot concat {l_ty} with {r_ty} (expected two strings or two lists)"
-                            )))
+                            return Err(TypeError(
+                                format!(
+                                    "type mismatch: cannot concat {l_ty} with {r_ty} (expected two strings or two lists)"
+                                ),
+                                spans[expr],
+                            ))
                         }
                     };
                     let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
-                        coerce(arena, l2, &l_ty, &r_ty)?
+                        coerce(arena, l2, &l_ty, &r_ty, spans)?
                     } else {
                         l2
                     };
                     let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
-                        coerce(arena, r2, &r_ty, &l_ty)?
+                        coerce(arena, r2, &r_ty, &l_ty, spans)?
                     } else {
                         r2
                     };
@@ -563,10 +588,10 @@ fn elaborate_node(
         }
 
         Expr::If(c, t, e) => {
-            let (c_ty, c_row, c2) = elaborate(arena, c, ctx, groups)?;
-            let c3 = coerce(arena, c2, &c_ty, &Type::Bool)?;
-            let (t_ty, t_row, t2) = elaborate(arena, t, ctx, groups)?;
-            let (e_ty, e_row, e2) = elaborate(arena, e, ctx, groups)?;
+            let (c_ty, c_row, c2) = elaborate(arena, c, ctx, groups, spans)?;
+            let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans)?;
+            let (t_ty, t_row, t2) = elaborate(arena, t, ctx, groups, spans)?;
+            let (e_ty, e_row, e2) = elaborate(arena, e, ctx, groups, spans)?;
             // Branches with differing concrete types aren't an error here
             // (no union types) -- just widen to Dyn rather than reject.
             let result_ty = if t_ty == e_ty { t_ty } else { Type::Dyn };
@@ -577,7 +602,7 @@ fn elaborate_node(
         }
 
         Expr::Check(ty, inner) => {
-            let (_, row, inner2) = elaborate(arena, inner, ctx, groups)?;
+            let (_, row, inner2) = elaborate(arena, inner, ctx, groups, spans)?;
             let ty_ret = ty.clone();
             Ok((ty_ret, row, arena.push(Expr::Check(ty, inner2))))
         }
@@ -585,14 +610,14 @@ fn elaborate_node(
         // The effect this specific operation performs, plus whatever the
         // payload expression itself might perform.
         Expr::Perform(effect, payload) => {
-            let (_, payload_row, payload2) = elaborate(arena, payload, ctx, groups)?;
+            let (_, payload_row, payload2) = elaborate(arena, payload, ctx, groups, spans)?;
             let row = EffectRow::union(&payload_row, &EffectRow::single(&effect));
             Ok((Type::Dyn, row, arena.push(Expr::Perform(effect, payload2))))
         }
 
         Expr::Handle { body, handler } => {
-            let (_, body_row, body2) = elaborate(arena, body, ctx, groups)?;
-            let (handler_ty, handler_row, handler2) = elaborate(arena, handler, ctx, groups)?;
+            let (_, body_row, body2) = elaborate(arena, body, ctx, groups, spans)?;
+            let (handler_ty, handler_row, handler2) = elaborate(arena, handler, ctx, groups, spans)?;
             // types.rs has no Type::Handler -- but every handler-producing
             // expression (MakeHandler, or deep(...)/shallow(...) applied
             // to one, or a var bound from either) synthesizes Dyn by this
@@ -600,9 +625,10 @@ fn elaborate_node(
             // (Int, Bool, Fun) can never legitimately be one. Reject it
             // statically instead of letting it reach machine.rs's panic.
             if handler_ty != Type::Dyn {
-                return Err(TypeError(format!(
-                    "handle: expected a handler value, found expression of type {handler_ty}"
-                )));
+                return Err(TypeError(
+                    format!("handle: expected a handler value, found expression of type {handler_ty}"),
+                    spans[handler],
+                ));
             }
             // Discharge the effect this handler catches, if we can
             // statically tell which one that is. If not, conservatively
@@ -622,19 +648,20 @@ fn elaborate_node(
         // that's cheaply provable; see missing_case's own doc comment for
         // exactly which shapes it can prove complete.
         Expr::Match(scrutinee, arms) => {
-            let (scrut_ty, scrut_row, scrutinee2) = elaborate(arena, scrutinee, ctx, groups)?;
+            let (scrut_ty, scrut_row, scrutinee2) = elaborate(arena, scrutinee, ctx, groups, spans)?;
             let mut row = scrut_row;
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
             for (pat, body) in arms.iter() {
                 let pat_ty = pattern_type(pat);
                 if !consistent(&scrut_ty, &pat_ty) {
-                    return Err(TypeError(format!(
-                        "match: pattern of type {pat_ty} can never match scrutinee of type {scrut_ty}"
-                    )));
+                    return Err(TypeError(
+                        format!("match: pattern of type {pat_ty} can never match scrutinee of type {scrut_ty}"),
+                        spans[expr],
+                    ));
                 }
                 let arm_ctx = bind_pattern_vars(ctx, pat);
-                let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, groups)?;
+                let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, groups, spans)?;
                 row = EffectRow::union(&row, &arm_row);
                 // Same widen-to-Dyn-on-disagreement rule as If's branches
                 // and ListLit's elements -- no union types.
@@ -646,7 +673,7 @@ fn elaborate_node(
                 new_arms.push((pat.clone(), body2));
             }
             if let Some(missing) = missing_case(&arms.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), groups) {
-                return Err(TypeError(format!("non-exhaustive match: {missing}")));
+                return Err(TypeError(format!("non-exhaustive match: {missing}"), spans[expr]));
             }
             Ok((result_ty.unwrap_or(Type::Dyn), row, arena.push(Expr::Match(scrutinee2, Rc::new(new_arms)))))
         }
@@ -656,7 +683,7 @@ fn elaborate_node(
         // see the doc comment on `elaborate`.
         Expr::MakeHandler { effect, payload_var, resume_var, body } => {
             let inner_ctx = extend(&extend(ctx, &payload_var, Type::Dyn), &resume_var, Type::Dyn);
-            let (_, _, body2) = elaborate(arena, body, &inner_ctx, groups)?;
+            let (_, _, body2) = elaborate(arena, body, &inner_ctx, groups, spans)?;
             Ok((
                 Type::Dyn,
                 EffectRow::pure(),
@@ -666,16 +693,19 @@ fn elaborate_node(
     }
 }
 
-pub fn check(arena: &mut Arena, root: ExprRef) -> Result<ExprRef, TypeError> {
-    let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), &[])?;
+pub fn check(arena: &mut Arena, root: ExprRef, spans: &SpanMap) -> Result<ExprRef, TypeError> {
+    let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), &[], spans)?;
     match row {
         EffectRow::Closed(unhandled) if !unhandled.is_empty() => {
             let names: Vec<_> = unhandled.into_iter().collect();
-            Err(TypeError(format!(
-                "unhandled effect{}: {}",
-                if names.len() > 1 { "s" } else { "" },
-                names.join(", ")
-            )))
+            Err(TypeError(
+                format!(
+                    "unhandled effect{}: {}",
+                    if names.len() > 1 { "s" } else { "" },
+                    names.join(", ")
+                ),
+                spans[root],
+            ))
         }
         _ => Ok(elaborated),
     }

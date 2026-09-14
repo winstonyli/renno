@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use cranelift_entity::{entity_impl, PrimaryMap};
 
+use crate::span::Span;
 use crate::types::Type;
 
 // AST nodes live in a flat arena instead of being individually
@@ -24,6 +25,15 @@ pub struct ExprRef(u32);
 entity_impl!(ExprRef, "expr");
 
 pub type Arena = PrimaryMap<ExprRef, Expr>;
+// The byte-span of each Arena node's ORIGINAL source text, indexed by the
+// same ExprRef -- built by the parser in lockstep with Arena (see
+// parser::Parser::push_spanned) so the two never desync. A node typecheck
+// synthesizes (a Check, a wrap_fun_contract chain, a re-emitted Let with a
+// resolved type) gets no entry here; typecheck never needs one, since every
+// error it reports uses the span of an ORIGINAL (pre-elaboration) ExprRef
+// that was already in scope before any such node was built -- see
+// typecheck::TypeError.
+pub type SpanMap = PrimaryMap<ExprRef, Span>;
 
 // No ADTs yet, so patterns only destructure the value shapes renno already
 // has natively: literals (matched by equality), List's two structural
