@@ -1,0 +1,10 @@
+// `let rec`: a self-referential let, for general (not just structural)
+// recursion. `loop` calls itself inside its own body -- ordinary `let`
+// can't do this, since the name it binds isn't in scope while its value
+// is being evaluated. renno has no `-` operator yet, so this counts UP
+// to `n` instead of down: sums 1..10 = 55.
+let rec sum_up_to = fun n ->
+  let rec go = fun i ->
+    if i < n + 1 then i + go(i + 1) else 0
+  in go(1)
+in sum_up_to(10)

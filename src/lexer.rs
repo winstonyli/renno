@@ -8,6 +8,8 @@ pub enum Token {
     Fun,
     #[token("let")]
     Let,
+    #[token("rec")]
+    Rec,
     #[token("in")]
     In,
     #[token("if")]

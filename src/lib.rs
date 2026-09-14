@@ -74,7 +74,7 @@ mod tests {
             Expr::ListLit(items) => items.iter().any(|i| contains_check(arena, *i)),
             Expr::Lambda(_, _, body) => contains_check(arena, *body),
             Expr::App(f, a) => contains_check(arena, *f) || contains_check(arena, *a),
-            Expr::Let(_, _, val, body) => contains_check(arena, *val) || contains_check(arena, *body),
+            Expr::Let(_, _, val, body, _) => contains_check(arena, *val) || contains_check(arena, *body),
             Expr::BinOp(_, l, r) => contains_check(arena, *l) || contains_check(arena, *r),
             Expr::If(c, t, e) => contains_check(arena, *c) || contains_check(arena, *t) || contains_check(arena, *e),
             Expr::Perform(_, payload) => contains_check(arena, *payload),
@@ -236,6 +236,44 @@ mod tests {
         let (mut arena, root) = parser::parse(r#"1 ++ "a""#).unwrap();
         let err = typecheck::check(&mut arena, root).unwrap_err();
         assert!(err.0.contains("cannot concat"), "unexpected message: {}", err.0);
+    }
+
+    // --- let rec ---
+
+    #[test]
+    fn let_rec_self_reference_recurses() {
+        // Sums 1..5 by counting UP (no `-` operator exists yet) -- proves
+        // `loop` inside its own body resolves to itself, not an unbound
+        // Var lookup.
+        let src = "let rec loop = fun i -> if i < 6 then i + loop(i + 1) else 0 in loop(1)";
+        assert_eq!(run_untyped(src).as_int(), 15);
+    }
+
+    #[test]
+    fn plain_let_with_self_reference_does_not_recurse() {
+        // Regression guard: without `rec`, a same-named inner reference
+        // means the OUTER `f` (unbound here, so Dyn/unknown at lookup
+        // time) -- confirms `rec` is what changes resolution, not just
+        // presence of the name.
+        let src = "let f = 10 in let f = fun x -> f in f(1)";
+        assert_eq!(run_untyped(src).as_int(), 10);
+    }
+
+    #[test]
+    fn let_rec_with_annotated_function_type_typechecks_and_runs() {
+        let src = "let rec loop: (Int -> Int) = fun i -> if i < 6 then i + loop(i + 1) else 0 in loop(1)";
+        let (mut arena, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude()).as_int(), 15);
+    }
+
+    #[test]
+    fn let_rec_composes_with_map() {
+        // `map`'s callback itself uses `let rec` internally -- confirms
+        // RecClosure works fine as a value passed through machine::apply,
+        // not just when called directly from the trampoline loop.
+        let src = "map(fun n -> let rec loop = fun i -> if i < n then i + loop(i + 1) else 0 in loop(1))([3, 6])";
+        assert_eq!(run_untyped(src).to_string(), "[3, 15]");
     }
 
     // --- row polymorphism ---

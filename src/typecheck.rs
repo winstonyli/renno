@@ -174,7 +174,7 @@ fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: 
     let call = arena.push(Expr::App(checked_fn, arg_var_ref));
     let checked_call = arena.push(Expr::Check((*ret_ty).clone(), call));
     let lambda = arena.push(Expr::Lambda(arg_var, Some((*param_ty).clone()), checked_call));
-    arena.push(Expr::Let(fn_var, None, e, lambda))
+    arena.push(Expr::Let(fn_var, None, e, lambda, false))
 }
 
 // A `let`/`fun` prefix collected while flattening a chain of them (see
@@ -182,7 +182,7 @@ fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: 
 // folded back into nested Let/Lambda nodes (and their types/rows) in
 // reverse, in the exact shape their original per-node match arms produced.
 enum PendingElab {
-    Let { var: String, bound_ty: Type, val_row: EffectRow, val: ExprRef },
+    Let { var: String, bound_ty: Type, val_row: EffectRow, val: ExprRef, rec: bool },
     Fun { param: String, param_ty: Type },
 }
 
@@ -243,14 +243,25 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, Effec
         // `arena` before the arm below needs to mutate it.
         let node = arena[cur_expr].clone();
         match node {
-            Expr::Let(var, ann, val, body) => {
-                let (val_ty, val_row, val2) = elaborate(arena, val, &cur_ctx)?;
+            Expr::Let(var, ann, val, body, rec) => {
+                // `rec`: `var` needs to resolve to its own (eventual) type
+                // WHILE elaborating `val`, for a self-reference inside it
+                // to type-check precisely rather than falling back to Dyn.
+                // That's only possible if the type is already known, i.e.
+                // annotated -- an unannotated `let rec` still works (the
+                // self-reference is just Dyn, like any other unbound-at-
+                // this-point lookup), it's just not precisely typed.
+                let val_ctx = match (rec, &ann) {
+                    (true, Some(t)) => extend(&cur_ctx, &var, t.clone()),
+                    _ => cur_ctx.clone(),
+                };
+                let (val_ty, val_row, val2) = elaborate(arena, val, &val_ctx)?;
                 let (bound_ty, val3) = match ann {
                     Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t)?),
                     None => (val_ty, val2),
                 };
                 cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone());
-                pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3 });
+                pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3, rec });
                 cur_expr = body;
             }
             Expr::Lambda(param, ann, body) => {
@@ -267,11 +278,11 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, Effec
 
     for frame in pending.into_iter().rev() {
         match frame {
-            PendingElab::Let { var, bound_ty, val_row, val } => {
+            PendingElab::Let { var, bound_ty, val_row, val, rec } => {
                 // Matches the original Let arm: body's type propagates
                 // through unchanged, row is the union of val's and body's.
                 result_row = EffectRow::union(&val_row, &result_row);
-                result_expr = arena.push(Expr::Let(var, Some(bound_ty), val, result_expr));
+                result_expr = arena.push(Expr::Let(var, Some(bound_ty), val, result_expr, rec));
             }
             PendingElab::Fun { param, param_ty } => {
                 // Matches the original Lambda arm: the body's row is

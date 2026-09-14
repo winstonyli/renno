@@ -48,7 +48,12 @@ pub enum Expr {
     // when the source has an explicit `: Type` annotation.
     Lambda(String, Option<Type>, ExprRef),
     App(ExprRef, ExprRef),
-    Let(String, Option<Type>, ExprRef, ExprRef),
+    // Last field: `let rec` (true) vs plain `let` (false). Meaningful only
+    // when `val` evaluates to a function -- machine.rs wraps it into a
+    // Value::RecClosure so it can rebind its own name into scope each time
+    // it's called (see Value::RecClosure's doc comment for how that avoids
+    // needing mutation or an AST-rewriting Y-combinator encoding).
+    Let(String, Option<Type>, ExprRef, ExprRef, bool),
     BinOp(BinOp, ExprRef, ExprRef),
     // Runtime type check: produced only by typecheck::elaborate, never by
     // the parser directly. Verifies the inner expr's value matches `Type`

@@ -24,7 +24,7 @@ struct Parser {
 // `atom`) -- deferred until the terminal body is parsed, then folded back
 // into nested Let/Lambda nodes in reverse.
 enum PendingBinder {
-    Let { var: String, ann: Option<Type>, val: ExprRef },
+    Let { var: String, ann: Option<Type>, rec: bool, val: ExprRef },
     Fun { param: String, ann: Option<Type> },
 }
 
@@ -186,12 +186,16 @@ impl Parser {
             match self.peek() {
                 Some(Token::Let) => {
                     self.bump();
+                    let rec = matches!(self.peek(), Some(Token::Rec));
+                    if rec {
+                        self.bump();
+                    }
                     let var = self.ident()?;
                     let ann = self.opt_annotation()?;
                     self.expect(&Token::Equals)?;
                     let val = self.expr()?;
                     self.expect(&Token::In)?;
-                    pending.push(PendingBinder::Let { var, ann, val });
+                    pending.push(PendingBinder::Let { var, ann, rec, val });
                 }
                 Some(Token::Fun) => {
                     self.bump();
@@ -207,7 +211,7 @@ impl Parser {
         let mut result = if pending.is_empty() { self.atom_leaf()? } else { self.expr()? };
         for binder in pending.into_iter().rev() {
             result = match binder {
-                PendingBinder::Let { var, ann, val } => self.arena.push(Expr::Let(var, ann, val, result)),
+                PendingBinder::Let { var, ann, rec, val } => self.arena.push(Expr::Let(var, ann, val, result, rec)),
                 PendingBinder::Fun { param, ann } => self.arena.push(Expr::Lambda(param, ann, result)),
             };
         }

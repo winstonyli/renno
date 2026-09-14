@@ -58,12 +58,22 @@ pub enum Value {
     Str(Rc<str>),
     // Rc<Vec<Value>>, not a persistent cons-list: most list use in a
     // scripting language is indexing/iteration, which arrays serve better
-    // than cons-lists -- and renno can't yet write cons-list-shaped
-    // recursive functions anyway (no pattern matching, no general
-    // recursion). Revisit if/when those land and list-heavy functional
-    // code becomes common.
+    // than cons-lists. There's also still no pattern matching to
+    // destructure one ([] vs [h, ...t]) -- map/fold (native, Rust-loop-
+    // driven) and, since Value::RecClosure below, ordinary `let rec`
+    // functions cover list consumption for now. Revisit if pattern
+    // matching lands and list-heavy functional code becomes common.
     List(Rc<Vec<Value>>),
     Closure(String, ExprRef, Env),
+    // `let rec name = fun param -> body in ...`: like Closure, but
+    // rebinds its OWN name to itself in the environment used to evaluate
+    // `body`, every time it's called (not once, at construction). That's
+    // what lets `body` reference `name` recursively with no mutation and
+    // no AST-rewriting Y-combinator encoding -- Env is already persistent
+    // and cheap to extend, so re-deriving "an env with myself bound" on
+    // each call is just one more `bind`, same cost as binding the
+    // parameter itself.
+    RecClosure(String, String, ExprRef, Env),
     Continuation(Cont),
     Handler(Rc<HandlerData>),
     Builtin(Builtin),
@@ -114,6 +124,7 @@ impl Value {
             // elements match the declared element type.
             (Value::List(_), Type::List(_)) => true,
             (Value::Closure(..), Type::Fun(_, _, _)) => true,
+            (Value::RecClosure(..), Type::Fun(_, _, _)) => true,
             (Value::Continuation(_), Type::Fun(_, _, _)) => true,
             (Value::Builtin(_), Type::Fun(_, _, _)) => true,
             (Value::PartialBuiltin(..), Type::Fun(_, _, _)) => true,
@@ -127,7 +138,7 @@ impl Value {
             Value::Bool(_) => "Bool",
             Value::Str(_) => "Str",
             Value::List(_) => "List",
-            Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => "Fun",
+            Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => "Fun",
             Value::Handler(_) => "Handler",
         }
     }
@@ -149,7 +160,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, "]")
             }
-            Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => {
+            Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => {
                 write!(f, "<function>")
             }
             Value::Handler(_) => write!(f, "<handler>"),
@@ -198,7 +209,7 @@ impl From<&Value> for Outcome {
             Value::Bool(b) => Outcome::Bool(*b),
             Value::Str(s) => Outcome::Str(s.to_string()),
             Value::List(items) => Outcome::List(items.iter().map(Outcome::from).collect()),
-            Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => {
+            Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => {
                 Outcome::Function
             }
             Value::Handler(_) => Outcome::Handler,

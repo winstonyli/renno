@@ -71,9 +71,9 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont) -> Value {
                     cont = Cont::cons(Frame::AppFunc { arg: *a, env: env.clone() }, cont);
                     control = Control::Eval(*f, env);
                 }
-                Expr::Let(var, _ann, val_expr, body) => {
+                Expr::Let(var, _ann, val_expr, body, is_rec) => {
                     cont = Cont::cons(
-                        Frame::LetBody { var: var.clone(), body: *body, env: env.clone() },
+                        Frame::LetBody { var: var.clone(), body: *body, env: env.clone(), is_rec: *is_rec },
                         cont,
                     );
                     control = Control::Eval(*val_expr, env);
@@ -136,6 +136,20 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont) -> Value {
                                 Value::Closure(param, body, closure_env) => {
                                     control = Control::Eval(body, closure_env.bind(param, value));
                                 }
+                                Value::RecClosure(self_name, param, body, closure_env) => {
+                                    // Rebind `self_name` to (a fresh copy
+                                    // of) this same RecClosure every call,
+                                    // not just once at construction --
+                                    // that's what makes a reference to
+                                    // `self_name` inside `body` resolve
+                                    // recursively, with Env's ordinary
+                                    // persistent bind/lookup doing all the
+                                    // work. No mutation, no AST rewriting.
+                                    let rec_val =
+                                        Value::RecClosure(self_name.clone(), param.clone(), body, closure_env.clone());
+                                    let env2 = closure_env.bind(self_name, rec_val).bind(param, value);
+                                    control = Control::Eval(body, env2);
+                                }
                                 Value::Continuation(k) => {
                                     // resume(value): splice the captured
                                     // continuation back in front of whatever
@@ -167,10 +181,21 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont) -> Value {
                                 _ => panic!("handle: expected a handler value"),
                             }
                         }
-                        Frame::LetBody { var, body, env } => {
-                            let (var, body, env) = (var.clone(), *body, env.clone());
+                        Frame::LetBody { var, body, env, is_rec } => {
+                            let (var, body, env, is_rec) = (var.clone(), *body, env.clone(), *is_rec);
                             cont = rest;
-                            control = Control::Eval(body, env.bind(var, value));
+                            // `let rec`: if the bound value is a function,
+                            // wrap it so it can rebind its own name on
+                            // every call (see Value::RecClosure). A
+                            // non-function value under `rec` (meaningless,
+                            // but not an error) just binds normally.
+                            let bound = match (is_rec, value) {
+                                (true, Value::Closure(param, closure_body, closure_env)) => {
+                                    Value::RecClosure(var.clone(), param, closure_body, closure_env)
+                                }
+                                (_, value) => value,
+                            };
+                            control = Control::Eval(body, env.bind(var, bound));
                         }
                         Frame::BinOpL { op, rhs, env } => {
                             let (op, rhs, env) = (*op, *rhs, env.clone());

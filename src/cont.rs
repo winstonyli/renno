@@ -12,7 +12,7 @@ use crate::value::{HandlerData, Value};
 pub enum Frame {
     AppFunc { arg: ExprRef, env: Env },
     AppArg { func: Value },
-    LetBody { var: String, body: ExprRef, env: Env },
+    LetBody { var: String, body: ExprRef, env: Env, is_rec: bool },
     BinOpL { op: BinOp, rhs: ExprRef, env: Env },
     BinOpR { op: BinOp, lhs: Value },
     If { then_: ExprRef, else_: ExprRef, env: Env },
