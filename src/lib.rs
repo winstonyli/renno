@@ -47,8 +47,27 @@ pub fn run_source(src: &str) -> Result<Outcome, String> {
 fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
     let (mut arena, spans, root) = parser::parse(src)?;
     let elaborated = typecheck::check(&mut arena, root, &spans).map_err(|e| e.1.format_error(src, &e.0))?;
-    std::panic::catch_unwind(|| machine::run(&arena, elaborated, Env::prelude()))
-        .map_err(|_| "runtime error (see panic message above)".to_string())
+    std::panic::catch_unwind(|| machine::run(&arena, elaborated, Env::prelude(), &spans)).map_err(|payload| {
+        // Recover the panic's own message (downcast_ref covers both a
+        // string-literal `panic!("...")` and a `panic!("{}", format!(...))`
+        // -- the only two shapes this interpreter ever panics with) instead
+        // of discarding it -- previously this just returned a placeholder
+        // telling the caller to go look at stderr. machine::current_span,
+        // read AFTER the panic unwound, names WHERE (see its own doc
+        // comment for the "last expression evaluated, not necessarily the
+        // exact culprit" caveat); no span at all (Perform/Apply's own
+        // frame processing panicking before any Eval ever ran) just
+        // leaves the bare message.
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "runtime error (no panic message available)".to_string());
+        match machine::current_span() {
+            Some(span) => span.format_error(src, &msg),
+            None => msg,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -59,8 +78,8 @@ mod tests {
     // semantics (multi-shot, deep/shallow, arithmetic) independent of the
     // typechecker.
     fn run_untyped(src: &str) -> Value {
-        let (arena, _spans, root) = parser::parse(src).expect("parse failed");
-        machine::run(&arena, root, Env::prelude())
+        let (arena, spans, root) = parser::parse(src).expect("parse failed");
+        machine::run(&arena, root, Env::prelude(), &spans)
     }
 
     // Walks the elaborated tree looking for a Check node. Needed because
@@ -157,7 +176,7 @@ mod tests {
         // comparison.
         let (mut arena, spans, root) = parser::parse("true == false").unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert!(!machine::run(&arena, elaborated, Env::prelude()).as_bool());
+        assert!(!machine::run(&arena, elaborated, Env::prelude(), &spans).as_bool());
     }
 
     #[test]
@@ -293,7 +312,7 @@ mod tests {
         let src = "let rec loop: (Int -> Int) = fun i -> if i < 6 then i + loop(i + 1) else 0 in loop(1)";
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude()).as_int(), 15);
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 15);
     }
 
     #[test]
@@ -350,7 +369,7 @@ mod tests {
         let (mut arena, spans, root) = parser::parse("let f = fun x: Int -> x + 1 in f(match 1 with | 1 -> 10 | _ -> 20)").unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert!(!contains_check(&arena, elaborated), "Int arms should need no runtime Check at the Int-annotated call");
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude()).as_int(), 11);
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 11);
     }
 
     #[test]
@@ -503,6 +522,55 @@ mod tests {
         assert!(err.starts_with("line 2, column 3:"), "unexpected message: {err}");
     }
 
+    // --- runtime panic locations ---
+
+    #[test]
+    fn unbound_variable_panic_reports_its_location() {
+        // `m` is unbound -- machine::run panics inside env.rs, with no
+        // Span parameter anywhere near that panic site; the location
+        // still comes through via machine::current_span (set centrally
+        // in run_loop's Eval step, read back after catch_unwind catches
+        // the panic in lib.rs).
+        let src = "let f = fun n -> n + m in\nf(3)";
+        let err = run_source(src).unwrap_err();
+        assert!(err.starts_with("line 1, column 22:"), "unexpected message: {err}");
+        assert!(err.contains("unbound variable: m"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn unhandled_effect_panic_reports_its_location() {
+        // Dyn-typed callee (via the explicit annotation) hides this from
+        // typecheck's static effect-row check -- perform's own runtime
+        // panic (machine.rs's `perform`) is what actually fires, still
+        // located precisely at the `perform` call itself.
+        let src = "let f: (Dyn -> Dyn) = fun y -> perform choose(y) in\nf(5)";
+        let err = run_source(src).unwrap_err();
+        assert!(err.starts_with("line 1, column 47:"), "unexpected message: {err}");
+        assert!(err.contains("unhandled effect: choose"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn match_failed_panic_reports_the_matchs_location() {
+        // Exhaustiveness passes statically (None/Some cover every
+        // constructor `data Option` declared) -- but `x` actually comes
+        // from a handler resuming with a bare Int, not a tagged List, so
+        // match_pattern finds no arm at runtime despite that. Confirms a
+        // panic from machine.rs's OWN code (not env.rs/value.rs) is
+        // located the same way.
+        let src = r#"
+            data Option = None | Some(Int) in
+            handle
+              let x = perform choose(0) in
+              match x with
+              | None -> 0
+              | Some(y) -> y
+            with deep(handler choose(p, resume) -> resume(42))
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("match failed: no pattern matched the value"), "unexpected message: {err}");
+        assert!(err.contains("line 5"), "unexpected message: {err}");
+    }
+
     // --- row polymorphism ---
 
     // `f`'s row is a variable (`{e}`), not Dyn -- so calling it isn't a
@@ -533,7 +601,7 @@ mod tests {
                     apply_twice(fun y -> perform choose(y))(5)";
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).expect("should typecheck (falls back to Dyn)");
-        machine::run(&arena, elaborated, Env::prelude());
+        machine::run(&arena, elaborated, Env::prelude(), &spans);
     }
 
     #[test]
@@ -594,7 +662,7 @@ mod tests {
         let (mut arena, spans, root) = parser::parse("let f = fun x: Int -> x + 1 in f(41)").unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert!(!contains_check(&arena, elaborated));
-        let result = machine::run(&arena, elaborated, Env::prelude());
+        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
         assert_eq!(result.as_int(), 42);
     }
 
@@ -622,7 +690,7 @@ mod tests {
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert!(contains_check(&arena, elaborated));
-        let result = machine::run(&arena, elaborated, Env::prelude());
+        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
         assert_eq!(result.as_int(), 42);
     }
 
@@ -640,7 +708,7 @@ mod tests {
         "#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        machine::run(&arena, elaborated, Env::prelude());
+        machine::run(&arena, elaborated, Env::prelude(), &spans);
     }
 
     #[test]
@@ -661,7 +729,7 @@ mod tests {
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            machine::run(&arena, elaborated, Env::prelude())
+            machine::run(&arena, elaborated, Env::prelude(), &spans)
         }));
         assert!(result.is_err(), "expected a panic from the return-type contract check");
     }
@@ -709,7 +777,7 @@ mod tests {
         "#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).expect("both effects are handled, should typecheck");
-        machine::run(&arena, elaborated, Env::prelude());
+        machine::run(&arena, elaborated, Env::prelude(), &spans);
     }
 
     #[test]
@@ -740,7 +808,7 @@ mod tests {
         let elaborated =
             typecheck::check(&mut arena, root, &spans).expect("Dyn-sourced call should not be statically rejected");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            machine::run(&arena, elaborated, Env::prelude())
+            machine::run(&arena, elaborated, Env::prelude(), &spans)
         }));
         assert!(result.is_err(), "expected the runtime unhandled-effect panic as a fallback");
     }
@@ -788,7 +856,7 @@ mod tests {
         src.push_str(&format!("x{}", n - 1));
         let (mut arena, spans, root) = parser::parse(&src).expect("parsing should not overflow the stack");
         let elaborated = typecheck::check(&mut arena, root, &spans).expect("typechecking should not overflow the stack");
-        let result = machine::run(&arena, elaborated, Env::prelude());
+        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
         assert_eq!(result.as_int(), (n - 1) as i64);
         // arena, and everything in it, drops normally here.
     }

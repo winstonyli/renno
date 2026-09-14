@@ -1,8 +1,10 @@
+use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::Env;
-use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern};
+use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
+use crate::span::Span;
 use crate::value::{Builtin, HandlerData, Value};
 
 enum Control {
@@ -11,14 +13,40 @@ enum Control {
     Perform(String, Value),
 }
 
+thread_local! {
+    // Updated every time the trampoline begins evaluating a new expression
+    // (see run_loop's Eval arm) -- read back by lib.rs's catch_unwind,
+    // AFTER a panic is caught, to attach a "line L, column C" location to
+    // whatever runtime panic just fired (unbound variable, a failed
+    // Check, a non-function call, `perform` with no handler, ...), no
+    // matter which function actually called panic! -- env.rs's,
+    // value.rs's, and machine.rs's own panics all get this for free, with
+    // no Span parameter threaded into any of them.
+    //
+    // Not perfectly precise: a panic several steps removed from the last
+    // Eval (deep inside apply_binop or Value::as_int, say) reports the
+    // last EXPRESSION evaluated, not necessarily the exact sub-part at
+    // fault -- e.g. `1 + true` reports `true`'s own span (the last thing
+    // evaluated before apply_binop's as_int() panics on it), not the
+    // whole `1 + true`. Always in the neighborhood, never wildly off,
+    // without threading a Span through every Frame variant and Value
+    // accessor -- the same 80/20 trade this checker already makes
+    // elsewhere (see typecheck::TypeError's doc comment, missing_case).
+    static CURRENT_SPAN: Cell<Option<Span>> = const { Cell::new(None) };
+}
+
+pub fn current_span() -> Option<Span> {
+    CURRENT_SPAN.with(|c| c.get())
+}
+
 // Trampolined CEK-style step loop -- no native recursion, so no stack
 // overflow risk from deep programs or from resuming captured continuations.
 // `arena` is only ever read here (all mutation happens during parsing and
 // typecheck::elaborate); ExprRef fields are Copy, so threading node
 // references through Control/Frame costs nothing beyond a plain integer
 // copy -- no Rc bump, unlike when this held Rc<Expr>.
-pub fn run(arena: &Arena, expr: ExprRef, env: Env) -> Value {
-    run_loop(arena, Control::Eval(expr, env), Cont::nil())
+pub fn run(arena: &Arena, expr: ExprRef, env: Env, spans: &SpanMap) -> Value {
+    run_loop(arena, Control::Eval(expr, env), Cont::nil(), spans)
 }
 
 // Calls a renno function VALUE from native Rust code (used by fold/map's
@@ -36,14 +64,27 @@ pub fn run(arena: &Arena, expr: ExprRef, env: Env) -> Value {
 // an FFI-like boundary) that this feature doesn't attempt. In practice
 // this is the expected shape for a structural-recursion primitive anyway
 // -- fold/map are conventionally pure transformations.
-pub fn apply(arena: &Arena, func: Value, arg: Value) -> Value {
-    run_loop(arena, Control::Apply(arg), Cont::cons(Frame::AppArg { func }, Cont::nil()))
+pub fn apply(arena: &Arena, func: Value, arg: Value, spans: &SpanMap) -> Value {
+    run_loop(arena, Control::Apply(arg), Cont::cons(Frame::AppArg { func }, Cont::nil()), spans)
 }
 
-fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont) -> Value {
+fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap) -> Value {
     loop {
         match control {
-            Control::Eval(expr, env) => match &arena[expr] {
+            Control::Eval(expr, env) => {
+                // `spans` covers every node the PARSER produced, but the
+                // tree actually running here is typecheck's ELABORATED
+                // one -- full of re-emitted and brand-new (Check, contract
+                // chains) nodes past the end of `spans`, which never
+                // tracks those (see typecheck::TypeError's doc comment).
+                // Skip the update rather than panic on those; CURRENT_SPAN
+                // just keeps whatever the last KNOWN-location Eval set,
+                // which is the same "last expression evaluated" fallback
+                // already documented above.
+                if let Some(span) = spans.get(expr) {
+                    CURRENT_SPAN.with(|c| c.set(Some(*span)));
+                }
+                match &arena[expr] {
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
                 Expr::Str(s) => control = Control::Apply(Value::Str(Rc::from(s.as_str()))),
@@ -119,7 +160,8 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont) -> Value {
                         deep: false,
                     })));
                 }
-            },
+                }
+            }
 
             // Matches on `frame` by reference: each arm clones only the
             // specific fields it actually moves elsewhere, instead of
@@ -172,11 +214,11 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont) -> Value {
                                     control = Control::Apply(value);
                                 }
                                 Value::Builtin(b) => {
-                                    control = Control::Apply(collect_builtin_arg(arena, b, Vec::new(), value));
+                                    control = Control::Apply(collect_builtin_arg(arena, b, Vec::new(), value, spans));
                                 }
                                 Value::PartialBuiltin(b, prev_args) => {
                                     let args = (*prev_args).clone();
-                                    control = Control::Apply(collect_builtin_arg(arena, b, args, value));
+                                    control = Control::Apply(collect_builtin_arg(arena, b, args, value, spans));
                                 }
                                 _ => panic!("attempt to call a non-function value"),
                             }
@@ -310,16 +352,16 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value) -> Value {
 // Appends one argument to a builtin's collected-so-far list, dispatching
 // the real operation once `b`'s declared arity is reached, otherwise
 // handing back a PartialBuiltin waiting for the rest.
-fn collect_builtin_arg(arena: &Arena, b: Builtin, mut args: Vec<Value>, arg: Value) -> Value {
+fn collect_builtin_arg(arena: &Arena, b: Builtin, mut args: Vec<Value>, arg: Value, spans: &SpanMap) -> Value {
     args.push(arg);
     if args.len() == b.arity() {
-        dispatch_builtin(arena, b, args)
+        dispatch_builtin(arena, b, args, spans)
     } else {
         Value::PartialBuiltin(b, Rc::new(args))
     }
 }
 
-fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>) -> Value {
+fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &SpanMap) -> Value {
     match b {
         // deep/shallow: clone the handler data, flip the `deep` bit, hand
         // back a new handler value. No AST-level flag.
@@ -338,7 +380,8 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>) -> Value {
             let (list, f) = (args.pop(), args.pop());
             match (f, list) {
                 (Some(f), Some(Value::List(items))) => {
-                    let mapped: Vec<Value> = items.iter().map(|v| apply(arena, f.clone(), v.clone())).collect();
+                    let mapped: Vec<Value> =
+                        items.iter().map(|v| apply(arena, f.clone(), v.clone(), spans)).collect();
                     Value::List(Rc::new(mapped))
                 }
                 _ => panic!("map expects a function and a list"),
@@ -352,8 +395,8 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>) -> Value {
                     for item in items.iter() {
                         // f is curried (one renno-level argument at a
                         // time): f(acc) yields a closure, applied to item.
-                        let partial = apply(arena, f.clone(), acc);
-                        acc = apply(arena, partial, item.clone());
+                        let partial = apply(arena, f.clone(), acc, spans);
+                        acc = apply(arena, partial, item.clone(), spans);
                     }
                     acc
                 }
