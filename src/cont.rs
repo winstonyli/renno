@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use crate::env::Env;
-use crate::expr::{BinOp, Expr};
+use crate::expr::{BinOp, ExprRef};
 use crate::types::Type;
 use crate::value::{HandlerData, Value};
 
@@ -10,17 +10,17 @@ use crate::value::{HandlerData, Value};
 // possible: a captured Cont is an immutable, cheaply-clonable value.
 #[derive(Clone)]
 pub enum Frame {
-    AppFunc { arg: Rc<Expr>, env: Env },
+    AppFunc { arg: ExprRef, env: Env },
     AppArg { func: Value },
-    LetBody { var: String, body: Rc<Expr>, env: Env },
-    BinOpL { op: BinOp, rhs: Rc<Expr>, env: Env },
+    LetBody { var: String, body: ExprRef, env: Env },
+    BinOpL { op: BinOp, rhs: ExprRef, env: Env },
     BinOpR { op: BinOp, lhs: Value },
-    If { then_: Rc<Expr>, else_: Rc<Expr>, env: Env },
+    If { then_: ExprRef, else_: ExprRef, env: Env },
     CheckFrame { ty: Type },
     PerformPayload { effect: String },
     // `handle body with handler_expr`: handler_expr has just evaluated to a
     // Value::Handler -- next step installs it as a HandlerMark and evals body.
-    InstallHandler { body: Rc<Expr>, env: Env },
+    InstallHandler { body: ExprRef, env: Env },
     // Wraps the same HandlerData a Value::Handler carries -- an Rc clone
     // (one pointer bump) instead of six separately-cloned fields, and one
     // definition instead of two structurally-identical ones to keep in sync.

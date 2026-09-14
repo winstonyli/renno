@@ -44,15 +44,43 @@ pub fn run_source(src: &str) -> Result<Outcome, String> {
 }
 
 fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
-    let expr = parser::parse(src)?;
-    let elaborated = typecheck::check(&expr).map_err(|e| e.0)?;
-    std::panic::catch_unwind(|| machine::run(elaborated, Env::prelude()))
+    let (mut arena, root) = parser::parse(src)?;
+    let elaborated = typecheck::check(&mut arena, root).map_err(|e| e.0)?;
+    std::panic::catch_unwind(|| machine::run(&arena, elaborated, Env::prelude()))
         .map_err(|_| "runtime error (see panic message above)".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Raw parse+run, no typecheck -- for tests exercising parser/machine
+    // semantics (multi-shot, deep/shallow, arithmetic) independent of the
+    // typechecker.
+    fn run_untyped(src: &str) -> Value {
+        let (arena, root) = parser::parse(src).expect("parse failed");
+        machine::run(&arena, root, Env::prelude())
+    }
+
+    // Walks the elaborated tree looking for a Check node. Needed because
+    // arena-indexed Expr's derived Debug only prints the immediate node
+    // (children are plain ExprRef indices now, not Rc<Expr>, so Debug no
+    // longer recurses through them the way it used to).
+    fn contains_check(arena: &expr::Arena, root: expr::ExprRef) -> bool {
+        use expr::Expr;
+        match &arena[root] {
+            Expr::Check(..) => true,
+            Expr::Int(_) | Expr::Bool(_) | Expr::Var(_) => false,
+            Expr::Lambda(_, _, body) => contains_check(arena, *body),
+            Expr::App(f, a) => contains_check(arena, *f) || contains_check(arena, *a),
+            Expr::Let(_, _, val, body) => contains_check(arena, *val) || contains_check(arena, *body),
+            Expr::BinOp(_, l, r) => contains_check(arena, *l) || contains_check(arena, *r),
+            Expr::If(c, t, e) => contains_check(arena, *c) || contains_check(arena, *t) || contains_check(arena, *e),
+            Expr::Perform(_, payload) => contains_check(arena, *payload),
+            Expr::Handle { body, handler } => contains_check(arena, *body) || contains_check(arena, *handler),
+            Expr::MakeHandler { body, .. } => contains_check(arena, *body),
+        }
+    }
 
     // handle { let x = perform choose(0) in x + 100 } with
     // handler choose(p, resume) -> resume(1) + resume(2)
@@ -68,9 +96,7 @@ mod tests {
               x + 100
             with handler choose(p, resume) -> resume(1) + resume(2)
         "#;
-        let expr = parser::parse(src).expect("parse failed");
-        let result = machine::run(expr, Env::prelude());
-        assert_eq!(result.as_int(), 203);
+        assert_eq!(run_untyped(src).as_int(), 203);
     }
 
     // Two *sequential* occurrences of the same effect (not multi-shot --
@@ -85,9 +111,7 @@ mod tests {
               x + y
             with deep(handler choose(p, resume) -> resume(1))
         "#;
-        let expr = parser::parse(src).expect("parse failed");
-        let result = machine::run(expr, Env::prelude());
-        assert_eq!(result.as_int(), 2);
+        assert_eq!(run_untyped(src).as_int(), 2);
     }
 
     // Same shape, no deep(...) -- shallow (the MakeHandler default) is
@@ -102,26 +126,22 @@ mod tests {
               x + y
             with handler choose(p, resume) -> resume(1)
         "#;
-        let expr = parser::parse(src).expect("parse failed");
-        machine::run(expr, Env::prelude());
+        run_untyped(src);
     }
 
     #[test]
     fn if_true_takes_then_branch() {
-        let expr = parser::parse("if 1 < 2 then 10 else 20").unwrap();
-        assert_eq!(machine::run(expr, Env::prelude()).as_int(), 10);
+        assert_eq!(run_untyped("if 1 < 2 then 10 else 20").as_int(), 10);
     }
 
     #[test]
     fn if_false_takes_else_branch() {
-        let expr = parser::parse("if 2 < 1 then 10 else 20").unwrap();
-        assert_eq!(machine::run(expr, Env::prelude()).as_int(), 20);
+        assert_eq!(run_untyped("if 2 < 1 then 10 else 20").as_int(), 20);
     }
 
     #[test]
     fn eq_and_bool_literals() {
-        let expr = parser::parse("if 3 == 3 then true else false").unwrap();
-        assert!(machine::run(expr, Env::prelude()).as_bool());
+        assert!(run_untyped("if 3 == 3 then true else false").as_bool());
     }
 
     #[test]
@@ -129,9 +149,9 @@ mod tests {
         // Regression test: Eq used to force both operands through Int,
         // rejecting this at typecheck time even though it's a valid
         // comparison.
-        let expr = parser::parse("true == false").unwrap();
-        let elaborated = typecheck::check(&expr).unwrap();
-        assert!(!machine::run(elaborated, Env::prelude()).as_bool());
+        let (mut arena, root) = parser::parse("true == false").unwrap();
+        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        assert!(!machine::run(&arena, elaborated, Env::prelude()).as_bool());
     }
 
     #[test]
@@ -146,10 +166,10 @@ mod tests {
     fn fully_annotated_code_has_no_check_nodes() {
         // Both sides concrete and consistent -- coerce() should insert
         // nothing. Confirms fully-typed code pays zero runtime-check cost.
-        let expr = parser::parse("let f = fun x: Int -> x + 1 in f(41)").unwrap();
-        let elaborated = typecheck::check(&expr).unwrap();
-        assert!(!format!("{elaborated:?}").contains("Check"));
-        let result = machine::run(elaborated, Env::prelude());
+        let (mut arena, root) = parser::parse("let f = fun x: Int -> x + 1 in f(41)").unwrap();
+        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        assert!(!contains_check(&arena, elaborated));
+        let result = machine::run(&arena, elaborated, Env::prelude());
         assert_eq!(result.as_int(), 42);
     }
 
@@ -157,8 +177,8 @@ mod tests {
     fn static_type_error_rejected_before_running() {
         // Both sides concrete and inconsistent -- rejected by the checker,
         // never reaches machine::run at all.
-        let expr = parser::parse("(fun x: Int -> x + 1)(true)").unwrap();
-        let err = typecheck::check(&expr).unwrap_err();
+        let (mut arena, root) = parser::parse("(fun x: Int -> x + 1)(true)").unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
         assert!(err.0.contains("expected Int"), "unexpected message: {}", err.0);
     }
 
@@ -174,10 +194,10 @@ mod tests {
               f(y)
             with handler choose(p, resume) -> resume(41)
         "#;
-        let expr = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&expr).unwrap();
-        assert!(format!("{elaborated:?}").contains("Check"));
-        let result = machine::run(elaborated, Env::prelude());
+        let (mut arena, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        assert!(contains_check(&arena, elaborated));
+        let result = machine::run(&arena, elaborated, Env::prelude());
         assert_eq!(result.as_int(), 42);
     }
 
@@ -193,9 +213,9 @@ mod tests {
               f(y)
             with handler choose(p, resume) -> resume(true)
         "#;
-        let expr = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&expr).unwrap();
-        machine::run(elaborated, Env::prelude());
+        let (mut arena, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root).unwrap();
+        machine::run(&arena, elaborated, Env::prelude());
     }
 
     #[test]
@@ -213,18 +233,18 @@ mod tests {
               g(5) + 1
             with handler choose(p, resume) -> resume(fun x -> true)
         "#;
-        let expr = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&expr).unwrap();
+        let (mut arena, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            machine::run(elaborated, Env::prelude())
+            machine::run(&arena, elaborated, Env::prelude())
         }));
         assert!(result.is_err(), "expected a panic from the return-type contract check");
     }
 
     #[test]
     fn handle_with_non_handler_value_rejected_statically() {
-        let expr = parser::parse("handle 1 with 5").unwrap();
-        let err = typecheck::check(&expr).unwrap_err();
+        let (mut arena, root) = parser::parse("handle 1 with 5").unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
         assert!(err.0.contains("expected a handler value"), "unexpected message: {}", err.0);
     }
 
@@ -235,8 +255,8 @@ mod tests {
         // No `handle` anywhere -- previously this would only fail at
         // runtime, inside machine::run, via perform()'s own panic. Now
         // caught by typecheck::check before anything executes.
-        let expr = parser::parse("perform choose(0)").unwrap();
-        let err = typecheck::check(&expr).unwrap_err();
+        let (mut arena, root) = parser::parse("perform choose(0)").unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
         assert!(err.0.contains("unhandled effect") && err.0.contains("choose"), "unexpected message: {}", err.0);
     }
 
@@ -248,8 +268,8 @@ mod tests {
               x + 100
             with handler choose(p, resume) -> resume(1) + resume(2)
         "#;
-        let expr = parser::parse(src).unwrap();
-        assert!(typecheck::check(&expr).is_ok());
+        let (mut arena, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root).is_ok());
     }
 
     #[test]
@@ -262,9 +282,9 @@ mod tests {
               with handler log(p, resume) -> resume(0)
             with handler choose(p, resume) -> resume(1)
         "#;
-        let expr = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&expr).expect("both effects are handled, should typecheck");
-        machine::run(elaborated, Env::prelude());
+        let (mut arena, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root).expect("both effects are handled, should typecheck");
+        machine::run(&arena, elaborated, Env::prelude());
     }
 
     #[test]
@@ -277,8 +297,8 @@ mod tests {
               perform log(x)
             with handler choose(p, resume) -> resume(1)
         "#;
-        let expr = parser::parse(src).unwrap();
-        let err = typecheck::check(&expr).unwrap_err();
+        let (mut arena, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
         assert!(err.0.contains("log"), "unexpected message: {}", err.0);
         assert!(!err.0.contains("choose"), "handled effect wrongly reported: {}", err.0);
     }
@@ -291,10 +311,11 @@ mod tests {
         // set. Static check can't reject it, but the real unhandled effect
         // still panics at runtime exactly as before this feature existed.
         let src = "(fun f -> f(0))(fun x -> perform mystery(x))";
-        let expr = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&expr).expect("Dyn-sourced call should not be statically rejected");
+        let (mut arena, root) = parser::parse(src).unwrap();
+        let elaborated =
+            typecheck::check(&mut arena, root).expect("Dyn-sourced call should not be statically rejected");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            machine::run(elaborated, Env::prelude())
+            machine::run(&arena, elaborated, Env::prelude())
         }));
         assert!(result.is_err(), "expected the runtime unhandled-effect panic as a fallback");
     }
@@ -302,19 +323,19 @@ mod tests {
     #[test]
     fn deeply_nested_let_chain_does_not_overflow_the_stack() {
         // Regression test: a long enough chain of nested `let`s used to
-        // crash the process with STATUS_STACK_OVERFLOW. Three independent
-        // native-recursion sources contributed to that, and this fix
-        // addresses two of them directly (see the next test): parser::atom
-        // and typecheck::elaborate flatten a Let/Fun chain iteratively
-        // instead of recursing, and plist.rs's custom iterative Drop fixes
-        // the typecheck Ctx (and Env) teardown cost. The third -- dropping
-        // the resulting Expr tree itself -- is still open (Expr is a
-        // branching tree, not a linked list, so PList's fix doesn't
-        // transfer directly). run_source's large-stack thread is what
-        // covers that one, plus deeply nested App/BinOp/If/Handle (which
-        // branch rather than chain, so the flattening above doesn't apply
-        // to them either, though they're far less likely to reach this
-        // depth in realistic code).
+        // crash the process with STATUS_STACK_OVERFLOW, from three
+        // independent native-recursion sources -- all three are now fixed
+        // (see the next test for the full breakdown): parser::atom and
+        // typecheck::elaborate flatten a Let/Fun chain iteratively instead
+        // of recursing, plist.rs's custom iterative Drop fixes the
+        // typecheck Ctx (and Env) teardown cost, and Expr moved into a
+        // flat arena (expr.rs) so dropping the whole tree is one Vec
+        // drop -- O(n), no recursion -- instead of a recursive walk
+        // through nested Rc<Expr> fields. run_source's large-stack thread
+        // remains in place as defense in depth for deeply nested
+        // App/BinOp/If/Handle (which branch rather than chain, so the
+        // flattening above doesn't apply to them, though they're far less
+        // likely to reach this depth in realistic code).
         let n = 5000;
         let mut src = String::from("let x0 = 0 in ");
         for i in 1..n {
@@ -326,41 +347,24 @@ mod tests {
     }
 
     #[test]
-    fn let_chain_construction_and_ctx_teardown_are_o1_stack() {
-        // Isolates two of the three native-recursion sources this fix
-        // touches from the third (still open -- see the comment below).
-        //
-        // 1) Construction: parser::atom's and elaborate's Let/Fun chain
-        //    flattening turned a long chain from O(depth) native
-        //    recursion into a loop.
-        // 2) Ctx teardown: elaborate() builds a deeply nested
-        //    PList<Type> internally while walking the chain (one `bind`
-        //    per level) -- Rust's default recursive Drop for that chain
-        //    was confirmed, independently of any parsing/typechecking, to
-        //    overflow the stack on its own at this depth. plist.rs's
-        //    custom iterative Drop (Rc::try_unwrap-based) fixed this for
-        //    both Env and Ctx, since they share PList<T>.
-        //
-        // Still open: dropping the elaborated Expr tree ITSELF is a
-        // third, separate native-recursion source (Expr's default Drop
-        // recurses through its own Rc<Expr> fields the same way) --
-        // confirmed independently to overflow on its own too, and not
-        // fixed here (Expr is a branching tree, not a linked list --
-        // fixing it needs an explicit worklist, not the single-parent-
-        // pointer trick that works for PList). std::mem::forget below
-        // deliberately skips that still-open drop so this test isolates
-        // exactly the two things this fix does cover. run_source's
-        // large-stack thread remains the real defense against Expr's
-        // teardown cost.
+    fn let_chain_is_o1_stack_construction_and_teardown() {
+        // Full proof, no forget() needed anymore: parsing, typechecking,
+        // AND dropping everything afterward, all on the default stack, at
+        // 10x the depth that used to crash a 256 MiB thread. Construction
+        // was fixed by chain flattening (parser.rs, typecheck.rs); Ctx/Env
+        // teardown by plist.rs's custom Drop; Expr's own teardown by
+        // moving the AST into a flat arena (expr.rs) instead of a linked
+        // Rc<Expr> tree -- dropping the arena is dropping one Vec.
         let n = 50_000;
         let mut src = String::from("let x0 = 0 in ");
         for i in 1..n {
             src.push_str(&format!("let x{i} = x{} + 1 in ", i - 1));
         }
         src.push_str(&format!("x{}", n - 1));
-        let expr = parser::parse(&src).expect("parsing should not overflow the stack");
-        let elaborated = typecheck::check(&expr).expect("typechecking should not overflow the stack");
-        std::mem::forget(elaborated);
-        std::mem::forget(expr);
+        let (mut arena, root) = parser::parse(&src).expect("parsing should not overflow the stack");
+        let elaborated = typecheck::check(&mut arena, root).expect("typechecking should not overflow the stack");
+        let result = machine::run(&arena, elaborated, Env::prelude());
+        assert_eq!(result.as_int(), (n - 1) as i64);
+        // arena, and everything in it, drops normally here.
     }
 }

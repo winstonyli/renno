@@ -12,6 +12,7 @@ name = "renno"
 path = "src/main.rs"
 
 [dependencies]
+cranelift-entity = "0.135.2"
 logos = "0.16.1"
 
 [dev-dependencies]

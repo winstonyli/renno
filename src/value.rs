@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::cont::Cont;
 use crate::env::Env;
-use crate::expr::Expr;
+use crate::expr::ExprRef;
 use crate::types::Type;
 
 // A handler as data: which effect it handles, the clause body plus its two
@@ -16,7 +16,7 @@ pub struct HandlerData {
     pub effect: String,
     pub payload_var: String,
     pub resume_var: String,
-    pub body: Rc<Expr>,
+    pub body: ExprRef,
     pub env: Env,
     pub deep: bool,
 }
@@ -31,7 +31,7 @@ pub enum Builtin {
 pub enum Value {
     Int(i64),
     Bool(bool),
-    Closure(String, Rc<Expr>, Env),
+    Closure(String, ExprRef, Env),
     Continuation(Cont),
     Handler(Rc<HandlerData>),
     Builtin(Builtin),

@@ -1,29 +1,30 @@
 use std::rc::Rc;
 
-use crate::expr::{BinOp, Expr};
+use crate::expr::{Arena, BinOp, Expr, ExprRef};
 use crate::lexer::{tokenize, Token};
 use crate::types::{EffectRow, Type};
 
-pub fn parse(src: &str) -> Result<Rc<Expr>, String> {
+pub fn parse(src: &str) -> Result<(Arena, ExprRef), String> {
     let tokens = tokenize(src)?;
-    let mut p = Parser { tokens, pos: 0 };
-    let e = p.expr()?;
+    let mut p = Parser { tokens, pos: 0, arena: Arena::new() };
+    let root = p.expr()?;
     if p.pos != p.tokens.len() {
         return Err(format!("trailing tokens after expression: {:?}", &p.tokens[p.pos..]));
     }
-    Ok(Rc::new(e))
+    Ok((p.arena, root))
 }
 
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    arena: Arena,
 }
 
 // A `let`/`fun` prefix collected while flattening a chain of them (see
 // `atom`) -- deferred until the terminal body is parsed, then folded back
 // into nested Let/Lambda nodes in reverse.
 enum PendingBinder {
-    Let { var: String, ann: Option<Type>, val: Rc<Expr> },
+    Let { var: String, ann: Option<Type>, val: ExprRef },
     Fun { param: String, ann: Option<Type> },
 }
 
@@ -98,12 +99,12 @@ impl Parser {
     }
 
     // expr := cmp
-    fn expr(&mut self) -> Result<Expr, String> {
+    fn expr(&mut self) -> Result<ExprRef, String> {
         self.cmp()
     }
 
     // cmp := add (("==" | "<") add)?  -- non-associative, one comparison
-    fn cmp(&mut self) -> Result<Expr, String> {
+    fn cmp(&mut self) -> Result<ExprRef, String> {
         let lhs = self.add()?;
         let op = match self.peek() {
             Some(Token::EqEq) => Some(BinOp::Eq),
@@ -114,31 +115,31 @@ impl Parser {
             Some(op) => {
                 self.bump();
                 let rhs = self.add()?;
-                Ok(Expr::BinOp(op, Rc::new(lhs), Rc::new(rhs)))
+                Ok(self.arena.push(Expr::BinOp(op, lhs, rhs)))
             }
             None => Ok(lhs),
         }
     }
 
     // add := postfix ("+" postfix)*  (left-associative)
-    fn add(&mut self) -> Result<Expr, String> {
+    fn add(&mut self) -> Result<ExprRef, String> {
         let mut lhs = self.postfix()?;
         while matches!(self.peek(), Some(Token::Plus)) {
             self.bump();
             let rhs = self.postfix()?;
-            lhs = Expr::BinOp(BinOp::Add, Rc::new(lhs), Rc::new(rhs));
+            lhs = self.arena.push(Expr::BinOp(BinOp::Add, lhs, rhs));
         }
         Ok(lhs)
     }
 
     // postfix := atom ("(" expr ")")*  -- supports curried calls f(a)(b)
-    fn postfix(&mut self) -> Result<Expr, String> {
+    fn postfix(&mut self) -> Result<ExprRef, String> {
         let mut e = self.atom()?;
         while matches!(self.peek(), Some(Token::LParen)) {
             self.bump();
             let arg = self.expr()?;
             self.expect(&Token::RParen)?;
-            e = Expr::App(Rc::new(e), Rc::new(arg));
+            e = self.arena.push(Expr::App(e, arg));
         }
         Ok(e)
     }
@@ -153,7 +154,7 @@ impl Parser {
     // chain ends is parsed with an ordinary self.expr() call, same as the
     // original recursive version -- only the "is there another prefix"
     // bookkeeping moved out of the call stack, not the grammar itself.
-    fn atom(&mut self) -> Result<Expr, String> {
+    fn atom(&mut self) -> Result<ExprRef, String> {
         let mut pending = Vec::new();
         loop {
             match self.peek() {
@@ -164,7 +165,7 @@ impl Parser {
                     self.expect(&Token::Equals)?;
                     let val = self.expr()?;
                     self.expect(&Token::In)?;
-                    pending.push(PendingBinder::Let { var, ann, val: Rc::new(val) });
+                    pending.push(PendingBinder::Let { var, ann, val });
                 }
                 Some(Token::Fun) => {
                     self.bump();
@@ -180,8 +181,8 @@ impl Parser {
         let mut result = if pending.is_empty() { self.atom_leaf()? } else { self.expr()? };
         for binder in pending.into_iter().rev() {
             result = match binder {
-                PendingBinder::Let { var, ann, val } => Expr::Let(var, ann, val, Rc::new(result)),
-                PendingBinder::Fun { param, ann } => Expr::Lambda(param, ann, Rc::new(result)),
+                PendingBinder::Let { var, ann, val } => self.arena.push(Expr::Let(var, ann, val, result)),
+                PendingBinder::Fun { param, ann } => self.arena.push(Expr::Lambda(param, ann, result)),
             };
         }
         Ok(result)
@@ -189,12 +190,12 @@ impl Parser {
 
     // Every atom form except `let`/`fun`, which `atom` handles iteratively
     // above. Reached only once no more chain prefix remains.
-    fn atom_leaf(&mut self) -> Result<Expr, String> {
+    fn atom_leaf(&mut self) -> Result<ExprRef, String> {
         match self.bump() {
-            Some(Token::Int(n)) => Ok(Expr::Int(n)),
-            Some(Token::True) => Ok(Expr::Bool(true)),
-            Some(Token::False) => Ok(Expr::Bool(false)),
-            Some(Token::Ident(name)) => Ok(Expr::Var(name)),
+            Some(Token::Int(n)) => Ok(self.arena.push(Expr::Int(n))),
+            Some(Token::True) => Ok(self.arena.push(Expr::Bool(true))),
+            Some(Token::False) => Ok(self.arena.push(Expr::Bool(false))),
+            Some(Token::Ident(name)) => Ok(self.arena.push(Expr::Var(name))),
 
             Some(Token::If) => {
                 let cond = self.expr()?;
@@ -202,7 +203,7 @@ impl Parser {
                 let then_ = self.expr()?;
                 self.expect(&Token::Else)?;
                 let else_ = self.expr()?;
-                Ok(Expr::If(Rc::new(cond), Rc::new(then_), Rc::new(else_)))
+                Ok(self.arena.push(Expr::If(cond, then_, else_)))
             }
 
             Some(Token::Perform) => {
@@ -210,7 +211,7 @@ impl Parser {
                 self.expect(&Token::LParen)?;
                 let payload = self.expr()?;
                 self.expect(&Token::RParen)?;
-                Ok(Expr::Perform(effect, Rc::new(payload)))
+                Ok(self.arena.push(Expr::Perform(effect, payload)))
             }
 
             // handle <body> with <handler-expr>
@@ -218,7 +219,7 @@ impl Parser {
                 let body = self.expr()?;
                 self.expect(&Token::With)?;
                 let handler = self.expr()?;
-                Ok(Expr::Handle { body: Rc::new(body), handler: Rc::new(handler) })
+                Ok(self.arena.push(Expr::Handle { body, handler }))
             }
 
             // handler <effect>(<payload_var>, <resume_var>) -> <body>
@@ -241,7 +242,7 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 self.expect(&Token::Arrow)?;
                 let body = self.expr()?;
-                Ok(Expr::MakeHandler { effect, payload_var, resume_var, body: Rc::new(body) })
+                Ok(self.arena.push(Expr::MakeHandler { effect, payload_var, resume_var, body }))
             }
 
             Some(Token::LParen) => {

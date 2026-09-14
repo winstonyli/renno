@@ -2,73 +2,71 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::Env;
-use crate::expr::{BinOp, Expr};
+use crate::expr::{Arena, BinOp, Expr, ExprRef};
 use crate::value::{Builtin, HandlerData, Value};
 
 enum Control {
-    Eval(Rc<Expr>, Env),
+    Eval(ExprRef, Env),
     Apply(Value),
     Perform(String, Value),
 }
 
 // Trampolined CEK-style step loop -- no native recursion, so no stack
 // overflow risk from deep programs or from resuming captured continuations.
-pub fn run(expr: Rc<Expr>, env: Env) -> Value {
+// `arena` is only ever read here (all mutation happens during parsing and
+// typecheck::elaborate); ExprRef fields are Copy, so threading node
+// references through Control/Frame costs nothing beyond a plain integer
+// copy -- no Rc bump, unlike when this held Rc<Expr>.
+pub fn run(arena: &Arena, expr: ExprRef, env: Env) -> Value {
     let mut control = Control::Eval(expr, env);
     let mut cont = Cont::nil();
 
     loop {
         match control {
-            Control::Eval(expr, env) => match &*expr {
+            Control::Eval(expr, env) => match &arena[expr] {
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
                 Expr::Var(name) => control = Control::Apply(env.lookup(name)),
                 Expr::Lambda(param, _ann, body) => {
-                    control = Control::Apply(Value::Closure(param.clone(), body.clone(), env));
+                    control = Control::Apply(Value::Closure(param.clone(), *body, env));
                 }
                 Expr::App(f, a) => {
-                    cont = Cont::cons(Frame::AppFunc { arg: a.clone(), env: env.clone() }, cont);
-                    control = Control::Eval(f.clone(), env);
+                    cont = Cont::cons(Frame::AppFunc { arg: *a, env: env.clone() }, cont);
+                    control = Control::Eval(*f, env);
                 }
                 Expr::Let(var, _ann, val_expr, body) => {
                     cont = Cont::cons(
-                        Frame::LetBody { var: var.clone(), body: body.clone(), env: env.clone() },
+                        Frame::LetBody { var: var.clone(), body: *body, env: env.clone() },
                         cont,
                     );
-                    control = Control::Eval(val_expr.clone(), env);
+                    control = Control::Eval(*val_expr, env);
                 }
                 Expr::BinOp(op, l, r) => {
-                    cont = Cont::cons(Frame::BinOpL { op: *op, rhs: r.clone(), env: env.clone() }, cont);
-                    control = Control::Eval(l.clone(), env);
+                    cont = Cont::cons(Frame::BinOpL { op: *op, rhs: *r, env: env.clone() }, cont);
+                    control = Control::Eval(*l, env);
                 }
                 Expr::If(c, t, e) => {
-                    cont = Cont::cons(
-                        Frame::If { then_: t.clone(), else_: e.clone(), env: env.clone() },
-                        cont,
-                    );
-                    control = Control::Eval(c.clone(), env);
+                    cont = Cont::cons(Frame::If { then_: *t, else_: *e, env: env.clone() }, cont);
+                    control = Control::Eval(*c, env);
                 }
                 Expr::Check(ty, inner) => {
                     cont = Cont::cons(Frame::CheckFrame { ty: ty.clone() }, cont);
-                    control = Control::Eval(inner.clone(), env);
+                    control = Control::Eval(*inner, env);
                 }
                 Expr::Perform(effect, payload) => {
                     cont = Cont::cons(Frame::PerformPayload { effect: effect.clone() }, cont);
-                    control = Control::Eval(payload.clone(), env);
+                    control = Control::Eval(*payload, env);
                 }
                 Expr::Handle { body, handler } => {
-                    cont = Cont::cons(
-                        Frame::InstallHandler { body: body.clone(), env: env.clone() },
-                        cont,
-                    );
-                    control = Control::Eval(handler.clone(), env);
+                    cont = Cont::cons(Frame::InstallHandler { body: *body, env: env.clone() }, cont);
+                    control = Control::Eval(*handler, env);
                 }
                 Expr::MakeHandler { effect, payload_var, resume_var, body } => {
                     control = Control::Apply(Value::Handler(Rc::new(HandlerData {
                         effect: effect.clone(),
                         payload_var: payload_var.clone(),
                         resume_var: resume_var.clone(),
-                        body: body.clone(),
+                        body: *body,
                         env,
                         deep: false,
                     })));
@@ -90,7 +88,7 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                     // typecheck, even though it would be sound.
                     match frame {
                         Frame::AppFunc { arg, env } => {
-                            let (arg, env) = (arg.clone(), env.clone());
+                            let (arg, env) = (*arg, env.clone());
                             cont = Cont::cons(Frame::AppArg { func: value }, rest);
                             control = Control::Eval(arg, env);
                         }
@@ -129,7 +127,7 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                             }
                         }
                         Frame::InstallHandler { body, env } => {
-                            let (body, env) = (body.clone(), env.clone());
+                            let (body, env) = (*body, env.clone());
                             cont = rest;
                             match value {
                                 Value::Handler(data) => {
@@ -140,12 +138,12 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                             }
                         }
                         Frame::LetBody { var, body, env } => {
-                            let (var, body, env) = (var.clone(), body.clone(), env.clone());
+                            let (var, body, env) = (var.clone(), *body, env.clone());
                             cont = rest;
                             control = Control::Eval(body, env.bind(var, value));
                         }
                         Frame::BinOpL { op, rhs, env } => {
-                            let (op, rhs, env) = (*op, rhs.clone(), env.clone());
+                            let (op, rhs, env) = (*op, *rhs, env.clone());
                             cont = Cont::cons(Frame::BinOpR { op, lhs: value }, rest);
                             control = Control::Eval(rhs, env);
                         }
@@ -155,7 +153,7 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                             control = Control::Apply(apply_binop(op, lhs, value));
                         }
                         Frame::If { then_, else_, env } => {
-                            let (then_, else_, env) = (then_.clone(), else_.clone(), env.clone());
+                            let (then_, else_, env) = (*then_, *else_, env.clone());
                             cont = rest;
                             control = Control::Eval(if value.as_bool() { then_ } else { else_ }, env);
                         }
@@ -217,7 +215,9 @@ fn value_eq(a: &Value, b: &Value) -> bool {
 // Search outward through `cont` for a matching HandlerMark, capturing every
 // frame passed along the way into `k`. `k` becomes the first-class
 // `resume` value bound in the handler body -- a persistent Cont, so the
-// handler can apply it zero, one, or many times.
+// handler can apply it zero, one, or many times. No arena needed here --
+// HandlerData.body is an ExprRef, just handed to Control::Eval as-is; the
+// next loop iteration in `run` is what looks it up.
 fn perform(cont: &mut Cont, effect: &str, payload: Value) -> Control {
     let mut captured = Vec::new();
     let mut node = cont.clone();
@@ -241,7 +241,7 @@ fn perform(cont: &mut Cont, effect: &str, payload: Value) -> Control {
                             .bind(data.payload_var.clone(), payload)
                             .bind(data.resume_var.clone(), Value::Continuation(k));
                         *cont = rest.clone();
-                        return Control::Eval(data.body.clone(), handler_env);
+                        return Control::Eval(data.body, handler_env);
                     }
                 }
                 captured.push(frame.clone());
