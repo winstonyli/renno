@@ -63,7 +63,7 @@ impl Parser {
         }
     }
 
-    // Bare, atom-only: "Int" | "Bool" | "Str" | "[" fun_type "]" |
+    // Bare, atom-only: "Int" | "Bool" | "Str" | "Dyn" | "[" fun_type "]" |
     // "(" fun_type ")". Deliberately does NOT chain "->" at this level --
     // an annotation site (`fun x: T ->`, `let x: T =`) is always
     // immediately followed by its own "->"/"=" token, so a bare trailing
@@ -77,6 +77,7 @@ impl Parser {
             Some(Token::TyInt) => Ok(Type::Int),
             Some(Token::TyBool) => Ok(Type::Bool),
             Some(Token::TyStr) => Ok(Type::Str),
+            Some(Token::TyDyn) => Ok(Type::Dyn),
             Some(Token::LBracket) => {
                 let elem = self.parse_fun_type()?;
                 self.expect(&Token::RBracket)?;
@@ -91,17 +92,28 @@ impl Parser {
         }
     }
 
-    // fun_type := type ("->" fun_type)?  (right-associative) -- only
-    // reachable from inside parens, where ")" unambiguously ends it.
-    // No surface syntax for effect rows yet -- a written function type
-    // always gets EffectRow::Dyn (unknown effects, gradual default),
-    // consistent with every other unannotated position.
+    // fun_type := type ("->" ("{" ident "}")? fun_type)?  (right-assoc) --
+    // only reachable from inside parens, where ")" unambiguously ends it.
+    // The optional `{name}` after "->" names a row variable for row
+    // polymorphism (typecheck::extend_generalized generalizes it at a
+    // `let`, typecheck::lookup instantiates a fresh copy at each use). No
+    // `{name}` -- the default, and the only option before this existed --
+    // means EffectRow::Dyn (unknown effects, gradual default), consistent
+    // with every other unannotated position.
     fn parse_fun_type(&mut self) -> Result<Type, String> {
         let atom = self.parse_type()?;
         if matches!(self.peek(), Some(Token::Arrow)) {
             self.bump();
+            let row = if matches!(self.peek(), Some(Token::LBrace)) {
+                self.bump();
+                let name = self.ident()?;
+                self.expect(&Token::RBrace)?;
+                EffectRow::Var(name)
+            } else {
+                EffectRow::Dyn
+            };
             let ret = self.parse_fun_type()?;
-            Ok(Type::Fun(Rc::new(atom), EffectRow::Dyn, Rc::new(ret)))
+            Ok(Type::Fun(Rc::new(atom), row, Rc::new(ret)))
         } else {
             Ok(atom)
         }

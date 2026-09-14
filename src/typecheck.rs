@@ -1,4 +1,6 @@
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::expr::{Arena, BinOp, Expr, ExprRef};
 use crate::plist::PList;
@@ -7,16 +9,120 @@ use crate::types::{consistent, EffectRow, Type};
 #[derive(Debug)]
 pub struct TypeError(pub String);
 
-type Ctx = PList<Type>;
+// A binding's type, plus the row-variable names (from explicit `->{e}`
+// annotations reachable in it) that are generalized -- quantified fresh at
+// every use, the way ML/Haskell generalize a `let`-bound type. Row
+// variables never come from inference (renno has none for value types),
+// only from what the user wrote, so this is simple name substitution, not
+// a unification engine: extend_generalized computes the row_vars once at
+// the `let`, lookup renames them to fresh names at each reference.
+#[derive(Clone)]
+struct Scheme {
+    row_vars: Vec<String>,
+    ty: Type,
+}
+
+impl Scheme {
+    fn mono(ty: Type) -> Scheme {
+        Scheme { row_vars: Vec::new(), ty }
+    }
+}
+
+type Ctx = PList<Scheme>;
 
 fn lookup(ctx: &Ctx, name: &str) -> Type {
     // Unbound at typecheck time: don't error here, machine::run's own
     // `unbound variable` panic at runtime is the right place for that.
-    ctx.get(name).unwrap_or(Type::Dyn)
+    match ctx.get(name) {
+        None => Type::Dyn,
+        Some(scheme) if scheme.row_vars.is_empty() => scheme.ty,
+        Some(scheme) => {
+            let subst: HashMap<String, EffectRow> = scheme
+                .row_vars
+                .iter()
+                .map(|v| (v.clone(), EffectRow::Var(fresh_row_name(v))))
+                .collect();
+            subst_type(&scheme.ty, &subst)
+        }
+    }
 }
 
+// Ordinary (non-generalized) binding -- lambda parameters, and anything
+// else that isn't a `let`. Row variables in `ty`, if any, stay exactly as
+// written: shared verbatim by every use within this one scope, not
+// instantiated fresh per use (that's what `extend_generalized` is for).
 fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
-    ctx.bind(name, ty)
+    ctx.bind(name, Scheme::mono(ty))
+}
+
+// `let`-binding: if `ty` mentions any row-variable names (from an explicit
+// `->{e}` annotation somewhere in it), generalize over them so each
+// reference gets its own fresh instantiation -- otherwise two calls to the
+// same row-polymorphic function with different concrete callbacks would
+// wrongly be forced to agree on one row.
+fn extend_generalized(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
+    let row_vars: Vec<String> = free_row_vars(&ty).into_iter().collect();
+    ctx.bind(name, Scheme { row_vars, ty })
+}
+
+fn free_row_vars(ty: &Type) -> BTreeSet<String> {
+    match ty {
+        Type::Fun(param, row, ret) => {
+            let mut vars = free_row_vars(param);
+            vars.extend(free_row_vars(ret));
+            if let EffectRow::Var(name) = row {
+                vars.insert(name.clone());
+            }
+            vars
+        }
+        Type::List(elem) => free_row_vars(elem),
+        Type::Dyn | Type::Int | Type::Bool | Type::Str => BTreeSet::new(),
+    }
+}
+
+fn fresh_row_name(base: &str) -> String {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{base}#{n}")
+}
+
+fn resolve_row(row: &EffectRow, subst: &HashMap<String, EffectRow>) -> EffectRow {
+    match row {
+        EffectRow::Var(name) => subst.get(name).cloned().unwrap_or_else(|| row.clone()),
+        other => other.clone(),
+    }
+}
+
+fn subst_type(ty: &Type, subst: &HashMap<String, EffectRow>) -> Type {
+    match ty {
+        Type::Fun(param, row, ret) => Type::Fun(
+            Rc::new(subst_type(param, subst)),
+            resolve_row(row, subst),
+            Rc::new(subst_type(ret, subst)),
+        ),
+        Type::List(elem) => Type::List(Rc::new(subst_type(elem, subst))),
+        other => other.clone(),
+    }
+}
+
+// Where a row variable actually gets bound to something concrete: `param`
+// is the callee's OWN declared parameter type (e.g. `(Dyn ->{e} Dyn)`),
+// `arg` is the actual argument's inferred type at this call site (e.g.
+// `(Dyn -> Dyn)` with a Closed({choose}) row, from an ordinary unannotated
+// closure). Every row variable found in `param`'s structure whose matching
+// position in `arg` is concrete gets bound in `subst`; the caller applies
+// that substitution to the call's return type (and its own row) so the
+// variable's meaning flows out of this one application.
+fn bind_row_vars(param: &Type, arg: &Type, subst: &mut HashMap<String, EffectRow>) {
+    if let (Type::Fun(p1, r1, p2), Type::Fun(a1, r2, a2)) = (param, arg) {
+        if let EffectRow::Var(name) = r1 {
+            if !matches!(r2, EffectRow::Var(_)) {
+                subst.entry(name.clone()).or_insert_with(|| r2.clone());
+            }
+        }
+        bind_row_vars(p1, a1, subst);
+        bind_row_vars(p2, a2, subst);
+    }
 }
 
 // "must be callable" -- the shape used wherever we need to check a value is
@@ -115,7 +221,7 @@ fn discharged_effect(arena: &Arena, handler: ExprRef) -> Option<String> {
 // sound: check() below rejects a program only when it can prove an effect
 // is never discharged, and stays silent (deferring to today's runtime
 // panic) whenever it can't prove either way.
-pub fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, EffectRow, ExprRef), TypeError> {
+fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     // Peels off a run of leading `let`/`fun` prefixes iteratively -- a
     // match per iteration, not a recursive call -- so a long chain of
     // either (sequential `let`s, or a deeply curried `fun a -> fun b ->
@@ -143,7 +249,7 @@ pub fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, E
                     Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t)?),
                     None => (val_ty, val2),
                 };
-                cur_ctx = extend(&cur_ctx, &var, bound_ty.clone());
+                cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone());
                 pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3 });
                 cur_expr = body;
             }
@@ -221,7 +327,18 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
             let (call_row, ret_ty, app2) = match &f_ty {
                 Type::Fun(param_ty, call_row, ret_ty) => {
                     let a3 = coerce(arena, a2, &a_ty, param_ty)?;
-                    (call_row.clone(), (**ret_ty).clone(), arena.push(Expr::App(f2, a3)))
+                    // If param_ty names a row variable (from an explicit
+                    // `->{e}` annotation on the callee) and the argument's
+                    // own inferred type reveals a concrete row in the
+                    // matching position, bind it -- and carry that binding
+                    // into the return type and this call's own row, so a
+                    // row-polymorphic function's result is precisely typed
+                    // once its callback is known, not just Dyn.
+                    let mut subst = HashMap::new();
+                    bind_row_vars(param_ty, &a_ty, &mut subst);
+                    let ret_ty2 = subst_type(ret_ty, &subst);
+                    let call_row2 = resolve_row(call_row, &subst);
+                    (call_row2, ret_ty2, arena.push(Expr::App(f2, a3)))
                 }
                 Type::Dyn => {
                     // Unknown callee: still route "is this even callable"

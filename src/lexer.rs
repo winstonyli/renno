@@ -34,6 +34,8 @@ pub enum Token {
     TyBool,
     #[token("Str")]
     TyStr,
+    #[token("Dyn")]
+    TyDyn,
 
     #[token("(")]
     LParen,
@@ -43,6 +45,10 @@ pub enum Token {
     LBracket,
     #[token("]")]
     RBracket,
+    #[token("{")]
+    LBrace,
+    #[token("}")]
+    RBrace,
     #[token(",")]
     Comma,
     #[token(":")]

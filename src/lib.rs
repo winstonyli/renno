@@ -201,6 +201,70 @@ mod tests {
         assert!(err.0.contains("cannot concat"), "unexpected message: {}", err.0);
     }
 
+    // --- row polymorphism ---
+
+    // `f`'s row is a variable (`{e}`), not Dyn -- so calling it isn't a
+    // Dyn-callee shrug, it's "whatever f's row turns out to be." Without
+    // this annotation (see the next test), the exact same program's effect
+    // is invisible to the static checker.
+    const APPLY_TWICE_ROW_POLY: &str =
+        "let apply_twice = fun f: (Dyn ->{e} Dyn) -> fun x: Dyn -> f(f(x)) in ";
+
+    #[test]
+    fn row_polymorphism_catches_unhandled_effect_through_higher_order_call() {
+        let src = format!("{APPLY_TWICE_ROW_POLY} apply_twice(fun y -> perform choose(y))(5)");
+        let (mut arena, root) = parser::parse(&src).unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
+        assert!(err.0.contains("unhandled effect") && err.0.contains("choose"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "unhandled effect: choose")]
+    fn without_row_annotation_same_program_only_fails_at_runtime() {
+        // Same shape, `f`'s row bare Dyn instead of `{e}` -- calling it
+        // collapses the whole expression's row to Dyn (today's ordinary
+        // higher-order fallback), so typecheck can't catch this; it only
+        // fails once machine::run actually gets there. Confirms the row
+        // annotation in the previous test is doing real work, not just
+        // reproducing what already happened.
+        let src = "let apply_twice = fun f: (Dyn -> Dyn) -> fun x: Dyn -> f(f(x)) in \
+                    apply_twice(fun y -> perform choose(y))(5)";
+        let (mut arena, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root).expect("should typecheck (falls back to Dyn)");
+        machine::run(&arena, elaborated, Env::prelude());
+    }
+
+    #[test]
+    fn row_polymorphic_function_runs_correctly_when_handled() {
+        // f(f(x)) performs choose TWICE sequentially (not multi-shot), so
+        // this needs deep(...) to catch both occurrences -- same deep/
+        // shallow rule as everywhere else in this interpreter, unrelated
+        // to row polymorphism itself.
+        let src = format!(
+            "{APPLY_TWICE_ROW_POLY} handle apply_twice(fun y -> perform choose(y))(5) \
+             with deep(handler choose(p, resume) -> resume(p + 1))"
+        );
+        assert_eq!(run_untyped(&src).as_int(), 7); // 5 -> 6 -> 7
+    }
+
+    #[test]
+    fn row_polymorphic_function_generalizes_across_uses() {
+        // The SAME row-polymorphic `run_it` used twice with two DIFFERENT
+        // effects, each handled independently -- if generalization were
+        // missing (one shared row variable instead of a fresh instance
+        // per use), there'd be no principled reason this should typecheck
+        // at all, let alone produce the right answer from both branches.
+        let src = r#"
+            let run_it = fun f: (Dyn ->{e} Dyn) -> f(0) in
+            handle
+              handle
+                run_it(fun x -> perform a(x)) + run_it(fun x -> perform b(x))
+              with handler b(p, resume) -> resume(10)
+            with handler a(p, resume) -> resume(1)
+        "#;
+        assert_eq!(run_untyped(src).as_int(), 11);
+    }
+
     #[test]
     fn str_type_annotation() {
         let src = r#"let f = fun x: Str -> x ++ "!" in f("hi")"#;

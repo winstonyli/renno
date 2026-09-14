@@ -1,0 +1,16 @@
+// Row polymorphism: `f`'s type annotation `(Dyn ->{e} Dyn)` names its
+// effect row `e` instead of leaving it Dyn. apply_twice's own inferred
+// type becomes "takes a function with SOME row e, returns (purely) a
+// function with that SAME row e" -- so calling apply_twice with a
+// concrete effectful callback makes the WHOLE call's effect precisely
+// {choose}, not Dyn. That's what lets typecheck catch an unhandled
+// `choose` here statically, even though it only happens two calls deep
+// inside apply_twice's own body.
+//
+// f(f(x)) performs choose twice sequentially (not multi-shot), so
+// catching both needs deep(...) -- ordinary deep/shallow rule, unrelated
+// to the row-polymorphism part.
+let apply_twice = fun f: (Dyn ->{e} Dyn) -> fun x: Dyn -> f(f(x)) in
+handle
+  apply_twice(fun y -> perform choose(y))(5)
+with deep(handler choose(p, resume) -> resume(p + 1))
