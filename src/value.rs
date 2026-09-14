@@ -66,9 +66,9 @@ impl Value {
             (_, Type::Dyn) => true,
             (Value::Int(_), Type::Int) => true,
             (Value::Bool(_), Type::Bool) => true,
-            (Value::Closure(..), Type::Fun(_, _)) => true,
-            (Value::Continuation(_), Type::Fun(_, _)) => true,
-            (Value::Builtin(_), Type::Fun(_, _)) => true,
+            (Value::Closure(..), Type::Fun(_, _, _)) => true,
+            (Value::Continuation(_), Type::Fun(_, _, _)) => true,
+            (Value::Builtin(_), Type::Fun(_, _, _)) => true,
             _ => false,
         }
     }

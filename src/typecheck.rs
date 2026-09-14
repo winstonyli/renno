@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use crate::expr::{BinOp, Expr};
 use crate::plist::PList;
-use crate::types::{consistent, Type};
+use crate::types::{consistent, EffectRow, Type};
 
 #[derive(Debug)]
 pub struct TypeError(pub String);
@@ -23,7 +23,7 @@ fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // applicable at all without knowing its exact signature (an unannotated
 // Dyn-typed callee, or the innermost check inside a function contract).
 fn any_fun() -> Type {
-    Type::Fun(Rc::new(Type::Dyn), Rc::new(Type::Dyn))
+    Type::Fun(Rc::new(Type::Dyn), EffectRow::Dyn, Rc::new(Type::Dyn))
 }
 
 // The only place a runtime Check gets inserted: `from` is Dyn (unknown
@@ -45,7 +45,7 @@ fn coerce(e: Rc<Expr>, from: &Type, to: &Type) -> Result<Rc<Expr>, TypeError> {
         return Ok(e);
     }
     match to {
-        Type::Fun(param_ty, ret_ty) => Ok(wrap_fun_contract(e, param_ty.clone(), ret_ty.clone())),
+        Type::Fun(param_ty, _row, ret_ty) => Ok(wrap_fun_contract(e, param_ty.clone(), ret_ty.clone())),
         _ => Ok(Rc::new(Expr::Check(to.clone(), e))),
     }
 }
@@ -80,66 +80,104 @@ fn wrap_fun_contract(e: Rc<Expr>, param_ty: Rc<Type>, ret_ty: Rc<Type>) -> Rc<Ex
     ))
 }
 
-// Bidirectional-lite synthesis: walks the tree once, producing both the
-// inferred Type and an elaborated Expr (same shape, with Check nodes --
-// or, at Fun boundaries, full contracts -- spliced in at Dyn-to-concrete
-// crossings). Effects stay untyped (Dyn) -- that's a separate, later
-// phase (effect typing), not this one.
-pub fn elaborate(expr: &Expr, ctx: &Ctx) -> Result<(Type, Rc<Expr>), TypeError> {
+// Recognizes the handler-expression shapes this codebase actually
+// produces (MakeHandler, optionally wrapped in deep(...)/shallow(...))
+// well enough to know which effect name a `handle` discharges. Anything
+// else (a bare variable, a computed handler) returns None -- Handle then
+// conservatively does NOT subtract anything from the body's row, which is
+// the sound direction to fail in: at worst it over-reports an effect as
+// possibly-unhandled, never hides a real one.
+fn discharged_effect(handler: &Expr) -> Option<&str> {
+    match handler {
+        Expr::MakeHandler { effect, .. } => Some(effect),
+        Expr::App(f, arg) => match &**f {
+            Expr::Var(name) if name == "deep" || name == "shallow" => discharged_effect(arg),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// Bidirectional-lite synthesis: walks the tree once, producing the
+// inferred Type, the inferred EffectRow (closed, no polymorphism -- just
+// the union of effect names this expression's evaluation might perform),
+// and an elaborated Expr (same shape, with Check nodes -- or, at Fun
+// boundaries, full contracts -- spliced in at Dyn-to-concrete crossings).
+//
+// Row inference is deliberately limited: it doesn't look inside a
+// MakeHandler clause body at all (typing what a handler does when it
+// resumes is a genuinely subtler question -- Koka/Frank treat it as its
+// own effect scope -- out of scope here), and it falls back to
+// EffectRow::Dyn wherever a value's own type is Dyn (an unannotated
+// function, an unrecognized handler expression). Within those limits it's
+// sound: check() below rejects a program only when it can prove an effect
+// is never discharged, and stays silent (deferring to today's runtime
+// panic) whenever it can't prove either way.
+pub fn elaborate(expr: &Expr, ctx: &Ctx) -> Result<(Type, EffectRow, Rc<Expr>), TypeError> {
     match expr {
-        Expr::Int(n) => Ok((Type::Int, Rc::new(Expr::Int(*n)))),
-        Expr::Bool(b) => Ok((Type::Bool, Rc::new(Expr::Bool(*b)))),
-        Expr::Var(name) => Ok((lookup(ctx, name), Rc::new(Expr::Var(name.clone())))),
+        Expr::Int(n) => Ok((Type::Int, EffectRow::pure(), Rc::new(Expr::Int(*n)))),
+        Expr::Bool(b) => Ok((Type::Bool, EffectRow::pure(), Rc::new(Expr::Bool(*b)))),
+        Expr::Var(name) => Ok((lookup(ctx, name), EffectRow::pure(), Rc::new(Expr::Var(name.clone())))),
 
         Expr::Lambda(param, ann, body) => {
             let param_ty = ann.clone().unwrap_or(Type::Dyn);
-            let (body_ty, body2) = elaborate(body, &extend(ctx, param, param_ty.clone()))?;
+            let (body_ty, body_row, body2) = elaborate(body, &extend(ctx, param, param_ty.clone()))?;
+            // Evaluating the Lambda expression itself is pure -- the
+            // body's row only manifests when the resulting function is
+            // called, so it's embedded in the Fun type, not returned here.
             Ok((
-                Type::Fun(Rc::new(param_ty.clone()), Rc::new(body_ty)),
+                Type::Fun(Rc::new(param_ty.clone()), body_row, Rc::new(body_ty)),
+                EffectRow::pure(),
                 Rc::new(Expr::Lambda(param.clone(), Some(param_ty), body2)),
             ))
         }
 
         Expr::App(f, a) => {
-            let (f_ty, f2) = elaborate(f, ctx)?;
-            let (a_ty, a2) = elaborate(a, ctx)?;
-            match f_ty {
-                Type::Fun(param_ty, ret_ty) => {
-                    let a3 = coerce(a2, &a_ty, &param_ty)?;
-                    Ok(((*ret_ty).clone(), Rc::new(Expr::App(f2, a3))))
+            let (f_ty, f_row, f2) = elaborate(f, ctx)?;
+            let (a_ty, a_row, a2) = elaborate(a, ctx)?;
+            let called_row_and_ty_expr = match &f_ty {
+                Type::Fun(param_ty, call_row, ret_ty) => {
+                    let a3 = coerce(a2, &a_ty, param_ty)?;
+                    (call_row.clone(), (**ret_ty).clone(), Rc::new(Expr::App(f2, a3)))
                 }
                 Type::Dyn => {
                     // Unknown callee: still route "is this even callable"
                     // through the same Check mechanism everything else
                     // uses, rather than leaving it to a differently-worded
-                    // panic in machine.rs.
+                    // panic in machine.rs. Can't know what it might
+                    // perform, so the call contributes an unknown (Dyn) row.
                     let f3 = Rc::new(Expr::Check(any_fun(), f2));
-                    Ok((Type::Dyn, Rc::new(Expr::App(f3, a2))))
+                    (EffectRow::Dyn, Type::Dyn, Rc::new(Expr::App(f3, a2)))
                 }
-                other => Err(TypeError(format!("cannot call a value of type {other}"))),
-            }
+                other => return Err(TypeError(format!("cannot call a value of type {other}"))),
+            };
+            let (call_row, ret_ty, app2) = called_row_and_ty_expr;
+            let row = EffectRow::union(&EffectRow::union(&f_row, &a_row), &call_row);
+            Ok((ret_ty, row, app2))
         }
 
         Expr::Let(var, ann, val, body) => {
-            let (val_ty, val2) = elaborate(val, ctx)?;
+            let (val_ty, val_row, val2) = elaborate(val, ctx)?;
             let (bound_ty, val3) = match ann {
                 Some(t) => (t.clone(), coerce(val2, &val_ty, t)?),
                 None => (val_ty, val2),
             };
-            let (body_ty, body2) = elaborate(body, &extend(ctx, var, bound_ty.clone()))?;
-            Ok((body_ty, Rc::new(Expr::Let(var.clone(), Some(bound_ty), val3, body2))))
+            let (body_ty, body_row, body2) = elaborate(body, &extend(ctx, var, bound_ty.clone()))?;
+            let row = EffectRow::union(&val_row, &body_row);
+            Ok((body_ty, row, Rc::new(Expr::Let(var.clone(), Some(bound_ty), val3, body2))))
         }
 
         Expr::BinOp(op, l, r) => {
-            let (l_ty, l2) = elaborate(l, ctx)?;
-            let (r_ty, r2) = elaborate(r, ctx)?;
+            let (l_ty, l_row, l2) = elaborate(l, ctx)?;
+            let (r_ty, r_row, r2) = elaborate(r, ctx)?;
+            let row = EffectRow::union(&l_row, &r_row);
             match op {
                 // Arithmetic and ordering: both operands must be Int.
                 BinOp::Add | BinOp::Lt => {
                     let l3 = coerce(l2, &l_ty, &Type::Int)?;
                     let r3 = coerce(r2, &r_ty, &Type::Int)?;
                     let result_ty = if *op == BinOp::Add { Type::Int } else { Type::Bool };
-                    Ok((result_ty, Rc::new(Expr::BinOp(*op, l3, r3))))
+                    Ok((result_ty, row, Rc::new(Expr::BinOp(*op, l3, r3))))
                 }
                 // Equality: operands just need to be consistent with EACH
                 // OTHER, not both forced to Int -- `true == false` is a
@@ -163,35 +201,41 @@ pub fn elaborate(expr: &Expr, ctx: &Ctx) -> Result<(Type, Rc<Expr>), TypeError> 
                     } else {
                         r2
                     };
-                    Ok((Type::Bool, Rc::new(Expr::BinOp(*op, l3, r3))))
+                    Ok((Type::Bool, row, Rc::new(Expr::BinOp(*op, l3, r3))))
                 }
             }
         }
 
         Expr::If(c, t, e) => {
-            let (c_ty, c2) = elaborate(c, ctx)?;
+            let (c_ty, c_row, c2) = elaborate(c, ctx)?;
             let c3 = coerce(c2, &c_ty, &Type::Bool)?;
-            let (t_ty, t2) = elaborate(t, ctx)?;
-            let (e_ty, e2) = elaborate(e, ctx)?;
+            let (t_ty, t_row, t2) = elaborate(t, ctx)?;
+            let (e_ty, e_row, e2) = elaborate(e, ctx)?;
             // Branches with differing concrete types aren't an error here
             // (no union types) -- just widen to Dyn rather than reject.
             let result_ty = if t_ty == e_ty { t_ty } else { Type::Dyn };
-            Ok((result_ty, Rc::new(Expr::If(c3, t2, e2))))
+            // Only one branch runs, but which one isn't known statically,
+            // so the possible effects are the union of both.
+            let row = EffectRow::union(&c_row, &EffectRow::union(&t_row, &e_row));
+            Ok((result_ty, row, Rc::new(Expr::If(c3, t2, e2))))
         }
 
         Expr::Check(ty, inner) => {
-            let (_, inner2) = elaborate(inner, ctx)?;
-            Ok((ty.clone(), Rc::new(Expr::Check(ty.clone(), inner2))))
+            let (_, row, inner2) = elaborate(inner, ctx)?;
+            Ok((ty.clone(), row, Rc::new(Expr::Check(ty.clone(), inner2))))
         }
 
-        // Effects are untyped for now (later phase: effect typing).
+        // The effect this specific operation performs, plus whatever the
+        // payload expression itself might perform.
         Expr::Perform(effect, payload) => {
-            let (_, payload2) = elaborate(payload, ctx)?;
-            Ok((Type::Dyn, Rc::new(Expr::Perform(effect.clone(), payload2))))
+            let (_, payload_row, payload2) = elaborate(payload, ctx)?;
+            let row = EffectRow::union(&payload_row, &EffectRow::single(effect));
+            Ok((Type::Dyn, row, Rc::new(Expr::Perform(effect.clone(), payload2))))
         }
+
         Expr::Handle { body, handler } => {
-            let (_, body2) = elaborate(body, ctx)?;
-            let (handler_ty, handler2) = elaborate(handler, ctx)?;
+            let (_, body_row, body2) = elaborate(body, ctx)?;
+            let (handler_ty, handler_row, handler2) = elaborate(handler, ctx)?;
             // types.rs has no Type::Handler -- but every handler-producing
             // expression (MakeHandler, or deep(...)/shallow(...) applied
             // to one, or a var bound from either) synthesizes Dyn by this
@@ -203,13 +247,26 @@ pub fn elaborate(expr: &Expr, ctx: &Ctx) -> Result<(Type, Rc<Expr>), TypeError> 
                     "handle: expected a handler value, found expression of type {handler_ty}"
                 )));
             }
-            Ok((Type::Dyn, Rc::new(Expr::Handle { body: body2, handler: handler2 })))
+            // Discharge the effect this handler catches, if we can
+            // statically tell which one that is. If not, conservatively
+            // leave body_row untouched (over-approximate, never hide).
+            let row = match discharged_effect(handler) {
+                Some(effect) => body_row.remove(effect),
+                None => body_row,
+            };
+            let row = EffectRow::union(&row, &handler_row);
+            Ok((Type::Dyn, row, Rc::new(Expr::Handle { body: body2, handler: handler2 })))
         }
+
+        // Constructing the handler value is pure -- the clause body's own
+        // effects (including what `resume` re-enters) aren't modeled here;
+        // see the doc comment on `elaborate`.
         Expr::MakeHandler { effect, payload_var, resume_var, body } => {
             let inner_ctx = extend(&extend(ctx, payload_var, Type::Dyn), resume_var, Type::Dyn);
-            let (_, body2) = elaborate(body, &inner_ctx)?;
+            let (_, _, body2) = elaborate(body, &inner_ctx)?;
             Ok((
                 Type::Dyn,
+                EffectRow::pure(),
                 Rc::new(Expr::MakeHandler {
                     effect: effect.clone(),
                     payload_var: payload_var.clone(),
@@ -222,5 +279,16 @@ pub fn elaborate(expr: &Expr, ctx: &Ctx) -> Result<(Type, Rc<Expr>), TypeError> 
 }
 
 pub fn check(expr: &Rc<Expr>) -> Result<Rc<Expr>, TypeError> {
-    elaborate(expr, &Ctx::empty()).map(|(_, e)| e)
+    let (_, row, elaborated) = elaborate(expr, &Ctx::empty())?;
+    match row {
+        EffectRow::Closed(unhandled) if !unhandled.is_empty() => {
+            let names: Vec<_> = unhandled.into_iter().collect();
+            Err(TypeError(format!(
+                "unhandled effect{}: {}",
+                if names.len() > 1 { "s" } else { "" },
+                names.join(", ")
+            )))
+        }
+        _ => Ok(elaborated),
+    }
 }

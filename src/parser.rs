@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use crate::expr::{BinOp, Expr};
 use crate::lexer::{tokenize, Token};
-use crate::types::Type;
+use crate::types::{EffectRow, Type};
 
 pub fn parse(src: &str) -> Result<Rc<Expr>, String> {
     let tokens = tokenize(src)?;
@@ -75,12 +75,15 @@ impl Parser {
 
     // fun_type := type ("->" fun_type)?  (right-associative) -- only
     // reachable from inside parens, where ")" unambiguously ends it.
+    // No surface syntax for effect rows yet -- a written function type
+    // always gets EffectRow::Dyn (unknown effects, gradual default),
+    // consistent with every other unannotated position.
     fn parse_fun_type(&mut self) -> Result<Type, String> {
         let atom = self.parse_type()?;
         if matches!(self.peek(), Some(Token::Arrow)) {
             self.bump();
             let ret = self.parse_fun_type()?;
-            Ok(Type::Fun(Rc::new(atom), Rc::new(ret)))
+            Ok(Type::Fun(Rc::new(atom), EffectRow::Dyn, Rc::new(ret)))
         } else {
             Ok(atom)
         }

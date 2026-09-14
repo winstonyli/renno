@@ -249,4 +249,75 @@ mod tests {
         let err = typecheck::check(&expr).unwrap_err();
         assert!(err.0.contains("expected a handler value"), "unexpected message: {}", err.0);
     }
+
+    // --- closed effect-row typing ---
+
+    #[test]
+    fn truly_unhandled_effect_rejected_statically() {
+        // No `handle` anywhere -- previously this would only fail at
+        // runtime, inside machine::run, via perform()'s own panic. Now
+        // caught by typecheck::check before anything executes.
+        let expr = parser::parse("perform choose(0)").unwrap();
+        let err = typecheck::check(&expr).unwrap_err();
+        assert!(err.0.contains("unhandled effect") && err.0.contains("choose"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn fully_handled_program_typechecks() {
+        let src = r#"
+            handle
+              let x = perform choose(0) in
+              x + 100
+            with handler choose(p, resume) -> resume(1) + resume(2)
+        "#;
+        let expr = parser::parse(src).unwrap();
+        assert!(typecheck::check(&expr).is_ok());
+    }
+
+    #[test]
+    fn nested_handlers_discharge_different_effects() {
+        let src = r#"
+            handle
+              let x = perform choose(0) in
+              handle
+                perform log(x)
+              with handler log(p, resume) -> resume(0)
+            with handler choose(p, resume) -> resume(1)
+        "#;
+        let expr = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&expr).expect("both effects are handled, should typecheck");
+        machine::run(elaborated, Env::prelude());
+    }
+
+    #[test]
+    fn partially_handled_program_flags_remaining_effect() {
+        // "choose" is handled, "log" is not -- the error should name the
+        // effect that's actually still open, not the one that was handled.
+        let src = r#"
+            handle
+              let x = perform choose(0) in
+              perform log(x)
+            with handler choose(p, resume) -> resume(1)
+        "#;
+        let expr = parser::parse(src).unwrap();
+        let err = typecheck::check(&expr).unwrap_err();
+        assert!(err.0.contains("log"), "unexpected message: {}", err.0);
+        assert!(!err.0.contains("choose"), "handled effect wrongly reported: {}", err.0);
+    }
+
+    #[test]
+    fn dyn_sourced_call_falls_back_permissively() {
+        // `f` is an unannotated (Dyn) lambda parameter, so calling it can't
+        // be proven to perform any particular set of effects -- the whole
+        // expression's row degrades to Dyn rather than a known-unhandled
+        // set. Static check can't reject it, but the real unhandled effect
+        // still panics at runtime exactly as before this feature existed.
+        let src = "(fun f -> f(0))(fun x -> perform mystery(x))";
+        let expr = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&expr).expect("Dyn-sourced call should not be statically rejected");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            machine::run(elaborated, Env::prelude())
+        }));
+        assert!(result.is_err(), "expected the runtime unhandled-effect panic as a fallback");
+    }
 }
