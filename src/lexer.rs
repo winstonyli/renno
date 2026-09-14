@@ -10,6 +10,8 @@ pub enum Token {
     Let,
     #[token("rec")]
     Rec,
+    #[token("data")]
+    Data,
     #[token("in")]
     In,
     #[token("if")]

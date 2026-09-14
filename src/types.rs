@@ -9,13 +9,13 @@ pub enum Type {
     Bool,
     Str,
     // Element type. renno's List is a native primitive (Value::List,
-    // Rc<Vec<Value>>) rather than something expressed via user-defined
-    // algebraic types -- renno still has no ADTs, so there's no
-    // `data List a = Nil | Cons a (List a)` to define it in terms of, even
-    // though `let rec` and pattern matching (expr.rs's Pattern) now cover
-    // the other two prerequisites. Worth revisiting if ADTs land: this
-    // could become sugar over a user-space definition instead of a
-    // builtin, the way it works in languages with real sum types.
+    // Rc<Vec<Value>>), not itself expressed via `data`/Pattern -- but
+    // `data` declarations (see parser::build_ctor_value) go the other way
+    // around: a user-defined ADT desugars INTO a tagged List, rather than
+    // List becoming sugar over an ADT. No nominal Type for those: an ADT
+    // value's type is just whatever a tagged list's structural type
+    // synthesizes to (typically Dyn, since a tag Str and a field of some
+    // other type don't unify to one concrete element type).
     List(Rc<Type>),
     // param, effect row (what calling this may perform), return type.
     Fun(Rc<Type>, EffectRow, Rc<Type>),

@@ -26,6 +26,10 @@ struct Parser {
 enum PendingBinder {
     Let { var: String, ann: Option<Type>, rec: bool, val: ExprRef },
     Fun { param: String, ann: Option<Type> },
+    // `data Name = Ctor1(T, ...) | Ctor2 | ...` -- one pending item expands
+    // to N nested Lets when folded back (one per constructor), not one.
+    // See build_ctor_value for what each constructor's bound value is.
+    Data { ctors: Vec<(String, Vec<Type>)> },
 }
 
 impl Parser {
@@ -88,6 +92,17 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(t)
             }
+            // A capitalized name that isn't one of the built-in type
+            // keywords: a reference to a `data`-declared type (see
+            // build_ctor_value). renno has no nominal Type for these --
+            // an ADT's own field-carrying constructors already synthesize
+            // Dyn-ish structural types (a tagged List), so a field typed
+            // as another data type just resolves to Dyn, same as any other
+            // unmodeled-statically position. This is also what makes a
+            // self-referential field (`Cons(Int, List)` inside `data List`
+            // itself) work with no special-casing: it's just Dyn, nothing
+            // to resolve.
+            Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => Ok(Type::Dyn),
             other => Err(format!("expected a type, found {other:?}")),
         }
     }
@@ -141,6 +156,27 @@ impl Parser {
             Some(Token::True) => Ok(Pattern::Bool(true)),
             Some(Token::False) => Ok(Pattern::Bool(false)),
             Some(Token::Str(s)) => Ok(Pattern::Str(s)),
+            // Case decides Var vs constructor, same convention as ML/
+            // Haskell/OCaml: `x`/`_` bind, `Some`/`None`/`Cons` match a
+            // tag (desugars to the same List shape build_ctor_value
+            // constructs -- Some(p) matches ["Some", p], None matches
+            // ["None"]). Renders this whole feature invisible to
+            // typecheck.rs/machine.rs: they only ever see Pattern::List/Str.
+            Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => {
+                let mut items = vec![Pattern::Str(name)];
+                if matches!(self.peek(), Some(Token::LParen)) {
+                    self.bump();
+                    if !matches!(self.peek(), Some(Token::RParen)) {
+                        items.push(self.pattern()?);
+                        while matches!(self.peek(), Some(Token::Comma)) {
+                            self.bump();
+                            items.push(self.pattern()?);
+                        }
+                    }
+                    self.expect(&Token::RParen)?;
+                }
+                Ok(Pattern::List(items))
+            }
             Some(Token::Ident(name)) => Ok(Pattern::Var(name)),
             Some(Token::LBracket) => {
                 let mut items = Vec::new();
@@ -259,6 +295,50 @@ impl Parser {
                     self.expect(&Token::Arrow)?;
                     pending.push(PendingBinder::Fun { param, ann });
                 }
+                Some(Token::Data) => {
+                    self.bump();
+                    let _type_name = self.ident()?; // not bound to anything -- see build_ctor_value
+                    self.expect(&Token::Equals)?;
+                    let mut ctors = Vec::new();
+                    loop {
+                        let name = self.ident()?;
+                        if !name.chars().next().is_some_and(char::is_uppercase) {
+                            // Pattern parsing (see pattern_atom) uses case
+                            // alone to tell a constructor pattern from an
+                            // ordinary binding -- a lowercase constructor
+                            // name would be unmatchable in a pattern
+                            // (always parsed as Var, never as this ctor's
+                            // tag), so reject it here rather than let that
+                            // surprise show up later.
+                            return Err(format!(
+                                "data {_type_name}: constructor names must start with an uppercase letter, found {name:?}"
+                            ));
+                        }
+                        let field_tys = if matches!(self.peek(), Some(Token::LParen)) {
+                            self.bump();
+                            let mut tys = Vec::new();
+                            if !matches!(self.peek(), Some(Token::RParen)) {
+                                tys.push(self.parse_fun_type()?);
+                                while matches!(self.peek(), Some(Token::Comma)) {
+                                    self.bump();
+                                    tys.push(self.parse_fun_type()?);
+                                }
+                            }
+                            self.expect(&Token::RParen)?;
+                            tys
+                        } else {
+                            Vec::new()
+                        };
+                        ctors.push((name, field_tys));
+                        if matches!(self.peek(), Some(Token::Pipe)) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&Token::In)?;
+                    pending.push(PendingBinder::Data { ctors });
+                }
                 _ => break,
             }
         }
@@ -268,9 +348,41 @@ impl Parser {
             result = match binder {
                 PendingBinder::Let { var, ann, rec, val } => self.arena.push(Expr::Let(var, ann, val, result, rec)),
                 PendingBinder::Fun { param, ann } => self.arena.push(Expr::Lambda(param, ann, result)),
+                PendingBinder::Data { ctors } => {
+                    let mut body = result;
+                    for (name, field_tys) in ctors.into_iter().rev() {
+                        let val = self.build_ctor_value(&name, &field_tys);
+                        body = self.arena.push(Expr::Let(name, None, val, body, false));
+                    }
+                    body
+                }
             };
         }
         Ok(result)
+    }
+
+    // ADTs are sugar over renno's existing native List: a constructed value
+    // IS a List whose first element is a Str tag (the constructor name)
+    // and whose remaining elements are the fields -- e.g. `Some(5)` is
+    // `["Some", 5]`, `None` is `["None"]`. That's a plain value with no new
+    // Value representation, and it's exactly the shape pattern_atom's
+    // constructor-pattern case (below) already expects, so match "just
+    // works" with zero changes to typecheck.rs or machine.rs. A 0-arity
+    // constructor is that List literal directly; an n-arity one is a chain
+    // of n curried Lambdas (annotated with the declared field types, so
+    // e.g. `Some("x")` is rejected statically) ending in the List literal.
+    fn build_ctor_value(&mut self, name: &str, field_tys: &[Type]) -> ExprRef {
+        let tag = self.arena.push(Expr::Str(name.to_string()));
+        let mut items = vec![tag];
+        let params: Vec<String> = (0..field_tys.len()).map(|i| format!("_{i}")).collect();
+        for p in &params {
+            items.push(self.arena.push(Expr::Var(p.clone())));
+        }
+        let mut value = self.arena.push(Expr::ListLit(items));
+        for (p, ty) in params.iter().zip(field_tys.iter()).rev() {
+            value = self.arena.push(Expr::Lambda(p.clone(), Some(ty.clone()), value));
+        }
+        value
     }
 
     // Every atom form except `let`/`fun`, which `atom` handles iteratively

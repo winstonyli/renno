@@ -358,6 +358,49 @@ mod tests {
         assert!(err.0.contains("can never match"), "unexpected message: {}", err.0);
     }
 
+    // --- ADTs (sugar over tagged Lists -- see parser::build_ctor_value) ---
+
+    #[test]
+    fn adt_nullary_and_unary_constructors_round_trip_through_match() {
+        let src = "data Option = None | Some(Int) in match Some(5) with | None -> 0 | Some(x) -> x";
+        assert_eq!(run_untyped(src).as_int(), 5);
+    }
+
+    #[test]
+    fn adt_nullary_constructor_matches_its_own_arm() {
+        let src = "data Option = None | Some(Int) in match None with | None -> 0 | Some(x) -> x";
+        assert_eq!(run_untyped(src).as_int(), 0);
+    }
+
+    #[test]
+    fn adt_self_referential_field_supports_recursive_structures() {
+        // `List`'s own name used as Cons's second field type -- resolves to
+        // Dyn (see parse_type's uppercase-Ident fallback), which is what
+        // makes a recursive type nameable at all with no name-resolution
+        // pass. Constructors are curried like every other multi-arg
+        // callable in renno (fold, map): Cons(1)(rest), not Cons(1, rest).
+        let src = r#"
+            data List = Nil | Cons(Int, List) in
+            let rec sum = fun l -> match l with | Nil -> 0 | Cons(h, t) -> h + sum(t) in
+            sum(Cons(1)(Cons(2)(Cons(3)(Nil))))
+        "#;
+        assert_eq!(run_untyped(src).as_int(), 6);
+    }
+
+    #[test]
+    fn adt_constructor_argument_is_type_checked_statically() {
+        let src = r#"data Option = None | Some(Int) in Some("x")"#;
+        let (mut arena, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
+        assert!(err.0.contains("expected Int, found Str"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn adt_lowercase_constructor_name_rejected_at_parse_time() {
+        let err = parser::parse("data Option = none | Some(Int) in None").unwrap_err();
+        assert!(err.contains("uppercase"), "unexpected message: {err}");
+    }
+
     // --- row polymorphism ---
 
     // `f`'s row is a variable (`{e}`), not Dyn -- so calling it isn't a

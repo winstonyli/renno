@@ -1,0 +1,19 @@
+// ADTs: sugar over renno's native List, not a new Value kind. `Some(5)` IS
+// `["Some", 5]`; `None` IS `["None"]` -- see parser::build_ctor_value. That
+// means match "just works" against them with the same List patterns
+// pattern_matching.rn already uses, and constructors are curried like any
+// other multi-arg callable (fold, map): `Cons(1)(rest)`, not `Cons(1, rest)`.
+//
+// A recursive type (List referencing itself in Cons's own field list)
+// needs no forward declaration or special casing: an unmodeled field type
+// just resolves to Dyn, so naming your own type is no different from
+// naming any other type this checker doesn't track structurally.
+data List = Nil | Cons(Int, List) in
+
+let rec sum = fun l ->
+  match l with
+  | Nil -> 0
+  | Cons(h, t) -> h + sum(t)
+in
+
+sum(Cons(1)(Cons(2)(Cons(3)(Nil))))
