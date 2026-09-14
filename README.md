@@ -1,0 +1,151 @@
+# renno
+
+A small scripting language with algebraic effect handlers and gradual typing, implemented in Rust as a trampolined CEK-style abstract machine.
+
+```
+let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in fact(10)
+```
+
+## Highlights
+
+- **Algebraic effects**: `perform`/`handle`, first-class handler values, deep and shallow semantics, and genuine multi-shot resumption (a captured continuation can be resumed zero, one, or many times).
+- **Gradual typing**: every position is `Dyn` unless annotated. Annotated code is checked statically and pays no runtime cost; annotated boundaries crossed by an unannotated (`Dyn`) value get a runtime check inserted automatically.
+- **Closed and row-polymorphic effect typing**: `check()` statically rejects a program if it can prove an effect is never handled. Row-polymorphic function types (`(Dyn ->{e} Dyn)`) let effect-safety survive through higher-order calls.
+- **`let rec` and mutual recursion**: `let rec f = ... and g = ... in ...` — any function in the group can call any sibling (including itself) by name.
+- **Pattern matching**: literals, lists (`[]`, `[a, b]`, `h :: t`), and ADT constructors, with static exhaustiveness and reachability checking wherever those are cheaply provable.
+- **ADTs**: `data Option = None | Some(Int) in ...`, desugared entirely into tagged lists and ordinary pattern matching — no new runtime representation. Constructors get real nominal types (`Type::Data`), so two differently-named types with identical shapes aren't interchangeable.
+- **Named-field access**: `data Point = Point(x: Int, y: Int) in ...` lets you write `p.x` instead of pattern-matching out a field by position, for any `data` type with exactly one constructor.
+- **Diagnostics**: every parse error, type error, and runtime panic reports a `line, column` location with a source snippet and a caret, not just a bare message.
+- **Multi-line REPL**: `let`/`match`/`data` blocks spanning multiple lines can be typed directly at the prompt.
+
+## Quick start
+
+Run a file:
+
+```bash
+cargo run --release -- examples/mutual_recursion.rn
+```
+
+Start the REPL:
+
+```bash
+cargo run --release
+```
+
+Run the test suite:
+
+```bash
+cargo test
+```
+
+Run the benchmarks:
+
+```bash
+cargo bench
+```
+
+## Language tour
+
+### Values and arithmetic
+
+```
+1 + 2 * 3        -- 7, usual precedence
+"a" ++ "b"       -- "ab"
+[1, 2] ++ [3]    -- [1, 2, 3]
+true == false    -- false
+```
+
+### Functions, currying, `let`, `let rec`
+
+Functions are curried closures; `fun a -> fun b -> ...` and calling `f(a)(b)` are the normal shape:
+
+```
+let add = fun a -> fun b -> a + b in add(1)(2)   -- 3
+```
+
+`let rec` makes a binding visible inside its own value, for recursion that an ordinary `let` can't express:
+
+```
+let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in fact(5)   -- 120
+```
+
+`and` extends this to a group of mutually recursive functions:
+
+```
+let rec is_even = fun n -> if n == 0 then true else is_odd(n - 1)
+and is_odd = fun n -> if n == 0 then false else is_even(n - 1)
+in is_even(10)
+```
+
+### Pattern matching
+
+```
+match xs with
+| [] -> 0
+| h :: t -> h + sum(t)
+```
+
+A match is rejected statically if it's missing an obviously necessary case (`[]`/`h :: t` both present, `true`/`false` both present, or every constructor a `data` type declared), and if an earlier arm already covers everything a later one would ever match.
+
+### ADTs and named fields
+
+```
+data Option = None | Some(Int) in
+match Some(5) with
+| None -> 0
+| Some(x) -> x
+```
+
+```
+data Point = Point(x: Int, y: Int) in
+let p = Point(3)(4) in
+p.x * p.x + p.y * p.y   -- 25
+```
+
+Constructors are curried like any other multi-argument callable (`Point(3)(4)`, not `Point(3, 4)`).
+
+### Effects
+
+```
+handle
+  let x = perform choose(0) in
+  x + 100
+with handler choose(p, resume) -> resume(1) + resume(2)   -- 203, multi-shot
+```
+
+`deep(handler ...)` reinstalls the handler around a resumed continuation, so it also catches an effect performed again during the resume; `shallow(handler ...)` (the default) does not.
+
+### Gradual typing
+
+```
+let f = fun x: Int -> x + 1 in f(41)     -- checked statically, no runtime check inserted
+```
+
+```
+handle
+  let y = perform choose(0) in           -- y: Dyn, unknown until runtime
+  let f = fun x: Int -> x + 1 in
+  f(y)                                    -- a runtime Check is inserted here
+with handler choose(p, resume) -> resume(41)
+```
+
+More complete examples for every feature above live in [`examples/`](examples/).
+
+## Architecture
+
+- `lexer.rs` — logos-based tokenizer.
+- `parser.rs` — recursive-descent parser into an arena-allocated AST (`expr.rs`); iteratively flattens long `let`/`fun`/`data` chains to keep native stack usage O(1) regardless of chain length.
+- `typecheck.rs` — bidirectional-lite gradual type checker: infers types and effect rows in one pass, inserts `Check` nodes (or full higher-order contracts) only at `Dyn`-to-concrete boundaries, and checks match exhaustiveness/reachability.
+- `machine.rs` — a trampolined CEK-style step loop (`cont.rs` holds the defunctionalized continuation frames). No native recursion during evaluation, so no stack-overflow risk from deep programs or from resuming captured continuations.
+- `value.rs` — runtime value representation.
+- `plist.rs` — the persistent linked list `Env` and typecheck's context are both built from.
+- `span.rs` — source locations and the snippet-with-caret error rendering shared by every error path.
+
+`run_source` (`lib.rs`) runs the whole parse → typecheck → run pipeline on a dedicated large-stack worker thread, since the parser and type checker are ordinary native recursive descent (unlike the machine, which is trampolined).
+
+## Known limitations
+
+- Effect-row inference doesn't look inside a handler clause's own body — what a handler does when it resumes isn't modeled.
+- A runtime type check at a `Dyn`-to-`Data(name)` boundary can only confirm "this is some tagged value," not "specifically this data type" — no type name is stamped into values at runtime.
+- Match exhaustiveness and reachability are checked only where cheaply provable (see the doc comments on `missing_case`/`first_unreachable` in `typecheck.rs`); anything past that silently falls back to a runtime panic.
+- A runtime panic's reported location is the last expression *evaluated*, not necessarily the exact sub-expression at fault a few steps later.
