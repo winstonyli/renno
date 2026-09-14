@@ -51,7 +51,7 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                     cont = Cont::cons(Frame::PerformPayload { effect: effect.clone() }, cont);
                     control = Control::Eval(payload.clone(), env);
                 }
-                Expr::Handle { body, effect, payload_var, resume_var, handler } => {
+                Expr::Handle { body, effect, payload_var, resume_var, handler, deep } => {
                     cont = Cont::cons(
                         Frame::HandlerMark {
                             effect: effect.clone(),
@@ -59,6 +59,7 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                             resume_var: resume_var.clone(),
                             handler_body: handler.clone(),
                             env: env.clone(),
+                            deep: *deep,
                         },
                         cont,
                     );
@@ -147,9 +148,19 @@ fn perform(cont: &mut Cont, effect: &str, payload: Value) -> Control {
         match &*node.0 {
             ContNode::Nil => panic!("unhandled effect: {effect}"),
             ContNode::Frame(frame, rest) => {
-                if let Frame::HandlerMark { effect: e, payload_var, resume_var, handler_body, env } = frame {
+                if let Frame::HandlerMark { effect: e, payload_var, resume_var, handler_body, env, deep } = frame {
                     if e == effect {
-                        let mut k = Cont::nil();
+                        // deep: reinstall this same HandlerMark at the far
+                        // end of k, exactly where it originally sat, so an
+                        // effect performed while running the resumed
+                        // continuation is caught by this handler again.
+                        // shallow: k ends bare -- a repeat occurrence
+                        // escapes to whatever handler sits further out.
+                        let mut k = if *deep {
+                            Cont::cons(frame.clone(), Cont::nil())
+                        } else {
+                            Cont::nil()
+                        };
                         for f in captured.into_iter().rev() {
                             k = Cont::cons(f, k);
                         }

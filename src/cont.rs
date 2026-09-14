@@ -22,6 +22,7 @@ pub enum Frame {
         resume_var: String,
         handler_body: Rc<Expr>,
         env: Env,
+        deep: bool,
     },
 }
 

@@ -16,5 +16,9 @@ pub enum Expr {
         payload_var: String,
         resume_var: String,
         handler: Rc<Expr>,
+        // deep: handler reinstalls itself around the resumed continuation,
+        // so a later occurrence of the same effect inside it is caught
+        // again by this handler. shallow: handles one occurrence only.
+        deep: bool,
     },
 }
