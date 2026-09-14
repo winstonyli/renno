@@ -7,18 +7,19 @@
 // here at parse time since the value's already known), or deferred to
 // runtime (an unannotated/Dyn-sourced value's real type/shape).
 //
-// renno has no `>`/`<=`/`>=` or boolean and/or/not yet, so a predicate is
-// limited to what `<`/`==` and arithmetic alone can express -- `0 < n`
-// for "n is positive", here.
+// renno has no `>`/`<=`/`>=` yet, so a predicate leans on `<`/`==` and
+// arithmetic (`0 < n` for "n is positive") -- but `&&`/`||`/`!` DO exist,
+// and compound predicates are just as provable: try_eval_bool recognizes
+// the `if` shape they desugar into and evaluates through it.
 
-// Proven at parse time: 5 is a known literal, `0 < 5` is decidable right
-// here, so this `let` compiles to EXACTLY `let n = 5 in n + 1` -- no
-// wrapping `if`/`fail` at all.
-let proven = let n: Int where 0 < n = 5 in n + 1 in
+// Proven at parse time: 50 is a known literal, `0 < 50 && 50 < 100` is
+// decidable right here, so this `let` compiles to EXACTLY `let n = 50 in
+// n + 1` -- no wrapping `if`/`fail` at all.
+let proven = let n: Int where 0 < n && n < 100 = 50 in n + 1 in
 
 // Not provable (the parameter's actual value is unknown until a caller
-// supplies one) -- becomes a real runtime check: `if n > 0 then n * 2
-// else fail(...)`.
-let double_positive = fun n: Int where 0 < n -> n * 2 in
+// supplies one) -- becomes a real runtime check: `if 0 < n && n < 100
+// then n * 2 else fail(...)`.
+let double_in_range = fun n: Int where 0 < n && n < 100 -> n * 2 in
 
-proven + double_positive(3)
+proven + double_in_range(3)

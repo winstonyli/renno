@@ -359,6 +359,74 @@ mod tests {
         run_untyped(src);
     }
 
+    // --- boolean operators (&&, ||, !) ---
+
+    #[test]
+    fn and_or_not_basic() {
+        assert!(!run_untyped("true && false").as_bool());
+        assert!(run_untyped("true || false").as_bool());
+        assert!(!run_untyped("!true").as_bool());
+        assert!(run_untyped("!false").as_bool());
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        // `false && true || true` is `(false && true) || true` = true,
+        // not `false && (true || true)` = false.
+        assert!(run_untyped("false && true || true").as_bool());
+    }
+
+    #[test]
+    fn comparisons_bind_tighter_than_and() {
+        assert!(run_untyped("1 < 2 && 3 < 4").as_bool());
+    }
+
+    #[test]
+    fn and_short_circuits() {
+        // No handler for `choose` at all -- if `&&` evaluated the RHS
+        // regardless of the LHS, this would panic with an unhandled
+        // effect (caught statically here, since `run_untyped` skips
+        // typecheck but the same over-approximation applies to Int/Bool
+        // typed programs too -- see the doc comment on and_expr/or_expr).
+        // With a real short-circuit, the RHS is never reached at runtime.
+        let src = "handle (false && perform choose(0)) with handler choose(p, resume) -> fail(\"handler was invoked!\")";
+        assert!(!run_untyped(src).as_bool());
+    }
+
+    #[test]
+    fn or_short_circuits() {
+        let src = "handle (true || perform choose(0)) with handler choose(p, resume) -> fail(\"handler was invoked!\")";
+        assert!(run_untyped(src).as_bool());
+    }
+
+    #[test]
+    #[should_panic(expected = "handler was invoked")]
+    fn and_does_not_short_circuit_when_lhs_is_true() {
+        // Sanity check for the two tests above: confirms the handler
+        // WOULD fire (and this test methodology is actually meaningful)
+        // when the RHS really is reached.
+        let src = "handle (true && perform choose(0)) with handler choose(p, resume) -> fail(\"handler was invoked!\")";
+        run_untyped(src);
+    }
+
+    #[test]
+    fn boolean_operators_compose_with_refinement_predicates() {
+        // The `&&` addition directly closes gradual verification's own
+        // documented limitation (only `<`/`==` alone before this).
+        let src = "let n: Int where 0 < n && n < 100 = 50 in n";
+        assert_eq!(run_untyped(src).as_int(), 50);
+    }
+
+    #[test]
+    fn compound_refinement_predicate_is_provable_at_parse_time() {
+        // try_eval_bool's If arm (added specifically because `&&` desugars
+        // into one) is what makes this provable at all -- without it,
+        // this would only be caught by a runtime check, not a parse error.
+        let err = parser::parse("let n: Int where 0 < n && n < 100 = 200 in n").unwrap_err();
+        assert!(err.contains("refinement violated"), "unexpected message: {err}");
+        assert!(err.contains("= 200"), "unexpected message: {err}");
+    }
+
     // --- map/fold: structural recursion over List without let rec ---
 
     #[test]

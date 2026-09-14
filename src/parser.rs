@@ -142,6 +142,18 @@ fn try_eval_bool(arena: &Arena, expr: ExprRef, var_name: &str, subst: i64) -> Op
         Expr::BinOp(BinOp::Eq, l, r) => {
             Some(try_eval_int(arena, *l, var_name, subst)? == try_eval_int(arena, *r, var_name, subst)?)
         }
+        // `&&`/`||`/`!` all desugar into exactly this If shape
+        // (and_expr/or_expr/unary), so evaluating an If by trying its
+        // condition first, then whichever branch that picks, handles all
+        // three uniformly -- a refinement predicate like `0 < n && n <
+        // 100` can still be proven, not just a bare single comparison.
+        Expr::If(c, t, e) => {
+            if try_eval_bool(arena, *c, var_name, subst)? {
+                try_eval_bool(arena, *t, var_name, subst)
+            } else {
+                try_eval_bool(arena, *e, var_name, subst)
+            }
+        }
         _ => None,
     }
 }
@@ -382,9 +394,44 @@ impl<'a> Parser<'a> {
         Ok((name, pat))
     }
 
-    // expr := cmp
+    // expr := or_expr
     fn expr(&mut self) -> Result<ExprRef, String> {
-        self.cmp()
+        self.or_expr()
+    }
+
+    // or_expr := and_expr ("||" and_expr)*  (left-associative, loosest of
+    // the boolean/comparison operators -- standard placement, `&&` binds
+    // tighter). Desugars into `if lhs then true else rhs` -- reusing If's
+    // existing lazy-branch semantics for SHORT-CIRCUITING (`rhs` isn't
+    // evaluated when `lhs` is already true), rather than a new BinOp
+    // (which would evaluate both sides eagerly -- wrong wherever `rhs`
+    // performs an effect or diverges).
+    fn or_expr(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
+        let mut lhs = self.and_expr()?;
+        while matches!(self.peek(), Some(Token::PipePipe)) {
+            self.bump();
+            let rhs = self.and_expr()?;
+            let span = Span { start, end: self.span_before().end };
+            let true_lit = self.push_spanned(Expr::Bool(true), span);
+            lhs = self.push_spanned(Expr::If(lhs, true_lit, rhs), span);
+        }
+        Ok(lhs)
+    }
+
+    // and_expr := cmp ("&&" cmp)*  (left-associative). Same short-
+    // circuiting reasoning as or_expr: `if lhs then rhs else false`.
+    fn and_expr(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
+        let mut lhs = self.cmp()?;
+        while matches!(self.peek(), Some(Token::AmpAmp)) {
+            self.bump();
+            let rhs = self.cmp()?;
+            let span = Span { start, end: self.span_before().end };
+            let false_lit = self.push_spanned(Expr::Bool(false), span);
+            lhs = self.push_spanned(Expr::If(lhs, rhs, false_lit), span);
+        }
+        Ok(lhs)
     }
 
     // cmp := cons (("==" | "<") cons)?  -- non-associative, one comparison
@@ -464,10 +511,15 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    // unary := "-"? postfix -- prefix negation, desugared to `0 - x` at
-    // parse time rather than a new AST node (Sub already exists, and this
-    // is the only user). Right-recursive (`unary` not `postfix` on the
-    // operand) so `- -x` parses too, for whatever that's worth.
+    // unary := ("-" | "!")? postfix -- prefix negation and boolean not,
+    // both desugared at parse time rather than new AST nodes: "-x" into
+    // `0 - x` (Sub already exists, and this is its only user), "!x" into
+    // `if x then false else true` (reuses If, same as and_expr/or_expr --
+    // there's no eagerness concern for a UNARY operator the way there is
+    // for &&/||, but reusing If still means zero new Expr/Value/machine.rs
+    // surface, consistent with how the rest of this parser prefers sugar
+    // over new primitives). Right-recursive (`unary` not `postfix` on the
+    // operand) so `- -x`/`!!x` parse too, for whatever that's worth.
     fn unary(&mut self) -> Result<ExprRef, String> {
         if matches!(self.peek(), Some(Token::Minus)) {
             let start = self.span_at().start;
@@ -476,6 +528,14 @@ impl<'a> Parser<'a> {
             let span = Span { start, end: self.span_before().end };
             let zero = self.push_spanned(Expr::Int(0), span);
             Ok(self.push_spanned(Expr::BinOp(BinOp::Sub, zero, operand), span))
+        } else if matches!(self.peek(), Some(Token::Bang)) {
+            let start = self.span_at().start;
+            self.bump();
+            let operand = self.unary()?;
+            let span = Span { start, end: self.span_before().end };
+            let f = self.push_spanned(Expr::Bool(false), span);
+            let t = self.push_spanned(Expr::Bool(true), span);
+            Ok(self.push_spanned(Expr::If(operand, f, t), span))
         } else {
             self.postfix()
         }

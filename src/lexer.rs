@@ -73,6 +73,19 @@ pub enum Token {
     ColonColon,
     #[token("|")]
     Pipe,
+    // Boolean and/or/not. Longer than a bare `|`, so logos's longest-
+    // match rule prefers this over two separate `|` tokens -- harmless in
+    // practice anyway, since a lone `|` only ever appears between match
+    // arms, never inside an expression, so it can't collide with a valid
+    // `||`. `and`/`or` as WORDS are already taken (`let rec f = ... and
+    // g = ...`), hence symbolic operators here, matching the rest of
+    // renno's operator set (+ - * / == < ++ ::).
+    #[token("&&")]
+    AmpAmp,
+    #[token("||")]
+    PipePipe,
+    #[token("!")]
+    Bang,
     #[token("->")]
     Arrow,
     #[token("=")]

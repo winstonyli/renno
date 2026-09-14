@@ -54,6 +54,9 @@ cargo bench
 "a" ++ "b"       -- "ab"
 [1, 2] ++ [3]    -- [1, 2, 3]
 true == false    -- false
+true && false || true    -- true (&& binds tighter than ||), both short-circuiting
+!true                     -- false
+1 :: 2 :: [3]             -- [1, 2, 3]
 ```
 
 ### Functions, currying, `let`, `let rec`
@@ -151,6 +154,8 @@ let n: Int where 0 < n = 5 in n + 1     -- proven at parse time; compiles to exa
 let f = fun n: Int where 0 < n -> n * 2 in f(-3)   -- a parameter's value is never known this early, so this is a real runtime check -- and it fails
 ```
 
+Compound predicates (`&&`/`||`/`!`) are just as provable — `let n: Int where 0 < n && n < 100 = 200 in n` is a parse-time error, not a runtime one.
+
 More complete examples for every feature above live in [`examples/`](examples/).
 
 ## Architecture
@@ -171,4 +176,4 @@ More complete examples for every feature above live in [`examples/`](examples/).
 - A runtime type check at a `Dyn`-to-`Data(name)` boundary can only confirm "this is some tagged value," not "specifically this data type" — no type name is stamped into values at runtime.
 - Match exhaustiveness and reachability are checked only where cheaply provable (see the doc comments on `missing_case`/`first_unreachable` in `typecheck.rs`); anything past that silently falls back to a runtime panic.
 - A runtime panic's reported location is the last expression *evaluated*, not necessarily the exact sub-expression at fault a few steps later.
-- `where` refinement predicates are limited to what `<`/`==` and arithmetic can express — no `>`/`<=`/`>=`/`!=` or boolean `and`/`or`/`not` yet. Proving is attempted only when the bound value reduces to a closed Int constant at parse time (`try_eval_closed_int`); a Lambda parameter's refinement is never proven statically, since its actual value is unknown until a caller supplies one.
+- `where` refinement predicates are limited to what `<`/`==`, `&&`/`||`/`!`, and arithmetic can express — no `>`/`<=`/`>=`/`!=` yet. Proving is attempted only when the bound value reduces to a closed Int constant at parse time (`try_eval_closed_int`); a Lambda parameter's refinement is never proven statically, since its actual value is unknown until a caller supplies one.
