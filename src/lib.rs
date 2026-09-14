@@ -831,6 +831,27 @@ mod tests {
     }
 
     #[test]
+    fn named_construction_uses_the_shadowing_declarations_own_field_order() {
+        // Two `data Point` blocks with DIFFERENT declared field order.
+        // `Point { x: 1, y: 2 }` in the SECOND block's body must reorder
+        // its args using the SECOND declaration's own order (y, x) --
+        // using the first (shadowed) declaration's order would silently
+        // swap x and y. Regression test for elaborate_node's NamedCall
+        // arm, which looked up `fields` by first match rather than
+        // lexically-current (same bug already fixed for resolve_pattern's
+        // NamedCtor arm and FieldAccess's lookup).
+        let src = r#"
+            data Point = Point(x: Int, y: Int) in
+            data Point = Point(y: Int, x: Int) in
+            let p = Point { x: 1, y: 2 } in
+            match p with | Point { x: a, y: b } -> a * 10 + b
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 12);
+    }
+
+    #[test]
     fn structurally_equivalent_recursive_types_with_different_names_unify() {
         // ListA and ListB are mutually-shaped recursive types with
         // different NAMES but the same ctor names/arities -- comparing

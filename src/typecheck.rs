@@ -1002,7 +1002,10 @@ fn elaborate_node(
                     }
                 }
             };
-            let info = fields.iter().find(|f| f.type_name == type_name).ok_or_else(|| {
+            // `.rev()`: same reasoning as resolve_pattern's NamedCtor arm
+            // and FieldAccess's own lookup -- pick the lexically-current
+            // `data Name`, not the first (possibly already-shadowed) one.
+            let info = fields.iter().rev().find(|f| f.type_name == type_name).ok_or_else(|| {
                 TypeError(format!("cannot use `{{ ... }}` syntax: no known fields for type {type_name}"), spans[callee])
             })?;
             if info.ctors.len() != 1 {
