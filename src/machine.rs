@@ -427,6 +427,13 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value) -> Value {
             }
             Value::Int(l / r)
         }
+        BinOp::Mod => {
+            let (l, r) = (lhs.as_int(), rhs.as_int());
+            if r == 0 {
+                panic!("modulo by zero");
+            }
+            Value::Int(l % r)
+        }
         BinOp::Lt => Value::Bool(lhs.as_int() < rhs.as_int()),
         BinOp::Eq => Value::Bool(value_eq(&lhs, &rhs)),
         BinOp::Concat => match (lhs, rhs) {

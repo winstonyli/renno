@@ -51,6 +51,7 @@ cargo bench
 
 ```
 1 + 2 * 3        -- 7, usual precedence
+7 % 3            -- 1, same precedence as * and /
 "a" ++ "b"       -- "ab"
 [1, 2] ++ [3]    -- [1, 2, 3]
 true == false    -- false

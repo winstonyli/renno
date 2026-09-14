@@ -235,6 +235,30 @@ mod tests {
         assert!(err.0.contains("expected Int, found Bool"), "unexpected message: {}", err.0);
     }
 
+    #[test]
+    fn modulo() {
+        assert_eq!(run_untyped("7 % 3").as_int(), 1);
+        assert_eq!(run_untyped("6 % 3").as_int(), 0);
+        assert_eq!(run_untyped("-7 % 2").as_int(), -1);
+    }
+
+    #[test]
+    fn modulo_binds_as_tightly_as_mul_div() {
+        assert_eq!(run_untyped("2 + 7 % 3").as_int(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "modulo by zero")]
+    fn modulo_by_zero_panics() {
+        run_untyped("5 % 0");
+    }
+
+    #[test]
+    fn modulo_is_provable_in_refinements() {
+        let err = parser::parse("let n: Int where n % 2 == 0 = 5 in n").unwrap_err();
+        assert!(err.contains("refinement violated"), "unexpected message: {err}");
+    }
+
     // --- String/List primitives ---
 
     #[test]

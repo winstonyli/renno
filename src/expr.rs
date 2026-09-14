@@ -71,6 +71,9 @@ pub enum BinOp {
     // dividing by zero panics at runtime (apply_binop), same as any other
     // Dyn-sourced-value mismatch this interpreter can't rule out statically.
     Div,
+    // Remainder, truncating toward zero same as Div (Rust's own `%` on
+    // i64) -- so `-7 % 2` is `-1`, not `1`. Same zero-divisor panic as Div.
+    Mod,
     Eq,
     Lt,
     // `++`: Str++Str or List++List. Kept separate from Add rather than

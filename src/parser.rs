@@ -99,14 +99,14 @@ fn ctor_type(type_name: &str, field_tys: &[(Option<String>, Type)]) -> Type {
 // predicates (desugar_refinement): substitutes `subst` for every Var named
 // `var_name` (the only variable a refinement can meaningfully reference --
 // the value being refined) and tries to reduce to a literal Int, handling
-// only Int literals, that one Var, and +/-/*// over two such. None the
-// moment anything else appears -- the caller falls back to a real runtime
-// check rather than reject the predicate as unsupported syntax, the same
-// "prove what's cheap, defer to runtime otherwise" stance as this
-// checker's other analyses (typecheck's missing_case, dominates). Note
-// renno has no `>`/`<=`/`>=`/`!=` or boolean and/or/not yet -- a predicate
-// is limited to what `<`/`==` and arithmetic alone can express (`0 < n`
-// for "n is positive", say).
+// only Int literals, that one Var, and +, -, *, /, % over two such. None
+// the moment anything else appears -- the caller falls back to a real
+// runtime check rather than reject the predicate as unsupported syntax,
+// the same "prove what's cheap, defer to runtime otherwise" stance as this
+// checker's other analyses (typecheck's missing_case, dominates). A
+// predicate can use any comparison (`<`/`<=`/`>`/`>=`/`==`/`!=`) and
+// `&&`/`||`/`!` freely -- see try_eval_bool, which recognizes the `If`
+// shape all of those desugar into.
 fn try_eval_int(arena: &Arena, expr: ExprRef, var_name: &str, subst: i64) -> Option<i64> {
     match &arena[expr] {
         Expr::Int(n) => Some(*n),
@@ -119,6 +119,7 @@ fn try_eval_int(arena: &Arena, expr: ExprRef, var_name: &str, subst: i64) -> Opt
                 BinOp::Sub => Some(l - r),
                 BinOp::Mul => Some(l * r),
                 BinOp::Div if r != 0 => Some(l / r),
+                BinOp::Mod if r != 0 => Some(l % r),
                 _ => None,
             }
         }
@@ -144,6 +145,7 @@ fn try_eval_closed_int(arena: &Arena, expr: ExprRef) -> Option<i64> {
                 BinOp::Sub => Some(l - r),
                 BinOp::Mul => Some(l * r),
                 BinOp::Div if r != 0 => Some(l / r),
+                BinOp::Mod if r != 0 => Some(l % r),
                 _ => None,
             }
         }
@@ -589,6 +591,7 @@ impl<'a> Parser<'a> {
             let op = match self.peek() {
                 Some(Token::Star) => BinOp::Mul,
                 Some(Token::Slash) => BinOp::Div,
+                Some(Token::Percent) => BinOp::Mod,
                 _ => break,
             };
             self.bump();
