@@ -87,6 +87,16 @@ match xs with
 
 A match is rejected statically if it's missing an obviously necessary case (`[]`/`h :: t` both present, `true`/`false` both present, or every constructor a `data` type declared), and if an earlier arm already covers everything a later one would ever match.
 
+`::` also works as an expression (`h :: t` prepends `h` onto list `t`), not just a pattern, so list-building functions can be written by hand:
+
+```
+let rec map = fun f -> fun xs ->
+  match xs with
+  | [] -> []
+  | h :: t -> f(h) :: map(f)(t)
+in map(fun x -> x * 2)([1, 2, 3])   -- [2, 4, 6]
+```
+
 ### ADTs and named fields
 
 ```

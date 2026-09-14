@@ -78,6 +78,13 @@ pub enum BinOp {
     // generalizing Add's existing Int-only typecheck arm; revisit if `+`
     // overloading turns out to read better in practice.
     Concat,
+    // `h :: t`: prepend h onto list t, producing a new list. The mirror
+    // image of Pattern::Cons, which only DEstructures -- until now there
+    // was no way to CONstruct a list incrementally in-language at all
+    // (only a full [a, b, c] literal or O(n^2) repeated `++`), which is
+    // also why map/fold had to be native Rust-loop builtins rather than
+    // ordinary renno functions written with `let rec` + `match`.
+    Cons,
 }
 
 #[derive(Debug, Clone)]

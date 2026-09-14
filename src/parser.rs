@@ -304,10 +304,10 @@ impl<'a> Parser<'a> {
         self.cmp()
     }
 
-    // cmp := add (("==" | "<") add)?  -- non-associative, one comparison
+    // cmp := cons (("==" | "<") cons)?  -- non-associative, one comparison
     fn cmp(&mut self) -> Result<ExprRef, String> {
         let start = self.span_at().start;
-        let lhs = self.add()?;
+        let lhs = self.cons()?;
         let op = match self.peek() {
             Some(Token::EqEq) => Some(BinOp::Eq),
             Some(Token::Lt) => Some(BinOp::Lt),
@@ -316,11 +316,30 @@ impl<'a> Parser<'a> {
         match op {
             Some(op) => {
                 self.bump();
-                let rhs = self.add()?;
+                let rhs = self.cons()?;
                 let span = Span { start, end: self.span_before().end };
                 Ok(self.push_spanned(Expr::BinOp(op, lhs, rhs), span))
             }
             None => Ok(lhs),
+        }
+    }
+
+    // cons := add ("::" cons)?  (right-associative, via right recursion
+    // rather than a loop, so `1 :: 2 :: [3]` parses as `1 :: (2 :: [3])`
+    // -- the same shape a chain of cons PATTERNS already builds. Binds
+    // looser than "+"/"-"/"*"/"/"/"++" (so `1 + 2 :: xs` is `(1 + 2) ::
+    // xs`) and tighter than "=="/"<", matching the usual OCaml/Haskell
+    // placement for list cons.
+    fn cons(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
+        let lhs = self.add()?;
+        if matches!(self.peek(), Some(Token::ColonColon)) {
+            self.bump();
+            let rhs = self.cons()?;
+            let span = Span { start, end: self.span_before().end };
+            Ok(self.push_spanned(Expr::BinOp(BinOp::Cons, lhs, rhs), span))
+        } else {
+            Ok(lhs)
         }
     }
 

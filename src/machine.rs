@@ -439,6 +439,15 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value) -> Value {
             }
             _ => panic!("++ expects two strings or two lists"),
         },
+        BinOp::Cons => match rhs {
+            Value::List(items) => {
+                let mut v = Vec::with_capacity(items.len() + 1);
+                v.push(lhs);
+                v.extend(items.iter().cloned());
+                Value::List(Rc::new(v))
+            }
+            _ => panic!(":: expects a list on the right"),
+        },
     }
 }
 

@@ -262,6 +262,50 @@ mod tests {
         assert_eq!(run_untyped("len([])").as_int(), 0);
     }
 
+    // --- cons (::) as an expression, not just a pattern ---
+
+    #[test]
+    fn cons_expression_prepends() {
+        assert_eq!(run_untyped("1 :: 2 :: [3]").to_string(), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn cons_binds_looser_than_add() {
+        // `1 + 2 :: [3]` is `(1 + 2) :: [3]`, not `1 + (2 :: [3])` (which
+        // wouldn't even typecheck -- Int + List).
+        assert_eq!(run_untyped("1 + 2 :: [3]").to_string(), "[3, 3]");
+    }
+
+    #[test]
+    fn cons_enables_hand_written_map() {
+        // The actual motivating case: before cons was an expression (only
+        // a pattern), there was no way to build a list incrementally in
+        // renno itself -- map/fold had to be native Rust-loop builtins.
+        let src = "let rec my_map = fun f -> fun xs -> \
+                     match xs with | [] -> [] | h :: t -> f(h) :: my_map(f)(t) \
+                   in my_map(fun x -> x * 2)([1, 2, 3])";
+        assert_eq!(run_untyped(src).to_string(), "[2, 4, 6]");
+    }
+
+    #[test]
+    fn cons_onto_non_list_rejected_statically() {
+        let (mut arena, spans, root) = parser::parse("1 :: 2").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected a list, found Int"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    #[should_panic(expected = ":: expects a list on the right")]
+    fn cons_onto_non_list_panics_at_runtime_for_dyn_sourced_values() {
+        // `perform choose(0)` is Dyn -- passes static checking (Dyn is
+        // consistent with List(Dyn)), but the handler resumes with a
+        // bare Int, which fails at apply_binop instead.
+        let src = "handle 1 :: perform choose(0) with handler choose(p, resume) -> resume(5)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).expect("Dyn-sourced value should not be statically rejected");
+        machine::run(&arena, elaborated, Env::prelude(), &spans);
+    }
+
     // --- map/fold: structural recursion over List without let rec ---
 
     #[test]

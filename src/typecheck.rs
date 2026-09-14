@@ -727,6 +727,29 @@ fn elaborate_node(
                     };
                     Ok((result_ty, row, arena.push(Expr::BinOp(op, l3, r3))))
                 }
+                // `h :: t`: `t` must be List-shaped (or Dyn -- checked no
+                // more precisely than that, same shallow "is this a list
+                // at all" story matches_type already tells everywhere
+                // else, e.g. ADT/FieldAccess's own List(Dyn) checks; a
+                // wrong-shaped Dyn value still fails at apply_binop, just
+                // without a location any more precise than
+                // machine::current_span already gives every other
+                // runtime panic). Result type widens to List(Dyn) unless
+                // `h`'s type and `t`'s element type actually agree.
+                BinOp::Cons => {
+                    let list_of_dyn = Type::List(Rc::new(Type::Dyn));
+                    if !consistent(&r_ty, &list_of_dyn) {
+                        return Err(TypeError(
+                            format!("type mismatch: expected a list, found {r_ty}"),
+                            spans[r],
+                        ));
+                    }
+                    let result_ty = match &r_ty {
+                        Type::List(elem) if **elem == l_ty => Type::List(Rc::new(l_ty.clone())),
+                        _ => Type::List(Rc::new(Type::Dyn)),
+                    };
+                    Ok((result_ty, row, arena.push(Expr::BinOp(op, l2, r2))))
+                }
             }
         }
 

@@ -1,0 +1,13 @@
+// `::` as an EXPRESSION (`h :: t`, prepend h onto list t), not just a
+// pattern. Before this, there was no way to build a list incrementally in
+// renno itself -- only a full `[a, b, c]` literal, or repeated `++`
+// (O(n^2)) -- which is exactly why map/fold (map_and_fold.rn) had to be
+// native Rust-loop builtins rather than ordinary renno functions. Now
+// they could be written by hand, the same way `sum`/`count` in
+// mutual_recursion.rn are:
+let rec my_map = fun f -> fun xs ->
+  match xs with
+  | [] -> []
+  | h :: t -> f(h) :: my_map(f)(t)
+in
+my_map(fun x -> x * 2)([1, 2, 3, 4, 5])
