@@ -665,6 +665,13 @@ impl<'a> Parser<'a> {
     // moved out of the call stack, not the grammar itself.
     fn atom(&mut self) -> Result<ExprRef, String> {
         let mut pending: Vec<(usize, PendingBinder)> = Vec::new();
+        // (ctor name, what self.branded_ctors mapped it to BEFORE a `data`
+        // block in this same chain touched it) -- restored, in reverse, at
+        // the end of this atom() call, so a `data` block's effect on
+        // branded_ctors is scoped to its own `in <body>` the same way its
+        // Env binding already is, not left dangling for the rest of the
+        // file. See the `Some(Token::Data)` arm below.
+        let mut branded_restore: Vec<(String, Option<u64>)> = Vec::new();
         loop {
             match self.peek() {
                 Some(Token::Let) => {
@@ -789,19 +796,30 @@ impl<'a> Parser<'a> {
                     // relevant, named fields are cosmetic).
                     let any_opaque = ctor_has_opaque.iter().any(|&b| b);
                     if any_opaque {
-                        if let Some(missing) =
-                            ctors.iter().zip(&ctor_has_opaque).find(|&(_, &has)| !has).map(|((n, _), _)| n.clone())
+                        // Position, not just name, in the message -- two
+                        // constructors in one block CAN share a name (e.g.
+                        // `Mk(Int) | Mk(Bool, opaque)`), and by-name-only
+                        // reporting can't tell those apart.
+                        if let Some((missing_idx, missing_name)) = ctors
+                            .iter()
+                            .zip(&ctor_has_opaque)
+                            .enumerate()
+                            .find(|&(_, (_, &has))| !has)
+                            .map(|(i, ((n, _), _))| (i, n.clone()))
                         {
-                            let branded = ctors
+                            let (branded_idx, branded_name) = ctors
                                 .iter()
                                 .zip(&ctor_has_opaque)
-                                .find(|&(_, &has)| has)
-                                .map(|((n, _), _)| n.clone())
+                                .enumerate()
+                                .find(|&(_, (_, &has))| has)
+                                .map(|(i, ((n, _), _))| (i, n.clone()))
                                 .unwrap();
                             return Err(self.err_at(
                                 Span { start, end: self.span_before().end },
                                 format!(
-                                    "data {type_name}: `opaque` must appear in every constructor or none -- found on {branded}, missing on {missing}"
+                                    "data {type_name}: `opaque` must appear in every constructor or none -- found on constructor #{} ({branded_name}), missing on constructor #{} ({missing_name})",
+                                    branded_idx + 1,
+                                    missing_idx + 1
                                 ),
                             ));
                         }
@@ -813,6 +831,14 @@ impl<'a> Parser<'a> {
                     // into (and matched against) runtime values.
                     let brand = any_opaque.then_some(start as u64);
                     for (name, _) in &ctors {
+                        // Record what this name mapped to BEFORE this block
+                        // touches it, so it can be put back once this
+                        // block's own `in <body>` scope ends (see
+                        // `branded_restore` below) -- otherwise a `data`
+                        // block nested inside a larger one's body would
+                        // permanently overwrite an outer, still-in-scope
+                        // ctor's brand for the rest of the file.
+                        branded_restore.push((name.clone(), self.branded_ctors.get(name).copied()));
                         match brand {
                             Some(id) => {
                                 self.branded_ctors.insert(name.clone(), id);
@@ -893,6 +919,23 @@ impl<'a> Parser<'a> {
                     self.push_spanned(Expr::DataGroup(Rc::new(info), body), span)
                 }
             };
+        }
+        // Undo every branded_ctors change this atom() call made, in
+        // reverse (LIFO), now that its own body -- the only scope any of
+        // those `data` blocks' brands were ever meant to cover -- is fully
+        // parsed. Without this, a `data` block nested anywhere inside this
+        // body (a let-bound sub-expression, a parenthesized atom, ...)
+        // would permanently clobber an outer, still-in-scope declaration's
+        // brand for the rest of the file.
+        for (name, old) in branded_restore.into_iter().rev() {
+            match old {
+                Some(id) => {
+                    self.branded_ctors.insert(name, id);
+                }
+                None => {
+                    self.branded_ctors.remove(&name);
+                }
+            }
         }
         Ok(result)
     }

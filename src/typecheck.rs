@@ -300,6 +300,17 @@ fn ctor_tag(pat: &Pattern) -> Option<&str> {
 // is the enclosing Match's own span (patterns carry no span of their
 // own), used for every error this can raise: an unknown constructor tag,
 // a field named twice, an unknown field name, or a missing one.
+// Appends a branded type's hidden trailing tag to a ctor-shaped pattern's
+// `items`, if it has one -- the one piece both resolve_pattern's NamedCtor
+// arm and FieldAccess's synthetic pattern need identically (each already
+// has its own `info: &DataInfo` in scope), kept in one place so the two
+// non-adjacent call sites can't independently drift on how it's encoded.
+fn push_brand_tag(items: &mut Vec<Pattern>, brand: Option<u64>) {
+    if let Some(id) = brand {
+        items.push(Pattern::Int(id as i64));
+    }
+}
+
 fn resolve_pattern(pat: &Pattern, fields: &[Rc<DataInfo>], span: Span) -> Result<Pattern, TypeError> {
     match pat {
         Pattern::Var(_) | Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => Ok(pat.clone()),
@@ -311,8 +322,15 @@ fn resolve_pattern(pat: &Pattern, fields: &[Rc<DataInfo>], span: Span) -> Result
             Box::new(resolve_pattern(tail, fields, span)?),
         )),
         Pattern::NamedCtor(tag, named) => {
+            // `.rev()`: `fields` accumulates outer-to-inner as `data`
+            // blocks are peeled (elaborate's DataGroup arm just pushes,
+            // never replaces), so a later, shadowing `data` block that
+            // reuses `tag` sits AFTER the one it shadows. Searching from
+            // the end picks the lexically-current declaration instead of
+            // the first (already-shadowed) one.
             let info = fields
                 .iter()
+                .rev()
                 .find(|f| f.ctors.iter().any(|(n, field_names)| n == tag && !field_names.is_empty()))
                 .ok_or_else(|| TypeError(format!("no `data` type has a constructor `{tag}` with named fields"), span))?;
             let (_, field_names) = info.ctors.iter().find(|(n, _)| n == tag).unwrap();
@@ -341,9 +359,7 @@ fn resolve_pattern(pat: &Pattern, fields: &[Rc<DataInfo>], span: Span) -> Result
             // this type only ever matches a value this EXACT `data` block
             // produced, the same defense positional patterns get via
             // Parser::branded_ctors.
-            if let Some(id) = info.brand {
-                items.push(Pattern::Int(id as i64));
-            }
+            push_brand_tag(&mut items, info.brand);
             Ok(Pattern::List(items))
         }
     }
@@ -910,7 +926,11 @@ fn elaborate_node(
                     ))
                 }
             };
-            let info = fields.iter().find(|f| f.type_name == type_name).ok_or_else(|| {
+            // `.rev()`: pick the lexically-current (most recently
+            // declared) `data Name` when one shadows an earlier same-named
+            // block, not the first/outer one -- same reasoning as
+            // resolve_pattern's NamedCtor arm.
+            let info = fields.iter().rev().find(|f| f.type_name == type_name).ok_or_else(|| {
                 TypeError(format!("cannot access field `{field}`: no known fields for type {type_name}"), spans[target])
             })?;
             if info.ctors.len() != 1 {
@@ -946,9 +966,7 @@ fn elaborate_node(
             // still reach here having slipped past a shallow runtime
             // Check -- matching the exact brand catches that instead of
             // silently reading a field off the wrong declaration's value.
-            if let Some(id) = info.brand {
-                items.push(Pattern::Int(id as i64));
-            }
+            push_brand_tag(&mut items, info.brand);
             let var_ref = arena.push(Expr::Var("__field".to_string()));
             let arms = Rc::new(vec![(Pattern::List(items), var_ref)]);
             let match_expr = arena.push(Expr::Match(target2, arms));

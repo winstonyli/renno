@@ -208,7 +208,7 @@ pub struct DataInfo {
     //     Data type except itself (types::consistent_inner), opting out
     //     of the default structural comparison.
     //   - runtime: `id` is genuinely stamped into every constructor's
-    //     built value as a hidden trailing List element (see
+    //     built value as a trailing List element (see
     //     parser::build_ctor_value), and into every pattern that can
     //     match it (positional via Parser::branded_ctors, named via
     //     typecheck::resolve_pattern, FieldAccess's own synthetic
@@ -216,6 +216,12 @@ pub struct DataInfo {
     //     against the EXACT declaration that produced it, not merely one
     //     with the same name and shape (see types::Type::Data's doc
     //     comment for the shadowing case this does and doesn't cover).
+    //     "Hidden" only means invisible to ordinary pattern matching and
+    //     field access, NOT invisible to Value's own Display or its
+    //     Outcome conversion (value.rs) -- neither knows a value's static
+    //     type, so neither can tell "real field" from "brand tag" to
+    //     leave the id out. A branded value printed or returned at the
+    //     top level shows its raw id as an extra trailing element.
     // None (the default) means fully structural and zero runtime
     // footprint: two `data` types with the same set of constructor names
     // and field types unify, regardless of their own names, the way two
