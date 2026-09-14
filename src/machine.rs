@@ -102,6 +102,13 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont) -> Value {
                     cont = Cont::cons(Frame::MatchArms { arms: arms.clone(), env: env.clone() }, cont);
                     control = Control::Eval(*scrutinee, env);
                 }
+                // Pure compile-time marker for typecheck (see Expr's doc
+                // comment on this variant) -- a typechecked program never
+                // has one (elaborate unwraps it), but the untyped path
+                // (e.g. tests' run_untyped) runs the parser's raw output
+                // directly, so this still needs to evaluate straight
+                // through to `body`.
+                Expr::DataGroup(_, body) => control = Control::Eval(*body, env),
                 Expr::MakeHandler { effect, payload_var, resume_var, body } => {
                     control = Control::Apply(Value::Handler(Rc::new(HandlerData {
                         effect: effect.clone(),

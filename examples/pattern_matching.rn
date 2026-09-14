@@ -1,7 +1,12 @@
 // Pattern matching: `match e with | pat -> body | ...`, tried top to
-// bottom, first match wins. No ADTs yet, so patterns destructure only
-// renno's native shapes: literals, and List's two forms -- `[]`/`[p, ...]`
-// (fixed length) and `h :: t` (cons, matches any non-empty list).
+// bottom, first match wins. Patterns destructure renno's native shapes:
+// literals, `data`-declared constructors (see adts.rn), and List's two
+// forms -- `[]`/`[p, ...]` (fixed length) and `h :: t` (cons, matches any
+// non-empty list).
+//
+// `[]` + `h :: t` together are recognized as exhaustive -- try deleting
+// either arm below and rerunning; typecheck rejects it before anything
+// runs, rather than waiting for a "match failed" panic at some input.
 //
 // This combines with `let rec` for real list-consuming recursion: `sum`
 // below is the pattern-matching equivalent of a `fold`, written by hand.

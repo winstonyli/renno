@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern};
@@ -349,12 +350,13 @@ impl Parser {
                 PendingBinder::Let { var, ann, rec, val } => self.arena.push(Expr::Let(var, ann, val, result, rec)),
                 PendingBinder::Fun { param, ann } => self.arena.push(Expr::Lambda(param, ann, result)),
                 PendingBinder::Data { ctors } => {
+                    let tags: BTreeSet<String> = ctors.iter().map(|(name, _)| name.clone()).collect();
                     let mut body = result;
                     for (name, field_tys) in ctors.into_iter().rev() {
                         let val = self.build_ctor_value(&name, &field_tys);
                         body = self.arena.push(Expr::Let(name, None, val, body, false));
                     }
-                    body
+                    self.arena.push(Expr::DataGroup(Rc::new(tags), body))
                 }
             };
         }

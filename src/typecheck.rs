@@ -232,6 +232,76 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern) -> Ctx {
     }
 }
 
+// The literal tag at the front of an ADT constructor pattern -- a
+// Pattern::List whose first element is a Pattern::Str (see parser.rs's
+// pattern_atom, which builds exactly this shape for `Some(x)`/`None`).
+// Anything else (a raw list pattern with no such tag, a literal, Var,
+// Cons) isn't a constructor pattern, so None.
+fn ctor_tag(pat: &Pattern) -> Option<&str> {
+    match pat {
+        Pattern::List(items) => match items.first() {
+            Some(Pattern::Str(tag)) => Some(tag.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// Exhaustiveness is checked only where it's cheaply provable -- same stance
+// as everywhere else in this checker (effect rows, list-length arity):
+// stay silent and defer to match_pattern's own runtime panic rather than
+// try to enumerate an open domain (Int and Str literals, in particular,
+// never close). Four shapes are recognized as covering every possible
+// value:
+//   - any Var (including "_") pattern present, anywhere -- matches
+//     everything by itself.
+//   - Bool: both `true` and `false` literals present.
+//   - List: both `[]` and an unconstrained `h :: t` present (`h`/`t`
+//     themselves must be Var -- `1 :: t` only covers SOME non-empty
+//     lists, not all of them).
+//   - a `data`-declared type: every arm's pattern is an ADT constructor
+//     tag (ctor_tag), and that exact set of tags matches one of the
+//     constructor sets `data` recorded (see Expr::DataGroup).
+// Anything else is reported as possibly non-exhaustive: Int/Str literals
+// with no catch-all, a List match using only fixed-length patterns, or an
+// ADT match that doesn't cover every constructor its `data` declared.
+fn missing_case(patterns: &[Pattern], groups: &[BTreeSet<String>]) -> Option<String> {
+    if patterns.iter().any(|p| matches!(p, Pattern::Var(_))) {
+        return None;
+    }
+
+    let has_true = patterns.iter().any(|p| matches!(p, Pattern::Bool(true)));
+    let has_false = patterns.iter().any(|p| matches!(p, Pattern::Bool(false)));
+    if has_true && has_false {
+        return None;
+    }
+
+    let has_nil = patterns.iter().any(|p| matches!(p, Pattern::List(items) if items.is_empty()));
+    let has_full_cons = patterns.iter().any(
+        |p| matches!(p, Pattern::Cons(h, t) if matches!(**h, Pattern::Var(_)) && matches!(**t, Pattern::Var(_))),
+    );
+    if has_nil && has_full_cons {
+        return None;
+    }
+
+    let tags: Option<BTreeSet<String>> = patterns.iter().map(|p| ctor_tag(p).map(str::to_string)).collect();
+    if let Some(tags) = &tags {
+        if groups.iter().any(|g| g == tags) {
+            return None;
+        }
+    }
+
+    Some(if has_true || has_false {
+        "the missing Bool case (add `true`/`false`, or a wildcard `_` arm)".to_string()
+    } else if has_nil || has_full_cons {
+        "the missing List case (add `[]`/`h :: t`, or a wildcard `_` arm)".to_string()
+    } else if tags.is_some() {
+        "a constructor this `data` declared (add it, or a wildcard `_` arm)".to_string()
+    } else {
+        "some value not covered by any arm (add a wildcard `_` arm)".to_string()
+    })
+}
+
 // Bidirectional-lite synthesis: walks the tree once, producing the
 // inferred Type, the inferred EffectRow (closed, no polymorphism -- just
 // the union of effect names this expression's evaluation might perform),
@@ -249,7 +319,12 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern) -> Ctx {
 // sound: check() below rejects a program only when it can prove an effect
 // is never discharged, and stays silent (deferring to today's runtime
 // panic) whenever it can't prove either way.
-fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, EffectRow, ExprRef), TypeError> {
+fn elaborate(
+    arena: &mut Arena,
+    expr: ExprRef,
+    ctx: &Ctx,
+    groups: &[BTreeSet<String>],
+) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     // Peels off a run of leading `let`/`fun` prefixes iteratively -- a
     // match per iteration, not a recursive call -- so a long chain of
     // either (sequential `let`s, or a deeply curried `fun a -> fun b ->
@@ -265,6 +340,7 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, Effec
     let mut pending = Vec::new();
     let mut cur_expr = expr;
     let mut cur_ctx: Ctx = ctx.clone();
+    let mut cur_groups: Vec<BTreeSet<String>> = groups.to_vec();
     loop {
         // Expr is Clone and, now that its fields are ExprRef (Copy)
         // instead of Rc<Expr>, cheap to clone -- this ends the borrow on
@@ -283,7 +359,7 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, Effec
                     (true, Some(t)) => extend(&cur_ctx, &var, t.clone()),
                     _ => cur_ctx.clone(),
                 };
-                let (val_ty, val_row, val2) = elaborate(arena, val, &val_ctx)?;
+                let (val_ty, val_row, val2) = elaborate(arena, val, &val_ctx, &cur_groups)?;
                 let (bound_ty, val3) = match ann {
                     Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t)?),
                     None => (val_ty, val2),
@@ -298,11 +374,25 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, Effec
                 pending.push(PendingElab::Fun { param, param_ty });
                 cur_expr = body;
             }
+            // Transparent marker for a `data` declaration's constructor tag
+            // set (see parser::build_ctor_value) -- peeled here, not left
+            // as a plain elaborate_node case, for the same reason Let/
+            // Lambda are: a long chain of `data` blocks costs O(1) native
+            // stack, not O(chain length). Nothing folds back for it: the
+            // elaborated tree drops this node entirely -- machine.rs's own
+            // passthrough arm only matters on the un-typechecked path
+            // (e.g. tests' run_untyped). Its only job here is extending
+            // `cur_groups` so a later Match in `body` can check
+            // exhaustiveness against it (see missing_case).
+            Expr::DataGroup(tags, body) => {
+                cur_groups.push((*tags).clone());
+                cur_expr = body;
+            }
             _ => break,
         }
     }
 
-    let (mut result_ty, mut result_row, mut result_expr) = elaborate_node(arena, cur_expr, &cur_ctx)?;
+    let (mut result_ty, mut result_row, mut result_expr) = elaborate_node(arena, cur_expr, &cur_ctx, &cur_groups)?;
 
     for frame in pending.into_iter().rev() {
         match frame {
@@ -326,9 +416,14 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, Effec
     Ok((result_ty, result_row, result_expr))
 }
 
-// Every Expr variant except Let/Lambda, which `elaborate` peels off
-// iteratively above -- reached only once no more chain prefix remains.
-fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, EffectRow, ExprRef), TypeError> {
+// Every Expr variant except Let/Lambda/DataGroup, which `elaborate` peels
+// off iteratively above -- reached only once no more chain prefix remains.
+fn elaborate_node(
+    arena: &mut Arena,
+    expr: ExprRef,
+    ctx: &Ctx,
+    groups: &[BTreeSet<String>],
+) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     let node = arena[expr].clone();
     match node {
         Expr::Int(_) => Ok((Type::Int, EffectRow::pure(), expr)),
@@ -341,7 +436,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
             let mut elem_ty: Option<Type> = None;
             let mut refs = Vec::with_capacity(items.len());
             for item in items {
-                let (item_ty, item_row, item2) = elaborate(arena, item, ctx)?;
+                let (item_ty, item_row, item2) = elaborate(arena, item, ctx, groups)?;
                 row = EffectRow::union(&row, &item_row);
                 refs.push(item2);
                 // Same rule as If's branches: differing concrete element
@@ -356,13 +451,13 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
             Ok((list_ty, row, arena.push(Expr::ListLit(refs))))
         }
 
-        Expr::Let(..) | Expr::Lambda(..) => {
-            unreachable!("Let/Lambda are peeled by elaborate's chain-flattening loop")
+        Expr::Let(..) | Expr::Lambda(..) | Expr::DataGroup(..) => {
+            unreachable!("Let/Lambda/DataGroup are peeled by elaborate's chain-flattening loop")
         }
 
         Expr::App(f, a) => {
-            let (f_ty, f_row, f2) = elaborate(arena, f, ctx)?;
-            let (a_ty, a_row, a2) = elaborate(arena, a, ctx)?;
+            let (f_ty, f_row, f2) = elaborate(arena, f, ctx, groups)?;
+            let (a_ty, a_row, a2) = elaborate(arena, a, ctx, groups)?;
             let (call_row, ret_ty, app2) = match &f_ty {
                 Type::Fun(param_ty, call_row, ret_ty) => {
                     let a3 = coerce(arena, a2, &a_ty, param_ty)?;
@@ -395,8 +490,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
         }
 
         Expr::BinOp(op, l, r) => {
-            let (l_ty, l_row, l2) = elaborate(arena, l, ctx)?;
-            let (r_ty, r_row, r2) = elaborate(arena, r, ctx)?;
+            let (l_ty, l_row, l2) = elaborate(arena, l, ctx, groups)?;
+            let (r_ty, r_row, r2) = elaborate(arena, r, ctx, groups)?;
             let row = EffectRow::union(&l_row, &r_row);
             match op {
                 // Arithmetic and ordering: both operands must be Int.
@@ -468,10 +563,10 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
         }
 
         Expr::If(c, t, e) => {
-            let (c_ty, c_row, c2) = elaborate(arena, c, ctx)?;
+            let (c_ty, c_row, c2) = elaborate(arena, c, ctx, groups)?;
             let c3 = coerce(arena, c2, &c_ty, &Type::Bool)?;
-            let (t_ty, t_row, t2) = elaborate(arena, t, ctx)?;
-            let (e_ty, e_row, e2) = elaborate(arena, e, ctx)?;
+            let (t_ty, t_row, t2) = elaborate(arena, t, ctx, groups)?;
+            let (e_ty, e_row, e2) = elaborate(arena, e, ctx, groups)?;
             // Branches with differing concrete types aren't an error here
             // (no union types) -- just widen to Dyn rather than reject.
             let result_ty = if t_ty == e_ty { t_ty } else { Type::Dyn };
@@ -482,7 +577,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
         }
 
         Expr::Check(ty, inner) => {
-            let (_, row, inner2) = elaborate(arena, inner, ctx)?;
+            let (_, row, inner2) = elaborate(arena, inner, ctx, groups)?;
             let ty_ret = ty.clone();
             Ok((ty_ret, row, arena.push(Expr::Check(ty, inner2))))
         }
@@ -490,14 +585,14 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
         // The effect this specific operation performs, plus whatever the
         // payload expression itself might perform.
         Expr::Perform(effect, payload) => {
-            let (_, payload_row, payload2) = elaborate(arena, payload, ctx)?;
+            let (_, payload_row, payload2) = elaborate(arena, payload, ctx, groups)?;
             let row = EffectRow::union(&payload_row, &EffectRow::single(&effect));
             Ok((Type::Dyn, row, arena.push(Expr::Perform(effect, payload2))))
         }
 
         Expr::Handle { body, handler } => {
-            let (_, body_row, body2) = elaborate(arena, body, ctx)?;
-            let (handler_ty, handler_row, handler2) = elaborate(arena, handler, ctx)?;
+            let (_, body_row, body2) = elaborate(arena, body, ctx, groups)?;
+            let (handler_ty, handler_row, handler2) = elaborate(arena, handler, ctx, groups)?;
             // types.rs has no Type::Handler -- but every handler-producing
             // expression (MakeHandler, or deep(...)/shallow(...) applied
             // to one, or a var bound from either) synthesizes Dyn by this
@@ -521,12 +616,13 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
         }
 
         // Tried top to bottom at runtime, but statically each arm is just
-        // elaborated independently under its own pattern-bound context --
-        // renno does no exhaustiveness or reachability checking, matching
-        // its general stance of leaving what it can't prove to a runtime
-        // panic (here, match_pattern finding no arm at all).
+        // elaborated independently under its own pattern-bound context.
+        // Reachability isn't checked (an arm after a wildcard is dead code,
+        // silently) -- only exhaustiveness (missing_case), and only where
+        // that's cheaply provable; see missing_case's own doc comment for
+        // exactly which shapes it can prove complete.
         Expr::Match(scrutinee, arms) => {
-            let (scrut_ty, scrut_row, scrutinee2) = elaborate(arena, scrutinee, ctx)?;
+            let (scrut_ty, scrut_row, scrutinee2) = elaborate(arena, scrutinee, ctx, groups)?;
             let mut row = scrut_row;
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
@@ -538,7 +634,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
                     )));
                 }
                 let arm_ctx = bind_pattern_vars(ctx, pat);
-                let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx)?;
+                let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, groups)?;
                 row = EffectRow::union(&row, &arm_row);
                 // Same widen-to-Dyn-on-disagreement rule as If's branches
                 // and ListLit's elements -- no union types.
@@ -549,6 +645,9 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
                 });
                 new_arms.push((pat.clone(), body2));
             }
+            if let Some(missing) = missing_case(&arms.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), groups) {
+                return Err(TypeError(format!("non-exhaustive match: {missing}")));
+            }
             Ok((result_ty.unwrap_or(Type::Dyn), row, arena.push(Expr::Match(scrutinee2, Rc::new(new_arms)))))
         }
 
@@ -557,7 +656,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
         // see the doc comment on `elaborate`.
         Expr::MakeHandler { effect, payload_var, resume_var, body } => {
             let inner_ctx = extend(&extend(ctx, &payload_var, Type::Dyn), &resume_var, Type::Dyn);
-            let (_, _, body2) = elaborate(arena, body, &inner_ctx)?;
+            let (_, _, body2) = elaborate(arena, body, &inner_ctx, groups)?;
             Ok((
                 Type::Dyn,
                 EffectRow::pure(),
@@ -568,7 +667,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
 }
 
 pub fn check(arena: &mut Arena, root: ExprRef) -> Result<ExprRef, TypeError> {
-    let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty())?;
+    let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), &[])?;
     match row {
         EffectRow::Closed(unhandled) if !unhandled.is_empty() => {
             let names: Vec<_> = unhandled.into_iter().collect();

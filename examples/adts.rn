@@ -8,6 +8,11 @@
 // needs no forward declaration or special casing: an unmodeled field type
 // just resolves to Dyn, so naming your own type is no different from
 // naming any other type this checker doesn't track structurally.
+//
+// `data` also records this type's constructor set for exhaustiveness: the
+// match below needs no wildcard arm because { Nil, Cons } is exactly what
+// this declaration named -- delete either arm and typecheck rejects the
+// program as non-exhaustive.
 data List = Nil | Cons(Int, List) in
 
 let rec sum = fun l ->

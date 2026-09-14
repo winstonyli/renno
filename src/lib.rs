@@ -83,6 +83,7 @@ mod tests {
             Expr::Match(scrutinee, arms) => {
                 contains_check(arena, *scrutinee) || arms.iter().any(|(_, body)| contains_check(arena, *body))
             }
+            Expr::DataGroup(_, body) => contains_check(arena, *body),
         }
     }
 
@@ -399,6 +400,71 @@ mod tests {
     fn adt_lowercase_constructor_name_rejected_at_parse_time() {
         let err = parser::parse("data Option = none | Some(Int) in None").unwrap_err();
         assert!(err.contains("uppercase"), "unexpected message: {err}");
+    }
+
+    // --- match exhaustiveness ---
+
+    #[test]
+    fn exhaustive_bool_match_typechecks() {
+        let src = "match 1 < 2 with | true -> 1 | false -> 0";
+        let (mut arena, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root).is_ok());
+    }
+
+    #[test]
+    fn non_exhaustive_bool_match_rejected_statically() {
+        let (mut arena, root) = parser::parse("match 1 < 2 with | true -> 1").unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
+        assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn exhaustive_list_match_typechecks_even_with_dyn_scrutinee() {
+        // xs is an unannotated (Dyn) param -- exhaustiveness is judged from
+        // the PATTERN shapes present ([] + unconstrained h :: t), not from
+        // the scrutinee's own static type, so this still needs no wildcard.
+        let src = "let rec f = fun xs -> match xs with | [] -> 0 | h :: t -> h in f([1, 2])";
+        let (mut arena, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root).is_ok());
+    }
+
+    #[test]
+    fn non_exhaustive_list_match_rejected_statically() {
+        let (mut arena, root) = parser::parse("match [1, 2] with | [] -> 0").unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
+        assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn list_match_with_restrictive_cons_head_is_not_exhaustive() {
+        // `1 :: t` only covers non-empty lists whose head is 1 -- NOT
+        // every non-empty list -- so this must still be rejected even
+        // though a Cons pattern is present.
+        let (mut arena, root) = parser::parse("match [2, 3] with | [] -> 0 | 1 :: t -> 1").unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
+        assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn exhaustive_adt_match_typechecks() {
+        let src = "data Option = None | Some(Int) in match Some(5) with | None -> 0 | Some(x) -> x";
+        let (mut arena, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root).is_ok());
+    }
+
+    #[test]
+    fn non_exhaustive_adt_match_rejected_statically() {
+        let src = "data Option = None | Some(Int) in match Some(5) with | None -> 0";
+        let (mut arena, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
+        assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn wildcard_arm_always_makes_a_match_exhaustive() {
+        let src = r#"match 5 with | 1 -> "a" | _ -> "b""#;
+        let (mut arena, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root).is_ok());
     }
 
     // --- row polymorphism ---

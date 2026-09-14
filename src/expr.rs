@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use cranelift_entity::{entity_impl, PrimaryMap};
@@ -103,4 +104,12 @@ pub enum Expr {
     // resuming it more than once (multi-shot) would otherwise reclone the
     // whole arm list on every resume.
     Match(ExprRef, Rc<Vec<(Pattern, ExprRef)>>),
+    // Emitted only for a `data` declaration (see parser::build_ctor_value)
+    // -- purely a compile-time marker recording which constructor tags
+    // belong to one type, consumed by typecheck's Match exhaustiveness
+    // check (missing_case) and otherwise fully transparent: evaluates
+    // straight through to `body` (see machine.rs), and typecheck's own
+    // elaborate unwraps it -- doesn't re-emit it -- once the tag set has
+    // been recorded, so it never reaches an already-typechecked program.
+    DataGroup(Rc<BTreeSet<String>>, ExprRef),
 }
