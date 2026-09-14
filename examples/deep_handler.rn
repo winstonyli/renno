@@ -1,0 +1,8 @@
+// Deep handler: the SAME handler catches repeated occurrences of an
+// effect, because deep(...) reinstalls it around the resumed computation.
+// Two sequential (not multi-shot) performs of "choose", both caught.
+handle
+  let x = perform choose(0) in
+  let y = perform choose(0) in
+  x + y
+with deep(handler choose(p, resume) -> resume(1))

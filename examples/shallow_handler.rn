@@ -1,0 +1,7 @@
+// Shallow handler (the default -- no deep(...) wrapper): catches exactly
+// one occurrence of the effect, then is gone. Used correctly here: there
+// is only one `perform`, resumed twice (multi-shot), which shallow
+// handles just fine -- deep is only needed for REPEATED occurrences.
+handle
+  perform choose(0)
+with handler choose(p, resume) -> resume(1) + resume(2)

@@ -1,0 +1,12 @@
+// Closed effect-row typing: this program performs two different effects,
+// "choose" and "log", each discharged by its own `handle`. Both being
+// handled means the whole program's effect row is empty -- typecheck
+// accepts it before running at all. Delete either `handle` block and
+// re-run: that effect becomes statically "unhandled" and is rejected at
+// typecheck time, not just at runtime.
+handle
+  let x = perform choose(0) in
+  handle
+    perform log(x)
+  with handler log(p, resume) -> resume(0)
+with handler choose(p, resume) -> resume(1)

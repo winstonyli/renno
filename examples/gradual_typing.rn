@@ -1,0 +1,11 @@
+// Gradual typing: `y` is Dyn (its value comes from an effect, untyped by
+// design -- effects stay untyped, see effect_rows.rn), but flows into
+// `f`, which declares an Int parameter. A runtime Check gets inserted at
+// that boundary automatically; it passes here because the handler
+// actually resumes with an Int. Change `resume(41)` to e.g. `resume(true)`
+// to see it fail cleanly at the boundary instead of somewhere unrelated.
+handle
+  let y = perform choose(0) in
+  let f = fun x: Int -> x + 1 in
+  f(y)
+with handler choose(p, resume) -> resume(41)
