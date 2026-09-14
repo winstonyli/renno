@@ -7,6 +7,16 @@ pub enum Type {
     Dyn,
     Int,
     Bool,
+    Str,
+    // Element type. renno's List is a native primitive (Value::List,
+    // Rc<Vec<Value>>) rather than something expressed via user-defined
+    // algebraic types, since renno has neither ADTs, pattern matching, nor
+    // general recursion yet -- all three would be prerequisites for a
+    // "std lib" `data List a = Nil | Cons a (List a)` definition. Worth
+    // revisiting once those exist: this could become sugar over a
+    // user-space definition instead of a builtin, the way it works in
+    // languages with real sum types.
+    List(Rc<Type>),
     // param, effect row (what calling this may perform), return type.
     Fun(Rc<Type>, EffectRow, Rc<Type>),
 }
@@ -82,6 +92,8 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         (Type::Dyn, _) | (_, Type::Dyn) => true,
         (Type::Int, Type::Int) => true,
         (Type::Bool, Type::Bool) => true,
+        (Type::Str, Type::Str) => true,
+        (Type::List(a), Type::List(b)) => consistent(a, b),
         (Type::Fun(a1, r1, b1), Type::Fun(a2, r2, b2)) => {
             consistent(a1, a2) && consistent(b1, b2) && row_consistent(r1, r2)
         }
@@ -102,6 +114,8 @@ impl fmt::Display for Type {
             Type::Dyn => write!(f, "Dyn"),
             Type::Int => write!(f, "Int"),
             Type::Bool => write!(f, "Bool"),
+            Type::Str => write!(f, "Str"),
+            Type::List(elem) => write!(f, "[{elem}]"),
             // Dyn row prints as a plain arrow -- matches every existing
             // (unannotated-row) Fun type exactly as before this existed.
             Type::Fun(a, EffectRow::Dyn, b) => write!(f, "({a} -> {b})"),

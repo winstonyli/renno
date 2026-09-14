@@ -26,6 +26,23 @@ pub fn run(arena: &Arena, expr: ExprRef, env: Env) -> Value {
             Control::Eval(expr, env) => match &arena[expr] {
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
+                Expr::Str(s) => control = Control::Apply(Value::Str(Rc::from(s.as_str()))),
+                Expr::ListLit(items) => {
+                    if items.is_empty() {
+                        control = Control::Apply(Value::List(Rc::new(Vec::new())));
+                    } else {
+                        // Reversed so ListElems can pop() (O(1)) instead of
+                        // remove(0) as each element finishes.
+                        let mut remaining = items.clone();
+                        remaining.reverse();
+                        let first = remaining.pop().unwrap();
+                        cont = Cont::cons(
+                            Frame::ListElems { remaining, done: Vec::new(), env: env.clone() },
+                            cont,
+                        );
+                        control = Control::Eval(first, env);
+                    }
+                }
                 Expr::Var(name) => control = Control::Apply(env.lookup(name)),
                 Expr::Lambda(param, _ann, body) => {
                     control = Control::Apply(Value::Closure(param.clone(), *body, env));
@@ -120,7 +137,9 @@ pub fn run(arena: &Arena, expr: ExprRef, env: Env) -> Value {
                                         (Builtin::Shallow, Value::Handler(data)) => {
                                             Value::Handler(Rc::new(HandlerData { deep: false, ..(*data).clone() }))
                                         }
-                                        _ => panic!("deep/shallow expect a handler value"),
+                                        (Builtin::Len, Value::Str(s)) => Value::Int(s.chars().count() as i64),
+                                        (Builtin::Len, Value::List(items)) => Value::Int(items.len() as i64),
+                                        _ => panic!("invalid builtin application"),
                                     });
                                 }
                                 _ => panic!("attempt to call a non-function value"),
@@ -166,6 +185,22 @@ pub fn run(arena: &Arena, expr: ExprRef, env: Env) -> Value {
                                 panic!("type error: expected {ty}, found {}", value.type_name());
                             }
                         }
+                        // Vec clones here are O(remaining/done length) per
+                        // element -- fine for typical list-literal sizes;
+                        // a large literal would make this O(n^2) overall.
+                        // Worth an index-based rewrite if that ever matters.
+                        Frame::ListElems { remaining, done, env } => {
+                            let (mut remaining, mut done, env) = (remaining.clone(), done.clone(), env.clone());
+                            done.push(value);
+                            cont = rest;
+                            match remaining.pop() {
+                                Some(next) => {
+                                    cont = Cont::cons(Frame::ListElems { remaining, done, env: env.clone() }, cont);
+                                    control = Control::Eval(next, env);
+                                }
+                                None => control = Control::Apply(Value::List(Rc::new(done))),
+                            }
+                        }
                         Frame::PerformPayload { effect } => {
                             let effect = effect.clone();
                             cont = rest;
@@ -195,12 +230,24 @@ pub fn run(arena: &Arena, expr: ExprRef, env: Env) -> Value {
 // structural: it compares whatever tags the two values actually carry
 // (typecheck.rs only requires the two operand types to be consistent with
 // each other, not both Int), so it dispatches on Value directly instead of
-// projecting through as_int().
+// projecting through as_int(). Concat (++) is Str/Str or List/List only --
+// typecheck.rs rejects anything else statically when it can tell, so a
+// runtime panic here only fires for a Dyn-sourced value of the wrong tag.
 fn apply_binop(op: BinOp, lhs: Value, rhs: Value) -> Value {
     match op {
         BinOp::Add => Value::Int(lhs.as_int() + rhs.as_int()),
         BinOp::Lt => Value::Bool(lhs.as_int() < rhs.as_int()),
         BinOp::Eq => Value::Bool(value_eq(&lhs, &rhs)),
+        BinOp::Concat => match (lhs, rhs) {
+            (Value::Str(a), Value::Str(b)) => Value::Str(Rc::from(format!("{a}{b}"))),
+            (Value::List(a), Value::List(b)) => {
+                let mut v = Vec::with_capacity(a.len() + b.len());
+                v.extend(a.iter().cloned());
+                v.extend(b.iter().cloned());
+                Value::List(Rc::new(v))
+            }
+            _ => panic!("++ expects two strings or two lists"),
+        },
     }
 }
 
@@ -208,6 +255,10 @@ fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::List(x), Value::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_eq(a, b))
+        }
         _ => false,
     }
 }

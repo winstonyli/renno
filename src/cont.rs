@@ -16,6 +16,9 @@ pub enum Frame {
     BinOpL { op: BinOp, rhs: ExprRef, env: Env },
     BinOpR { op: BinOp, lhs: Value },
     If { then_: ExprRef, else_: ExprRef, env: Env },
+    // Evaluates a list literal's elements left to right. `remaining` are
+    // not-yet-evaluated; `done` accumulates results in order.
+    ListElems { remaining: Vec<ExprRef>, done: Vec<Value>, env: Env },
     CheckFrame { ty: Type },
     PerformPayload { effect: String },
     // `handle body with handler_expr`: handler_expr has just evaluated to a

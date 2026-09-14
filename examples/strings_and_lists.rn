@@ -1,0 +1,5 @@
+// Native String and List primitives. `++` concatenates (Str++Str or
+// List++List); `len` works on either; `==` compares structurally.
+let greeting = "Hello" ++ ", " ++ "world!" in
+let nums = [1, 2, 3] ++ [4, 5] in
+if len(nums) == 5 then greeting else "unexpected"

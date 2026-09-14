@@ -188,7 +188,28 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
     match node {
         Expr::Int(_) => Ok((Type::Int, EffectRow::pure(), expr)),
         Expr::Bool(_) => Ok((Type::Bool, EffectRow::pure(), expr)),
+        Expr::Str(_) => Ok((Type::Str, EffectRow::pure(), expr)),
         Expr::Var(name) => Ok((lookup(ctx, &name), EffectRow::pure(), expr)),
+
+        Expr::ListLit(items) => {
+            let mut row = EffectRow::pure();
+            let mut elem_ty: Option<Type> = None;
+            let mut refs = Vec::with_capacity(items.len());
+            for item in items {
+                let (item_ty, item_row, item2) = elaborate(arena, item, ctx)?;
+                row = EffectRow::union(&row, &item_row);
+                refs.push(item2);
+                // Same rule as If's branches: differing concrete element
+                // types aren't an error (no union types) -- widen to Dyn.
+                elem_ty = Some(match elem_ty {
+                    None => item_ty,
+                    Some(t) if t == item_ty => t,
+                    Some(_) => Type::Dyn,
+                });
+            }
+            let list_ty = Type::List(Rc::new(elem_ty.unwrap_or(Type::Dyn)));
+            Ok((list_ty, row, arena.push(Expr::ListLit(refs))))
+        }
 
         Expr::Let(..) | Expr::Lambda(..) => {
             unreachable!("Let/Lambda are peeled by elaborate's chain-flattening loop")
@@ -252,6 +273,40 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx) -> Result<(Type, 
                         r2
                     };
                     Ok((Type::Bool, row, arena.push(Expr::BinOp(op, l3, r3))))
+                }
+                // Concat: like Eq, operands just need to be consistent with
+                // each other -- but ALSO must actually be Str or List, not
+                // e.g. Int (unlike Eq, which is happy to compare any two
+                // consistent types). Result type: whichever side is
+                // concretely known; Dyn if neither is.
+                BinOp::Concat => {
+                    if !consistent(&l_ty, &r_ty) {
+                        return Err(TypeError(format!(
+                            "type mismatch: cannot concat {l_ty} with {r_ty}"
+                        )));
+                    }
+                    let result_ty = match (&l_ty, &r_ty) {
+                        (Type::Dyn, Type::Dyn) => Type::Dyn,
+                        (Type::Dyn, t) | (t, Type::Dyn) => t.clone(),
+                        (Type::Str, Type::Str) => Type::Str,
+                        (Type::List(_), Type::List(_)) => l_ty.clone(),
+                        _ => {
+                            return Err(TypeError(format!(
+                                "type mismatch: cannot concat {l_ty} with {r_ty} (expected two strings or two lists)"
+                            )))
+                        }
+                    };
+                    let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
+                        coerce(arena, l2, &l_ty, &r_ty)?
+                    } else {
+                        l2
+                    };
+                    let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
+                        coerce(arena, r2, &r_ty, &l_ty)?
+                    } else {
+                        r2
+                    };
+                    Ok((result_ty, row, arena.push(Expr::BinOp(op, l3, r3))))
                 }
             }
         }

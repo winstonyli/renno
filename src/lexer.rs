@@ -32,11 +32,17 @@ pub enum Token {
     TyInt,
     #[token("Bool")]
     TyBool,
+    #[token("Str")]
+    TyStr,
 
     #[token("(")]
     LParen,
     #[token(")")]
     RParen,
+    #[token("[")]
+    LBracket,
+    #[token("]")]
+    RBracket,
     #[token(",")]
     Comma,
     #[token(":")]
@@ -45,6 +51,8 @@ pub enum Token {
     Arrow,
     #[token("=")]
     Equals,
+    #[token("++")]
+    PlusPlus,
     #[token("+")]
     Plus,
     #[token("==")]
@@ -55,10 +63,35 @@ pub enum Token {
     #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
     Int(i64),
 
+    // `"..."` with a small set of escapes (\" \\ \n \t). Slice includes
+    // the surrounding quotes; unescape() strips them and processes escapes.
+    #[regex(r#""([^"\\]|\\.)*""#, |lex| unescape(lex.slice()))]
+    Str(String),
+
     // Keyword #[token]s above take priority over this regex on exact
     // matches (logos: equal-length match, token literal wins over regex).
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
+}
+
+fn unescape(raw: &str) -> Option<String> {
+    let inner = &raw[1..raw.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                _ => return None,
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
 }
 
 pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {

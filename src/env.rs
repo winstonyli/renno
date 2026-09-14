@@ -13,6 +13,7 @@ impl PList<Value> {
         Env::empty()
             .bind("deep", Value::Builtin(Builtin::Deep))
             .bind("shallow", Value::Builtin(Builtin::Shallow))
+            .bind("len", Value::Builtin(Builtin::Len))
     }
 
     pub fn lookup(&self, name: &str) -> Value {

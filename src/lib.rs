@@ -70,7 +70,8 @@ mod tests {
         use expr::Expr;
         match &arena[root] {
             Expr::Check(..) => true,
-            Expr::Int(_) | Expr::Bool(_) | Expr::Var(_) => false,
+            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) => false,
+            Expr::ListLit(items) => items.iter().any(|i| contains_check(arena, *i)),
             Expr::Lambda(_, _, body) => contains_check(arena, *body),
             Expr::App(f, a) => contains_check(arena, *f) || contains_check(arena, *a),
             Expr::Let(_, _, val, body) => contains_check(arena, *val) || contains_check(arena, *body),
@@ -152,6 +153,64 @@ mod tests {
         let (mut arena, root) = parser::parse("true == false").unwrap();
         let elaborated = typecheck::check(&mut arena, root).unwrap();
         assert!(!machine::run(&arena, elaborated, Env::prelude()).as_bool());
+    }
+
+    // --- String/List primitives ---
+
+    #[test]
+    fn string_literal_and_concat() {
+        assert_eq!(run_untyped(r#""hello" ++ " world""#).as_str(), "hello world");
+    }
+
+    #[test]
+    fn string_escapes() {
+        assert_eq!(run_untyped(r#""a\"b\\c\n""#).as_str(), "a\"b\\c\n");
+    }
+
+    #[test]
+    fn len_of_string_counts_chars() {
+        assert_eq!(run_untyped(r#"len("hello")"#).as_int(), 5);
+    }
+
+    #[test]
+    fn list_literal_concat_and_len() {
+        assert_eq!(run_untyped("len([1,2] ++ [3,4,5])").as_int(), 5);
+    }
+
+    #[test]
+    fn empty_list_literal() {
+        assert_eq!(run_untyped("len([])").as_int(), 0);
+    }
+
+    #[test]
+    fn list_equality_is_structural() {
+        assert!(run_untyped("[1, 2, 3] == [1, 2, 3]").as_bool());
+        assert!(!run_untyped("[1, 2] == [1, 2, 3]").as_bool());
+    }
+
+    #[test]
+    fn string_equality_compares_content() {
+        assert!(run_untyped(r#""ab" == "ab""#).as_bool());
+        assert!(!run_untyped(r#""ab" == "ac""#).as_bool());
+    }
+
+    #[test]
+    fn concat_rejects_mismatched_types_statically() {
+        let (mut arena, root) = parser::parse(r#"1 ++ "a""#).unwrap();
+        let err = typecheck::check(&mut arena, root).unwrap_err();
+        assert!(err.0.contains("cannot concat"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn str_type_annotation() {
+        let src = r#"let f = fun x: Str -> x ++ "!" in f("hi")"#;
+        assert_eq!(run_untyped(src).as_str(), "hi!");
+    }
+
+    #[test]
+    fn list_type_annotation() {
+        let src = "let g = fun xs: [Int] -> len(xs) in g([1, 2, 3])";
+        assert_eq!(run_untyped(src).as_int(), 3);
     }
 
     #[test]

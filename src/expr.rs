@@ -27,12 +27,21 @@ pub enum BinOp {
     Add,
     Eq,
     Lt,
+    // `++`: Str++Str or List++List. Kept separate from Add rather than
+    // overloading `+` (Python/JS-style) -- simpler and lower-risk than
+    // generalizing Add's existing Int-only typecheck arm; revisit if `+`
+    // overloading turns out to read better in practice.
+    Concat,
 }
 
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64),
     Bool(bool),
+    Str(String),
+    // Variable-arity, unlike every other node -- elaborate/machine handle
+    // it with a loop over the Vec rather than a fixed-shape match.
+    ListLit(Vec<ExprRef>),
     Var(String),
     // param annotation is optional -- None means Dyn. The typechecker fills
     // this in (or leaves it) when elaborating; the parser fills it in only
