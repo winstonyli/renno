@@ -1,14 +1,23 @@
 use std::rc::Rc;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BinOp {
+    Add,
+    Eq,
+    Lt,
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64),
+    Bool(bool),
     Var(String),
     Lambda(String, Rc<Expr>),
     App(Rc<Expr>, Rc<Expr>),
     Let(String, Rc<Expr>, Rc<Expr>),
-    Add(Rc<Expr>, Rc<Expr>),
-    If0(Rc<Expr>, Rc<Expr>, Rc<Expr>),
+    BinOp(BinOp, Rc<Expr>, Rc<Expr>),
+    // cond must evaluate to Bool.
+    If(Rc<Expr>, Rc<Expr>, Rc<Expr>),
     Perform(String, Rc<Expr>),
     // `handler` evaluates to a Value::Handler. Handle itself carries no
     // deep/shallow flag -- that lives on the handler value, set by the

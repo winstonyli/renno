@@ -10,12 +10,16 @@ pub enum Token {
     Let,
     #[token("in")]
     In,
-    #[token("if0")]
-    If0,
+    #[token("if")]
+    If,
     #[token("then")]
     Then,
     #[token("else")]
     Else,
+    #[token("true")]
+    True,
+    #[token("false")]
+    False,
     #[token("perform")]
     Perform,
     #[token("handle")]
@@ -37,6 +41,10 @@ pub enum Token {
     Equals,
     #[token("+")]
     Plus,
+    #[token("==")]
+    EqEq,
+    #[token("<")]
+    Lt,
 
     #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
     Int(i64),

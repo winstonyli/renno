@@ -9,7 +9,7 @@ mod value;
 use std::rc::Rc;
 
 use env::Env;
-use expr::Expr;
+use expr::{BinOp, Expr};
 
 // handle {
 //   let x = perform choose 0 in
@@ -24,13 +24,14 @@ fn build_multi_shot_demo() -> Rc<Expr> {
         body: Rc::new(Expr::Let(
             "x".into(),
             Rc::new(Expr::Perform("choose".into(), Rc::new(Expr::Int(0)))),
-            Rc::new(Expr::Add(Rc::new(Expr::Var("x".into())), Rc::new(Expr::Int(100)))),
+            Rc::new(Expr::BinOp(BinOp::Add, Rc::new(Expr::Var("x".into())), Rc::new(Expr::Int(100)))),
         )),
         handler: Rc::new(Expr::MakeHandler {
             effect: "choose".into(),
             payload_var: "_ignored".into(),
             resume_var: "resume".into(),
-            body: Rc::new(Expr::Add(
+            body: Rc::new(Expr::BinOp(
+                BinOp::Add,
                 Rc::new(Expr::App(Rc::new(Expr::Var("resume".into())), Rc::new(Expr::Int(1)))),
                 Rc::new(Expr::App(Rc::new(Expr::Var("resume".into())), Rc::new(Expr::Int(2)))),
             )),
@@ -78,7 +79,7 @@ fn two_sequential_performs(deep: bool) -> Rc<Expr> {
             Rc::new(Expr::Let(
                 "y".into(),
                 Rc::new(Expr::Perform("choose".into(), Rc::new(Expr::Int(0)))),
-                Rc::new(Expr::Add(Rc::new(Expr::Var("x".into())), Rc::new(Expr::Var("y".into())))),
+                Rc::new(Expr::BinOp(BinOp::Add, Rc::new(Expr::Var("x".into())), Rc::new(Expr::Var("y".into())))),
             )),
         )),
         handler,
@@ -146,5 +147,23 @@ mod tests {
         "#;
         let expr = parser::parse(src).expect("parse failed");
         machine::run(expr, Env::prelude());
+    }
+
+    #[test]
+    fn if_true_takes_then_branch() {
+        let expr = parser::parse("if 1 < 2 then 10 else 20").unwrap();
+        assert_eq!(machine::run(expr, Env::prelude()).as_int(), 10);
+    }
+
+    #[test]
+    fn if_false_takes_else_branch() {
+        let expr = parser::parse("if 2 < 1 then 10 else 20").unwrap();
+        assert_eq!(machine::run(expr, Env::prelude()).as_int(), 20);
+    }
+
+    #[test]
+    fn eq_and_bool_literals() {
+        let expr = parser::parse("if 3 == 3 then true else false").unwrap();
+        assert!(machine::run(expr, Env::prelude()).as_bool());
     }
 }

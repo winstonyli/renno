@@ -28,6 +28,7 @@ pub enum Builtin {
 #[derive(Clone)]
 pub enum Value {
     Int(i64),
+    Bool(bool),
     Closure(String, Rc<Expr>, Env),
     Continuation(Cont),
     Handler(Rc<HandlerData>),
@@ -40,6 +41,13 @@ impl Value {
         match self {
             Value::Int(n) => *n,
             _ => panic!("expected int"),
+        }
+    }
+
+    pub fn as_bool(&self) -> bool {
+        match self {
+            Value::Bool(b) => *b,
+            _ => panic!("expected bool"),
         }
     }
 }

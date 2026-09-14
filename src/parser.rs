@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::expr::Expr;
+use crate::expr::{BinOp, Expr};
 use crate::lexer::{tokenize, Token};
 
 pub fn parse(src: &str) -> Result<Rc<Expr>, String> {
@@ -43,9 +43,27 @@ impl Parser {
         }
     }
 
-    // expr := add
+    // expr := cmp
     fn expr(&mut self) -> Result<Expr, String> {
-        self.add()
+        self.cmp()
+    }
+
+    // cmp := add (("==" | "<") add)?  -- non-associative, one comparison
+    fn cmp(&mut self) -> Result<Expr, String> {
+        let lhs = self.add()?;
+        let op = match self.peek() {
+            Some(Token::EqEq) => Some(BinOp::Eq),
+            Some(Token::Lt) => Some(BinOp::Lt),
+            _ => None,
+        };
+        match op {
+            Some(op) => {
+                self.bump();
+                let rhs = self.add()?;
+                Ok(Expr::BinOp(op, Rc::new(lhs), Rc::new(rhs)))
+            }
+            None => Ok(lhs),
+        }
     }
 
     // add := postfix ("+" postfix)*  (left-associative)
@@ -54,7 +72,7 @@ impl Parser {
         while matches!(self.peek(), Some(Token::Plus)) {
             self.bump();
             let rhs = self.postfix()?;
-            lhs = Expr::Add(Rc::new(lhs), Rc::new(rhs));
+            lhs = Expr::BinOp(BinOp::Add, Rc::new(lhs), Rc::new(rhs));
         }
         Ok(lhs)
     }
@@ -74,6 +92,8 @@ impl Parser {
     fn atom(&mut self) -> Result<Expr, String> {
         match self.bump() {
             Some(Token::Int(n)) => Ok(Expr::Int(n)),
+            Some(Token::True) => Ok(Expr::Bool(true)),
+            Some(Token::False) => Ok(Expr::Bool(false)),
             Some(Token::Ident(name)) => Ok(Expr::Var(name)),
 
             Some(Token::Fun) => {
@@ -92,13 +112,13 @@ impl Parser {
                 Ok(Expr::Let(var, Rc::new(val), Rc::new(body)))
             }
 
-            Some(Token::If0) => {
+            Some(Token::If) => {
                 let cond = self.expr()?;
                 self.expect(&Token::Then)?;
                 let then_ = self.expr()?;
                 self.expect(&Token::Else)?;
                 let else_ = self.expr()?;
-                Ok(Expr::If0(Rc::new(cond), Rc::new(then_), Rc::new(else_)))
+                Ok(Expr::If(Rc::new(cond), Rc::new(then_), Rc::new(else_)))
             }
 
             Some(Token::Perform) => {

@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::Env;
-use crate::expr::Expr;
+use crate::expr::{BinOp, Expr};
 use crate::value::{Builtin, HandlerData, Value};
 
 enum Control {
@@ -21,6 +21,7 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
         match control {
             Control::Eval(expr, env) => match &*expr {
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
+                Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
                 Expr::Var(name) => control = Control::Apply(env.lookup(name)),
                 Expr::Lambda(param, body) => {
                     control = Control::Apply(Value::Closure(param.clone(), body.clone(), env));
@@ -36,13 +37,13 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                     );
                     control = Control::Eval(val_expr.clone(), env);
                 }
-                Expr::Add(l, r) => {
-                    cont = Cont::cons(Frame::AddL { rhs: r.clone(), env: env.clone() }, cont);
+                Expr::BinOp(op, l, r) => {
+                    cont = Cont::cons(Frame::BinOpL { op: *op, rhs: r.clone(), env: env.clone() }, cont);
                     control = Control::Eval(l.clone(), env);
                 }
-                Expr::If0(c, t, e) => {
+                Expr::If(c, t, e) => {
                     cont = Cont::cons(
-                        Frame::If0 { then_: t.clone(), else_: e.clone(), env: env.clone() },
+                        Frame::If { then_: t.clone(), else_: e.clone(), env: env.clone() },
                         cont,
                     );
                     control = Control::Eval(c.clone(), env);
@@ -136,18 +137,18 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                             cont = rest;
                             control = Control::Eval(body, env.bind(var, value));
                         }
-                        Frame::AddL { rhs, env } => {
-                            cont = Cont::cons(Frame::AddR { lhs: value }, rest);
+                        Frame::BinOpL { op, rhs, env } => {
+                            cont = Cont::cons(Frame::BinOpR { op, lhs: value }, rest);
                             control = Control::Eval(rhs, env);
                         }
-                        Frame::AddR { lhs } => {
+                        Frame::BinOpR { op, lhs } => {
                             cont = rest;
-                            control = Control::Apply(Value::Int(lhs.as_int() + value.as_int()));
+                            control = Control::Apply(apply_binop(op, lhs, value));
                         }
-                        Frame::If0 { then_, else_, env } => {
+                        Frame::If { then_, else_, env } => {
                             cont = rest;
                             control = Control::Eval(
-                                if value.as_int() == 0 { then_ } else { else_ },
+                                if value.as_bool() { then_ } else { else_ },
                                 env,
                             );
                         }
@@ -170,6 +171,16 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                 control = perform(&mut cont, &effect, payload);
             }
         }
+    }
+}
+
+// Int-only for now; comparisons producing Bool. No mixed-type coercion --
+// wrong operand type panics via as_int(), matching the rest of the runtime.
+fn apply_binop(op: BinOp, lhs: Value, rhs: Value) -> Value {
+    match op {
+        BinOp::Add => Value::Int(lhs.as_int() + rhs.as_int()),
+        BinOp::Eq => Value::Bool(lhs.as_int() == rhs.as_int()),
+        BinOp::Lt => Value::Bool(lhs.as_int() < rhs.as_int()),
     }
 }
 
