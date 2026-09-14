@@ -1,0 +1,4 @@
+handle
+  let x = perform choose(0) in
+  x + 100
+with handler choose(p, resume) -> resume(1) + resume(2)

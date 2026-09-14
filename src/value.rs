@@ -1,3 +1,4 @@
+use std::fmt;
 use std::rc::Rc;
 
 use crate::cont::Cont;
@@ -78,6 +79,17 @@ impl Value {
             Value::Bool(_) => "Bool",
             Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) => "Fun",
             Value::Handler(_) => "Handler",
+        }
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Value::Int(n) => write!(f, "{n}"),
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Closure(..) | Value::Continuation(_) | Value::Builtin(_) => write!(f, "<function>"),
+            Value::Handler(_) => write!(f, "<handler>"),
         }
     }
 }

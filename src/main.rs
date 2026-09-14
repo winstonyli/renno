@@ -10,23 +10,66 @@ mod types;
 mod value;
 
 use env::Env;
+use value::Value;
+
+// parse -> typecheck -> run, catching runtime panics as errors so a bad
+// line in the REPL (or a bad program passed on the command line) reports
+// cleanly instead of taking the whole process down.
+fn run_source(src: &str) -> Result<Value, String> {
+    let expr = parser::parse(src)?;
+    let elaborated = typecheck::check(&expr).map_err(|e| e.0)?;
+    std::panic::catch_unwind(|| machine::run(elaborated, Env::prelude()))
+        .map_err(|_| "runtime error (see panic message above)".to_string())
+}
+
+fn run_file(path: &str) {
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot read {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    match run_source(&src) {
+        Ok(v) => println!("{v}"),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn repl() {
+    use std::io::{self, BufRead, Write};
+    println!("renno REPL -- Ctrl+D to exit");
+    let stdin = io::stdin();
+    loop {
+        print!("renno> ");
+        if io::stdout().flush().is_err() {
+            break;
+        }
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match run_source(line) {
+            Ok(v) => println!("{v}"),
+            Err(e) => println!("error: {e}"),
+        }
+    }
+}
 
 fn main() {
-    let src = r#"
-        handle
-          let x = perform choose(0) in
-          x + 100
-        with handler choose(p, resume) -> resume(1) + resume(2)
-    "#;
-    let expr = parser::parse(src).expect("parse failed");
-    // `x` is Dyn (bound from perform's result -- effects stay untyped for
-    // now), but flows into `x + 100`, which expects Int: elaboration
-    // inserts a runtime Check(Int, x) there. Passes since the handler
-    // resumes with real ints.
-    let elaborated = typecheck::check(&expr).unwrap_or_else(|e| panic!("type error: {}", e.0));
-    let result = machine::run(elaborated, Env::prelude());
-    println!("result = {}", result.as_int());
-    assert_eq!(result.as_int(), 203);
+    match std::env::args().nth(1) {
+        Some(path) => run_file(&path),
+        None => repl(),
+    }
 }
 
 #[cfg(test)]
