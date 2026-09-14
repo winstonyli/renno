@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::value::Value;
+use crate::value::{Builtin, Value};
 
 // Persistent environment: extending never mutates the parent, so any Env
 // captured by a closure or continuation stays valid forever. Lookup is O(n)
@@ -16,6 +16,15 @@ pub enum EnvNode {
 impl Env {
     pub fn empty() -> Env {
         Env(Rc::new(EnvNode::Empty))
+    }
+
+    // `deep`/`shallow` bound as ordinary values -- functions that take a
+    // handler value and return a new one with the reinstall bit flipped.
+    // Nothing else in the core language knows about deep vs shallow.
+    pub fn prelude() -> Env {
+        Env::empty()
+            .bind("deep", Value::Builtin(Builtin::Deep))
+            .bind("shallow", Value::Builtin(Builtin::Shallow))
     }
 
     pub fn bind(&self, name: impl Into<String>, value: Value) -> Env {

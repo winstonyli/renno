@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::Env;
 use crate::expr::Expr;
-use crate::value::Value;
+use crate::value::{Builtin, HandlerData, Value};
 
 enum Control {
     Eval(Rc<Expr>, Env),
@@ -51,19 +51,22 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                     cont = Cont::cons(Frame::PerformPayload { effect: effect.clone() }, cont);
                     control = Control::Eval(payload.clone(), env);
                 }
-                Expr::Handle { body, effect, payload_var, resume_var, handler, deep } => {
+                Expr::Handle { body, handler } => {
                     cont = Cont::cons(
-                        Frame::HandlerMark {
-                            effect: effect.clone(),
-                            payload_var: payload_var.clone(),
-                            resume_var: resume_var.clone(),
-                            handler_body: handler.clone(),
-                            env: env.clone(),
-                            deep: *deep,
-                        },
+                        Frame::InstallHandler { body: body.clone(), env: env.clone() },
                         cont,
                     );
-                    control = Control::Eval(body.clone(), env);
+                    control = Control::Eval(handler.clone(), env);
+                }
+                Expr::MakeHandler { effect, payload_var, resume_var, body } => {
+                    control = Control::Apply(Value::Handler(Rc::new(HandlerData {
+                        effect: effect.clone(),
+                        payload_var: payload_var.clone(),
+                        resume_var: resume_var.clone(),
+                        body: body.clone(),
+                        env,
+                        deep: false,
+                    })));
                 }
             },
 
@@ -92,7 +95,41 @@ pub fn run(expr: Rc<Expr>, env: Env) -> Value {
                                     cont = Cont::append(&k, &cont);
                                     control = Control::Apply(value);
                                 }
+                                Value::Builtin(b) => {
+                                    // deep/shallow: clone the handler data,
+                                    // flip the `deep` bit, hand back a new
+                                    // handler value. No AST-level flag.
+                                    control = Control::Apply(match (b, value) {
+                                        (Builtin::Deep, Value::Handler(data)) => {
+                                            Value::Handler(Rc::new(HandlerData { deep: true, ..(*data).clone() }))
+                                        }
+                                        (Builtin::Shallow, Value::Handler(data)) => {
+                                            Value::Handler(Rc::new(HandlerData { deep: false, ..(*data).clone() }))
+                                        }
+                                        _ => panic!("deep/shallow expect a handler value"),
+                                    });
+                                }
                                 _ => panic!("attempt to call a non-function value"),
+                            }
+                        }
+                        Frame::InstallHandler { body, env } => {
+                            cont = rest;
+                            match value {
+                                Value::Handler(data) => {
+                                    cont = Cont::cons(
+                                        Frame::HandlerMark {
+                                            effect: data.effect.clone(),
+                                            payload_var: data.payload_var.clone(),
+                                            resume_var: data.resume_var.clone(),
+                                            handler_body: data.body.clone(),
+                                            env: data.env.clone(),
+                                            deep: data.deep,
+                                        },
+                                        cont,
+                                    );
+                                    control = Control::Eval(body, env);
+                                }
+                                _ => panic!("handle: expected a handler value"),
                             }
                         }
                         Frame::LetBody { var, body, env } => {

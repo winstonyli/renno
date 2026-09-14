@@ -16,6 +16,9 @@ pub enum Frame {
     AddR { lhs: Value },
     If0 { then_: Rc<Expr>, else_: Rc<Expr>, env: Env },
     PerformPayload { effect: String },
+    // `handle body with handler_expr`: handler_expr has just evaluated to a
+    // Value::Handler -- next step installs it as a HandlerMark and evals body.
+    InstallHandler { body: Rc<Expr>, env: Env },
     HandlerMark {
         effect: String,
         payload_var: String,
