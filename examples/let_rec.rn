@@ -1,7 +1,7 @@
 // `let rec`: a self-referential let, for general (not just structural)
-// recursion. `sum_down` calls itself inside its own body -- ordinary
-// `let` can't do this, since the name it binds isn't in scope while its
-// value is being evaluated.
-let rec sum_down = fun n ->
-  if n == 0 then 0 else n + sum_down(n - 1)
-in sum_down(10)
+// recursion. `fact` calls itself inside its own body -- ordinary `let`
+// can't do this, since the name it binds isn't in scope while its value
+// is being evaluated.
+let rec fact = fun n ->
+  if n == 0 then 1 else n * fact(n - 1)
+in fact(10)

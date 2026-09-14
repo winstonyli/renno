@@ -77,6 +77,10 @@ pub enum Token {
     Plus,
     #[token("-")]
     Minus,
+    #[token("*")]
+    Star,
+    #[token("/")]
+    Slash,
     #[token("==")]
     EqEq,
     #[token("<")]

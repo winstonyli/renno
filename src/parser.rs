@@ -256,15 +256,34 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // add := unary (("+" | "-" | "++") unary)*  (left-associative)
+    // add := mul (("+" | "-" | "++") mul)*  (left-associative)
     fn add(&mut self) -> Result<ExprRef, String> {
         let start = self.span_at().start;
-        let mut lhs = self.unary()?;
+        let mut lhs = self.mul()?;
         loop {
             let op = match self.peek() {
                 Some(Token::Plus) => BinOp::Add,
                 Some(Token::Minus) => BinOp::Sub,
                 Some(Token::PlusPlus) => BinOp::Concat,
+                _ => break,
+            };
+            self.bump();
+            let rhs = self.mul()?;
+            let span = Span { start, end: self.span_before().end };
+            lhs = self.push_spanned(Expr::BinOp(op, lhs, rhs), span);
+        }
+        Ok(lhs)
+    }
+
+    // mul := unary (("*" | "/") unary)*  (left-associative, binds tighter
+    // than "+"/"-"/"++" -- `1 + 2 * 3` is `1 + (2 * 3)`)
+    fn mul(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
+        let mut lhs = self.unary()?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::Star) => BinOp::Mul,
+                Some(Token::Slash) => BinOp::Div,
                 _ => break,
             };
             self.bump();

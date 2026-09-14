@@ -515,7 +515,7 @@ fn elaborate_node(
             let row = EffectRow::union(&l_row, &r_row);
             match op {
                 // Arithmetic and ordering: both operands must be Int.
-                BinOp::Add | BinOp::Sub | BinOp::Lt => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Lt => {
                     let l3 = coerce(arena, l2, &l_ty, &Type::Int, spans)?;
                     let r3 = coerce(arena, r2, &r_ty, &Type::Int, spans)?;
                     let result_ty = if op == BinOp::Lt { Type::Bool } else { Type::Int };

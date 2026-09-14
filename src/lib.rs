@@ -202,6 +202,32 @@ mod tests {
         assert!(err.0.contains("expected Int, found Bool"), "unexpected message: {}", err.0);
     }
 
+    #[test]
+    fn multiplication_and_division() {
+        assert_eq!(run_untyped("6 * 7").as_int(), 42);
+        assert_eq!(run_untyped("10 / 3").as_int(), 3);
+    }
+
+    #[test]
+    fn mul_div_bind_tighter_than_add_sub() {
+        assert_eq!(run_untyped("2 + 3 * 4").as_int(), 14);
+        assert_eq!(run_untyped("2 * 3 + 4").as_int(), 10);
+        assert_eq!(run_untyped("-2 * 3").as_int(), -6);
+    }
+
+    #[test]
+    #[should_panic(expected = "division by zero")]
+    fn division_by_zero_panics() {
+        run_untyped("5 / 0");
+    }
+
+    #[test]
+    fn mul_rejects_non_int_operand_statically() {
+        let (mut arena, spans, root) = parser::parse("true * 1").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected Int, found Bool"), "unexpected message: {}", err.0);
+    }
+
     // --- String/List primitives ---
 
     #[test]

@@ -55,6 +55,11 @@ pub enum Pattern {
 pub enum BinOp {
     Add,
     Sub,
+    Mul,
+    // Integer division, truncating toward zero (Rust's own `/` on i64) --
+    // dividing by zero panics at runtime (apply_binop), same as any other
+    // Dyn-sourced-value mismatch this interpreter can't rule out statically.
+    Div,
     Eq,
     Lt,
     // `++`: Str++Str or List++List. Kept separate from Add rather than

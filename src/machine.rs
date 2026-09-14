@@ -334,6 +334,14 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value) -> Value {
     match op {
         BinOp::Add => Value::Int(lhs.as_int() + rhs.as_int()),
         BinOp::Sub => Value::Int(lhs.as_int() - rhs.as_int()),
+        BinOp::Mul => Value::Int(lhs.as_int() * rhs.as_int()),
+        BinOp::Div => {
+            let (l, r) = (lhs.as_int(), rhs.as_int());
+            if r == 0 {
+                panic!("division by zero");
+            }
+            Value::Int(l / r)
+        }
         BinOp::Lt => Value::Bool(lhs.as_int() < rhs.as_int()),
         BinOp::Eq => Value::Bool(value_eq(&lhs, &rhs)),
         BinOp::Concat => match (lhs, rhs) {
