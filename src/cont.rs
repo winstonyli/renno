@@ -78,3 +78,23 @@ impl Cont {
         Cont::from_frames(frames, tail.clone())
     }
 }
+
+// Same shape, same fix as plist.rs's PList<T>: Rust's default Drop for a
+// struct wrapping Rc<ContNode> recurses through `rest` one field-drop at a
+// time, which is O(depth) native stack for a long continuation chain (many
+// nested lets/binops evaluated in sequence build exactly this shape).
+// Unwind iteratively instead via Rc::try_unwrap, stopping the moment some
+// other clone of a node is still held elsewhere (a captured/resumable
+// continuation, e.g.) -- that node and everything under it stays alive and
+// gets cleaned up normally by whoever else holds it.
+impl Drop for Cont {
+    fn drop(&mut self) {
+        let mut node = std::mem::replace(&mut self.0, Rc::new(ContNode::Nil));
+        loop {
+            match Rc::try_unwrap(node) {
+                Ok(ContNode::Frame(_, mut rest)) => node = std::mem::replace(&mut rest.0, Rc::new(ContNode::Nil)),
+                _ => break,
+            }
+        }
+    }
+}

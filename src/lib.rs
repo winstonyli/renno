@@ -367,4 +367,23 @@ mod tests {
         assert_eq!(result.as_int(), (n - 1) as i64);
         // arena, and everything in it, drops normally here.
     }
+
+    #[test]
+    fn deep_cont_chain_drops_without_overflowing_the_stack() {
+        // Cont(Rc<ContNode>) has the exact same shape as plist.rs's
+        // PList<T> (a struct wrapping an Rc pointing at "cargo + rest"),
+        // so it has the same recursive-Drop risk: a long enough chain's
+        // default field-by-field Drop recurses through `rest` and can
+        // overflow the stack, independent of how the chain was built.
+        // Built directly here (bypassing the parser/machine entirely) to
+        // isolate exactly that -- cont.rs's custom iterative Drop
+        // (Rc::try_unwrap-based, same technique as PList's) is what makes
+        // this not crash.
+        let n = 50_000usize;
+        let mut chain = cont::Cont::nil();
+        for _ in 0..n {
+            chain = cont::Cont::cons(cont::Frame::PerformPayload { effect: "e".to_string() }, chain);
+        }
+        drop(chain);
+    }
 }
