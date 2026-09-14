@@ -14,6 +14,8 @@ pub enum Token {
     Rec,
     #[token("and")]
     And,
+    #[token("where")]
+    Where,
     #[token("data")]
     Data,
     #[token("in")]

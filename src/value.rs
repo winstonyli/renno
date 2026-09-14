@@ -39,12 +39,19 @@ pub enum Builtin {
     // no user-definable fixpoint needed. Same effect-handling caveat as
     // Map.
     Fold,
+    // Str -> Dyn (never actually returns -- always panics with its
+    // argument as the message). What a `where` refinement clause
+    // (parser::desugar_refinement) desugars into when it CAN'T be proven
+    // at parse time: `let n: Int where P = val in body` becomes
+    // `let n: Int = val in if P then body else fail("...")`, an ordinary
+    // runtime check built entirely from existing If/App nodes.
+    Fail,
 }
 
 impl Builtin {
     pub fn arity(self) -> usize {
         match self {
-            Builtin::Deep | Builtin::Shallow | Builtin::Len => 1,
+            Builtin::Deep | Builtin::Shallow | Builtin::Len | Builtin::Fail => 1,
             Builtin::Map => 2,
             Builtin::Fold => 3,
         }

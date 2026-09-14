@@ -478,6 +478,10 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             Some(Value::List(items)) => Value::Int(items.len() as i64),
             _ => panic!("len expects a string or list"),
         },
+        Builtin::Fail => match args.pop() {
+            Some(Value::Str(s)) => panic!("{s}"),
+            _ => panic!("fail expects a string message"),
+        },
         Builtin::Map => {
             let (list, f) = (args.pop(), args.pop());
             match (f, list) {

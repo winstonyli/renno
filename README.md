@@ -10,6 +10,7 @@ let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in fact(10)
 
 - **Algebraic effects**: `perform`/`handle`, first-class handler values, deep and shallow semantics, and genuine multi-shot resumption (a captured continuation can be resumed zero, one, or many times).
 - **Gradual typing**: every position is `Dyn` unless annotated. Annotated code is checked statically and pays no runtime cost; annotated boundaries crossed by an unannotated (`Dyn`) value get a runtime check inserted automatically.
+- **Gradual verification**: `let n: Int where 0 < n = 5 in ...` — a refinement predicate proven outright when it cheaply can be (a literal value, zero runtime cost), and backed by a real runtime check otherwise. Same three-way shape as gradual typing's own boundary checks, generalized from type tags to arbitrary decidable predicates.
 - **Closed and row-polymorphic effect typing**: `check()` statically rejects a program if it can prove an effect is never handled. Row-polymorphic function types (`(Dyn ->{e} Dyn)`) let effect-safety survive through higher-order calls.
 - **`let rec` and mutual recursion**: `let rec f = ... and g = ... in ...` — any function in the group can call any sibling (including itself) by name.
 - **Pattern matching**: literals, lists (`[]`, `[a, b]`, `h :: t`), and ADT constructors, with static exhaustiveness and reachability checking wherever those are cheaply provable.
@@ -140,6 +141,16 @@ handle
 with handler choose(p, resume) -> resume(41)
 ```
 
+### Gradual verification
+
+```
+let n: Int where 0 < n = 5 in n + 1     -- proven at parse time; compiles to exactly `let n = 5 in n + 1`
+```
+
+```
+let f = fun n: Int where 0 < n -> n * 2 in f(-3)   -- a parameter's value is never known this early, so this is a real runtime check -- and it fails
+```
+
 More complete examples for every feature above live in [`examples/`](examples/).
 
 ## Architecture
@@ -160,3 +171,4 @@ More complete examples for every feature above live in [`examples/`](examples/).
 - A runtime type check at a `Dyn`-to-`Data(name)` boundary can only confirm "this is some tagged value," not "specifically this data type" — no type name is stamped into values at runtime.
 - Match exhaustiveness and reachability are checked only where cheaply provable (see the doc comments on `missing_case`/`first_unreachable` in `typecheck.rs`); anything past that silently falls back to a runtime panic.
 - A runtime panic's reported location is the last expression *evaluated*, not necessarily the exact sub-expression at fault a few steps later.
+- `where` refinement predicates are limited to what `<`/`==` and arithmetic can express — no `>`/`<=`/`>=`/`!=` or boolean `and`/`or`/`not` yet. Proving is attempted only when the bound value reduces to a closed Int constant at parse time (`try_eval_closed_int`); a Lambda parameter's refinement is never proven statically, since its actual value is unknown until a caller supplies one.

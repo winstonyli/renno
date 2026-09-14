@@ -306,6 +306,59 @@ mod tests {
         machine::run(&arena, elaborated, Env::prelude(), &spans);
     }
 
+    // --- gradual verification (`where` refinements) ---
+
+    #[test]
+    fn refinement_proven_at_parse_time_has_no_runtime_check() {
+        // If desugar_refinement's proof succeeds, `body` is used
+        // COMPLETELY UNCHANGED -- confirmed here by matching the bound
+        // value with a pattern that would fail if any wrapping `if`/`fail`
+        // node were still present around it.
+        let src = r#"let n: Int where 0 < n = 5 in match n with | 5 -> "unwrapped" | _ -> "bug""#;
+        assert_eq!(run_untyped(src).as_str(), "unwrapped");
+    }
+
+    #[test]
+    fn refinement_proven_false_is_a_parse_time_error() {
+        // -1 is `0 - 1` (unary minus desugars, see parser::unary), not a
+        // literal Expr::Int -- try_eval_closed_int has to see through that
+        // for this to be proven at parse time rather than falling back to
+        // a runtime check.
+        let err = parser::parse("let n: Int where 0 < n = -1 in n").unwrap_err();
+        assert!(err.contains("refinement violated"), "unexpected message: {err}");
+        assert!(err.contains("= -1"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn refinement_on_dyn_sourced_value_falls_back_to_a_runtime_check_that_passes() {
+        let src = "handle (let n: Int where 0 < n = perform choose(0) in n + 1) \
+                    with handler choose(p, resume) -> resume(5)";
+        assert_eq!(run_untyped(src).as_int(), 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "refinement violated")]
+    fn refinement_on_dyn_sourced_value_runtime_check_fails() {
+        let src = "handle (let n: Int where 0 < n = perform choose(0) in n + 1) \
+                    with handler choose(p, resume) -> resume(-5)";
+        run_untyped(src);
+    }
+
+    #[test]
+    fn refinement_on_lambda_parameter_passes_at_runtime() {
+        // Never proven statically -- a parameter's value is whatever the
+        // caller passes, unknown at definition time.
+        let src = "let f = fun n: Int where 0 < n -> n * 2 in f(3)";
+        assert_eq!(run_untyped(src).as_int(), 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "refinement violated")]
+    fn refinement_on_lambda_parameter_fails_at_runtime() {
+        let src = "let f = fun n: Int where 0 < n -> n * 2 in f(-3)";
+        run_untyped(src);
+    }
+
     // --- map/fold: structural recursion over List without let rec ---
 
     #[test]

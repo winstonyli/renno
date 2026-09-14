@@ -1,0 +1,24 @@
+// "Gradual verification": a `where` refinement predicate is PROVEN
+// outright when it cheaply can be, skipping the runtime check entirely --
+// zero overhead, the actual payoff of doing this gradually instead of as
+// a bare assert -- and falls back to an ordinary runtime check otherwise.
+// Same three-way shape as gradual TYPING's own Dyn-boundary Check nodes:
+// proven statically (nothing inserted), refuted statically (a real error,
+// here at parse time since the value's already known), or deferred to
+// runtime (an unannotated/Dyn-sourced value's real type/shape).
+//
+// renno has no `>`/`<=`/`>=` or boolean and/or/not yet, so a predicate is
+// limited to what `<`/`==` and arithmetic alone can express -- `0 < n`
+// for "n is positive", here.
+
+// Proven at parse time: 5 is a known literal, `0 < 5` is decidable right
+// here, so this `let` compiles to EXACTLY `let n = 5 in n + 1` -- no
+// wrapping `if`/`fail` at all.
+let proven = let n: Int where 0 < n = 5 in n + 1 in
+
+// Not provable (the parameter's actual value is unknown until a caller
+// supplies one) -- becomes a real runtime check: `if n > 0 then n * 2
+// else fail(...)`.
+let double_positive = fun n: Int where 0 < n -> n * 2 in
+
+proven + double_positive(3)
