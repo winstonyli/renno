@@ -1,16 +1,24 @@
-// Named-field access: `data Point = Point(x: Int, y: Int)` names each
-// field, and `p.x`/`p.y` reads it back -- but this is sugar, not a new
-// feature. `.field` only works when the target's type is a concretely
-// known Data(name) (see nominal typing) whose `data` block has EXACTLY
-// ONE constructor -- which constructor's field would it mean otherwise?
-// -- and typecheck desugars it into an ordinary Match against that sole
-// constructor (a Var at the target field's position, `_` everywhere
-// else), so machine.rs needs no new opcode for it at all.
+// Named fields, three ways: construction, access, and patterns.
+// `data Point = Point(x: Int, y: Int)` names each field; all three uses
+// below are sugar, resolved entirely at typecheck time from the SAME
+// field-order info recorded by that one declaration -- no new runtime
+// representation, no new machine.rs opcode.
 //
-// Construction stays positional and curried, same as any other
-// constructor (fold, map): `Point(1)(2)`, not `Point(x: 1, y: 2)`.
+// Positional construction/patterns (`Point(1)(2)`, `Point(a, b)`) still
+// work exactly as before and can be freely mixed with the named forms --
+// named fields are an alternative notation, not a replacement.
 data Point = Point(x: Int, y: Int) in
 
-let dist_from_origin_squared = fun p: Point -> p.x * p.x + p.y * p.y in
+// Construction: `{ field: expr, ... }`, any order.
+let p = Point { y: 4, x: 3 } in
 
-dist_from_origin_squared(Point(3)(4))
+// Access: `.field`, needs the value's type known as a Data(name) with
+// exactly one constructor.
+let via_access = p.x * p.x + p.y * p.y in
+
+// Pattern: `{ field: pat, ... }`, also any order -- and, since this is
+// just a Match under the hood, composes with everything match already
+// does (multiple arms, nested patterns, exhaustiveness checking).
+let via_pattern = match p with | Point { y: b, x: a } -> a * a + b * b in
+
+via_access + via_pattern

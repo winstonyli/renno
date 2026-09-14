@@ -37,9 +37,12 @@ pub type SpanMap = PrimaryMap<ExprRef, Span>;
 // Patterns destructure the value shapes renno has natively: literals
 // (matched by equality), List's two structural forms (fixed-length and
 // cons), and Var, which matches anything and binds it -- "_" is just an
-// ordinary (unused) Var name, not a special token. `data`-declared ADT
-// constructors (parser::pattern_atom) desugar into List/Str shapes too, so
-// there's no separate constructor-pattern variant here.
+// ordinary (unused) Var name, not a special token. A POSITIONAL `data`-
+// declared ADT constructor (parser::pattern_atom's `Ctor(p1, p2)` form)
+// desugars into a plain List/Str shape too, so there's no separate
+// variant for it -- but a NAMED one (`Ctor { field: p, ... }`) can't
+// desugar until typecheck knows the constructor's declared field ORDER
+// (see typecheck::resolve_pattern), so it keeps its own shape until then.
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Var(String),
@@ -50,6 +53,13 @@ pub enum Pattern {
     List(Vec<Pattern>),
     // `head :: tail` -- matches a non-empty list of any length.
     Cons(Box<Pattern>, Box<Pattern>),
+    // `Ctor { field: pat, ... }`, fields in whatever order they're
+    // written (typecheck reorders them). Never reaches machine.rs's
+    // match_pattern -- typecheck::resolve_pattern always rewrites it into
+    // an ordinary Pattern::List before a Match is elaborated, the same
+    // way FieldAccess resolves into a Match rather than becoming a new
+    // runtime shape.
+    NamedCtor(String, Vec<(String, Pattern)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -150,6 +160,15 @@ pub enum Expr {
     // Type::Data's own doc comment on why field names aren't stamped into
     // values themselves).
     FieldAccess(ExprRef, String),
+    // `Ctor { field: expr, ... }`, fields in whatever order they're
+    // written -- ONLY meaningful once typechecked, same story as
+    // FieldAccess: elaborate_node resolves it (using `callee`'s own
+    // Data(name) return type and its DataInfo) into the ordinary curried
+    // Application chain `Point(1)(2)` already produces, in the
+    // constructor's declared field order, reusing App's existing
+    // coercion logic entirely. `callee` is almost always a bare
+    // Expr::Var naming the constructor, but isn't required to be one.
+    NamedCall(ExprRef, Rc<Vec<(String, ExprRef)>>),
 }
 
 // What one `data Name = Ctor1(f1: T1, ...) | Ctor2(...) | ...` declared:

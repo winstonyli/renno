@@ -14,7 +14,7 @@ let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in fact(10)
 - **`let rec` and mutual recursion**: `let rec f = ... and g = ... in ...` — any function in the group can call any sibling (including itself) by name.
 - **Pattern matching**: literals, lists (`[]`, `[a, b]`, `h :: t`), and ADT constructors, with static exhaustiveness and reachability checking wherever those are cheaply provable.
 - **ADTs**: `data Option = None | Some(Int) in ...`, desugared entirely into tagged lists and ordinary pattern matching — no new runtime representation. Constructors get real nominal types (`Type::Data`), so two differently-named types with identical shapes aren't interchangeable.
-- **Named-field access**: `data Point = Point(x: Int, y: Int) in ...` lets you write `p.x` instead of pattern-matching out a field by position, for any `data` type with exactly one constructor.
+- **Named fields**: `data Point = Point(x: Int, y: Int) in ...` supports `p.x` access, `Point { x: 1, y: 2 }` construction (any order), and `Point { x: a, y: b }` patterns (any order) — all sugar over ordinary positional construction and pattern matching, for any `data` type with exactly one constructor.
 - **Diagnostics**: every parse error, type error, and runtime panic reports a `line, column` location with a source snippet and a caret, not just a bare message.
 - **Multi-line REPL**: `let`/`match`/`data` blocks spanning multiple lines can be typed directly at the prompt.
 
@@ -98,11 +98,12 @@ match Some(5) with
 
 ```
 data Point = Point(x: Int, y: Int) in
-let p = Point(3)(4) in
-p.x * p.x + p.y * p.y   -- 25
+let p = Point { x: 3, y: 4 } in
+match p with
+| Point { y: b, x: a } -> a * a + b * b   -- 25
 ```
 
-Constructors are curried like any other multi-argument callable (`Point(3)(4)`, not `Point(3, 4)`).
+Positional construction and patterns (`Point(3)(4)`, `Point { x, y }` written `Point(x, y)`) still work and freely mix with the named forms above — named fields are an alternative notation, not a replacement. Constructors are curried like any other multi-argument callable (`Point(3)(4)`, not `Point(3, 4)`).
 
 ### Effects
 

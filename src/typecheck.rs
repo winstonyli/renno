@@ -245,6 +245,9 @@ fn pattern_type(pat: &Pattern) -> Type {
         Pattern::Str(_) => Type::Str,
         _ if ctor_tag(pat).is_some() => Type::Dyn,
         Pattern::List(_) | Pattern::Cons(..) => Type::List(Rc::new(Type::Dyn)),
+        Pattern::NamedCtor(..) => {
+            unreachable!("resolve_pattern always rewrites NamedCtor into List before a Match's patterns reach here")
+        }
     }
 }
 
@@ -258,6 +261,9 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern) -> Ctx {
         Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => ctx.clone(),
         Pattern::List(pats) => pats.iter().fold(ctx.clone(), |c, p| bind_pattern_vars(&c, p)),
         Pattern::Cons(head, tail) => bind_pattern_vars(&bind_pattern_vars(ctx, head), tail),
+        Pattern::NamedCtor(..) => {
+            unreachable!("resolve_pattern always rewrites NamedCtor into List before a Match's patterns reach here")
+        }
     }
 }
 
@@ -273,6 +279,57 @@ fn ctor_tag(pat: &Pattern) -> Option<&str> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+// Rewrites a Pattern::NamedCtor into the ordinary Pattern::List shape
+// every other pattern-consuming function here already understands --
+// recursing through List/Cons so a NamedCtor nested anywhere inside a
+// larger pattern (`Some(Point { x: a, y: b })`) still gets resolved, not
+// just one at the top level. This is the ONLY place `field: name` order
+// gets reconciled with the constructor's own DECLARED order (`data
+// Point = Point(x: Int, y: Int)`), which is why it needs `fields` --
+// something no other Pattern-consuming function in this file does. `span`
+// is the enclosing Match's own span (patterns carry no span of their
+// own), used for every error this can raise: an unknown constructor tag,
+// a field named twice, an unknown field name, or a missing one.
+fn resolve_pattern(pat: &Pattern, fields: &[Rc<DataInfo>], span: Span) -> Result<Pattern, TypeError> {
+    match pat {
+        Pattern::Var(_) | Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => Ok(pat.clone()),
+        Pattern::List(items) => {
+            Ok(Pattern::List(items.iter().map(|p| resolve_pattern(p, fields, span)).collect::<Result<_, _>>()?))
+        }
+        Pattern::Cons(head, tail) => Ok(Pattern::Cons(
+            Box::new(resolve_pattern(head, fields, span)?),
+            Box::new(resolve_pattern(tail, fields, span)?),
+        )),
+        Pattern::NamedCtor(tag, named) => {
+            let info = fields
+                .iter()
+                .find(|f| f.ctors.iter().any(|(n, field_names)| n == tag && !field_names.is_empty()))
+                .ok_or_else(|| TypeError(format!("no `data` type has a constructor `{tag}` with named fields"), span))?;
+            let (_, field_names) = info.ctors.iter().find(|(n, _)| n == tag).unwrap();
+
+            let mut by_name: HashMap<&str, &Pattern> = HashMap::new();
+            for (name, p) in named {
+                if by_name.insert(name.as_str(), p).is_some() {
+                    return Err(TypeError(format!("field `{name}` given more than once"), span));
+                }
+            }
+            for (name, _) in named {
+                if !field_names.iter().any(|f| f == name) {
+                    return Err(TypeError(format!("{} has no field named `{name}`", info.type_name), span));
+                }
+            }
+            let mut items = vec![Pattern::Str(tag.clone())];
+            for fname in field_names {
+                let p = by_name
+                    .get(fname.as_str())
+                    .ok_or_else(|| TypeError(format!("missing field `{fname}` in `{tag}` pattern"), span))?;
+                items.push(resolve_pattern(p, fields, span)?);
+            }
+            Ok(Pattern::List(items))
+        }
     }
 }
 
@@ -734,7 +791,13 @@ fn elaborate_node(
         // silently never runs, so this is the only chance to catch it, and
         // there's no point elaborating a body that can't run anyway.
         Expr::Match(scrutinee, arms) => {
-            let pats: Vec<Pattern> = arms.iter().map(|(p, _)| p.clone()).collect();
+            // Named-field patterns (Pattern::NamedCtor) are resolved into
+            // ordinary List/Str shapes right here, first -- everything
+            // below (reachability, exhaustiveness, per-arm binding, and
+            // the pattern finally stored in the elaborated tree) works on
+            // the resolved form, the only one machine.rs ever understands.
+            let pats: Vec<Pattern> =
+                arms.iter().map(|(p, _)| resolve_pattern(p, fields, spans[expr])).collect::<Result<_, _>>()?;
             if let Some(i) = first_unreachable(&pats) {
                 return Err(TypeError(
                     "unreachable match arm: an earlier arm already covers everything it matches".to_string(),
@@ -746,7 +809,7 @@ fn elaborate_node(
             let mut row = scrut_row;
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
-            for (pat, body) in arms.iter() {
+            for (pat, (_, body)) in pats.iter().zip(arms.iter()) {
                 let pat_ty = pattern_type(pat);
                 if !consistent(&scrut_ty, &pat_ty) {
                     return Err(TypeError(
@@ -842,6 +905,81 @@ fn elaborate_node(
             let arms = Rc::new(vec![(Pattern::List(items), var_ref)]);
             let match_expr = arena.push(Expr::Match(target2, arms));
             Ok((Type::Dyn, target_row, match_expr))
+        }
+
+        // `Ctor { field: expr, ... }` -- only resolvable, like FieldAccess,
+        // once `callee`'s type is concretely known as a nominal
+        // Data(name) with EXACTLY one constructor whose fields are all
+        // named. Reorders the given fields into the constructor's own
+        // DECLARED order and desugars into the same curried Application
+        // chain `Ctor(a)(b)` already produces -- reusing App's existing
+        // per-argument coercion (coerce) rather than duplicating it.
+        // Constructors never have row-polymorphic parameter types
+        // (parser::ctor_type always builds EffectRow::pure() arrows), so
+        // unlike ordinary App there's no row-variable binding to do here.
+        Expr::NamedCall(callee, named_args) => {
+            let (callee_ty, callee_row, callee2) = elaborate(arena, callee, ctx, fields, spans)?;
+            let mut param_tys = Vec::new();
+            let mut cur_ty = &callee_ty;
+            let type_name = loop {
+                match cur_ty {
+                    Type::Fun(p, _, ret) => {
+                        param_tys.push((**p).clone());
+                        cur_ty = ret.as_ref();
+                    }
+                    Type::Data(name) => break name.clone(),
+                    other => {
+                        return Err(TypeError(
+                            format!("cannot use `{{ field: value, ... }}` syntax on a value of type {other} (expected a `data` constructor)"),
+                            spans[callee],
+                        ))
+                    }
+                }
+            };
+            let info = fields.iter().find(|f| f.type_name == type_name).ok_or_else(|| {
+                TypeError(format!("cannot use `{{ ... }}` syntax: no known fields for type {type_name}"), spans[callee])
+            })?;
+            if info.ctors.len() != 1 {
+                return Err(TypeError(
+                    format!(
+                        "cannot use `{{ ... }}` syntax on {type_name}: it has {} constructors, not exactly one",
+                        info.ctors.len()
+                    ),
+                    spans[callee],
+                ));
+            }
+            let (_, field_names) = &info.ctors[0];
+            if field_names.is_empty() {
+                return Err(TypeError(
+                    format!("cannot use `{{ ... }}` syntax on {type_name}: its constructor has no named fields"),
+                    spans[callee],
+                ));
+            }
+
+            let mut by_name: HashMap<&str, ExprRef> = HashMap::new();
+            for (name, val) in named_args.iter() {
+                if by_name.insert(name.as_str(), *val).is_some() {
+                    return Err(TypeError(format!("field `{name}` given more than once"), spans[expr]));
+                }
+            }
+            for (name, _) in named_args.iter() {
+                if !field_names.iter().any(|f| f == name) {
+                    return Err(TypeError(format!("{type_name} has no field named `{name}`"), spans[expr]));
+                }
+            }
+
+            let mut result = callee2;
+            let mut row = callee_row;
+            for (fname, param_ty) in field_names.iter().zip(param_tys.iter()) {
+                let val = *by_name
+                    .get(fname.as_str())
+                    .ok_or_else(|| TypeError(format!("missing field `{fname}` in {type_name} construction"), spans[expr]))?;
+                let (a_ty, a_row, a2) = elaborate(arena, val, ctx, fields, spans)?;
+                let a3 = coerce(arena, a2, &a_ty, param_ty, spans[val])?;
+                row = EffectRow::union(&row, &a_row);
+                result = arena.push(Expr::App(result, a3));
+            }
+            Ok((Type::Data(type_name), row, result))
         }
     }
 }

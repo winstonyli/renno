@@ -172,6 +172,12 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                 Expr::FieldAccess(_, field) => {
                     panic!("field access `.{field}` requires typechecking (run through typecheck::check, not raw parser output)")
                 }
+                // Same story as FieldAccess, for the same reason: needs
+                // the constructor's declared field order, which only
+                // exists statically.
+                Expr::NamedCall(..) => {
+                    panic!("named-field construction requires typechecking (run through typecheck::check, not raw parser output)")
+                }
                 Expr::MakeHandler { effect, payload_var, resume_var, body } => {
                     control = Control::Apply(Value::Handler(Rc::new(HandlerData {
                         effect: effect.clone(),
@@ -527,6 +533,14 @@ fn match_pattern(pat: &Pattern, value: &Value, env: Env) -> Option<Env> {
             }
             _ => None,
         },
+        // typecheck::resolve_pattern always rewrites this into Pattern::List
+        // before a Match reaches an elaborated program; only the untyped
+        // path (e.g. tests' run_untyped) could ever hand one to
+        // match_pattern directly, and it has no field-order information to
+        // match against anyway (see Expr::NamedCall's own doc comment).
+        Pattern::NamedCtor(tag, _) => {
+            panic!("named-field pattern `{tag} {{ ... }}` requires typechecking (run through typecheck::check, not raw parser output)")
+        }
     }
 }
 

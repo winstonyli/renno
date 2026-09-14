@@ -238,11 +238,28 @@ impl<'a> Parser<'a> {
             Some(Token::Str(s)) => Ok(Pattern::Str(s)),
             // Case decides Var vs constructor, same convention as ML/
             // Haskell/OCaml: `x`/`_` bind, `Some`/`None`/`Cons` match a
-            // tag (desugars to the same List shape build_ctor_value
-            // constructs -- Some(p) matches ["Some", p], None matches
-            // ["None"]). Renders this whole feature invisible to
-            // typecheck.rs/machine.rs: they only ever see Pattern::List/Str.
+            // tag. Positional (`Some(p)`, desugars right here to the same
+            // List shape build_ctor_value constructs -- Some(p) matches
+            // ["Some", p], None matches ["None"]) renders invisible to
+            // typecheck.rs/machine.rs entirely. Named (`Point { x: p, ...
+            // }`) can't desugar here -- it needs the constructor's
+            // declared field ORDER, which only typecheck knows (see
+            // resolve_pattern) -- so it keeps its own Pattern::NamedCtor
+            // shape until then.
             Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => {
+                if matches!(self.peek(), Some(Token::LBrace)) {
+                    self.bump();
+                    let mut fields = Vec::new();
+                    if !matches!(self.peek(), Some(Token::RBrace)) {
+                        fields.push(self.parse_named_field_pattern()?);
+                        while matches!(self.peek(), Some(Token::Comma)) {
+                            self.bump();
+                            fields.push(self.parse_named_field_pattern()?);
+                        }
+                    }
+                    self.expect(&Token::RBrace)?;
+                    return Ok(Pattern::NamedCtor(name, fields));
+                }
                 let mut items = vec![Pattern::Str(name)];
                 if matches!(self.peek(), Some(Token::LParen)) {
                     self.bump();
@@ -272,6 +289,14 @@ impl<'a> Parser<'a> {
             }
             other => Err(self.err_at(self.span_before(), format!("expected a pattern, found {other:?}"))),
         }
+    }
+
+    // One field inside a `Ctor { field: pattern, ... }` pattern.
+    fn parse_named_field_pattern(&mut self) -> Result<(String, Pattern), String> {
+        let name = self.ident()?;
+        self.expect(&Token::Colon)?;
+        let pat = self.pattern()?;
+        Ok((name, pat))
     }
 
     // expr := cmp
@@ -561,6 +586,14 @@ impl<'a> Parser<'a> {
         value
     }
 
+    // One field inside a `Ctor { field: expr, ... }` construction.
+    fn parse_named_arg(&mut self) -> Result<(String, ExprRef), String> {
+        let name = self.ident()?;
+        self.expect(&Token::Colon)?;
+        let val = self.expr()?;
+        Ok((name, val))
+    }
+
     // Every atom form except `let`/`fun`/`data`, which `atom` handles
     // iteratively above. Reached only once no more chain prefix remains.
     fn atom_leaf(&mut self) -> Result<ExprRef, String> {
@@ -574,8 +607,29 @@ impl<'a> Parser<'a> {
                 Ok(self.push_spanned(Expr::Bool(false), Span { start, end: self.span_before().end }))
             }
             Some(Token::Str(s)) => Ok(self.push_spanned(Expr::Str(s), Span { start, end: self.span_before().end })),
+            // `Ident { field: expr, ... }` -- named-field construction,
+            // ONLY meaningful once typechecked (see Expr::NamedCall's own
+            // doc comment); a bare `Ident` not followed by `{` is just an
+            // ordinary variable reference, unchanged.
             Some(Token::Ident(name)) => {
-                Ok(self.push_spanned(Expr::Var(name), Span { start, end: self.span_before().end }))
+                let callee_span = Span { start, end: self.span_before().end };
+                if matches!(self.peek(), Some(Token::LBrace)) {
+                    self.bump();
+                    let mut fields = Vec::new();
+                    if !matches!(self.peek(), Some(Token::RBrace)) {
+                        fields.push(self.parse_named_arg()?);
+                        while matches!(self.peek(), Some(Token::Comma)) {
+                            self.bump();
+                            fields.push(self.parse_named_arg()?);
+                        }
+                    }
+                    self.expect(&Token::RBrace)?;
+                    let callee = self.push_spanned(Expr::Var(name), callee_span);
+                    let span = Span { start, end: self.span_before().end };
+                    Ok(self.push_spanned(Expr::NamedCall(callee, Rc::new(fields)), span))
+                } else {
+                    Ok(self.push_spanned(Expr::Var(name), callee_span))
+                }
             }
 
             // [e1, e2, ...] -- no trailing comma, no empty-element gaps.

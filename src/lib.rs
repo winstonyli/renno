@@ -108,6 +108,9 @@ mod tests {
             }
             Expr::DataGroup(_, body) => contains_check(arena, *body),
             Expr::FieldAccess(target, _) => contains_check(arena, *target),
+            Expr::NamedCall(callee, args) => {
+                contains_check(arena, *callee) || args.iter().any(|(_, v)| contains_check(arena, *v))
+            }
         }
     }
 
@@ -617,6 +620,99 @@ mod tests {
     #[should_panic(expected = "requires typechecking")]
     fn field_access_on_the_untyped_path_panics_clearly() {
         run_untyped("data Point = Point(x: Int, y: Int) in Point(1)(2).x");
+    }
+
+    // --- named-field construction and patterns ---
+
+    #[test]
+    fn named_construction_and_named_pattern_round_trip() {
+        let src = r#"
+            data Point = Point(x: Int, y: Int) in
+            match Point { x: 3, y: 4 } with
+            | Point { x: a, y: b } -> a * a + b * b
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 25);
+    }
+
+    #[test]
+    fn named_construction_field_order_does_not_matter() {
+        let src = "data Point = Point(x: Int, y: Int) in \
+                    let p = Point { y: 4, x: 3 } in p.x * p.x + p.y * p.y";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 25);
+    }
+
+    #[test]
+    fn named_pattern_field_order_does_not_matter() {
+        // Positional construction, named pattern in the OPPOSITE order --
+        // confirms reordering happens on both sides independently.
+        let src = "data Point = Point(x: Int, y: Int) in \
+                    match Point(3)(4) with | Point { y: b, x: a } -> a - b";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), -1);
+    }
+
+    #[test]
+    fn named_construction_missing_field_rejected_statically() {
+        let (mut arena, spans, root) = parser::parse("data Point = Point(x: Int, y: Int) in Point { x: 1 }").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("missing field `y`"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn named_construction_unknown_field_rejected_statically() {
+        let src = "data Point = Point(x: Int, y: Int) in Point { x: 1, y: 2, z: 3 }";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("no field named `z`"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn named_construction_duplicate_field_rejected_statically() {
+        let src = "data Point = Point(x: Int, y: Int) in Point { x: 1, x: 2 }";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("given more than once"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn named_construction_on_multi_constructor_type_rejected_statically() {
+        let src = "data Option = None | Some(x: Int) in Some { x: 1 }";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("not exactly one"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn named_construction_field_type_still_checked() {
+        let src = "data Point = Point(x: Int, y: Int) in Point { x: true, y: 2 }";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected Int, found Bool"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn named_pattern_missing_field_rejected_statically() {
+        let src = "data Point = Point(x: Int, y: Int) in match Point(1)(2) with | Point { x: a } -> a";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("missing field `y`"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires typechecking")]
+    fn named_construction_on_the_untyped_path_panics_clearly() {
+        run_untyped("data Point = Point(x: Int, y: Int) in Point { x: 1, y: 2 }");
+    }
+
+    #[test]
+    #[should_panic(expected = "requires typechecking")]
+    fn named_pattern_on_the_untyped_path_panics_clearly() {
+        run_untyped("data Point = Point(x: Int, y: Int) in match Point(1)(2) with | Point { x: a, y: b } -> a");
     }
 
     // --- match exhaustiveness ---
