@@ -730,10 +730,15 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // postfix := atom atom*  -- curried calls, either by juxtaposition
-    // (f a b) or explicit parens (f(a)(b) -- unaffected: "(" is itself an
-    // atom-starting token, so parsing the parenthesized expression as the
-    // argument atom produces the identical App chain either way).
+    // postfix := atom (("." ident) | atom)*  -- curried calls, either by
+    // juxtaposition (f a b) or explicit parens (f(a)(b) -- unaffected:
+    // "(" is itself an atom-starting token, so parsing the parenthesized
+    // expression as the argument atom produces the identical App chain
+    // either way), and field access p.x. Both are peers in this ONE
+    // left-to-right loop over the accumulating `e`: `f(a).x` means
+    // `(f(a)).x` (dot binds to whatever the chain has built so far, not
+    // to the argument atom alone), and correspondingly `f x.y` means
+    // `(f x).y`, not `f(x.y)`.
     //
     // The juxtaposed-argument case parses just ONE atom (self.atom(), not
     // self.expr()) for the same reason application binds tighter than
@@ -754,6 +759,12 @@ impl<'a> Parser<'a> {
                     let arg = self.atom()?;
                     let span = Span { start, end: self.span_before().end };
                     e = self.push_spanned(Expr::App(e, arg), span);
+                }
+                Some(Token::Dot) => {
+                    self.bump();
+                    let name = self.ident()?;
+                    let span = Span { start, end: self.span_before().end };
+                    e = self.push_spanned(Expr::FieldAccess(e, name), span);
                 }
                 _ => break,
             }

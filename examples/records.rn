@@ -3,17 +3,23 @@
 // position. A real, separate runtime kind (Value::Record), not a
 // disguised list -- see types::Type::Record's own doc comment for why:
 // name-based lookup is what lets width subtyping (below) work with no
-// value transformation at any boundary.
+// value transformation at any boundary, and lets `.field` access (also
+// below) desugar into an ordinary two-argument call with no new
+// runtime opcode.
 let p = {x: 3, y: 4} in
 
-// No `.field` access -- records are read back by destructuring, the same
-// mechanism tuples already use. A bare field name puns to itself:
-// `{x, y}` in pattern position means `{x: x, y: y}`.
+// Destructuring, the same mechanism tuples already use. A bare field
+// name puns to itself: `{x, y}` in pattern position means `{x: x, y: y}`.
 let sum_of_squares = match p with | {x, y} -> x * x + y * y in
+
+// `.field` access -- a peer of application in the same postfix chain
+// (`f(a).x` means `(f(a)).x`), not the only way to read a record back,
+// but often the more direct one.
+let product = p.x * p.y in
 
 // Width subtyping: a `{x: Int}` annotation accepts any record that has
 // AT LEAST field x -- extra fields (like `y` here) just ride along,
 // unobserved by anything that only ever asked for x.
-let fst = fun r: {x: Int} -> match r with | {x} -> x in
+let fst = fun r: {x: Int} -> r.x in
 
-sum_of_squares + fst(p)
+sum_of_squares + product + fst(p)

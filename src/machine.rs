@@ -132,6 +132,19 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     );
                     control = Control::Eval(first, env);
                 }
+                // Reachable only if this tree skipped typecheck::check --
+                // elaborate_node's own FieldAccess arm rewrites every
+                // Expr::FieldAccess into an ordinary get_field(...) call
+                // during elaboration (see its own doc comment). Same
+                // caveat as Expr::Record's own arm just above: a
+                // properly typechecked tree never has one left by the
+                // time it gets here, but machine::run itself has no such
+                // guarantee for a tree that reached it directly (e.g.
+                // lib.rs's run_untyped) -- `.field` access simply isn't
+                // supported on that untyped path.
+                Expr::FieldAccess(..) => unreachable!(
+                    "Expr::FieldAccess reached machine::run directly -- `.field` needs typecheck::check first, see its own doc comment"
+                ),
                 Expr::ListLit(items) => {
                     if items.is_empty() {
                         control = Control::Apply(Value::List(Rc::new(Vec::new())));
@@ -626,6 +639,25 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                     Value::Bool(find_field(&fields, &name).is_some())
                 }
                 _ => panic!("has_field expects a record and a string"),
+            }
+        }
+        // Same (record, name) argument order as HasField just above.
+        // Panics on a missing field the same way Get panics on an
+        // out-of-range index -- renno has no Option/Result to return
+        // instead. The common case (target statically known to have this
+        // field) never reaches here with a missing name at all --
+        // typecheck::elaborate_node's own Expr::FieldAccess arm already
+        // rejected that statically; this only fires for a genuinely
+        // Dyn-sourced value that turns out to be missing what was asked
+        // for, or isn't a Record at all.
+        Builtin::GetField => {
+            let (name, record) = (args.pop(), args.pop());
+            match (record, name) {
+                (Some(Value::Record(fields)), Some(Value::Str(name))) => match find_field(&fields, &name) {
+                    Some(v) => v.clone(),
+                    None => panic!("no field named `{name}`"),
+                },
+                _ => panic!("get_field expects a record and a string"),
             }
         }
         // Same shallow "is it callable at all" story Value::matches_type's

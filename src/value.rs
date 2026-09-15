@@ -64,6 +64,15 @@ pub enum Builtin {
     // Record boundary check into: is_record(v) && has_field(v, "x") &&
     // ... , one clause per required field name.
     HasField,
+    // (Dyn, Str) -> Dyn -- extracts a named field's value. What `.field`
+    // access desugars into (typecheck::elaborate_node's own
+    // Expr::FieldAccess arm) rather than a dedicated runtime opcode --
+    // same "no new machine.rs code" story build_predicate_call's other
+    // callers already get, since this is just an ordinary two-argument
+    // call like HasField. Panics, like Get, rather than returning an
+    // Option: renno has no Option/Result in the prelude, and every other
+    // Dyn-sourced shape mismatch already panics at the point of use.
+    GetField,
     // Dyn -> Bool, one per primitive tag. typecheck::coerce desugars a
     // Dyn-to-primitive boundary Check into `if is_X(e) then e else
     // fail(...)` using these, instead of a dedicated Check AST node/Frame
@@ -102,7 +111,7 @@ impl Builtin {
             | Builtin::IsFun
             | Builtin::IsRecord
             | Builtin::TypeName => 1,
-            Builtin::Map | Builtin::Get | Builtin::HasField => 2,
+            Builtin::Map | Builtin::Get | Builtin::HasField | Builtin::GetField => 2,
             Builtin::Fold => 3,
         }
     }

@@ -28,6 +28,10 @@ impl PList<Value> {
             .bind("is_fun", Value::Builtin(Builtin::IsFun))
             .bind("is_record", Value::Builtin(Builtin::IsRecord))
             .bind("has_field", Value::Builtin(Builtin::HasField))
+            // Runtime half of `.field` access's own desugaring
+            // (typecheck::elaborate_node's Expr::FieldAccess arm) --
+            // same "ordinary prelude builtin, not hidden" treatment.
+            .bind("get_field", Value::Builtin(Builtin::GetField))
             .bind("type_name", Value::Builtin(Builtin::TypeName))
     }
 

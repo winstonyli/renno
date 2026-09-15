@@ -122,6 +122,18 @@ pub enum Expr {
     // their own name-keyed runtime kind), and machine.rs evaluates it
     // directly via Frame::RecordElems into a Value::Record.
     Record(Rc<Vec<(String, ExprRef)>>),
+    // `p.x` -- reads field `x` off a record. Parser-emitted and
+    // typecheck-consumed only: elaborate_node's own FieldAccess arm
+    // desugars it into an ordinary `get_field(target, "x")` call (see
+    // Builtin::GetField's own doc comment) after checking what it can
+    // statically -- machine.rs never evaluates a FieldAccess node
+    // directly, the same "parser/typecheck marker, rewritten away before
+    // it can reach the runtime loop" shape Expr::Record itself used to
+    // have (back when it rewrote to Expr::Tuple), except FieldAccess
+    // never graduates out of that shape the way Record did, since
+    // reading one field needs no evaluation semantics beyond an ordinary
+    // two-argument call.
+    FieldAccess(ExprRef, String),
     // Variable-arity, unlike every other node -- elaborate/machine handle
     // it with a loop over the Vec rather than a fixed-shape match.
     ListLit(Vec<ExprRef>),

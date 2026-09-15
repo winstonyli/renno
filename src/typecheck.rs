@@ -310,8 +310,9 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type) -> Ex
         // AROUND it) would let has_field run on a value that was never
         // confirmed to be a Record at all.
         Type::Record(fields) => {
-            let has_all =
-                fold_predicate(arena, fields, FoldOp::And, |arena, (name, _)| build_has_field_call(arena, value_ref, name));
+            let has_all = fold_predicate(arena, fields, FoldOp::And, |arena, (name, _)| {
+                build_str_call(arena, "has_field", value_ref, name)
+            });
             let is_record = build_predicate_call(arena, "is_record", value_ref);
             let false_lit = arena.push(Expr::Bool(false));
             arena.push(Expr::If(is_record, has_all, false_lit))
@@ -362,13 +363,14 @@ fn build_predicate_call(arena: &mut Arena, name: &str, value_ref: ExprRef) -> Ex
     arena.push(Expr::App(v, value_ref))
 }
 
-// `has_field(value_ref, field_name)` -- the two-argument counterpart to
-// build_predicate_call, used only by Record's own shape predicate/check.
-fn build_has_field_call(arena: &mut Arena, value_ref: ExprRef, field_name: &str) -> ExprRef {
-    let f = arena.push(Expr::Var("has_field".to_string()));
+// `builtin(value_ref, str_arg)` -- the two-argument counterpart to
+// build_predicate_call, shared by Record's own has_field-based shape
+// check above and `.field` access's get_field desugaring below.
+fn build_str_call(arena: &mut Arena, builtin: &str, value_ref: ExprRef, str_arg: &str) -> ExprRef {
+    let f = arena.push(Expr::Var(builtin.to_string()));
     let applied = arena.push(Expr::App(f, value_ref));
-    let name_lit = arena.push(Expr::Str(field_name.to_string()));
-    arena.push(Expr::App(applied, name_lit))
+    let arg_lit = arena.push(Expr::Str(str_arg.to_string()));
+    arena.push(Expr::App(applied, arg_lit))
 }
 
 // `let __check_tmp = e in if <cond(__check_tmp)> then __check_tmp else
@@ -516,6 +518,52 @@ fn pattern_type(pat: &Pattern) -> Type {
         // diagnostic's own message text -- see pattern_could_match, the
         // function that actually decides Record's case, right below.
         Pattern::Record(_) => Type::Dyn,
+    }
+}
+
+// True for a Type::Record, or a Type::Union whose every alternative is
+// itself record_shaped -- the set of static types `.field` access (see
+// Expr::FieldAccess's own doc comment) can meaningfully ask a field of.
+// Anything else (Int, Tuple, Fun, a Union with a non-record alternative,
+// ...) is definitely not, and gets the "expected a record" error instead
+// of "no field named" -- the two are worth telling apart even though
+// both are just `.field` being rejected, the same way a Fun-annotation
+// mismatch and a wrong-argument-type mismatch are worded differently.
+fn record_shaped(ty: &Type) -> bool {
+    match ty {
+        Type::Record(_) => true,
+        Type::Union(alts) => alts.iter().all(record_shaped),
+        _ => false,
+    }
+}
+
+// The type `.field` access on a record_shaped `ty` returns, if `ty`
+// definitely HAS this field -- for a Union, only when EVERY alternative
+// has it (recursing, so a Union of Unions works too), since a value of
+// that type could be ANY alternative at runtime. Field types across
+// alternatives widen to Dyn on disagreement, the same "no union types,
+// pick Dyn instead" rule If's branches/ListLit's elements/Match's arms
+// already use elsewhere in this file. None means the field is missing
+// from at least one alternative (or, for a bare Record, missing
+// entirely) -- record_shaped's own caller already ruled out "not even
+// shaped like a record" separately, so this only ever needs to answer
+// the narrower "does it have GOT this one" question.
+fn record_field_type(ty: &Type, name: &str) -> Option<Type> {
+    match ty {
+        Type::Record(fields) => find_field(fields, name).cloned(),
+        Type::Union(alts) => {
+            let mut result: Option<Type> = None;
+            for alt in alts.iter() {
+                let t = record_field_type(alt, name)?;
+                result = Some(match &result {
+                    Some(prev) if *prev == t => t,
+                    Some(_) => Type::Dyn,
+                    None => t,
+                });
+            }
+            result
+        }
+        _ => None,
     }
 }
 
@@ -904,6 +952,40 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
                 field_refs.push((name.clone(), field2));
             }
             Ok((Type::Record(Rc::new(field_tys)), row, arena.push(Expr::Record(Rc::new(field_refs)))))
+        }
+
+        // `p.x` -- desugars into an ordinary get_field(target, "x") call
+        // (Builtin::GetField, machine.rs) -- never a new machine.rs
+        // opcode. Statically checked where `target`'s type says enough
+        // to check: a concrete Type::Record (or a Type::Union of them,
+        // every alternative required to have the field -- see
+        // record_field_type's own doc comment), rejected immediately if
+        // it's neither and not Dyn either, the same way calling a
+        // non-Fun value is. A Dyn target gets a REAL runtime shape check
+        // (build_shape_check, same machinery every other Dyn-to-Record
+        // boundary already uses) before the get_field call, not a bare
+        // call -- Expr::App's own Type::Dyn arm makes the identical
+        // choice (wrapping in build_shallow_check) for the exact same
+        // reason its own comment gives: a bare call would leave a
+        // shape mismatch to machine.rs's own differently-worded (and
+        // differently-styled) panic instead of this file's ordinary
+        // fail()+type_name() message.
+        Expr::FieldAccess(target, name) => {
+            let (target_ty, target_row, target2) = elaborate(arena, target, ctx, spans)?;
+            let field_ty = match &target_ty {
+                Type::Dyn => Type::Dyn,
+                ty if record_shaped(ty) => record_field_type(ty, &name)
+                    .ok_or_else(|| TypeError(format!("no field named `{name}`"), spans[expr]))?,
+                other => return Err(TypeError(format!("expected a record, found {other}"), spans[target])),
+            };
+            let checked_target = if target_ty == Type::Dyn {
+                let required = Type::Record(Rc::new(vec![(name.clone(), Type::Dyn)]));
+                build_shape_check(arena, target2, &required)
+            } else {
+                target2
+            };
+            let call = build_str_call(arena, "get_field", checked_target, &name);
+            Ok((field_ty, target_row, call))
         }
 
         Expr::ListLit(items) => {

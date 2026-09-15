@@ -113,10 +113,15 @@ mod tests {
             Expr::Match(scrutinee, arms) => {
                 contains_check(arena, *scrutinee) || arms.iter().any(|(_, body)| contains_check(arena, *body))
             }
+            // Stale as of records getting a real runtime kind: Expr::Record
+            // DOES survive elaboration now (see its own doc comment), so
+            // this walks its field values like any other compound node.
+            Expr::Record(fields) => fields.iter().any(|(_, v)| contains_check(arena, *v)),
             // Never reaches here -- this walks an ELABORATED tree, and
-            // Expr::Record never survives elaboration (see its own doc
+            // Expr::FieldAccess never survives elaboration (rewritten
+            // into an ordinary get_field(...) call -- see its own doc
             // comment).
-            Expr::Record(..) => unreachable!("Expr::Record never survives elaboration"),
+            Expr::FieldAccess(..) => unreachable!("Expr::FieldAccess never survives elaboration"),
         }
     }
 
@@ -1130,14 +1135,42 @@ mod tests {
     // NAMED product, a separate type from Tuple (see types::Type::Record's
     // own doc comment for why: real record ergonomics need order-
     // independent construction, which Tuple's strictly-positional
-    // comparison doesn't give). Desugars to a plain Expr::Tuple/Value::List
-    // at elaboration time -- no new Value kind, field names live at the
-    // type level only. Read back via destructuring only, no `.field`. ---
+    // comparison doesn't give). A real name-keyed Value::Record at
+    // runtime (see its own doc comment), which is what lets width
+    // subtyping work with no per-boundary value transformation. Read
+    // back either way -- `.field` access, or destructuring
+    // (`{x, y}` punning for `{x: x, y: y}`). ---
 
     #[test]
     fn record_construction_and_destructure_round_trip() {
         let src = "match {x: 1, y: 2} with | {x: a, y: b} -> a + b";
         assert_eq!(run_source(src).unwrap().as_int(), 3);
+    }
+
+    #[test]
+    fn contains_check_recurses_into_a_records_field_values() {
+        // Direct coverage for contains_check's own Expr::Record arm
+        // (previously had none -- see its own doc comment history): a
+        // Dyn-to-Int check nested inside a field's value expression must
+        // still be found, proving the arm actually recurses into field
+        // VALUES rather than trivially returning false.
+        let src = r#"
+            handle
+              let y = perform choose(0) in
+              let f = fun x: Int -> x in
+              {a: f(y)}
+            with handler choose(p, resume) -> resume(41)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(contains_check(&arena, elaborated));
+    }
+
+    #[test]
+    fn contains_check_finds_no_check_in_a_plain_record() {
+        let (mut arena, spans, root) = parser::parse("{a: 1}").unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(!contains_check(&arena, elaborated));
     }
 
     #[test]
@@ -1377,6 +1410,95 @@ mod tests {
             with handler choose(p, resume) -> resume({x: 1, y: 2})
         "#;
         assert!(!run_source(src).unwrap().as_bool());
+    }
+
+    #[test]
+    fn field_access_reads_the_right_field() {
+        assert_eq!(run_source("let p = {x: 3, y: 4} in p.x + p.y").unwrap().as_int(), 7);
+    }
+
+    #[test]
+    fn field_access_chains_and_binds_to_the_whole_application_chain() {
+        // `f(5).x` means `(f(5)).x`, the same postfix binding order
+        // juxtaposition/application already established -- dot is a peer
+        // of application in the same left-to-right loop, not bound to
+        // the argument atom alone.
+        let src = "let f = fun n -> {x: n} in f(5).x";
+        assert_eq!(run_source(src).unwrap().as_int(), 5);
+    }
+
+    #[test]
+    fn field_access_on_a_width_subtyped_record_still_works() {
+        let src = "let f = fun r: {x: Int} -> r.x in f({x: 1, y: 2})";
+        assert_eq!(run_source(src).unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn unknown_field_access_rejected_statically() {
+        let (mut arena, spans, root) = parser::parse("let p = {x: 3} in p.y").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("no field named `y`"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn field_access_on_a_non_record_type_rejected_statically() {
+        let (mut arena, spans, root) = parser::parse("5.x").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected a record, found Int"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn field_access_on_a_dyn_sourced_record_works_at_runtime() {
+        let src = r#"
+            handle
+              let y = perform choose(0) in
+              y.x
+            with handler choose(p, resume) -> resume({x: 42})
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 42);
+    }
+
+    #[test]
+    fn field_access_on_a_dyn_sourced_non_record_panics_at_runtime() {
+        // Regression: a Dyn-target `.field` used to dispatch straight to
+        // get_field with no shape check first, so a non-record value hit
+        // get_field's own internal-assertion panic instead of the file's
+        // ordinary fail()+type_name() message every other Dyn-boundary
+        // Record check produces. Now goes through build_shape_check
+        // first, same as any other Dyn-to-Record boundary.
+        let src = r#"
+            handle
+              let y = perform choose(0) in
+              y.x
+            with handler choose(p, resume) -> resume(5)
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected {x: Dyn}, found Int"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn field_access_on_a_dyn_sourced_record_missing_the_field_panics_cleanly() {
+        let src = r#"
+            handle
+              let y = perform choose(0) in
+              y.x
+            with handler choose(p, resume) -> resume({z: 1})
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected {x: Dyn}, found Record"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn field_access_accepted_on_a_union_when_every_alternative_has_the_field() {
+        let src = "let f = fun r: {x: Int} | {x: Int, y: Int} -> r.x in f({x: 1, y: 2}) + f({x: 5})";
+        assert_eq!(run_source(src).unwrap().as_int(), 6);
+    }
+
+    #[test]
+    fn field_access_rejected_on_a_union_when_one_alternative_lacks_the_field() {
+        let (mut arena, spans, root) = parser::parse("let f = fun r: {x: Int} | {y: Int} -> r.x in f").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("no field named `x`"), "unexpected message: {}", err.0);
     }
 
     // --- match exhaustiveness ---
