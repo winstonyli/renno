@@ -5,6 +5,7 @@ use crate::cont::{Cont, ContNode, Frame};
 use crate::env::Env;
 use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
 use crate::span::Span;
+use crate::util::find_field;
 use crate::value::{Builtin, HandlerData, Value};
 
 enum Control {
@@ -622,7 +623,7 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             let (name, record) = (args.pop(), args.pop());
             match (record, name) {
                 (Some(Value::Record(fields)), Some(Value::Str(name))) => {
-                    Value::Bool(fields.iter().any(|(n, _)| n.as_str() == &*name))
+                    Value::Bool(find_field(&fields, &name).is_some())
                 }
                 _ => panic!("has_field expects a record and a string"),
             }
@@ -713,8 +714,7 @@ fn match_pattern(pat: &Pattern, value: &Value, env: Env) -> Option<Env> {
             Value::Record(entries) => {
                 let mut env = env;
                 for (name, p) in fields {
-                    let (_, v) = entries.iter().find(|(n, _)| n == name)?;
-                    env = match_pattern(p, v, env)?;
+                    env = match_pattern(p, find_field(entries, name)?, env)?;
                 }
                 Some(env)
             }
@@ -761,7 +761,7 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         // typing) doesn't make two DIFFERENT Meters values compare
         // equal just because both satisfy the same annotation.
         (Value::Record(x), Value::Record(y)) => {
-            x.len() == y.len() && x.iter().all(|(n, v)| y.iter().any(|(n2, v2)| n == n2 && value_eq(v, v2)))
+            x.len() == y.len() && x.iter().all(|(n, v)| find_field(y, n).is_some_and(|v2| value_eq(v, v2)))
         }
         _ => false,
     }

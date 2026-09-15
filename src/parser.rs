@@ -5,6 +5,7 @@ use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
 use crate::lexer::{tokenize, Token};
 use crate::span::Span;
 use crate::types::{EffectRow, Type};
+use crate::util::find_field;
 
 pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
     let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
@@ -253,7 +254,7 @@ impl<'a> Parser<'a> {
             // bumped since), not at the closing "}" a later post-hoc scan
             // would only reach after the whole record (and its span) had
             // already moved past every field.
-            if fields.iter().any(|(n, _)| n == &name) {
+            if find_field(&fields, &name).is_some() {
                 return Err(self.err_at(self.span_before(), format!("field `{name}` given more than once")));
             }
             let value = if matches!(self.peek(), Some(Token::Colon)) {

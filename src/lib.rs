@@ -8,6 +8,7 @@ pub mod plist;
 pub mod span;
 pub mod typecheck;
 pub mod types;
+pub mod util;
 pub mod value;
 
 use env::Env;

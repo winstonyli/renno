@@ -6,6 +6,7 @@ use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
 use crate::plist::PList;
 use crate::span::Span;
 use crate::types::{consistent, record_satisfies, EffectRow, Type};
+use crate::util::find_field;
 
 // The Span is always an ORIGINAL (pre-elaboration) node's -- the one whose
 // type was being checked when the error fired, always already in scope
@@ -513,7 +514,7 @@ fn pattern_type(pat: &Pattern) -> Type {
 fn pattern_could_match(pat: &Pattern, ty: &Type) -> bool {
     match (pat, ty) {
         (Pattern::Record(fields), Type::Record(type_fields)) => {
-            fields.iter().all(|(name, _)| type_fields.iter().any(|(n, _)| n == name))
+            fields.iter().all(|(name, _)| find_field(type_fields, name).is_some())
         }
         (Pattern::Record(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt)),
         (Pattern::Record(_), Type::Dyn) => true,
@@ -567,9 +568,9 @@ fn dominates(earlier: &Pattern, later: &Pattern) -> bool {
         Pattern::Bool(b) => matches!(later, Pattern::Bool(c) if c == b),
         Pattern::Str(s) => matches!(later, Pattern::Str(t) if t == s),
         Pattern::Record(efields) => match later {
-            Pattern::Record(lfields) => efields.iter().all(|(name, esub)| {
-                lfields.iter().find(|(n, _)| n == name).is_some_and(|(_, lsub)| dominates(esub, lsub))
-            }),
+            Pattern::Record(lfields) => {
+                efields.iter().all(|(name, esub)| find_field(lfields, name).is_some_and(|lsub| dominates(esub, lsub)))
+            }
             _ => false,
         },
         _ => false,
@@ -609,9 +610,9 @@ fn covers_tuple_position(pat: &Pattern, ty: &Type) -> bool {
         (Pattern::List(subpats), Type::Tuple(items)) if subpats.len() == items.len() => {
             subpats.iter().zip(items.iter()).all(|(sp, t)| covers_tuple_position(sp, t))
         }
-        (Pattern::Record(pat_fields), Type::Record(type_fields)) => pat_fields.iter().all(|(name, sp)| {
-            type_fields.iter().find(|(n, _)| n == name).is_some_and(|(_, t)| covers_tuple_position(sp, t))
-        }),
+        (Pattern::Record(pat_fields), Type::Record(type_fields)) => pat_fields
+            .iter()
+            .all(|(name, sp)| find_field(type_fields, name).is_some_and(|t| covers_tuple_position(sp, t))),
         _ => false,
     }
 }

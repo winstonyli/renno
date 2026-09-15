@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
 
+use crate::util::find_field;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Dyn,
@@ -223,7 +225,7 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
 // by typecheck::coerce, alongside (not instead of) its own consistent()
 // check.
 pub fn record_satisfies(required: &[(String, Type)], actual: &[(String, Type)]) -> bool {
-    required.iter().all(|(name, ty)| actual.iter().any(|(aname, aty)| aname == name && consistent(ty, aty)))
+    required.iter().all(|(name, ty)| find_field(actual, name).is_some_and(|aty| consistent(ty, aty)))
 }
 
 fn row_consistent(a: &EffectRow, b: &EffectRow) -> bool {
