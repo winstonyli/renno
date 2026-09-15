@@ -178,12 +178,16 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| consistent(x, y))
         }
         // Same idea as Tuple, plus each position's NAME must also match --
-        // both sides are always stored sorted by name (see Type::Record's
-        // own doc comment), so this is still a plain positional zip, not a
-        // set comparison.
-        (Type::Record(a), Type::Record(b)) => {
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|((n1, t1), (n2, t2))| n1 == n2 && consistent(t1, t2))
-        }
+        // reuses record_satisfies (the one-directional "has at least
+        // these fields" relation coerce's width subtyping is built from)
+        // for the actual per-field name+type check, adding only the
+        // length equality that turns "at least" into "exactly." Sound
+        // because field names within one Type::Record are always unique
+        // (parse_record_fields rejects a duplicate) -- same length plus
+        // every one of `a`'s (name, type) pairs found in `b` forces the
+        // two name SETS to be identical, not just one contained in the
+        // other.
+        (Type::Record(a), Type::Record(b)) => a.len() == b.len() && record_satisfies(a, b),
         // Two unions: consistent as SETS -- every alternative on each
         // side has a match on the other (order and duplicates don't
         // matter, only membership). Must come before the single-Union
