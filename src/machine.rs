@@ -99,6 +99,7 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
                 Expr::Str(s) => control = Control::Apply(Value::Str(Rc::from(s.as_str()))),
+                Expr::Token(id) => control = Control::Apply(Value::Token(*id)),
                 Expr::ListLit(items) => {
                     if items.is_empty() {
                         control = Control::Apply(Value::List(Rc::new(Vec::new())));
@@ -405,7 +406,7 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                             // the value's own trailing brand tag
                                             // (see build_ctor_value) to match.
                                             && match brand {
-                                                Some(b) => matches!(items.last(), Some(Value::Int(n)) if *n == b as i64),
+                                                Some(b) => matches!(items.last(), Some(Value::Token(n)) if *n == b),
                                                 None => true,
                                             }
                                     }
@@ -674,6 +675,7 @@ fn match_pattern(pat: &Pattern, value: &Value, env: Env) -> Option<Env> {
         Pattern::Int(n) => matches!(value, Value::Int(v) if v == n).then_some(env),
         Pattern::Bool(b) => matches!(value, Value::Bool(v) if v == b).then_some(env),
         Pattern::Str(s) => matches!(value, Value::Str(v) if &**v == s.as_str()).then_some(env),
+        Pattern::Token(id) => matches!(value, Value::Token(v) if v == id).then_some(env),
         Pattern::List(pats) => match value {
             Value::List(items) if items.len() == pats.len() => {
                 let mut env = env;
@@ -708,6 +710,7 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Token(x), Value::Token(y)) => x == y,
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_eq(a, b))
         }

@@ -474,7 +474,7 @@ impl<'a> Parser<'a> {
                     self.expect(&Token::RParen)?;
                 }
                 if let Some(id) = brand_id {
-                    items.push(Pattern::Int(id as i64));
+                    items.push(Pattern::Token(id));
                 }
                 Ok(Pattern::List(items))
             }
@@ -1125,7 +1125,7 @@ impl<'a> Parser<'a> {
             items.push(self.push_spanned(Expr::Var(p.clone()), span));
         }
         if let Some(id) = brand {
-            items.push(self.push_spanned(Expr::Int(id as i64), span));
+            items.push(self.push_spanned(Expr::Token(id), span));
         }
         let mut value = self.push_spanned(Expr::ListLit(items), span);
         for (p, (_, ty)) in params.iter().zip(field_tys.iter()).rev() {

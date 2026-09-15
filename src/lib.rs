@@ -90,7 +90,7 @@ mod tests {
         use expr::Expr;
         match &arena[root] {
             Expr::Check(..) | Expr::CheckData(..) => true,
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) => false,
+            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
             Expr::ListLit(items) => items.iter().any(|i| contains_check(arena, *i)),
             Expr::Lambda(_, _, body) => contains_check(arena, *body),
             Expr::App(f, a) => contains_check(arena, *f) || contains_check(arena, *a),
@@ -959,6 +959,33 @@ mod tests {
             (Value::List(b), Value::List(p)) => assert_eq!(b.len(), p.len() + 1),
             (b, p) => panic!("expected two lists, got {b} and {p}"),
         }
+    }
+
+    #[test]
+    fn opaque_brand_tag_is_a_distinct_value_kind_not_a_plain_int() {
+        // Before Value::Token existed, this trailing element was a bare
+        // Value::Int -- indistinguishable from a real Int field (a
+        // Pattern::Int could accidentally match it, or vice versa).
+        // Confirms it's now its own runtime kind.
+        let branded = run_untyped("data Meters = Mk(Int, opaque) in Mk(5)");
+        match branded {
+            Value::List(items) => {
+                let tail = items.last().map(|v| v.to_string());
+                assert!(matches!(items.last(), Some(Value::Token(_))), "expected a trailing Value::Token, got {tail:?}");
+            }
+            v => panic!("expected a list, got {v}"),
+        }
+    }
+
+    #[test]
+    fn opaque_brand_tag_prints_as_a_marker_not_a_raw_number() {
+        // Regression test for the Display leak the README used to flag:
+        // a branded value's hidden tag is still visible when printed
+        // (Value's Display has no way to know it should hide it), but it
+        // no longer shows the meaningless numeric id -- Value::Token's
+        // own Display renders a fixed `<brand>` marker instead.
+        let outcome = run_source("data Meters = Mk(Int, opaque) in Mk(5)").unwrap();
+        assert_eq!(outcome.to_string(), "[Mk, 5, <brand>]");
     }
 
     #[test]

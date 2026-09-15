@@ -71,6 +71,14 @@ pub enum Value {
     Int(i64),
     Bool(bool),
     Str(Rc<str>),
+    // An `opaque` `data` constructor's hidden trailing brand tag (see
+    // parser::build_ctor_value) -- a DISTINCT kind from Int specifically
+    // so it can never be confused with (or forged as) a real Int field:
+    // Pattern::Int can never match it, and Pattern::Token can never match
+    // an ordinary Value::Int. Never produced by any surface syntax, never
+    // a legal type annotation target (matches_type always rejects it);
+    // purely an implementation-internal runtime tag.
+    Token(u64),
     // Rc<Vec<Value>>, not a persistent cons-list: most list use in a
     // scripting language is indexing/iteration, which arrays serve better
     // than cons-lists. Pattern matching (Pattern::List/Cons) and `data`
@@ -156,6 +164,9 @@ impl Value {
             (Value::Continuation(_), Type::Fun(_, _, _)) => true,
             (Value::Builtin(_), Type::Fun(_, _, _)) => true,
             (Value::PartialBuiltin(..), Type::Fun(_, _, _)) => true,
+            // Never satisfies any surface annotation -- there's no syntax
+            // to even write a type that would mean "a brand tag."
+            (Value::Token(_), _) => false,
             _ => false,
         }
     }
@@ -165,6 +176,7 @@ impl Value {
             Value::Int(_) => "Int",
             Value::Bool(_) => "Bool",
             Value::Str(_) => "Str",
+            Value::Token(_) => "Token",
             Value::List(_) => "List",
             Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => "Fun",
             Value::Handler(_) => "Handler",
@@ -178,6 +190,13 @@ impl fmt::Display for Value {
             Value::Int(n) => write!(f, "{n}"),
             Value::Bool(b) => write!(f, "{b}"),
             Value::Str(s) => write!(f, "{s}"),
+            // Never the numeric id -- that would leak a meaningless
+            // implementation detail (and previously did, back when this
+            // was just a bare Value::Int). A branded value printed at the
+            // top level (Value::List's own arm below loops straight
+            // through to here for its trailing element) now shows this
+            // marker instead of a raw number.
+            Value::Token(_) => write!(f, "<brand>"),
             Value::List(items) => {
                 write!(f, "[")?;
                 for (i, v) in items.iter().enumerate() {
@@ -209,6 +228,8 @@ pub enum Outcome {
     Int(i64),
     Bool(bool),
     Str(String),
+    // Mirrors Value::Token -- see its own doc comment.
+    Token,
     List(Vec<Outcome>),
     Function,
     Handler,
@@ -236,6 +257,7 @@ impl From<&Value> for Outcome {
             Value::Int(n) => Outcome::Int(*n),
             Value::Bool(b) => Outcome::Bool(*b),
             Value::Str(s) => Outcome::Str(s.to_string()),
+            Value::Token(_) => Outcome::Token,
             Value::List(items) => Outcome::List(items.iter().map(Outcome::from).collect()),
             Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => {
                 Outcome::Function
@@ -251,6 +273,7 @@ impl fmt::Display for Outcome {
             Outcome::Int(n) => write!(f, "{n}"),
             Outcome::Bool(b) => write!(f, "{b}"),
             Outcome::Str(s) => write!(f, "{s}"),
+            Outcome::Token => write!(f, "<brand>"),
             Outcome::List(items) => {
                 write!(f, "[")?;
                 for (i, v) in items.iter().enumerate() {

@@ -301,6 +301,11 @@ fn pattern_type(pat: &Pattern) -> Type {
         Pattern::Int(_) => Type::Int,
         Pattern::Bool(_) => Type::Bool,
         Pattern::Str(_) => Type::Str,
+        // Never written by a user (see Pattern::Token's own doc comment)
+        // -- only ever appears as the trailing element of a List pattern
+        // an opaque ctor's own desugaring built, which is typed via that
+        // List pattern's own arm below, not this one directly.
+        Pattern::Token(_) => Type::Dyn,
         _ if ctor_tag(pat).is_some() => Type::Dyn,
         Pattern::List(_) | Pattern::Cons(..) => Type::List(Rc::new(Type::Dyn)),
         Pattern::NamedCtor(..) => {
@@ -316,7 +321,7 @@ fn pattern_type(pat: &Pattern) -> Type {
 fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern) -> Ctx {
     match pat {
         Pattern::Var(name) => extend(ctx, name, Type::Dyn),
-        Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => ctx.clone(),
+        Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) | Pattern::Token(_) => ctx.clone(),
         Pattern::List(pats) => pats.iter().fold(ctx.clone(), |c, p| bind_pattern_vars(&c, p)),
         Pattern::Cons(head, tail) => bind_pattern_vars(&bind_pattern_vars(ctx, head), tail),
         Pattern::NamedCtor(..) => {
@@ -358,13 +363,13 @@ fn ctor_tag(pat: &Pattern) -> Option<&str> {
 // non-adjacent call sites can't independently drift on how it's encoded.
 fn push_brand_tag(items: &mut Vec<Pattern>, brand: Option<u64>) {
     if let Some(id) = brand {
-        items.push(Pattern::Int(id as i64));
+        items.push(Pattern::Token(id));
     }
 }
 
 fn resolve_pattern(pat: &Pattern, fields: &[Rc<DataInfo>], span: Span) -> Result<Pattern, TypeError> {
     match pat {
-        Pattern::Var(_) | Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => Ok(pat.clone()),
+        Pattern::Var(_) | Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) | Pattern::Token(_) => Ok(pat.clone()),
         Pattern::List(items) => {
             Ok(Pattern::List(items.iter().map(|p| resolve_pattern(p, fields, span)).collect::<Result<_, _>>()?))
         }
@@ -675,6 +680,10 @@ fn elaborate_node(
         Expr::Int(_) => Ok((Type::Int, EffectRow::pure(), expr)),
         Expr::Bool(_) => Ok((Type::Bool, EffectRow::pure(), expr)),
         Expr::Str(_) => Ok((Type::Str, EffectRow::pure(), expr)),
+        // Never written by a user (see Expr::Token's own doc comment) --
+        // Dyn since there's no surface Type it could ever mean; matches_type
+        // rejects it against every Type regardless.
+        Expr::Token(_) => Ok((Type::Dyn, EffectRow::pure(), expr)),
         Expr::Var(name) => Ok((lookup(ctx, &name), EffectRow::pure(), expr)),
 
         Expr::ListLit(items) => {

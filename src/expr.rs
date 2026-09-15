@@ -49,6 +49,13 @@ pub enum Pattern {
     Int(i64),
     Bool(bool),
     Str(String),
+    // Matches only a Value::Token carrying this exact id -- the trailing
+    // element an `opaque` constructor's own pattern (positional, named,
+    // or FieldAccess's synthetic one) matches its hidden brand tag
+    // against. A DISTINCT variant from Int (not just a matching integer
+    // literal) so a real Int field can never accidentally satisfy a brand
+    // slot, or vice versa -- see Value::Token's own doc comment.
+    Token(u64),
     // [], [p1, p2, ...] -- matches only a list of exactly this length.
     List(Vec<Pattern>),
     // `head :: tail` -- matches a non-empty list of any length.
@@ -95,6 +102,12 @@ pub enum Expr {
     Int(i64),
     Bool(bool),
     Str(String),
+    // A literal Value::Token(u64) -- produced only by parser::
+    // build_ctor_value, for an `opaque` constructor's own hidden trailing
+    // brand element (never written directly by a user; there's no surface
+    // syntax for it). See Pattern::Token's own doc comment for why this
+    // is a distinct literal kind rather than reusing Int.
+    Token(u64),
     // Variable-arity, unlike every other node -- elaborate/machine handle
     // it with a loop over the Vec rather than a fixed-shape match.
     ListLit(Vec<ExprRef>),
@@ -249,8 +262,10 @@ pub struct DataInfo {
     //     field access, NOT invisible to Value's own Display or its
     //     Outcome conversion (value.rs) -- neither knows a value's static
     //     type, so neither can tell "real field" from "brand tag" to
-    //     leave the id out. A branded value printed or returned at the
-    //     top level shows its raw id as an extra trailing element.
+    //     leave it out. A branded value printed or returned at the top
+    //     level shows an extra trailing `<brand>` element (Value::Token's
+    //     own Display -- the id itself is never printed, unlike before
+    //     Token existed as its own Value kind).
     // None (the default) means fully structural and zero runtime
     // footprint: two `data` types with the same set of constructor names
     // and field types unify, regardless of their own names, the way two
