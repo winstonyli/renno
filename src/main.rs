@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn eof_mid_match_looks_incomplete() {
-        let err = parser::parse("match 5 with | 1 -> ").unwrap_err();
+        let err = parser::parse("match 5 | 1 -> ").unwrap_err();
         assert!(looks_incomplete(&err), "unexpected message: {err}");
     }
 

@@ -6,7 +6,7 @@
 // they could be written by hand, the same way `sum`/`count` in
 // mutual_recursion.rn are:
 let rec my_map = fun f -> fun xs ->
-  match xs with
+  match xs
   | [] -> []
   | h :: t -> f(h) :: my_map(f)(t)
 in

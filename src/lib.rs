@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn bare_match_is_not_a_juxtaposable_argument() {
-        assert!(parser::parse("f match x with | y -> y").is_err());
+        assert!(parser::parse("f match x | y -> y").is_err());
     }
 
     #[test]
@@ -431,7 +431,7 @@ mod tests {
         // a pattern), there was no way to build a list incrementally in
         // renno itself -- map/fold had to be native Rust-loop builtins.
         let src = "let rec my_map = fun f -> fun xs -> \
-                     match xs with | [] -> [] | h :: t -> f(h) :: my_map(f)(t) \
+                     match xs | [] -> [] | h :: t -> f(h) :: my_map(f)(t) \
                    in my_map(fun x -> x * 2)([1, 2, 3])";
         assert_eq!(run_untyped(src).to_string(), "[2, 4, 6]");
     }
@@ -463,7 +463,7 @@ mod tests {
         // COMPLETELY UNCHANGED -- confirmed here by matching the bound
         // value with a pattern that would fail if any wrapping `if`/`fail`
         // node were still present around it.
-        let src = r#"let n: Int where 0 < n = 5 in match n with | 5 -> "unwrapped" | _ -> "bug""#;
+        let src = r#"let n: Int where 0 < n = 5 in match n | 5 -> "unwrapped" | _ -> "bug""#;
         assert_eq!(run_untyped(src).as_str(), "unwrapped");
     }
 
@@ -785,8 +785,8 @@ mod tests {
     fn mutual_recursion_composes_with_hand_rolled_tagged_tuples_and_match() {
         let src = format!(
             "{NIL_CONS_PRELUDE} \
-             let rec sum = fun l -> match l with | (\"Nil\",) -> 0 | (\"Cons\", h, t) -> h + count(t)
-             and count = fun l -> match l with | (\"Nil\",) -> 0 | (\"Cons\", h, t) -> 1 + sum(t)
+             let rec sum = fun l -> match l | (\"Nil\",) -> 0 | (\"Cons\", h, t) -> h + count(t)
+             and count = fun l -> match l | (\"Nil\",) -> 0 | (\"Cons\", h, t) -> 1 + sum(t)
              in sum(Cons(1)(Cons(2)(Cons(3)(Nil))))"
         );
         assert_eq!(run_untyped(&src).as_int(), 5);
@@ -796,45 +796,45 @@ mod tests {
 
     #[test]
     fn match_literal_picks_matching_arm() {
-        let src = r#"match 2 with | 1 -> "one" | 2 -> "two" | _ -> "many""#;
+        let src = r#"match 2 | 1 -> "one" | 2 -> "two" | _ -> "many""#;
         assert_eq!(run_untyped(src).as_str(), "two");
     }
 
     #[test]
     fn match_wildcard_arm_is_fallback() {
-        let src = r#"match 99 with | 1 -> "one" | _ -> "many""#;
+        let src = r#"match 99 | 1 -> "one" | _ -> "many""#;
         assert_eq!(run_untyped(src).as_str(), "many");
     }
 
     #[test]
     fn match_nil_and_cons_recurses_over_a_list() {
-        let src = "let rec sum = fun xs -> match xs with | [] -> 0 | h :: t -> h + sum(t) in sum([1, 2, 3, 4])";
+        let src = "let rec sum = fun xs -> match xs | [] -> 0 | h :: t -> h + sum(t) in sum([1, 2, 3, 4])";
         assert_eq!(run_untyped(src).as_int(), 10);
     }
 
     #[test]
     fn match_fixed_length_list_pattern_binds_each_element() {
-        assert_eq!(run_untyped("match [1, 2] with | [a, b] -> a + b | _ -> 0").as_int(), 3);
+        assert_eq!(run_untyped("match [1, 2] | [a, b] -> a + b | _ -> 0").as_int(), 3);
     }
 
     #[test]
     fn match_fixed_length_list_pattern_requires_exact_length() {
         // [a, b] must NOT match a 3-element list -- falls through to the
         // wildcard arm instead of binding a/b partially.
-        assert_eq!(run_untyped(r#"match [1, 2, 3] with | [a, b] -> "two" | _ -> "other""#).as_str(), "other");
+        assert_eq!(run_untyped(r#"match [1, 2, 3] | [a, b] -> "two" | _ -> "other""#).as_str(), "other");
     }
 
     #[test]
     #[should_panic(expected = "match failed: no pattern matched the value")]
     fn match_with_no_matching_arm_panics() {
-        run_untyped(r#"match 5 with | 1 -> "x""#);
+        run_untyped(r#"match 5 | 1 -> "x""#);
     }
 
     #[test]
     fn match_result_type_check() {
         // Every arm's body is Int -- confirms the elaborated Match's result
         // type is Int (not Dyn), same widen-only-on-disagreement rule as If.
-        let (mut arena, spans, root) = parser::parse("let f = fun x: Int -> x + 1 in f(match 1 with | 1 -> 10 | _ -> 20)").unwrap();
+        let (mut arena, spans, root) = parser::parse("let f = fun x: Int -> x + 1 in f(match 1 | 1 -> 10 | _ -> 20)").unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert!(!contains_check(&arena, elaborated), "Int arms should need no runtime Check at the Int-annotated call");
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 11);
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn match_rejects_impossible_pattern_statically() {
-        let (mut arena, spans, root) = parser::parse("match 5 with | true -> 1 | _ -> 2").unwrap();
+        let (mut arena, spans, root) = parser::parse("match 5 | true -> 1 | _ -> 2").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("can never match"), "unexpected message: {}", err.0);
     }
@@ -858,7 +858,7 @@ mod tests {
         let src = r#"
             let None = ("None",) in
             let Some = fun x -> ("Some", x) in
-            match Some(5) with | ("None",) -> 0 | ("Some", x) -> x
+            match Some(5) | ("None",) -> 0 | ("Some", x) -> x
         "#;
         assert_eq!(run_untyped(src).as_int(), 5);
     }
@@ -868,7 +868,7 @@ mod tests {
         let src = r#"
             let None = ("None",) in
             let Some = fun x -> ("Some", x) in
-            match None with | ("None",) -> 0 | ("Some", x) -> x
+            match None | ("None",) -> 0 | ("Some", x) -> x
         "#;
         assert_eq!(run_untyped(src).as_int(), 0);
     }
@@ -883,7 +883,7 @@ mod tests {
         // renno (fold, map): Cons(1)(rest), not Cons(1, rest).
         let src = format!(
             "{NIL_CONS_PRELUDE} \
-             let rec sum = fun l -> match l with | (\"Nil\",) -> 0 | (\"Cons\", h, t) -> h + sum(t) in
+             let rec sum = fun l -> match l | (\"Nil\",) -> 0 | (\"Cons\", h, t) -> h + sum(t) in
              sum(Cons(1)(Cons(2)(Cons(3)(Nil))))"
         );
         assert_eq!(run_untyped(&src).as_int(), 6);
@@ -902,7 +902,7 @@ mod tests {
 
     #[test]
     fn tuple_literal_and_destructure_round_trip() {
-        let src = "match (1, \"a\", true) with | (a, b, c) -> a";
+        let src = "match (1, \"a\", true) | (a, b, c) -> a";
         assert_eq!(run_source(src).unwrap().as_int(), 1);
     }
 
@@ -918,7 +918,7 @@ mod tests {
         // top-level sub-pattern is a bare Var -- missing_case's
         // covers_tuple_position must recurse into the nested tuple
         // position, not just check "all top-level subpatterns are Var".
-        let src = "match ((1, 2), 3) with | ((p, q), x) -> p + q + x";
+        let src = "match ((1, 2), 3) | ((p, q), x) -> p + q + x";
         assert_eq!(run_source(src).unwrap().as_int(), 6);
     }
 
@@ -933,7 +933,7 @@ mod tests {
         // never actually firing at runtime, with no diagnostic saying so.
         let src = r#"
             let t3: (Int, Int, Int) = (1, 2, 3) in
-            match t3 with | (a, b) -> a + b | _ -> 0
+            match t3 | (a, b) -> a + b | _ -> 0
         "#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
@@ -942,7 +942,7 @@ mod tests {
 
     #[test]
     fn tuple_pattern_with_matching_arity_still_accepted() {
-        let src = "let t3: (Int, Int, Int) = (1, 2, 3) in match t3 with | (a, b, c) -> a + b + c";
+        let src = "let t3: (Int, Int, Int) = (1, 2, 3) in match t3 | (a, b, c) -> a + b + c";
         assert_eq!(run_source(src).unwrap().as_int(), 6);
     }
 
@@ -952,7 +952,7 @@ mod tests {
         // fixed arity to check a pattern's length against, so this stays
         // exactly as permissive as before: falls through to the wildcard
         // at runtime, not rejected statically.
-        let src = "let f = fun xs: [Int] -> match xs with | [a, b] -> a + b | _ -> 0 in f([1, 2, 3])";
+        let src = "let f = fun xs: [Int] -> match xs | [a, b] -> a + b | _ -> 0 in f([1, 2, 3])";
         assert_eq!(run_source(src).unwrap().as_int(), 0);
     }
 
@@ -988,7 +988,7 @@ mod tests {
         // pattern.
         let src = r#"
             let Meters = fun n -> (n, opaque) in
-            match Meters(5) with
+            match Meters(5)
             | (n, t) -> n
         "#;
         let outcome = run_source(src).unwrap();
@@ -1001,8 +1001,8 @@ mod tests {
             let Meters = fun n -> (n, opaque) in
             let a = Meters(5) in
             let b = Meters(10) in
-            match a with
-            | (an, at) -> match b with
+            match a
+            | (an, at) -> match b
               | (bn, bt) -> at == bt
         "#;
         let outcome = run_source(src).unwrap();
@@ -1014,8 +1014,8 @@ mod tests {
         let src = r#"
             let Meters = fun n -> (n, opaque) in
             let Seconds = fun n -> (n, opaque) in
-            match Meters(5) with
-            | (an, at) -> match Seconds(5) with
+            match Meters(5)
+            | (an, at) -> match Seconds(5)
               | (bn, bt) -> at == bt
         "#;
         let outcome = run_source(src).unwrap();
@@ -1033,7 +1033,7 @@ mod tests {
         // Regression: without trailing-comma support, `,` always required
         // a following expression/pattern/type, so a 1-tuple could never
         // be written at all -- `(x,)` used to be a parse error.
-        let src = "match (5,) with | (n,) -> n";
+        let src = "match (5,) | (n,) -> n";
         assert_eq!(run_source(src).unwrap().as_int(), 5);
     }
 
@@ -1118,7 +1118,7 @@ mod tests {
         let src = r#"
             type Pair = (Int,) | (Int, Int) in
             let f = fun p: Pair ->
-              match p with
+              match p
               | (n,) -> n
             in f((5,))
         "#;
@@ -1132,7 +1132,7 @@ mod tests {
         let src = r#"
             type Pair = (Int,) | (Int, Int) in
             let f = fun p: Pair ->
-              match p with
+              match p
               | (n,) -> n
               | (n, m) -> n + m
             in f((5,))
@@ -1177,7 +1177,7 @@ mod tests {
 
     #[test]
     fn record_construction_and_destructure_round_trip() {
-        let src = "match {x: 1, y: 2} with | {x: a, y: b} -> a + b";
+        let src = "match {x: 1, y: 2} | {x: a, y: b} -> a + b";
         assert_eq!(run_source(src).unwrap().as_int(), 3);
     }
 
@@ -1212,14 +1212,14 @@ mod tests {
         // Fields are sorted by name at parse time everywhere records
         // appear -- construction written in one order, pattern written in
         // the OPPOSITE order, still line up correctly.
-        let src = "match {y: 2, x: 1} with | {x: a, y: b} -> a - b";
+        let src = "match {y: 2, x: 1} | {x: a, y: b} -> a - b";
         assert_eq!(run_source(src).unwrap().as_int(), -1);
     }
 
     #[test]
     fn record_field_punning_works_in_construction_and_pattern() {
         // `{x, y}` means `{x: x, y: y}` on both sides.
-        let src = "let x = 3 in let y = 4 in match {x, y} with | {x, y} -> x * x + y * y";
+        let src = "let x = 3 in let y = 4 in match {x, y} | {x, y} -> x * x + y * y";
         assert_eq!(run_source(src).unwrap().as_int(), 25);
     }
 
@@ -1304,7 +1304,7 @@ mod tests {
     fn width_subtyping_accepts_a_wider_record_statically() {
         let src = r#"
             let f = fun p: {x: Int} -> p in
-            match f({x: 1, y: 2}) with | {x} -> x
+            match f({x: 1, y: 2}) | {x} -> x
         "#;
         assert_eq!(run_source(src).unwrap().as_int(), 1);
     }
@@ -1332,7 +1332,7 @@ mod tests {
         // no second arm needed the way exact-arity Tuple matching would.
         let src = r#"
             type R = {x: Int} | {x: Int, y: Int} in
-            let f = fun p: R -> match p with | {x: a} -> a
+            let f = fun p: R -> match p | {x: a} -> a
             in f({x: 1, y: 2}) + f({x: 5})
         "#;
         assert_eq!(run_source(src).unwrap().as_int(), 6);
@@ -1348,7 +1348,7 @@ mod tests {
         let src = r#"
             type Shape = {kind: Str, radius: Int} | {kind: Str, side: Int} in
             let area = fun p: Shape ->
-              match p with
+              match p
               | {radius: r} -> r * r * 3
               | {side: s} -> s * s
             in area({kind: "circle", radius: 2}) + area({kind: "square", side: 3})
@@ -1360,7 +1360,7 @@ mod tests {
     fn non_exhaustive_record_union_match_rejected_statically() {
         let src = r#"
             type Shape = {kind: Str, radius: Int} | {kind: Str, side: Int} in
-            let area = fun p: Shape -> match p with | {radius: r} -> r * r * 3
+            let area = fun p: Shape -> match p | {radius: r} -> r * r * 3
             in area({kind: "circle", radius: 2})
         "#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
@@ -1407,7 +1407,7 @@ mod tests {
         // Record specifically without breaking width-tolerant matching
         // against an actual Record-typed scrutinee (covered by
         // width_subtyping_accepts_a_wider_record_statically and friends).
-        let src = r#"let f = fun p: Str -> match p with | {x: a} -> a | s -> s in f("hi")"#;
+        let src = r#"let f = fun p: Str -> match p | {x: a} -> a | s -> s in f("hi")"#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("can never match"), "unexpected message: {}", err.0);
@@ -1421,7 +1421,7 @@ mod tests {
         // guarantees the earlier arm already covers it.
         let src = r#"
             type R = {x: Int} | {x: Int, y: Int} in
-            let f = fun p: R -> match p with | {x: a} -> a | {x: a, y: b} -> a + b
+            let f = fun p: R -> match p | {x: a} -> a | {x: a, y: b} -> a + b
             in f({x: 5})
         "#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
@@ -1539,14 +1539,14 @@ mod tests {
 
     #[test]
     fn exhaustive_bool_match_typechecks() {
-        let src = "match 1 < 2 with | true -> 1 | false -> 0";
+        let src = "match 1 < 2 | true -> 1 | false -> 0";
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         assert!(typecheck::check(&mut arena, root, &spans).is_ok());
     }
 
     #[test]
     fn non_exhaustive_bool_match_rejected_statically() {
-        let (mut arena, spans, root) = parser::parse("match 1 < 2 with | true -> 1").unwrap();
+        let (mut arena, spans, root) = parser::parse("match 1 < 2 | true -> 1").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
     }
@@ -1556,14 +1556,14 @@ mod tests {
         // xs is an unannotated (Dyn) param -- exhaustiveness is judged from
         // the PATTERN shapes present ([] + unconstrained h :: t), not from
         // the scrutinee's own static type, so this still needs no wildcard.
-        let src = "let rec f = fun xs -> match xs with | [] -> 0 | h :: t -> h in f([1, 2])";
+        let src = "let rec f = fun xs -> match xs | [] -> 0 | h :: t -> h in f([1, 2])";
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         assert!(typecheck::check(&mut arena, root, &spans).is_ok());
     }
 
     #[test]
     fn non_exhaustive_list_match_rejected_statically() {
-        let (mut arena, spans, root) = parser::parse("match [1, 2] with | [] -> 0").unwrap();
+        let (mut arena, spans, root) = parser::parse("match [1, 2] | [] -> 0").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
     }
@@ -1573,14 +1573,14 @@ mod tests {
         // `1 :: t` only covers non-empty lists whose head is 1 -- NOT
         // every non-empty list -- so this must still be rejected even
         // though a Cons pattern is present.
-        let (mut arena, spans, root) = parser::parse("match [2, 3] with | [] -> 0 | 1 :: t -> 1").unwrap();
+        let (mut arena, spans, root) = parser::parse("match [2, 3] | [] -> 0 | 1 :: t -> 1").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
     }
 
     #[test]
     fn wildcard_arm_always_makes_a_match_exhaustive() {
-        let src = r#"match 5 with | 1 -> "a" | _ -> "b""#;
+        let src = r#"match 5 | 1 -> "a" | _ -> "b""#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         assert!(typecheck::check(&mut arena, root, &spans).is_ok());
     }
@@ -1589,21 +1589,21 @@ mod tests {
 
     #[test]
     fn arm_after_a_wildcard_is_unreachable() {
-        let (mut arena, spans, root) = parser::parse("match 5 with | _ -> 1 | 1 -> 2").unwrap();
+        let (mut arena, spans, root) = parser::parse("match 5 | _ -> 1 | 1 -> 2").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("unreachable match arm"), "unexpected message: {}", err.0);
     }
 
     #[test]
     fn duplicate_literal_arm_is_unreachable() {
-        let (mut arena, spans, root) = parser::parse(r#"match 5 with | 1 -> "a" | 1 -> "b" | _ -> "c""#).unwrap();
+        let (mut arena, spans, root) = parser::parse(r#"match 5 | 1 -> "a" | 1 -> "b" | _ -> "c""#).unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("unreachable match arm"), "unexpected message: {}", err.0);
     }
 
     #[test]
     fn wildcard_as_the_last_arm_is_fine() {
-        let src = r#"match 5 with | 1 -> "a" | 2 -> "b" | _ -> "c""#;
+        let src = r#"match 5 | 1 -> "a" | 2 -> "b" | _ -> "c""#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         assert!(typecheck::check(&mut arena, root, &spans).is_ok());
     }
@@ -1612,7 +1612,7 @@ mod tests {
     fn distinct_literals_are_all_reachable() {
         // Regression guard: dominates() must not over-fire -- different
         // Int literals must never be reported as unreachable.
-        let src = r#"match 5 with | 1 -> "a" | 2 -> "b" | 3 -> "c" | _ -> "d""#;
+        let src = r#"match 5 | 1 -> "a" | 2 -> "b" | 3 -> "c" | _ -> "d""#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         assert!(typecheck::check(&mut arena, root, &spans).is_ok());
     }
@@ -1651,7 +1651,7 @@ mod tests {
 
     #[test]
     fn non_exhaustive_match_error_reports_the_matchs_own_line() {
-        let src = "let f = fun n ->\n  match n < 5 with\n  | true -> 1\nin f(3)";
+        let src = "let f = fun n ->\n  match n < 5\n  | true -> 1\nin f(3)";
         let err = run_source(src).unwrap_err();
         assert!(err.starts_with("line 2, column 3:"), "unexpected message: {err}");
     }

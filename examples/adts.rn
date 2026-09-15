@@ -22,7 +22,7 @@ let Nil = ("Nil",) in
 let Cons = fun h -> fun t -> ("Cons", h, t) in
 
 let rec sum = fun l ->
-  match l with
+  match l
   | ("Nil",) -> 0
   | ("Cons", h, t) -> h + sum(t)
   | _ -> 0

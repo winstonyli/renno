@@ -176,7 +176,7 @@ pub enum Expr {
         resume_var: String,
         body: ExprRef,
     },
-    // `match scrutinee with | p1 -> e1 | p2 -> e2 ...`, tried top to bottom,
+    // `match scrutinee | p1 -> e1 | p2 -> e2 ...`, tried top to bottom,
     // first match wins. Arms in Rc (not a plain Vec, unlike ListLit) since
     // a captured continuation can carry a MatchArms frame (see cont.rs) --
     // resuming it more than once (multi-shot) would otherwise reclone the

@@ -31,7 +31,7 @@ let Seconds2 = fun v -> (v, opaque) in
 let same_function_twice_is_equal = Meters2(5) == Meters2(5) in                             // true
 let different_functions_are_not_equal = dynify(Meters2(5)) == dynify(Seconds2(5)) in       // false
 
-let n = match five with | (v,) -> v in
+let n = match five | (v,) -> v in
 
 n + (if same_function_twice_is_equal then 1 else 0) + (if different_functions_are_not_equal then 10 else 0)
 // 5 + 1 + 0 = 6

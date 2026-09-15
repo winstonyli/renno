@@ -10,7 +10,7 @@ let p = {x: 3, y: 4} in
 
 // Destructuring, the same mechanism tuples already use. A bare field
 // name puns to itself: `{x, y}` in pattern position means `{x: x, y: y}`.
-let sum_of_squares = match p with | {x, y} -> x * x + y * y in
+let sum_of_squares = match p | {x, y} -> x * x + y * y in
 
 // `.field` access -- a peer of application in the same postfix chain
 // (`f(a).x` means `(f(a)).x`), not the only way to read a record back,

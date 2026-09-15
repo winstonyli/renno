@@ -47,24 +47,24 @@ fn deep_chain_source(n: usize) -> String {
     format!("handle {src}{} with deep(handler choose(p, resume) -> resume(1))", sum.join(" + "))
 }
 
-// `let rec sum = fun n -> match n with | 0 -> 0 | _ -> n + sum(n - 1) in
+// `let rec sum = fun n -> match n | 0 -> 0 | _ -> n + sum(n - 1) in
 // sum(n)` -- a realistic recursive hot loop, using the two features that
 // have replaced hand-rolled recursion as renno's idiomatic style this
 // session (let rec, match) but had zero benchmark coverage before now.
 // Exercises Value::RecClosure's rebind-on-every-call path and
 // Frame::MatchArms's dispatch (match_pattern), n times each.
 fn recursive_match_source(n: i64) -> String {
-    format!("let rec sum = fun n -> match n with | 0 -> 0 | _ -> n + sum(n - 1) in sum({n})")
+    format!("let rec sum = fun n -> match n | 0 -> 0 | _ -> n + sum(n - 1) in sum({n})")
 }
 
 // Same shape, but each step also constructs a tuple and reads both fields
 // back off it via a single-arm match destructure ((n, n) -- a Tuple
-// literal -- then match (n, n) with | (x, y) -> x + y). Exercises
+// literal -- then match (n, n) | (x, y) -> x + y). Exercises
 // construction and destructure together, since tuples had zero benchmark
 // coverage before now.
 fn tuple_construction_source(n: i64) -> String {
     format!(
-        "let rec sum = fun n -> match n with | 0 -> 0 | _ -> (match (n, n) with | (x, y) -> x + y) + sum(n - 1) in \
+        "let rec sum = fun n -> match n | 0 -> 0 | _ -> (match (n, n) | (x, y) -> x + y) + sum(n - 1) in \
          sum({n})"
     )
 }
@@ -77,7 +77,7 @@ fn tuple_construction_source(n: i64) -> String {
 // since records had zero benchmark coverage before now.
 fn record_construction_source(n: i64) -> String {
     format!(
-        "let rec sum = fun n -> match n with | 0 -> 0 | _ -> (match {{x: n, y: n}} with | {{x, y}} -> x + y) + sum(n - 1) in \
+        "let rec sum = fun n -> match n | 0 -> 0 | _ -> (match {{x: n, y: n}} | {{x, y}} -> x + y) + sum(n - 1) in \
          sum({n})"
     )
 }

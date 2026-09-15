@@ -1,4 +1,4 @@
-// Pattern matching: `match e with | pat -> body | ...`, tried top to
+// Pattern matching: `match e | pat -> body | ...`, tried top to
 // bottom, first match wins. Patterns destructure renno's native shapes:
 // literals, tuples (see adts.rn for a hand-rolled tagged-tuple sum type),
 // and List's two forms -- `[]`/`[p, ...]` (fixed length) and `h :: t`
@@ -11,7 +11,7 @@
 // This combines with `let rec` for real list-consuming recursion: `sum`
 // below is the pattern-matching equivalent of a `fold`, written by hand.
 let rec sum = fun xs ->
-  match xs with
+  match xs
   | [] -> 0
   | h :: t -> h + sum(t)
 in sum([1, 2, 3, 4, 5])

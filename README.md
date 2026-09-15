@@ -15,7 +15,7 @@ let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in fact(10)
 - **`let rec` and mutual recursion**: `let rec f = ... and g = ... in ...` — any function in the group can call any sibling (including itself) by name.
 - **Pattern matching**: literals, lists (`[]`, `[a, b]`, `h :: t`), tuples, and records, with static exhaustiveness and reachability checking wherever those are cheaply provable.
 - **Tuples**: `(a, b, c)` — a fixed-arity, per-position-typed product, distinct from a variable-length `List`. Desugars to a plain list at runtime (no new value representation), typed `Type::Tuple` for real positional structural comparison. `(p, q)` also works as a pattern, sugar for `[p, q]`.
-- **Records**: `{x: 1, y: 2}` — a named counterpart to Tuple, a real separate runtime kind (name-keyed, not Tuple's positional one — needed for width subtyping below to work with no per-boundary value transformation). Read back by `.field` access or by destructuring (`match p with | {x, y} -> ...`, `{x, y}` punning for `{x: x, y: y}`). **Width subtyping**: a `{x: Int}`-annotated parameter accepts any record with *at least* field `x` — extras just ride along, unobserved by anything that didn't ask for them, and a `Dyn`-to-`Record` boundary check is genuinely name-aware (not just arity), backed by three new prelude builtins, `is_record`/`has_field`/`get_field`.
+- **Records**: `{x: 1, y: 2}` — a named counterpart to Tuple, a real separate runtime kind (name-keyed, not Tuple's positional one — needed for width subtyping below to work with no per-boundary value transformation). Read back by `.field` access or by destructuring (`match p | {x, y} -> ...`, `{x, y}` punning for `{x: x, y: y}`). **Width subtyping**: a `{x: Int}`-annotated parameter accepts any record with *at least* field `x` — extras just ride along, unobserved by anything that didn't ask for them, and a `Dyn`-to-`Record` boundary check is genuinely name-aware (not just arity), backed by three new prelude builtins, `is_record`/`has_field`/`get_field`.
 - **Hand-rolled sum types**: no dedicated ADT syntax — a same-arity tagged sum is an ordinary tuple whose first element is a literal tag (`let None = ("None",) in let Some = fun x -> ("Some", x) in ...`), matched by ordinary literal comparison in pattern position. No new runtime representation, no constructor-pattern sugar to special-case.
 - **First-class `opaque`**: `opaque` is an expression — writing it anywhere yields a token unique to that exact source position (the same token every time that code runs, since it's a literal, not a generator), bindable, passable, and comparable with `==`. Combined with tuples, this builds a hand-rolled nominal type: `let Meters = fun n -> (n, opaque) in ...` — two `Meters(_)` values always carry equal tokens, and a same-shaped tuple from anywhere else never does.
 - **Union types and type aliases**: `type Name = TypeExpr in ...` names any type expression, and `A | B` unions two or more into one — a self-contained "one of these" with no registry lookup, usable in any annotation (`fun x: Int | Str -> ...`). A `Dyn` value crossing a Union-typed boundary is accepted if it shallowly matches *any* alternative; `match` exhaustiveness over a Union-typed scrutinee is proven when every alternative (not necessarily by the same arm) is covered by some pattern — `type Pair = (Int,) | (Int, Int) in ... | (n,) -> n | (n, m) -> n + m` is exhaustive this way, even though neither arm alone covers the whole union.
@@ -90,7 +90,7 @@ in is_even(10)
 ### Pattern matching
 
 ```
-match xs with
+match xs
 | [] -> 0
 | h :: t -> h + sum(t)
 ```
@@ -101,7 +101,7 @@ A match is rejected statically if it's missing an obviously necessary case (`[]`
 
 ```
 let rec map = fun f -> fun xs ->
-  match xs with
+  match xs
   | [] -> []
   | h :: t -> f(h) :: map(f)(t)
 in map(fun x -> x * 2)([1, 2, 3])   -- [2, 4, 6]
@@ -111,7 +111,7 @@ in map(fun x -> x * 2)([1, 2, 3])   -- [2, 4, 6]
 
 ```
 let p = (1, "a", true) in
-match p with
+match p
 | (a, b, c) -> a   -- 1
 ```
 
@@ -122,7 +122,7 @@ There's no dedicated ADT syntax — a same-arity tagged sum is just a tuple whos
 ```
 let None = ("None",) in
 let Some = fun x -> ("Some", x) in
-match Some(5) with
+match Some(5)
 | ("None",) -> 0
 | ("Some", x) -> x   -- 5
 ```
@@ -141,7 +141,7 @@ let f = fun x: Meters -> x in f((5,))   -- accepted: any (Int,) tuple satisfies 
 
 ```
 let p = {x: 3, y: 4} in
-match p with
+match p
 | {x, y} -> x * x + y * y   -- 25
 ```
 
@@ -151,7 +151,7 @@ Read back either way: `.field` access, or destructuring (the same mechanism tupl
 
 ```
 let x = 3 in let y = 4 in
-{x, y}.x + match {x, y} with | {x, y} -> y   -- 7, `.x` reads directly, `{x, y}` means `{x: x, y: y}` on both sides
+{x, y}.x + match {x, y} | {x, y} -> y   -- 7, `.x` reads directly, `{x, y}` means `{x: x, y: y}` on both sides
 ```
 
 `.field` desugars entirely into an ordinary call (no new runtime opcode) and is a peer of application in the same postfix chain: `f(a).x` means `(f(a)).x`, not `f(a.x)`.
@@ -160,7 +160,7 @@ let x = 3 in let y = 4 in
 
 ```
 let f = fun p: {x: Int} -> p in
-match f({x: 1, y: 2}) with | {x} -> x   -- 1, `y` is still there on the value, just never asked for
+match f({x: 1, y: 2}) | {x} -> x   -- 1, `y` is still there on the value, just never asked for
 ```
 
 That's also why a single arm can be exhaustive across record shapes that would need one arm each as a Tuple: `{x: a}` alone covers every alternative of `type R = {x: Int} | {x: Int, y: Int} in ...`, since every alternative has field `x`. A `Dyn`-sourced record crossing a record-typed boundary gets a real, name-aware check too (`is_record`/`has_field`, both ordinary prelude functions) — not just an arity check — so a same-arity value with the wrong field names is correctly rejected, while a wider one is correctly accepted.
@@ -181,8 +181,8 @@ Combined with tuples, this builds a nominal type — `opaque`, written once insi
 let Meters = fun n -> (n, opaque) in
 let a = Meters(5) in
 let b = Meters(10) in
-match a with
-| (an, at) -> match b with
+match a
+| (an, at) -> match b
   | (bn, bt) -> at == bt   -- true: same function, same embedded `opaque`
 ```
 

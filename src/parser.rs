@@ -1179,15 +1179,18 @@ impl<'a> Parser<'a> {
                 Ok(self.push_spanned(Expr::Record(Rc::new(fields)), Span { start, end: self.span_before().end }))
             }
 
-            // match <scrutinee> with (| pattern -> expr)+  -- the first "|"
-            // before the first arm is optional (OCaml-style), every one
-            // after it is required to separate arms.
+            // match <scrutinee> (| pattern -> expr)+  -- no "with": a literal
+            // "|" can never appear inside an expression, so unlike `handle`
+            // (see its own arm below -- handler-expr is arbitrary, `with` is
+            // its only delimiter), the scrutinee's unbounded tail (same
+            // juxtaposition hazard starts_juxtaposed_arg documents above) is
+            // already unambiguous without one. The leading "|" is therefore
+            // mandatory now, not optional/OCaml-style as before: optional
+            // would reopen that exact ambiguity (`match e p -> body` could
+            // otherwise be `e` applied to `p`).
             Some(Token::Match) => {
                 let scrutinee = self.expr()?;
-                self.expect(&Token::With)?;
-                if matches!(self.peek(), Some(Token::Pipe)) {
-                    self.bump();
-                }
+                self.expect(&Token::Pipe)?;
                 let mut arms = Vec::new();
                 loop {
                     let pat = self.pattern()?;
