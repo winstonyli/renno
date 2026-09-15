@@ -48,6 +48,15 @@ pub enum Frame {
     // Evaluates a list literal's elements left to right. `remaining` are
     // not-yet-evaluated; `done` accumulates results in order.
     ListElems { remaining: Vec<ExprRef>, done: Vec<Value>, env: Env },
+    // Evaluating a record's field VALUES left to right -- `names` is the
+    // fixed, full field-name list for the whole record (needed once every
+    // value is in, to zip back together into the final Value::Record; see
+    // LetRecBody just above for the same names+remaining+done shape, used
+    // for the same reason). Not ListElems: that always wraps its `done`
+    // as a plain Value::List, which is right for Tuple/ListLit but wrong
+    // here -- see Value::Record's own doc comment for why records need a
+    // name-keyed runtime shape ListElems has no way to produce.
+    RecordElems { names: Rc<Vec<String>>, remaining: Vec<ExprRef>, done: Vec<Value>, env: Env },
     PerformPayload { effect: String },
     // `handle body with handler_expr`: handler_expr has just evaluated to a
     // Value::Handler -- next step installs it as a HandlerMark and evals body.

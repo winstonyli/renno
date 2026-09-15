@@ -34,13 +34,18 @@ pub enum Type {
     // requires the names to match (not just the types). ALWAYS stored
     // sorted by name (parser::parse_record_fields' job, for the type
     // itself, a construction, and a pattern alike) -- that's what makes
-    // `{y: 2, x: 1}` and `{x: 1, y: 2}` the same type/value with zero
-    // runtime name-tracking: sort once at every site records appear, and
-    // a Record's runtime shape becomes indistinguishable from a Tuple's
-    // (see Expr::Record's own doc comment -- it desugars to Expr::Tuple
-    // during elaboration, no new Value kind). Anonymous, no registry:
-    // like Tuple, two Record types are compared directly, positionally
-    // (name then type), nothing to look up.
+    // `{y: 2, x: 1}` and `{x: 1, y: 2}` the same type. Anonymous, no
+    // registry: like Tuple, two Record types are compared directly,
+    // positionally (name then type), nothing to look up.
+    //
+    // Unlike Tuple, Record does NOT share Tuple's runtime representation
+    // -- it has its own real, name-keyed Value::Record (see its own doc
+    // comment for why: width subtyping needs a value whose fields are
+    // addressable by name, not position, so an extra field a narrower
+    // type never asked for is simply never observed rather than needing
+    // to be projected away at some boundary). `coerce` uses a SEPARATE,
+    // one-directional relation for that -- types::record_satisfies, not
+    // this type's own (exact, symmetric) consistency.
     Record(Rc<Vec<(String, Type)>>),
     // "One of these" -- a self-contained sum, no registry/name lookup.
     // Typically each alternative is a Tuple whose first element is a
@@ -197,13 +202,28 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         // Pattern::List, typed List(Dyn) by typecheck::pattern_type, same
         // as any other List pattern) can match a Tuple-typed scrutinee.
         (Type::List(elem), Type::Tuple(_)) | (Type::Tuple(_), Type::List(elem)) => matches!(**elem, Type::Dyn),
-        // Same bridge, for Record -- a `{x, y}` pattern desugars straight
-        // to Pattern::List too (see Type::Record's own doc comment), so it
-        // needs the identical List-typed-as-Dyn allowance to match a
-        // Record-typed scrutinee.
-        (Type::List(elem), Type::Record(_)) | (Type::Record(_), Type::List(elem)) => matches!(**elem, Type::Dyn),
+        // No equivalent bridge for Record: a `{x, y}` pattern is now its
+        // own Pattern::Record (see its own doc comment), not sugar over
+        // Pattern::List, so typecheck::pattern_type gives it plain
+        // Type::Dyn like every other imprecisely-typed pattern -- already
+        // consistent with anything via the Dyn arm at the top of this
+        // function, no special-casing needed here.
         _ => false,
     }
+}
+
+// One-directional: does `actual` have AT LEAST every field `required`
+// names, each with a consistent type? (Extra fields on `actual` are
+// fine -- see Pattern::Record's own doc comment for why nothing ever
+// needs to know about them.) This is NOT part of `consistent()` --
+// `consistent()` stays a symmetric equivalence relation everywhere,
+// including for two Record types (exact field-set match, used by `==`
+// and Union-alternative membership) -- width subtyping is a one-way
+// "does this value fit where that type is expected" question, asked only
+// by typecheck::coerce, alongside (not instead of) its own consistent()
+// check.
+pub fn record_satisfies(required: &[(String, Type)], actual: &[(String, Type)]) -> bool {
+    required.iter().all(|(name, ty)| actual.iter().any(|(aname, aty)| aname == name && consistent(ty, aty)))
 }
 
 fn row_consistent(a: &EffectRow, b: &EffectRow) -> bool {

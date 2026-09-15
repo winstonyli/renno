@@ -509,12 +509,11 @@ impl<'a> Parser<'a> {
                 }
             }
             // "{" ident (":" pattern)? ("," ident (":" pattern)?)* "}"  --
-            // record destructure. A bare `x` field puns to `x: x` (see
-            // parse_record_fields' own doc comment). Fields come back
-            // sorted by name, so -- exactly like the tuple-pattern arm
-            // above -- this is just sugar for Pattern::List over the
-            // canonical order; a Record-typed scrutinee's own consistency
-            // bridge (types::consistent) is what lets it match one.
+            // record destructure, a REAL Pattern::Record (not sugar over
+            // Pattern::List -- see its own doc comment for why: width-
+            // tolerant, name-based matching needs the names kept, not
+            // dropped). A bare `x` field puns to `x: x` (see
+            // parse_record_fields' own doc comment).
             Some(Token::LBrace) => {
                 // `{x, y}` means `{x: x, y: y}` in pattern position too --
                 // no arena/span bookkeeping needed (Pattern is a plain
@@ -523,7 +522,7 @@ impl<'a> Parser<'a> {
                 // `default` parameter shape.
                 let fields =
                     self.parse_record_fields(Self::pattern, Some(|_: &mut Self, name| Pattern::Var(name)))?;
-                Ok(Pattern::List(fields.into_iter().map(|(_, pat)| pat).collect()))
+                Ok(Pattern::Record(fields))
             }
             // No case distinction: with `data`-declared constructors gone,
             // any identifier here -- upper or lowercase, "_" included --
@@ -1113,11 +1112,10 @@ impl<'a> Parser<'a> {
             // "{" ident (":" expr)? ("," ident (":" expr)?)* "}"  -- record
             // construction. A bare `x` field puns to `x: x` (see
             // parse_record_fields' own doc comment). Fields come back
-            // sorted by name, so this is just an Expr::Record over the
-            // canonical order -- elaborate_node infers types::Type::Record
-            // from it, then rewrites it into a plain Expr::Tuple; nothing
-            // past typecheck ever sees Expr::Record (see its own doc
-            // comment).
+            // sorted by name, though that's cosmetic now -- elaborate_node
+            // infers types::Type::Record from this Expr::Record, and
+            // machine.rs evaluates it directly into a name-keyed
+            // Value::Record (see both their own doc comments).
             Some(Token::LBrace) => {
                 // `{x, y}` means `{x: x, y: y}` -- a punned field's
                 // default value is a fresh Expr::Var for its own name,

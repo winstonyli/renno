@@ -26,6 +26,8 @@ impl PList<Value> {
             .bind("is_str", Value::Builtin(Builtin::IsStr))
             .bind("is_list", Value::Builtin(Builtin::IsList))
             .bind("is_fun", Value::Builtin(Builtin::IsFun))
+            .bind("is_record", Value::Builtin(Builtin::IsRecord))
+            .bind("has_field", Value::Builtin(Builtin::HasField))
             .bind("type_name", Value::Builtin(Builtin::TypeName))
     }
 

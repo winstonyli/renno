@@ -1179,7 +1179,7 @@ mod tests {
     #[test]
     fn record_type_annotation_accepts_matching_fields() {
         let src = "let f = fun p: {x: Int, y: Str} -> p in f({x: 5, y: \"hi\"})";
-        assert_eq!(run_source(src).unwrap().to_string(), "[5, hi]");
+        assert_eq!(run_source(src).unwrap().to_string(), "{x: 5, y: hi}");
     }
 
     #[test]
@@ -1199,12 +1199,11 @@ mod tests {
     }
 
     #[test]
-    fn dyn_boundary_to_record_only_checks_arity_not_field_names() {
-        // Documented, accepted limitation (same as Tuple's own boundary
-        // check): no new Value kind means field names exist only at the
-        // type level, so a Dyn-sourced value crossing a Record-typed
-        // boundary can only be checked for arity -- a same-arity record
-        // with entirely different field names passes right through.
+    fn dyn_boundary_to_record_rejects_wrong_field_names() {
+        // Fixed limitation: is_record/has_field give the Dyn-to-Record
+        // boundary a real, name-aware check now (build_shape_predicate's
+        // own Record arm) -- a same-arity value with entirely different
+        // field names is correctly rejected, not silently accepted.
         let src = r#"
             handle
               let y = perform choose(0) in
@@ -1212,32 +1211,171 @@ mod tests {
               f(y)
             with handler choose(p, resume) -> resume({a: 1, b: 2})
         "#;
-        assert_eq!(run_source(src).unwrap().to_string(), "[1, 2]");
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected {x: Int, y: Int}, found Record"), "unexpected message: {err}");
     }
 
     #[test]
-    fn record_as_one_alternative_of_a_union_with_exhaustiveness_checking() {
+    fn dyn_boundary_to_record_accepts_a_wider_value() {
+        // The other half of the same fix: width subtyping applies at the
+        // Dyn boundary too, not just to statically-known values -- a
+        // Dyn-sourced record with an EXTRA field the annotation never
+        // asked for still passes, unchanged (no narrowing -- see
+        // Pattern::Record's own doc comment for why none is needed).
+        let src = r#"
+            handle
+              let y = perform choose(0) in
+              let f = fun p: {x: Int} -> p in
+              f(y)
+            with handler choose(p, resume) -> resume({x: 1, y: 2})
+        "#;
+        assert_eq!(run_source(src).unwrap().to_string(), "{x: 1, y: 2}");
+    }
+
+    #[test]
+    fn width_subtyping_accepts_a_wider_record_statically() {
+        let src = r#"
+            let f = fun p: {x: Int} -> p in
+            match f({x: 1, y: 2}) with | {x} -> x
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn width_subtyping_rejects_a_record_missing_a_required_field() {
+        let src = r#"
+            let f = fun p: {x: Int, y: Int} -> p in
+            f({x: 1})
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(
+            err.0.contains("expected {x: Int, y: Int}, found {x: Int}"),
+            "unexpected message: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn single_width_tolerant_arm_is_exhaustive_for_narrower_and_wider_records() {
+        // The headline consequence of width-tolerant matching: `{x: a}`
+        // alone covers EVERY Record type that includes field `x`,
+        // regardless of what else that type's own alternatives carry --
+        // no second arm needed the way exact-arity Tuple matching would.
         let src = r#"
             type R = {x: Int} | {x: Int, y: Int} in
-            let f = fun p: R ->
-              match p with
-              | {x: a} -> a
-              | {x: a, y: b} -> a + b
+            let f = fun p: R -> match p with | {x: a} -> a
             in f({x: 1, y: 2}) + f({x: 5})
         "#;
-        assert_eq!(run_source(src).unwrap().as_int(), 8);
+        assert_eq!(run_source(src).unwrap().as_int(), 6);
+    }
+
+    #[test]
+    fn record_union_of_genuinely_different_shapes_needs_both_arms() {
+        // Unlike the narrower/wider case above, these two alternatives
+        // are NOT one a subset of the other -- `radius` isn't in the
+        // second, `side` isn't in the first -- so covering the whole
+        // Union genuinely needs one arm per alternative, same as any
+        // other Union whose alternatives don't overlap.
+        let src = r#"
+            type Shape = {kind: Str, radius: Int} | {kind: Str, side: Int} in
+            let area = fun p: Shape ->
+              match p with
+              | {radius: r} -> r * r * 3
+              | {side: s} -> s * s
+            in area({kind: "circle", radius: 2}) + area({kind: "square", side: 3})
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 21);
     }
 
     #[test]
     fn non_exhaustive_record_union_match_rejected_statically() {
         let src = r#"
-            type R = {x: Int} | {x: Int, y: Int} in
-            let f = fun p: R -> match p with | {x: a} -> a
-            in f({x: 5})
+            type Shape = {kind: Str, radius: Int} | {kind: Str, side: Int} in
+            let area = fun p: Shape -> match p with | {radius: r} -> r * r * 3
+            in area({kind: "circle", radius: 2})
         "#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn record_equality_compares_fields_order_independently() {
+        assert!(run_source("{x: 1, y: 2} == {y: 2, x: 1}").unwrap().as_bool());
+        assert!(!run_source("{x: 1, y: 2} == {x: 1, y: 3}").unwrap().as_bool());
+    }
+
+    #[test]
+    fn is_record_and_has_field_builtins() {
+        let src = r#"(is_record({x: 1}), has_field({x: 1})("x"), has_field({x: 1})("y"), is_record(5))"#;
+        assert_eq!(run_untyped(src).to_string(), "[true, true, false, false]");
+    }
+
+    #[test]
+    fn dyn_boundary_to_record_reports_a_clean_error_for_a_non_record_value() {
+        // Regression: build_shape_predicate's Record arm used to check
+        // has_field BEFORE is_record, so a non-Record Dyn value hit
+        // has_field's own panic ("expects a record and a string")
+        // instead of the ordinary desugared type-error message every
+        // other boundary check produces.
+        let src = r#"
+            handle
+              let y = perform choose(0) in
+              let f = fun p: {x: Int} -> p in
+              f(y)
+            with handler choose(p, resume) -> resume(5)
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected {x: Int}, found Int"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn record_pattern_against_an_incompatible_scrutinee_rejected_statically() {
+        // Regression: pattern_type's Pattern::Record => Type::Dyn made
+        // this trivially "possibly matchable" via a bare consistent()
+        // check, losing the impossible-pattern diagnostic every other
+        // pattern shape still gets. pattern_could_match restores it for
+        // Record specifically without breaking width-tolerant matching
+        // against an actual Record-typed scrutinee (covered by
+        // width_subtyping_accepts_a_wider_record_statically and friends).
+        let src = r#"let f = fun p: Str -> match p with | {x: a} -> a | s -> s in f("hi")"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("can never match"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn width_dominated_record_arm_reported_unreachable() {
+        // Regression: dominates() had no Pattern::Record arm, so a later
+        // arm naming a superset of an earlier arm's fields went
+        // undiagnosed as dead code even though width-tolerant matching
+        // guarantees the earlier arm already covers it.
+        let src = r#"
+            type R = {x: Int} | {x: Int, y: Int} in
+            let f = fun p: R -> match p with | {x: a} -> a | {x: a, y: b} -> a + b
+            in f({x: 5})
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("unreachable match arm"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn record_equality_compares_actual_fields_not_the_annotated_type() {
+        // A value satisfying a type (width subtyping) is a different
+        // question from two values being equal -- see value_eq's own
+        // doc comment. `y` is width-coerced to fit {x: Int} but keeps
+        // its extra field, so it correctly does NOT equal a genuinely
+        // exact-shape {x: 1}.
+        let src = r#"
+            handle
+              let y = perform choose(0) in
+              let r = {x: 1} in
+              y == r
+            with handler choose(p, resume) -> resume({x: 1, y: 2})
+        "#;
+        assert!(!run_source(src).unwrap().as_bool());
     }
 
     // --- match exhaustiveness ---

@@ -53,6 +53,17 @@ pub enum Builtin {
     // "a Dyn-sourced shape mismatch panics at the point of use" as this
     // interpreter's one error-handling story.
     Get,
+    // (Dyn, Str) -> Bool -- does this Record have a field with this name?
+    // Record's own field-presence analogue to Get: named lookup instead
+    // of positional, and a bool instead of panicking, since "does it have
+    // this field" (unlike "index N of this list") is a genuinely common
+    // question to ask about a value whose exact shape isn't statically
+    // known -- width subtyping means a Dyn-sourced record's exact field
+    // set is routinely broader than what any one annotation names. What
+    // typecheck::build_boundary_check's Record arm desugars a Dyn-to-
+    // Record boundary check into: is_record(v) && has_field(v, "x") &&
+    // ... , one clause per required field name.
+    HasField,
     // Dyn -> Bool, one per primitive tag. typecheck::coerce desugars a
     // Dyn-to-primitive boundary Check into `if is_X(e) then e else
     // fail(...)` using these, instead of a dedicated Check AST node/Frame
@@ -65,6 +76,11 @@ pub enum Builtin {
     IsStr,
     IsList,
     IsFun,
+    // Dyn -> Bool. Record's own tag test, same story as the other IsX
+    // builtins above -- see Value::Record's own doc comment for why it's
+    // a distinct kind from List (name-keyed, not positional) rather than
+    // reusing IsList.
+    IsRecord,
     // Dyn -> Str: the same string Value::type_name() computes, exposed so
     // a desugared boundary-check failure can build its own "found {type}"
     // message at runtime (the actual runtime value's type isn't known
@@ -84,8 +100,9 @@ impl Builtin {
             | Builtin::IsStr
             | Builtin::IsList
             | Builtin::IsFun
+            | Builtin::IsRecord
             | Builtin::TypeName => 1,
-            Builtin::Map | Builtin::Get => 2,
+            Builtin::Map | Builtin::Get | Builtin::HasField => 2,
             Builtin::Fold => 3,
         }
     }
@@ -109,6 +126,16 @@ pub enum Value {
     // (a fixed-arity List, see types::Type::Tuple) both destructure this
     // same representation.
     List(Rc<Vec<Value>>),
+    // A record: name-keyed, unlike Tuple's plain positional List (see
+    // types::Type::Record's own doc comment for why records need this --
+    // width subtyping needs a value whose fields can be looked up by
+    // name, not just position, so an extra field a narrower type never
+    // asked for is simply never observed instead of needing to be
+    // projected away at some boundary). Order is never significant here
+    // (lookup is always by name -- see machine::match_pattern's own
+    // Pattern::Record arm), though the parser's existing sort-by-name
+    // behavior is harmless and left in place.
+    Record(Rc<Vec<(String, Value)>>),
     Closure(String, ExprRef, Env),
     // `let rec f = fun p -> body [and g = ... ...] in ...`: `group[i]` is
     // (name_i, param_i, body_i) for the i-th binding in one mutually-
@@ -162,6 +189,7 @@ impl Value {
             Value::Str(_) => "Str",
             Value::Token(_) => "Token",
             Value::List(_) => "List",
+            Value::Record(_) => "Record",
             Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => "Fun",
             Value::Handler(_) => "Handler",
         }
@@ -191,6 +219,19 @@ impl fmt::Display for Value {
                 }
                 write!(f, "]")
             }
+            // Prints every field the value actually carries -- including
+            // ones width subtyping let it keep that no annotation ever
+            // named (see Outcome::from's own doc comment on this Value).
+            Value::Record(fields) => {
+                write!(f, "{{")?;
+                for (i, (name, v)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name}: {v}")?;
+                }
+                write!(f, "}}")
+            }
             Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => {
                 write!(f, "<function>")
             }
@@ -215,6 +256,8 @@ pub enum Outcome {
     // Mirrors Value::Token -- see its own doc comment.
     Token,
     List(Vec<Outcome>),
+    // Mirrors Value::Record -- see its own doc comment.
+    Record(Vec<(String, Outcome)>),
     Function,
     Handler,
 }
@@ -243,6 +286,19 @@ impl From<&Value> for Outcome {
             Value::Str(s) => Outcome::Str(s.to_string()),
             Value::Token(_) => Outcome::Token,
             Value::List(items) => Outcome::List(items.iter().map(Outcome::from).collect()),
+            // Width subtyping is only invisible to PATTERN matching (see
+            // Pattern::Record's own doc comment) -- it does NOT hide a
+            // wider value's extra fields from THIS conversion, which
+            // walks every field the Value actually carries, not just the
+            // ones some earlier annotation happened to name. A record
+            // width-coerced to satisfy a narrower type still crosses to
+            // Outcome (and Display, below) with every field intact --
+            // same kind of leak Token's own Display/Outcome arm already
+            // has for its hidden brand id, just for a Record's "extra"
+            // fields instead of a Token's numeric id.
+            Value::Record(fields) => {
+                Outcome::Record(fields.iter().map(|(n, v)| (n.clone(), Outcome::from(v))).collect())
+            }
             Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => {
                 Outcome::Function
             }
@@ -267,6 +323,16 @@ impl fmt::Display for Outcome {
                     write!(f, "{v}")?;
                 }
                 write!(f, "]")
+            }
+            Outcome::Record(fields) => {
+                write!(f, "{{")?;
+                for (i, (name, v)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name}: {v}")?;
+                }
+                write!(f, "}}")
             }
             Outcome::Function => write!(f, "<function>"),
             Outcome::Handler => write!(f, "<handler>"),

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
 use crate::plist::PList;
 use crate::span::Span;
-use crate::types::{consistent, EffectRow, Type};
+use crate::types::{consistent, record_satisfies, EffectRow, Type};
 
 // The Span is always an ORIGINAL (pre-elaboration) node's -- the one whose
 // type was being checked when the error fired, always already in scope
@@ -169,21 +169,33 @@ fn any_fun() -> Type {
 // The only place a runtime boundary check gets built: `from` is Dyn
 // (unknown statically) and `to` is concrete. If both sides are concrete
 // and disagree, that's a real static error -- reject before running at
-// all. If `from` is already exactly consistent and concrete, no check
-// needed: zero overhead for fully-annotated code. The error, if any,
-// points at `span` -- the CALLER's job to have already looked up via the
-// ORIGINAL (pre-elaboration) ExprRef for the value in question, e.g.
-// `spans[val]` where `val` is a field straight off the un-elaborated
-// node, NOT the elaborated `e` this function receives to potentially
-// wrap: elaborate_node re-pushes almost every compound node it touches
-// (App, BinOp, If, ...) regardless of whether anything actually changed,
-// so `e` itself is often already a brand new ExprRef past the end of the
+// all, UNLESS `to` is a Record that `from` (also a concrete Record)
+// width-satisfies (see types::record_satisfies' own doc comment) -- the
+// one place `from`/`to`'s naming is more than accidental, since that
+// relation is genuinely directional, unlike consistent()'s own symmetric
+// one. Accepted with NO wrapping at all: a wider record needs no runtime
+// projection to be used where a narrower type is expected (see
+// Pattern::Record's own doc comment for why). If `from` is already
+// exactly consistent and concrete, no check needed either: zero overhead
+// for fully-annotated code. The error, if any, points at `span` -- the
+// CALLER's job to have already looked up via the ORIGINAL
+// (pre-elaboration) ExprRef for the value in question, e.g. `spans[val]`
+// where `val` is a field straight off the un-elaborated node, NOT the
+// elaborated `e` this function receives to potentially wrap:
+// elaborate_node re-pushes almost every compound node it touches (App,
+// BinOp, If, ...) regardless of whether anything actually changed, so
+// `e` itself is often already a brand new ExprRef past the end of the
 // parser-built SpanMap by the time it reaches here -- indexing spans BY
 // IT, not by the original, was a latent bug (worked by coincidence
 // whenever the mismatched value happened to be a leaf that elaborate_node
 // returns unchanged).
 fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span) -> Result<ExprRef, TypeError> {
     if !consistent(from, to) {
+        if let (Type::Record(actual), Type::Record(required)) = (from, to)
+            && record_satisfies(required, actual)
+        {
+            return Ok(e);
+        }
         return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span));
     }
     if *from != Type::Dyn || *to == Type::Dyn {
@@ -256,16 +268,6 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type) -> ExprRef {
     arena.push(Expr::Let(tmp, None, e, result))
 }
 
-// Tuple and Record's shared "how many positions" -- only ever called
-// with `ty` already known to be one or the other.
-fn shape_arity(ty: &Type) -> usize {
-    match ty {
-        Type::Tuple(items) => items.len(),
-        Type::Record(fields) => fields.len(),
-        _ => unreachable!("shape_arity is only ever called with a Tuple or Record"),
-    }
-}
-
 // The bare boolean half of build_boundary_check's per-type dispatch --
 // "does `value_ref` shallowly look like `ty`," with no let-binding and no
 // fail() of its own, so build_union_check can OR several of these
@@ -284,21 +286,38 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type) -> Ex
             let lit = arena.push(Expr::Token(*id));
             arena.push(Expr::BinOp(BinOp::Eq, value_ref, lit))
         }
-        // Record shares this arm with Tuple -- shape-wise it IS a Tuple
-        // (see Type::Record's own doc comment), just with names attached
-        // that this shallow check has no way to verify at runtime anyway
-        // (no new Value kind -- see Expr::Record's own doc comment).
-        // `shape_arity` reads the position count straight from whichever
-        // one `ty` actually is, so there's no second match here re-asking
-        // a question the outer one already answered.
-        Type::Tuple(_) | Type::Record(_) => {
+        Type::Tuple(items) => {
             let is_list = build_predicate_call(arena, "is_list", value_ref);
             let len_var = arena.push(Expr::Var("len".to_string()));
             let len_call = arena.push(Expr::App(len_var, value_ref));
-            let arity_lit = arena.push(Expr::Int(shape_arity(ty) as i64));
+            let arity_lit = arena.push(Expr::Int(items.len() as i64));
             let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, arity_lit));
             let false_lit = arena.push(Expr::Bool(false));
             arena.push(Expr::If(is_list, len_eq, false_lit))
+        }
+        // Width-tolerant, unlike Tuple's exact arity check above: `v` need
+        // only HAVE (at least) every required field -- extra fields are
+        // fine, see Pattern::Record's own doc comment for why nothing
+        // downstream can ever observe them. `is_record(v) && has_field(v,
+        // "x") && has_field(v, "y") && ...`, one clause per required
+        // field name, BUT `is_record` has to be the OUTERMOST/first-
+        // evaluated check, same as `is_list` is for Tuple just above --
+        // `has_field` panics on a non-Record argument (see its own doc
+        // comment), so building the has_field chain first and only
+        // wrapping it in `is_record` at the very end (rather than
+        // starting the fold from `is_record` and nesting has_field
+        // AROUND it) would let has_field run on a value that was never
+        // confirmed to be a Record at all.
+        Type::Record(fields) => {
+            let mut result = arena.push(Expr::Bool(true));
+            for (name, _) in fields.iter().rev() {
+                let has = build_has_field_call(arena, value_ref, name);
+                let false_lit = arena.push(Expr::Bool(false));
+                result = arena.push(Expr::If(has, result, false_lit));
+            }
+            let is_record = build_predicate_call(arena, "is_record", value_ref);
+            let false_lit = arena.push(Expr::Bool(false));
+            arena.push(Expr::If(is_record, result, false_lit))
         }
         Type::Union(alts) => {
             let mut result = arena.push(Expr::Bool(false));
@@ -317,6 +336,15 @@ fn build_predicate_call(arena: &mut Arena, name: &str, value_ref: ExprRef) -> Ex
     arena.push(Expr::App(v, value_ref))
 }
 
+// `has_field(value_ref, field_name)` -- the two-argument counterpart to
+// build_predicate_call, used only by Record's own shape predicate/check.
+fn build_has_field_call(arena: &mut Arena, value_ref: ExprRef, field_name: &str) -> ExprRef {
+    let f = arena.push(Expr::Var("has_field".to_string()));
+    let applied = arena.push(Expr::App(f, value_ref));
+    let name_lit = arena.push(Expr::Str(field_name.to_string()));
+    arena.push(Expr::App(applied, name_lit))
+}
+
 // A singleton: the only thing a Dyn-sourced value could ever satisfy this
 // against is the EXACT same Value::Token, so this reuses ordinary `==`
 // (BinOp::Eq, backed by machine::value_eq's own Token arm) against a
@@ -332,21 +360,17 @@ fn build_token_check(arena: &mut Arena, e: ExprRef, to: &Type, id: u64) -> ExprR
     arena.push(Expr::Let(tmp, None, e, if_expr))
 }
 
-// Shallow, like List(_) in build_boundary_check: confirms arity only --
-// for a Record, NOT that the right field names are present (there's
-// nothing left at runtime to check that against: no new Value kind means
-// field names live only at the type level, see Type::Record's own doc
-// comment -- a same-arity value with entirely different field names
-// still passes) -- and not that each position's own value matches ITS
-// OWN element type either. A full per-position recursive check (extract
-// each element, apply build_boundary_check to it, rebuild the
-// tuple/record) is possible but not built yet; this matches the same
-// "confirm the shape, not deeper" precedent every other Dyn boundary
-// check here already sets. Entirely generic over `to` -- the actual
-// shape test is build_shape_predicate's own job, not re-derived here, so
-// this one function serves both Type::Tuple and Type::Record (a Record IS,
-// shape-wise, just a Tuple with names attached -- see Type::Record's own
-// doc comment) with no duplicated arity/is_list logic between them.
+// Shallow: confirms shape (arity for Tuple; field PRESENCE, width-
+// tolerantly, for Record -- see build_shape_predicate's own Record arm),
+// not that each position/field's own value matches ITS OWN element type.
+// A full recursive check (extract each element, apply
+// build_boundary_check to it, rebuild the tuple/record) is possible but
+// not built yet; this matches the same "confirm the shape, not deeper"
+// precedent every other Dyn boundary check here already sets. Entirely
+// generic over `to` -- the actual shape test is build_shape_predicate's
+// own job, not re-derived here, so this one function serves both
+// Type::Tuple and Type::Record with nothing Tuple/Record-specific of its
+// own.
 fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type) -> ExprRef {
     let tmp = "__check_tmp".to_string();
     let tmp_ref = arena.push(Expr::Var(tmp.clone()));
@@ -458,6 +482,43 @@ fn pattern_type(pat: &Pattern) -> Type {
         Pattern::Bool(_) => Type::Bool,
         Pattern::Str(_) => Type::Str,
         Pattern::List(_) | Pattern::Cons(..) => Type::List(Rc::new(Type::Dyn)),
+        // Dyn -- but unlike every other arm above, this is NOT what
+        // decides whether a Record pattern can match a given scrutinee
+        // (Dyn is trivially consistent with anything, which would make
+        // EVERY scrutinee type "possibly matchable," silently losing the
+        // same impossible-pattern diagnostic every other arm here
+        // provides). This is only the DISPLAY type used in that
+        // diagnostic's own message text -- see pattern_could_match, the
+        // function that actually decides Record's case, right below.
+        Pattern::Record(_) => Type::Dyn,
+    }
+}
+
+// Does `pat` have ANY chance of matching a value of type `ty`? For every
+// pattern shape except Record this is exactly `consistent(ty,
+// &pattern_type(pat))` -- but a plain consistent() check is too coarse
+// for Record specifically, now that matching is width-tolerant: a
+// pattern naming only SOME of a Record type's fields must still be
+// considered a possible match (that's the whole point of width
+// subtyping), which consistent()'s own exact-field-set Record arm can't
+// express (it would wrongly reject `{x: a}` against a scrutinee typed
+// `{x: Int, y: Int}` as impossible, and giving Pattern::Record a plain
+// Type::Dyn phantom type -- see pattern_type's own Record arm -- would
+// swing too far the OTHER way and never reject anything, even a Record
+// pattern against a manifestly non-record scrutinee like Str). So Record
+// gets its own real check here: every field the pattern names must
+// exist in the scrutinee type (recursing into a Union's alternatives,
+// any one of which might supply it), everything else falls back to the
+// ordinary consistent()-based question.
+fn pattern_could_match(pat: &Pattern, ty: &Type) -> bool {
+    match (pat, ty) {
+        (Pattern::Record(fields), Type::Record(type_fields)) => {
+            fields.iter().all(|(name, _)| type_fields.iter().any(|(n, _)| n == name))
+        }
+        (Pattern::Record(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt)),
+        (Pattern::Record(_), Type::Dyn) => true,
+        (Pattern::Record(_), _) => false,
+        _ => consistent(ty, &pattern_type(pat)),
     }
 }
 
@@ -471,6 +532,7 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern) -> Ctx {
         Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => ctx.clone(),
         Pattern::List(pats) => pats.iter().fold(ctx.clone(), |c, p| bind_pattern_vars(&c, p)),
         Pattern::Cons(head, tail) => bind_pattern_vars(&bind_pattern_vars(ctx, head), tail),
+        Pattern::Record(fields) => fields.iter().fold(ctx.clone(), |c, (_, p)| bind_pattern_vars(&c, p)),
     }
 }
 
@@ -489,12 +551,27 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern) -> Ctx {
 // a real but more nuanced case than this function attempts; a redundant
 // arm of that shape is silently allowed, same as any other question this
 // checker can't cheaply answer.
+//
+// Record IS handled, though, unlike List/Cons -- width-tolerant matching
+// (see Pattern::Record's own doc comment) makes this cheaply provable in
+// a way List/Cons's open-ended lengths aren't: an earlier pattern
+// dominates a later one iff every field name the earlier pattern needs
+// is also named by the later one (so any value matching `later` already
+// has everything `earlier` needs too), and each such shared field's own
+// sub-pattern is dominated in turn. `{x: a}` dominates `{x: a, y: b}`
+// this way -- the second arm can never run.
 fn dominates(earlier: &Pattern, later: &Pattern) -> bool {
     match earlier {
         Pattern::Var(_) => true,
         Pattern::Int(n) => matches!(later, Pattern::Int(m) if m == n),
         Pattern::Bool(b) => matches!(later, Pattern::Bool(c) if c == b),
         Pattern::Str(s) => matches!(later, Pattern::Str(t) if t == s),
+        Pattern::Record(efields) => match later {
+            Pattern::Record(lfields) => efields.iter().all(|(name, esub)| {
+                lfields.iter().find(|(n, _)| n == name).is_some_and(|(_, lsub)| dominates(esub, lsub))
+            }),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -517,20 +594,24 @@ fn first_unreachable(patterns: &[&Pattern]) -> Option<usize> {
 // binding's own type is just Dyn, not the precise Tuple/Record type this
 // needs): a fully-nested pattern in ONE match sidesteps that, a match on
 // a separately-destructured intermediate variable does not.
+//
+// Record's own arm is genuinely simpler than Tuple's, not just a variant
+// of it: since Pattern::Record matching is width-tolerant (extra fields
+// on the VALUE are never looked at -- see its own doc comment), a
+// pattern covers a Record TYPE as soon as every field the pattern names
+// exists in the type with a covering sub-pattern -- no arity match
+// required at all. `{x: a}` alone is exhaustive for `{x: Int}` AND for
+// `{x: Int, y: Int}` AND for any other Record type that happens to
+// include field `x`.
 fn covers_tuple_position(pat: &Pattern, ty: &Type) -> bool {
     match (pat, ty) {
         (Pattern::Var(_), _) => true,
         (Pattern::List(subpats), Type::Tuple(items)) if subpats.len() == items.len() => {
             subpats.iter().zip(items.iter()).all(|(sp, t)| covers_tuple_position(sp, t))
         }
-        // A `{x: a, y: b}` pattern desugars straight to Pattern::List (see
-        // parser::pattern_atom's own LBrace arm) -- covering a Record is
-        // the same arity-zip as Tuple, just reading each field's TYPE
-        // (its name doesn't matter here: pattern content isn't
-        // name-checked, only shape).
-        (Pattern::List(subpats), Type::Record(fields)) if subpats.len() == fields.len() => {
-            subpats.iter().zip(fields.iter()).all(|(sp, (_, t))| covers_tuple_position(sp, t))
-        }
+        (Pattern::Record(pat_fields), Type::Record(type_fields)) => pat_fields.iter().all(|(name, sp)| {
+            type_fields.iter().find(|(n, _)| n == name).is_some_and(|(_, t)| covers_tuple_position(sp, t))
+        }),
         _ => false,
     }
 }
@@ -779,24 +860,25 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
             Ok((Type::Tuple(Rc::new(tys)), row, arena.push(Expr::Tuple(refs))))
         }
 
-        // Parser-emitted only (see Expr::Record's own doc comment) --
-        // fields already arrive sorted by name, so elaborating them in
-        // the order given is elaborating (and evaluating) them in
-        // canonical order, no extra reordering needed. Infers the precise
-        // types::Type::Record, then rewrites straight into a plain
-        // Expr::Tuple -- everything past this point (machine.rs included)
-        // only ever sees an ordinary Tuple, never Expr::Record.
+        // Fields already arrive sorted by name (parser::parse_record_fields),
+        // so elaborating them in the order given is elaborating (and
+        // evaluating) them in canonical order, no extra reordering needed.
+        // Infers the precise types::Type::Record and re-emits Expr::Record
+        // with its fields elaborated -- unlike Tuple's own arm just above,
+        // this is NOT rewritten into anything else: machine.rs evaluates
+        // Expr::Record directly into a Value::Record (see both their own
+        // doc comments for why records need this and Tuple doesn't).
         Expr::Record(fields) => {
             let mut row = EffectRow::pure();
             let mut field_tys = Vec::with_capacity(fields.len());
-            let mut refs = Vec::with_capacity(fields.len());
+            let mut field_refs = Vec::with_capacity(fields.len());
             for (name, field_expr) in fields.iter() {
                 let (field_ty, field_row, field2) = elaborate(arena, *field_expr, ctx, spans)?;
                 row = EffectRow::union(&row, &field_row);
                 field_tys.push((name.clone(), field_ty));
-                refs.push(field2);
+                field_refs.push((name.clone(), field2));
             }
-            Ok((Type::Record(Rc::new(field_tys)), row, arena.push(Expr::Tuple(refs))))
+            Ok((Type::Record(Rc::new(field_tys)), row, arena.push(Expr::Record(Rc::new(field_refs)))))
         }
 
         Expr::ListLit(items) => {
@@ -1026,10 +1108,12 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
             for (pat, (_, body)) in pats.iter().copied().zip(arms.iter()) {
-                let pat_ty = pattern_type(pat);
-                if !consistent(&scrut_ty, &pat_ty) {
+                if !pattern_could_match(pat, &scrut_ty) {
                     return Err(TypeError(
-                        format!("match: pattern of type {pat_ty} can never match scrutinee of type {scrut_ty}"),
+                        format!(
+                            "match: pattern of type {} can never match scrutinee of type {scrut_ty}",
+                            pattern_type(pat)
+                        ),
                         spans[expr],
                     ));
                 }

@@ -1,10 +1,9 @@
-// Records: `{x: 3, y: 4}` -- a fixed-arity, per-position-typed product
-// like Tuple, but each position also carries a field NAME, and fields
-// are read back by name instead of position. Not a new Value kind
-// either -- `{x: 3, y: 4}` desugars to the exact same `Value::List([3,
-// 4])` a plain `(3, 4)` tuple would, sorted into canonical (alphabetical)
-// field order the moment it's parsed. That's what makes field order not
-// matter -- `{y: 4, x: 3}` means the identical thing.
+// Records: `{x: 3, y: 4}` -- a fixed-arity product like Tuple, but each
+// position also carries a field NAME, looked up by name instead of
+// position. A real, separate runtime kind (Value::Record), not a
+// disguised list -- see types::Type::Record's own doc comment for why:
+// name-based lookup is what lets width subtyping (below) work with no
+// value transformation at any boundary.
 let p = {x: 3, y: 4} in
 
 // No `.field` access -- records are read back by destructuring, the same
@@ -12,13 +11,9 @@ let p = {x: 3, y: 4} in
 // `{x, y}` in pattern position means `{x: x, y: y}`.
 let sum_of_squares = match p with | {x, y} -> x * x + y * y in
 
-// Type annotations are name-aware, unlike Tuple's own: a `{x: Int}`
-// annotation only accepts a value with exactly that field name, not just
-// a same-shaped one-field product.
-let dx = fun a: {x: Int} -> fun b: {x: Int} ->
-  match a with
-  | {x: ax} -> match b with
-    | {x: bx} -> bx - ax
-in
+// Width subtyping: a `{x: Int}` annotation accepts any record that has
+// AT LEAST field x -- extra fields (like `y` here) just ride along,
+// unobserved by anything that only ever asked for x.
+let fst = fun r: {x: Int} -> match r with | {x} -> x in
 
-sum_of_squares + dx({x: 1})({x: 5})
+sum_of_squares + fst(p)

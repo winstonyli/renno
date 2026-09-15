@@ -36,10 +36,11 @@ pub type SpanMap = PrimaryMap<ExprRef, Span>;
 
 // Patterns destructure the value shapes renno has natively: literals
 // (matched by equality), List's two structural forms (fixed-length and
-// cons), and Var, which matches anything and binds it -- "_" is just an
-// ordinary (unused) Var name, not a special token. A tuple pattern (`(p,
-// q)`) is sugar over List -- see parser::pattern_atom's LParen arm --
-// so there's no separate variant for it either.
+// cons), Record (name-keyed, width-tolerant), and Var, which matches
+// anything and binds it -- "_" is just an ordinary (unused) Var name, not
+// a special token. A tuple pattern (`(p, q)`) is sugar over List -- see
+// parser::pattern_atom's LParen arm -- so there's no separate variant for
+// it either.
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Var(String),
@@ -50,6 +51,16 @@ pub enum Pattern {
     List(Vec<Pattern>),
     // `head :: tail` -- matches a non-empty list of any length.
     Cons(Box<Pattern>, Box<Pattern>),
+    // `{x: p, y: p, ...}` -- matches a Value::Record that has AT LEAST
+    // these field names (see Value::Record's own doc comment), each
+    // looked up by name and matched against its own sub-pattern. Unlike
+    // List's own two forms, this is NOT exact -- a field the pattern
+    // doesn't name is simply never looked at, which is what makes width
+    // subtyping work with no separate value-narrowing step anywhere (see
+    // types::record_satisfies' own doc comment): a wider record value
+    // just flows through unchanged, and only a pattern that actually
+    // names an extra field could ever observe it.
+    Record(Vec<(String, Pattern)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -103,14 +114,13 @@ pub enum Expr {
     // expression with no comma stays ordinary grouping.
     Tuple(Vec<ExprRef>),
     // `{y: 2, x: 1}` -- fields ALWAYS sorted by name by the parser (see
-    // Type::Record's own doc comment), so this and `{x: 1, y: 2}` produce
-    // identical nodes. Parser-emitted and typecheck-consumed ONLY:
-    // elaborate_node's own Record arm infers types::Type::Record from it,
-    // then immediately rewrites the node into a plain Expr::Tuple (its
-    // values, in the same sorted order) for everything downstream --
-    // machine.rs never evaluates an Expr::Record directly, the same way
-    // Type::Union has no runtime representation of its own. No new Value
-    // kind, no new machine.rs Eval arm.
+    // Type::Record's own doc comment), though order is no longer
+    // semantically significant once evaluated: elaborate_node's own
+    // Record arm infers types::Type::Record from it (elaborating each
+    // field value, unlike Tuple's own sibling arm this is NOT rewritten
+    // away -- see Value::Record's own doc comment for why records need
+    // their own name-keyed runtime kind), and machine.rs evaluates it
+    // directly via Frame::RecordElems into a Value::Record.
     Record(Rc<Vec<(String, ExprRef)>>),
     // Variable-arity, unlike every other node -- elaborate/machine handle
     // it with a loop over the Vec rather than a fixed-shape match.

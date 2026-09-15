@@ -111,21 +111,26 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     cont = Cont::cons(Frame::ListElems { remaining, done: Vec::new(), env: env.clone() }, cont);
                     control = Control::Eval(first, env);
                 }
-                // Reachable only if this tree skipped typecheck::check --
-                // elaborate_node's own Record arm rewrites every
-                // Expr::Record into a plain Expr::Tuple during
-                // elaboration (see Expr::Record's own doc comment), so a
-                // PROPERLY TYPECHECKED tree never has one left by the
-                // time it gets here. machine::run itself has no such
-                // guarantee, though: it's called on the raw parsed tree
-                // directly wherever a test wants machine.rs's own
-                // semantics without going through the typechecker (e.g.
-                // lib.rs's run_untyped) -- record syntax simply isn't
-                // supported on that untyped path, the same way a `data`
-                // declaration's old desugaring never was either.
-                Expr::Record(..) => unreachable!(
-                    "Expr::Record reached machine::run directly -- record syntax needs typecheck::check first, see its own doc comment"
-                ),
+                // Same left-to-right field-value evaluation shape as
+                // LetRec's own binding-value evaluation just below (names
+                // fixed upfront, remaining/done accumulate) -- not
+                // ListElems, since the final wrap differs (Value::Record,
+                // not Value::List; see Frame::RecordElems's own doc
+                // comment). Always 1+ fields: parser::parse_record_fields
+                // rejects `{}` (see its own doc comment), the same "no
+                // empty case to special-case" guarantee Tuple's own arm
+                // above relies on.
+                Expr::Record(fields) => {
+                    let names: Rc<Vec<String>> = Rc::new(fields.iter().map(|(n, _)| n.clone()).collect());
+                    let mut remaining: Vec<ExprRef> = fields.iter().map(|(_, v)| *v).collect();
+                    remaining.reverse();
+                    let first = remaining.pop().expect("parse_record_fields rejects an empty record");
+                    cont = Cont::cons(
+                        Frame::RecordElems { names, remaining, done: Vec::new(), env: env.clone() },
+                        cont,
+                    );
+                    control = Control::Eval(first, env);
+                }
                 Expr::ListLit(items) => {
                     if items.is_empty() {
                         control = Control::Apply(Value::List(Rc::new(Vec::new())));
@@ -389,6 +394,30 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                 None => control = Control::Apply(Value::List(Rc::new(done))),
                             }
                         }
+                        // Same left-to-right accumulation as ListElems just
+                        // above, differing only in the final wrap: `names`
+                        // (fixed for the whole record, like LetRecBody's
+                        // own `names`) zipped back together with `done`
+                        // into a Value::Record instead of a bare Value::List.
+                        Frame::RecordElems { names, remaining, done, env } => {
+                            let (names, mut remaining, mut done, env) =
+                                (names.clone(), remaining.clone(), done.clone(), env.clone());
+                            done.push(value);
+                            cont = rest;
+                            match remaining.pop() {
+                                Some(next) => {
+                                    cont = Cont::cons(
+                                        Frame::RecordElems { names, remaining, done, env: env.clone() },
+                                        cont,
+                                    );
+                                    control = Control::Eval(next, env);
+                                }
+                                None => {
+                                    let fields = names.iter().cloned().zip(done).collect();
+                                    control = Control::Apply(Value::Record(Rc::new(fields)));
+                                }
+                            }
+                        }
                         Frame::PerformPayload { effect } => {
                             let effect = effect.clone();
                             cont = rest;
@@ -586,6 +615,18 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
         Builtin::IsBool => Value::Bool(matches!(args.pop(), Some(Value::Bool(_)))),
         Builtin::IsStr => Value::Bool(matches!(args.pop(), Some(Value::Str(_)))),
         Builtin::IsList => Value::Bool(matches!(args.pop(), Some(Value::List(_)))),
+        Builtin::IsRecord => Value::Bool(matches!(args.pop(), Some(Value::Record(_)))),
+        // (record, name) -- args.pop() order matches Get's own (list, i)
+        // convention: last-pushed arg (name) pops first.
+        Builtin::HasField => {
+            let (name, record) = (args.pop(), args.pop());
+            match (record, name) {
+                (Some(Value::Record(fields)), Some(Value::Str(name))) => {
+                    Value::Bool(fields.iter().any(|(n, _)| n.as_str() == &*name))
+                }
+                _ => panic!("has_field expects a record and a string"),
+            }
+        }
         // Same shallow "is it callable at all" story Value::matches_type's
         // own Fun arm used to answer -- confirms a representation, not a
         // specific signature (typecheck::coerce's higher-order contract,
@@ -663,6 +704,22 @@ fn match_pattern(pat: &Pattern, value: &Value, env: Env) -> Option<Env> {
             }
             _ => None,
         },
+        // Width-tolerant, unlike Pattern::List above: looked up by NAME,
+        // not position, and a field the pattern doesn't name is simply
+        // never looked at -- see Pattern::Record's own doc comment. A
+        // name the pattern DOES need but the value doesn't have fails
+        // the match, same "no match" story as any other shape mismatch.
+        Pattern::Record(fields) => match value {
+            Value::Record(entries) => {
+                let mut env = env;
+                for (name, p) in fields {
+                    let (_, v) = entries.iter().find(|(n, _)| n == name)?;
+                    env = match_pattern(p, v, env)?;
+                }
+                Some(env)
+            }
+            _ => None,
+        },
     }
 }
 
@@ -674,6 +731,37 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::Token(x), Value::Token(y)) => x == y,
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_eq(a, b))
+        }
+        // By name, not position -- O(n*m), not the O(n) a positional zip
+        // (like List's own arm just above) would give, but NOT safely
+        // interchangeable with one: every Value::Record built through
+        // typecheck::check does land in the parser's canonical
+        // sorted-by-name order, but nothing here can assume that -- a
+        // caller that skips typecheck::check entirely (e.g. lib.rs's
+        // run_untyped, or any future one) can construct two same-length,
+        // different-field-set records that a pure positional zip would
+        // wrongly call equal (`{a:1}` vs `{b:1}`, position 0 both `1`).
+        // Comparing names at each position is what makes this correct
+        // regardless of how the values were built, not just an
+        // unnecessarily cautious version of the faster zip.
+        //
+        // Same field count, and every one of `x`'s fields present in `y`
+        // under that name with an equal value. Deliberately EXACT, not
+        // width-tolerant: `==`
+        // compares the actual data two values carry, which is a
+        // different question from typecheck::coerce's own "does this
+        // value's type fit where that type is expected" -- width
+        // subtyping is purely a static/matching-time notion (see
+        // Pattern::Record's own doc comment: no value is ever narrowed
+        // at a boundary), so a Dyn-sourced value width-coerced to fit a
+        // narrower annotation still carries every field it always had,
+        // and `==` still sees all of them. A value that fits a type is
+        // not the same claim as two values being equal, the same way a
+        // `Seconds` satisfying a `Meters` annotation (structural Tuple
+        // typing) doesn't make two DIFFERENT Meters values compare
+        // equal just because both satisfy the same annotation.
+        (Value::Record(x), Value::Record(y)) => {
+            x.len() == y.len() && x.iter().all(|(n, v)| y.iter().any(|(n2, v2)| n == n2 && value_eq(v, v2)))
         }
         _ => false,
     }
