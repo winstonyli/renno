@@ -1,27 +1,31 @@
-// ADTs: sugar over renno's native List, not a new Value kind. `Some(5)` IS
-// `["Some", 5]`; `None` IS `["None"]` -- see parser::build_ctor_value. That
-// means match "just works" against them with the same List patterns
-// pattern_matching.rn already uses, and constructors are curried like any
-// other multi-arg callable (fold, map): `Cons(1)(rest)`, not `Cons(1, rest)`.
+// Sum types, now that `data` is gone: a hand-rolled tagged tuple, not a
+// new Value kind. `Cons(1)(rest)` IS `("Cons", 1, rest)`; `Nil` IS
+// `("Nil",)` -- so match "just works" against them with ordinary tuple
+// patterns, the tag matched by plain literal-Str comparison in pattern
+// position (pattern_matching.rn covers literal matching on its own).
+// Constructors are curried like any other multi-arg callable (fold, map):
+// `Cons(1)(rest)`, not `Cons(1, rest)`.
 //
-// Each constructor also gets a real type, Type::Data("List") -- e.g.
-// Cons: (Int -> List -> List) -- so a recursive type (List referencing
-// itself in Cons's own field list) needs no forward declaration: `List`
-// there is just a name, nothing to resolve. Data types are STRUCTURAL by
-// default (two differently-named types with the same constructor names
-// and field types unify) -- see structural_types.rn for that, and for
-// opting a type OUT of it (`opaque`) when it shouldn't be interchangeable.
+// No dedicated recursive TYPE names this (Type::Tuple/Type::Union are
+// finite trees, never self-referential -- see types::consistent's own doc
+// comment), so `List` here is a Rust-level naming convenience only, not a
+// static type: the value is recursive, its type stays Dyn all the way
+// down. See structural_types.rn for what real structural/nominal typing
+// (Type::Tuple, Type::Union, `opaque`) looks like instead.
 //
-// `data` also records this type's constructor set for exhaustiveness: the
-// match below needs no wildcard arm because { Nil, Cons } is exactly what
-// this declaration named -- delete either arm and typecheck rejects the
-// program as non-exhaustive.
-data List = Nil | Cons(Int, List) in
+// `l` itself is unannotated (Dyn) -- missing_case's Tuple/Union coverage
+// rule only fires for a scrutinee whose type is statically known to BE a
+// Tuple/Union, so a Dyn scrutinee still needs an explicit wildcard arm to
+// typecheck, even though these two patterns cover every value this
+// program ever actually produces.
+let Nil = ("Nil",) in
+let Cons = fun h -> fun t -> ("Cons", h, t) in
 
 let rec sum = fun l ->
   match l with
-  | Nil -> 0
-  | Cons(h, t) -> h + sum(t)
+  | ("Nil",) -> 0
+  | ("Cons", h, t) -> h + sum(t)
+  | _ -> 0
 in
 
 sum(Cons(1)(Cons(2)(Cons(3)(Nil))))

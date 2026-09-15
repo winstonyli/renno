@@ -1,24 +1,12 @@
-// Named fields, three ways: construction, access, and patterns.
-// `data Point = Point(x: Int, y: Int)` names each field; all three uses
-// below are sugar, resolved entirely at typecheck time from the SAME
-// field-order info recorded by that one declaration -- no new runtime
-// representation, no new machine.rs opcode.
+// Positional product types: a tuple, not a new Value kind -- `(3, 4)` IS
+// `Value::List([3, 4])` at runtime (Type::Tuple([Int, Int]) is its static
+// type, a fixed-arity/per-position-typed product, see types::Type::Tuple).
 //
-// Positional construction/patterns (`Point(1)(2)`, `Point(a, b)`) still
-// work exactly as before and can be freely mixed with the named forms --
-// named fields are an alternative notation, not a replacement.
-data Point = Point(x: Int, y: Int) in
+// renno has no named fields yet (anonymous records are a planned future
+// feature) -- so a "Point" here is just a positional (x, y) tuple, read
+// back out by destructuring pattern, not `.field` access.
+let p: (Int, Int) = (3, 4) in
 
-// Construction: `{ field: expr, ... }`, any order.
-let p = Point { y: 4, x: 3 } in
+let sum_of_squares = match p with | (x, y) -> x * x + y * y in
 
-// Access: `.field`, needs the value's type known as a Data(name) with
-// exactly one constructor.
-let via_access = p.x * p.x + p.y * p.y in
-
-// Pattern: `{ field: pat, ... }`, also any order -- and, since this is
-// just a Match under the hood, composes with everything match already
-// does (multiple arms, nested patterns, exhaustiveness checking).
-let via_pattern = match p with | Point { y: b, x: a } -> a * a + b * b in
-
-via_access + via_pattern
+sum_of_squares

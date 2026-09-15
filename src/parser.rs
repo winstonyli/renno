@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::expr::{Arena, BinOp, DataInfo, Expr, ExprRef, Pattern, SpanMap};
+use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
 use crate::lexer::{tokenize, Token};
 use crate::span::Span;
 use crate::types::{EffectRow, Type};
@@ -15,8 +15,6 @@ pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
         arena: Arena::new(),
         expr_spans: SpanMap::new(),
         src,
-        branded_ctors: HashMap::new(),
-        type_brands: HashMap::new(),
         type_aliases: HashMap::new(),
     };
     let root = p.expr()?;
@@ -34,41 +32,20 @@ struct Parser<'a> {
     arena: Arena,
     expr_spans: SpanMap,
     src: &'a str,
-    // Ctor name -> brand id, for every `data` block parsed SO FAR whose
-    // constructors carry a hidden `opaque` runtime tag (see
-    // build_ctor_value/pattern_atom). Patterns are built at parse time
-    // with no type information available, so this is how a positional
-    // constructor pattern (`Mk(x)`) learns it needs the same hidden
-    // trailing tag its ctor's VALUE carries. Updated as each `data` block
-    // finishes parsing its constructor list (before its body is parsed,
-    // so it's visible to every pattern the body can contain) -- a later
-    // `data` block reusing a ctor name always overwrites (or clears) the
-    // entry, modeling ordinary lexical shadowing.
-    branded_ctors: HashMap<String, u64>,
-    // Type name -> brand id, for every `data` block parsed SO FAR whose
-    // constructors carry a hidden `opaque` runtime tag -- the STATIC
-    // counterpart of `branded_ctors`, consulted by parse_type's bare-
-    // identifier case (`x: Celsius`) so a type annotation resolves to the
-    // brand of whichever `data Celsius` is lexically in scope there, the
-    // same way `branded_ctors` lets a pattern learn its ctor's hidden tag.
-    // Scoped identically (updated/restored in lockstep with
-    // `branded_ctors`, same `data` arm in `atom`, same LIFO restore at its
-    // end) -- see that field's own doc comment for why.
-    type_brands: HashMap<String, u64>,
     // Type name -> the fully-resolved Type it stands for -- `type Name =
     // TypeExpr in body` (see atom's own `Some(Token::TypeKw)` arm), a pure
     // compile-time directive with no runtime effect of its own. Consulted
-    // by parse_type's bare-identifier case BEFORE falling back to
-    // Type::Data(name, ...) -- a name found here is substituted in
-    // directly, fully resolved at the point of use, not deferred. Scoped
-    // the same way as type_brands/branded_ctors: updated when a `type`
-    // binder is parsed, restored (LIFO) once its own `in <body>` ends.
+    // by parse_type's bare-identifier case: a name found here is
+    // substituted in directly, fully resolved at the point of use, not
+    // deferred. Scoped lexically: updated when a `type` binder is parsed,
+    // restored (LIFO) once its own `in <body>` ends -- see atom's own
+    // `type_alias_restore`.
     type_aliases: HashMap<String, Type>,
 }
 
-// A `let`/`fun`/`data` prefix collected while flattening a chain of them
-// (see `atom`) -- deferred until the terminal body is parsed, then folded
-// back into nested Let/Lambda/DataGroup nodes in reverse.
+// A `let`/`fun` prefix collected while flattening a chain of them (see
+// `atom`) -- deferred until the terminal body is parsed, then folded back
+// into nested Let/Lambda nodes in reverse.
 enum PendingBinder {
     // `where_pred`, if present, is a gradual-verification refinement on
     // this binding (`let n: Int where n > 0 = ...`) -- see
@@ -87,33 +64,6 @@ enum PendingBinder {
     // whatever the CALLER passes, unknown at definition time, so this
     // always becomes a real runtime check.
     Fun { param: String, ann: Option<Type>, where_pred: Option<ExprRef> },
-    // `data Name = Ctor1(T, ...) | Ctor2 | ...` -- one pending item expands
-    // to N nested Lets when folded back (one per constructor), not one.
-    // See build_ctor_value for what each constructor's bound value is, and
-    // ctor_type for the Type::Data(Name) annotation each one gets.
-    // Each field is optionally named (parse_ctor_field) -- `field: Int`
-    // instead of a bare `Int` -- for FieldAccess's `.field` desugaring;
-    // unnamed by default, and not required to be uniform within one `data`
-    // block (a constructor whose fields are only PARTLY named still just
-    // has no field-name entry built for it -- see the Data fold-back arm).
-    // `brand`: Some(id), unique to this `data` block's own source position,
-    // if any constructor wrote an `opaque` field -- see DataInfo::brand.
-    Data { type_name: String, ctors: Vec<(String, Vec<(Option<String>, Type)>)>, brand: Option<u64> },
-}
-
-// The type a `data Name = ... | Ctor(T1, T2) | ...` constructor gets:
-// `T1 -> T2 -> ... -> Data(Name)`, curried the same way the constructor's
-// own VALUE is (build_ctor_value). Two `data` types with identically-
-// shaped constructors (e.g. `data Celsius = Mk(Int)` and `data Fahrenheit
-// = Mk(Int)`) are consistent with each other by default (structural, see
-// types::consistent) -- add an `opaque` field to either if they should
-// NOT be interchangeable. See types::Type::Data's own doc comment.
-fn ctor_type(type_name: &str, field_tys: &[(Option<String>, Type)], brand: Option<u64>) -> Type {
-    let mut result = Type::Data(type_name.to_string(), brand);
-    for (_, ty) in field_tys.iter().rev() {
-        result = Type::Fun(Rc::new(ty.clone()), EffectRow::pure(), Rc::new(result));
-    }
-    result
 }
 
 // A tiny, deliberately narrow compile-time evaluator for `where` refinement
@@ -297,17 +247,13 @@ impl<'a> Parser<'a> {
 
     // union_type := fun_type ("|" fun_type)*  (left-associative in surface
     // syntax, though Type::Union itself is an unordered set -- order in
-    // the Vec never matters to consistent_inner). `|` binds LOOSER than
+    // the Vec never matters to types::consistent). `|` binds LOOSER than
     // `->` (parse_fun_type's own right-recursion is greedy, so `A -> B | C`
     // parses as `(A -> B) | C`, not `A -> (B | C)`). Used everywhere a
     // trailing `->` couldn't be ambiguous with something else that follows
     // (unlike opt_annotation -- see parse_type_atom_union): inside `[...]`/
     // `(...)`, and a `type` alias's own RHS (terminated by `in`, not `->`/
-    // `=`). Deliberately NOT threaded into parse_ctor_field: a `data`
-    // block's own `|` already separates constructors at the OUTER level,
-    // and allowing it inside one field's type too would be needlessly
-    // confusing right next to that existing meaning, for no real use case
-    // yet.
+    // `=`).
     fn parse_union_type(&mut self) -> Result<Type, String> {
         let first = self.parse_fun_type()?;
         if !matches!(self.peek(), Some(Token::Pipe)) {
@@ -364,31 +310,18 @@ impl<'a> Parser<'a> {
                     Ok(first)
                 }
             }
-            // A capitalized name: either a known `type` alias
-            // (Parser::type_aliases -- checked FIRST, and if found,
-            // substituted in directly, fully resolved, not deferred) or a
-            // reference to a `data`-declared type. Structural comparison
-            // still needs no name-resolution pass for the latter -- an
-            // undeclared/misspelled name is just never found in `fields`
-            // and conservatively rejected (types::consistent_inner) -- but
-            // opaque comparison does need to know WHICH declaration this
-            // name currently refers to, so `type_brands` (updated as each
-            // `data` block is parsed, restored when its scope ends -- see
-            // its own doc comment) is consulted here: None if the name
-            // isn't currently branded (either genuinely unbranded, or not
-            // actually declared -- both look the same to a bare type
-            // annotation, same as before this field existed). A self-
-            // referential field (`Cons(Int, List, opaque)` inside `data
-            // List` itself) still resolves correctly: the `data` arm below
-            // inserts `List`'s OWN (possibly tentative) brand into
-            // `type_brands` before parsing its constructor field list, for
-            // exactly this case.
+            // A capitalized name: a reference to a `type Name = ... in`
+            // alias (Parser::type_aliases) currently in scope -- fully
+            // resolved right here, not deferred. Unlike `data`'s own
+            // former bare-Data(name) fallback, an unknown name is a
+            // static error immediately: there's no "maybe it resolves
+            // later" story left once every type must be a builtin, a
+            // Token/Tuple/Union, or a named alias.
             Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => {
-                if let Some(ty) = self.type_aliases.get(&name) {
-                    return Ok(ty.clone());
+                match self.type_aliases.get(&name) {
+                    Some(ty) => Ok(ty.clone()),
+                    None => Err(self.err_at(self.span_before(), format!("unknown type: {name}"))),
                 }
-                let brand = self.type_brands.get(&name).copied();
-                Ok(Type::Data(name, brand))
             }
             other => Err(self.err_at(self.span_before(), format!("expected a type, found {other:?}"))),
         }
@@ -419,79 +352,6 @@ impl<'a> Parser<'a> {
         } else {
             Ok(atom)
         }
-    }
-
-    // One field inside a `data` constructor's parens: `field: Type`, or a
-    // bare `Type` (no name -- positional, no `.field` access possible for
-    // it later). No lookahead needed to disambiguate: a bare type can
-    // never itself START with a lowercase identifier (parse_type's
-    // uppercase-Ident fallback requires an uppercase first letter, and no
-    // other type-starting token is a lowercase-starting Ident), so seeing
-    // one unambiguously means "field name, then `:`".
-    fn parse_ctor_field(&mut self) -> Result<(Option<String>, Type), String> {
-        if let Some(Token::Ident(name)) = self.peek() {
-            if name.chars().next().is_some_and(char::is_lowercase) {
-                let name = name.clone();
-                self.bump();
-                self.expect(&Token::Colon)?;
-                return Ok((Some(name), self.parse_fun_type()?));
-            }
-        }
-        Ok((None, self.parse_fun_type()?))
-    }
-
-    // One item in a `data` constructor's field list, which may be an
-    // ordinary field (see parse_ctor_field) OR a bare `opaque` marker --
-    // consuming no field slot (no param, no name, no type; None here means
-    // "not a real field, push nothing"). `saw_opaque` is THIS constructor's
-    // own flag (the caller enforces every constructor in a block has one,
-    // or none -- see the `data` arm) -- the actual brand id is derived
-    // once for the whole block from the block's own `data` keyword
-    // position, not from where `opaque` itself was written. See
-    // DataInfo::brand and build_ctor_value/pattern_atom for where that id
-    // ends up: stamped into (and matched against) every constructor's
-    // runtime representation.
-    fn parse_ctor_field_or_opaque(&mut self, saw_opaque: &mut bool) -> Result<Option<(Option<String>, Type)>, String> {
-        if matches!(self.peek(), Some(Token::Opaque)) {
-            self.bump();
-            *saw_opaque = true;
-            Ok(None)
-        } else {
-            Ok(Some(self.parse_ctor_field()?))
-        }
-    }
-
-    // Scans forward from the current position (right after `data Name =`,
-    // before any constructor is actually parsed) to check whether ANY
-    // constructor in this block writes an `opaque` field -- needed BEFORE
-    // parsing constructor field types, not just after: a self-referential
-    // field (`Cons(Int, List, opaque)`, `List` referring to this very
-    // declaration) must resolve via `type_brands` to the CORRECT brand
-    // while it's still being parsed (see the `data` arm in `atom`), not
-    // one filled in only once the whole block is done.
-    //
-    // Unambiguous without tracking exactly where each `(`/`)` "belongs":
-    // the constructor-list grammar is Type-only, and `opaque` is a
-    // dedicated token (Token::Opaque, not a generic Ident) that can never
-    // legitimately appear inside a Type -- so a plain scan for that one
-    // token, stopping at this block's own closing `in` (tracked via paren/
-    // bracket depth so a nested Fun-type paren or List-type bracket isn't
-    // mistaken for one), can't false-positive on anything else. `in` can
-    // only appear at depth 0 here: Type grammar has no `let`/`in` of its
-    // own, so the first depth-0 `in` reached IS this block's own
-    // terminator, never a later one from inside the block's body.
-    fn lookahead_any_opaque(&self) -> bool {
-        let mut depth = 0i32;
-        for tok in &self.tokens[self.pos..] {
-            match tok {
-                Token::LParen | Token::LBracket => depth += 1,
-                Token::RParen | Token::RBracket => depth -= 1,
-                Token::In if depth <= 0 => return false,
-                Token::Opaque => return true,
-                _ => {}
-            }
-        }
-        false
     }
 
     // pattern := pattern_atom ("::" pattern)?  (right-assoc, `h :: t`)
@@ -540,54 +400,12 @@ impl<'a> Parser<'a> {
                     Ok(first)
                 }
             }
-            // Case decides Var vs constructor, same convention as ML/
-            // Haskell/OCaml: `x`/`_` bind, `Some`/`None`/`Cons` match a
-            // tag. Positional (`Some(p)`, desugars right here to the same
-            // List shape build_ctor_value constructs -- Some(p) matches
-            // ["Some", p], None matches ["None"]) renders invisible to
-            // typecheck.rs/machine.rs entirely. Named (`Point { x: p, ...
-            // }`) can't desugar here -- it needs the constructor's
-            // declared field ORDER, which only typecheck knows (see
-            // resolve_pattern) -- so it keeps its own Pattern::NamedCtor
-            // shape until then.
-            Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => {
-                if matches!(self.peek(), Some(Token::LBrace)) {
-                    self.bump();
-                    let mut fields = Vec::new();
-                    if !matches!(self.peek(), Some(Token::RBrace)) {
-                        fields.push(self.parse_named_field_pattern()?);
-                        while matches!(self.peek(), Some(Token::Comma)) {
-                            self.bump();
-                            fields.push(self.parse_named_field_pattern()?);
-                        }
-                    }
-                    self.expect(&Token::RBrace)?;
-                    return Ok(Pattern::NamedCtor(name, fields));
-                }
-                // Looked up before `name` moves into the tag below -- Some
-                // iff this ctor's `data` block is branded (see
-                // Parser::branded_ctors), in which case the matching
-                // hidden trailing element (appended by build_ctor_value)
-                // must be accounted for here too, or this pattern's length
-                // would never match its own ctor's real values.
-                let brand_id = self.branded_ctors.get(&name).copied();
-                let mut items = vec![Pattern::Str(name)];
-                if matches!(self.peek(), Some(Token::LParen)) {
-                    self.bump();
-                    if !matches!(self.peek(), Some(Token::RParen)) {
-                        items.push(self.pattern()?);
-                        while matches!(self.peek(), Some(Token::Comma)) {
-                            self.bump();
-                            items.push(self.pattern()?);
-                        }
-                    }
-                    self.expect(&Token::RParen)?;
-                }
-                if let Some(id) = brand_id {
-                    items.push(Pattern::Token(id));
-                }
-                Ok(Pattern::List(items))
-            }
+            // No case distinction: with `data`-declared constructors gone,
+            // any identifier here -- upper or lowercase, "_" included --
+            // just binds. A hand-rolled tagged value (`(opaque, x)`) is
+            // matched positionally instead, via the tuple/list forms
+            // above -- see the pin-pattern discussion for the still-open
+            // "match against an already-bound value" gap that leaves.
             Some(Token::Ident(name)) => Ok(Pattern::Var(name)),
             Some(Token::LBracket) => {
                 let mut items = Vec::new();
@@ -603,14 +421,6 @@ impl<'a> Parser<'a> {
             }
             other => Err(self.err_at(self.span_before(), format!("expected a pattern, found {other:?}"))),
         }
-    }
-
-    // One field inside a `Ctor { field: pattern, ... }` pattern.
-    fn parse_named_field_pattern(&mut self) -> Result<(String, Pattern), String> {
-        let name = self.ident()?;
-        self.expect(&Token::Colon)?;
-        let pat = self.pattern()?;
-        Ok((name, pat))
     }
 
     // expr := or_expr
@@ -795,20 +605,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // postfix := atom (("." ident) | atom)*  -- curried calls, either by
-    // juxtaposition (f a b) or explicit parens (f(a)(b) -- unaffected:
-    // "(" is itself an atom-starting token, so parsing the parenthesized
-    // expression as the argument atom produces the identical App chain
-    // either way), and field access p.x (only meaningful once
-    // typechecked -- see Expr::FieldAccess's own doc comment). Both cases
-    // are peers in this ONE left-to-right loop over the accumulating `e`,
-    // exactly as before juxtaposition existed: `f(a).field` still means
-    // `(f(a)).field` (dot binds to whatever the chain has built so far,
-    // not to the argument atom alone) -- and correspondingly `f x.field`
-    // means `(f x).field`, not `f(x.field)`. Different from e.g. OCaml
-    // (where `.field` binds tighter than application), but internally
-    // consistent with renno's own pre-existing rule and zero risk to
-    // every already-shipped `f(a).field` program.
+    // postfix := atom atom*  -- curried calls, either by juxtaposition
+    // (f a b) or explicit parens (f(a)(b) -- unaffected: "(" is itself an
+    // atom-starting token, so parsing the parenthesized expression as the
+    // argument atom produces the identical App chain either way).
     //
     // The juxtaposed-argument case parses just ONE atom (self.atom(), not
     // self.expr()) for the same reason application binds tighter than
@@ -825,12 +625,6 @@ impl<'a> Parser<'a> {
         let mut e = self.atom()?;
         loop {
             match self.peek() {
-                Some(Token::Dot) => {
-                    self.bump();
-                    let field = self.ident()?;
-                    let span = Span { start, end: self.span_before().end };
-                    e = self.push_spanned(Expr::FieldAccess(e, field), span);
-                }
                 Some(tok) if Self::starts_juxtaposed_arg(tok) => {
                     let arg = self.atom()?;
                     let span = Span { start, end: self.span_before().end };
@@ -843,8 +637,8 @@ impl<'a> Parser<'a> {
     }
 
     // NOT the full First(atom) set -- deliberately narrower. `atom`/
-    // `atom_leaf` also start on If/Match/Let/Fun/Data/Handle/HandlerKw,
-    // but every one of those ends in an UNBOUNDED `self.expr()` for its
+    // `atom_leaf` also start on If/Match/Let/Fun/Handle/HandlerKw, but
+    // every one of those ends in an UNBOUNDED `self.expr()` for its
     // tail position (an `if`'s `else` branch, a `let`'s body, a `match`
     // arm's body, a `handle`'s handler expression, ...) with no closing
     // delimiter of its own -- so as a bare JUXTAPOSED argument, that tail
@@ -876,9 +670,9 @@ impl<'a> Parser<'a> {
         )
     }
 
-    // Peels off a run of leading `let ... in` / `fun ... ->` / `data ...
-    // in` prefixes iteratively -- a token peek per iteration, not a
-    // recursive call -- so a long chain of any of them costs O(1) native
+    // Peels off a run of leading `let ... in` / `fun ... ->` prefixes
+    // iteratively -- a token peek per iteration, not a recursive call --
+    // so a long chain of either of them costs O(1) native
     // stack instead of O(chain length). That chain shape is exactly what
     // used to overflow the stack on deeply nested/generated source (see
     // lib.rs's run_source). The terminal body/value once the chain ends is
@@ -887,19 +681,11 @@ impl<'a> Parser<'a> {
     // moved out of the call stack, not the grammar itself.
     fn atom(&mut self) -> Result<ExprRef, String> {
         let mut pending: Vec<(usize, PendingBinder)> = Vec::new();
-        // (ctor name, what self.branded_ctors mapped it to BEFORE a `data`
-        // block in this same chain touched it) -- restored, in reverse, at
-        // the end of this atom() call, so a `data` block's effect on
-        // branded_ctors is scoped to its own `in <body>` the same way its
-        // Env binding already is, not left dangling for the rest of the
-        // file. See the `Some(Token::Data)` arm below.
-        let mut branded_restore: Vec<(String, Option<u64>)> = Vec::new();
-        // Same restore-on-scope-exit story as `branded_restore`, but for
-        // `type_brands` (type NAME -> brand id) instead of ctor name ->
-        // brand id -- one entry per `data` block, pushed/restored at the
-        // same points.
-        let mut type_brand_restore: Vec<(String, Option<u64>)> = Vec::new();
-        // Same restore-on-scope-exit story, for `type_aliases`.
+        // (name, its OLD value before this `type` binder touched it) --
+        // restored, in reverse, at the end of this atom() call, so a
+        // `type` binder's effect on `type_aliases` is scoped to its own
+        // `in <body>` the same way its Env binding already is, not left
+        // dangling for the rest of the file.
         let mut type_alias_restore: Vec<(String, Option<Type>)> = Vec::new();
         // `type` pushes NOTHING to `pending` (no AST node to fold back --
         // see the arm below), so `pending.is_empty()` alone can't tell the
@@ -986,153 +772,6 @@ impl<'a> Parser<'a> {
                     self.expect(&Token::Arrow)?;
                     pending.push((start, PendingBinder::Fun { param, ann, where_pred }));
                 }
-                Some(Token::Data) => {
-                    let start = self.span_at().start;
-                    self.bump();
-                    let type_name = self.ident()?;
-                    self.expect(&Token::Equals)?;
-
-                    // Resolve (tentatively) whether THIS block ends up
-                    // opaque, and record its brand into `type_brands`,
-                    // BEFORE parsing its own constructor field types below
-                    // -- so a self-referential field annotation resolves
-                    // to the correct brand while it's parsed, not left
-                    // unresolved until this block is fully done (see
-                    // lookahead_any_opaque's own doc comment). Confirmed
-                    // against the REAL per-constructor scan below
-                    // (`any_opaque`) once that's available.
-                    let will_be_opaque = self.lookahead_any_opaque();
-                    let tentative_brand = will_be_opaque.then_some(start as u64);
-                    type_brand_restore.push((type_name.clone(), self.type_brands.get(&type_name).copied()));
-                    match tentative_brand {
-                        Some(id) => {
-                            self.type_brands.insert(type_name.clone(), id);
-                        }
-                        None => {
-                            self.type_brands.remove(type_name.as_str());
-                        }
-                    }
-
-                    let mut ctors = Vec::new();
-                    // Whether EACH constructor (same order/length as
-                    // `ctors`) wrote an `opaque` field -- checked for
-                    // all-or-nothing once the whole block is parsed, below.
-                    let mut ctor_has_opaque = Vec::new();
-                    loop {
-                        let ctor_span = self.span_at();
-                        let name = self.ident()?;
-                        if !name.chars().next().is_some_and(char::is_uppercase) {
-                            // Pattern parsing (see pattern_atom) uses case
-                            // alone to tell a constructor pattern from an
-                            // ordinary binding -- a lowercase constructor
-                            // name would be unmatchable in a pattern
-                            // (always parsed as Var, never as this ctor's
-                            // tag), so reject it here rather than let that
-                            // surprise show up later.
-                            return Err(self.err_at(
-                                ctor_span,
-                                format!(
-                                    "data {type_name}: constructor names must start with an uppercase letter, found {name:?}"
-                                ),
-                            ));
-                        }
-                        let mut saw_opaque = false;
-                        let field_tys = if matches!(self.peek(), Some(Token::LParen)) {
-                            self.bump();
-                            let mut tys = Vec::new();
-                            if !matches!(self.peek(), Some(Token::RParen)) {
-                                if let Some(f) = self.parse_ctor_field_or_opaque(&mut saw_opaque)? {
-                                    tys.push(f);
-                                }
-                                while matches!(self.peek(), Some(Token::Comma)) {
-                                    self.bump();
-                                    if let Some(f) = self.parse_ctor_field_or_opaque(&mut saw_opaque)? {
-                                        tys.push(f);
-                                    }
-                                }
-                            }
-                            self.expect(&Token::RParen)?;
-                            tys
-                        } else {
-                            Vec::new()
-                        };
-                        ctors.push((name, field_tys));
-                        ctor_has_opaque.push(saw_opaque);
-                        if matches!(self.peek(), Some(Token::Pipe)) {
-                            self.bump();
-                        } else {
-                            break;
-                        }
-                    }
-                    self.expect(&Token::In)?;
-
-                    // `opaque` is a whole-TYPE brand (see DataInfo::brand),
-                    // but written per-constructor -- require it on every
-                    // constructor, or none, so that scope is never a
-                    // silent surprise (unlike named fields, which degrade
-                    // quietly when only partially used: brand is safety-
-                    // relevant, named fields are cosmetic).
-                    let any_opaque = ctor_has_opaque.iter().any(|&b| b);
-                    if any_opaque {
-                        // Position, not just name, in the message -- two
-                        // constructors in one block CAN share a name (e.g.
-                        // `Mk(Int) | Mk(Bool, opaque)`), and by-name-only
-                        // reporting can't tell those apart.
-                        if let Some((missing_idx, missing_name)) = ctors
-                            .iter()
-                            .zip(&ctor_has_opaque)
-                            .enumerate()
-                            .find(|&(_, (_, &has))| !has)
-                            .map(|(i, ((n, _), _))| (i, n.clone()))
-                        {
-                            let (branded_idx, branded_name) = ctors
-                                .iter()
-                                .zip(&ctor_has_opaque)
-                                .enumerate()
-                                .find(|&(_, (_, &has))| has)
-                                .map(|(i, ((n, _), _))| (i, n.clone()))
-                                .unwrap();
-                            return Err(self.err_at(
-                                Span { start, end: self.span_before().end },
-                                format!(
-                                    "data {type_name}: `opaque` must appear in every constructor or none -- found on constructor #{} ({branded_name}), missing on constructor #{} ({missing_name})",
-                                    branded_idx + 1,
-                                    missing_idx + 1
-                                ),
-                            ));
-                        }
-                    }
-                    // One id for the whole block (its own `data` keyword's
-                    // position), not the `opaque` token's -- every
-                    // constructor shares it. See build_ctor_value and
-                    // pattern_atom for where this id is actually stamped
-                    // into (and matched against) runtime values.
-                    let brand = any_opaque.then_some(start as u64);
-                    debug_assert_eq!(
-                        brand, tentative_brand,
-                        "lookahead_any_opaque disagreed with the real per-constructor scan"
-                    );
-                    for (name, _) in &ctors {
-                        // Record what this name mapped to BEFORE this block
-                        // touches it, so it can be put back once this
-                        // block's own `in <body>` scope ends (see
-                        // `branded_restore` below) -- otherwise a `data`
-                        // block nested inside a larger one's body would
-                        // permanently overwrite an outer, still-in-scope
-                        // ctor's brand for the rest of the file.
-                        branded_restore.push((name.clone(), self.branded_ctors.get(name).copied()));
-                        match brand {
-                            Some(id) => {
-                                self.branded_ctors.insert(name.clone(), id);
-                            }
-                            None => {
-                                self.branded_ctors.remove(name.as_str());
-                            }
-                        }
-                    }
-
-                    pending.push((start, PendingBinder::Data { type_name, ctors, brand }));
-                }
                 _ => break,
             }
         }
@@ -1140,9 +779,9 @@ impl<'a> Parser<'a> {
         let mut result = if pending.is_empty() && !saw_type_alias { self.atom_leaf()? } else { self.expr()? };
         // Every wrapping binder shares this same END position (the
         // terminal body's own end) -- only its START differs (where its
-        // own `let`/`fun`/`data` keyword began). `let x = 1 in let y = 2
-        // in body`'s outer Let spans `[first "let", end of body]`; the
-        // inner one spans `[second "let", end of body]`.
+        // own `let`/`fun` keyword began). `let x = 1 in let y = 2 in
+        // body`'s outer Let spans `[first "let", end of body]`; the inner
+        // one spans `[second "let", end of body]`.
         let end = self.expr_spans[result].end;
         for (start, binder) in pending.into_iter().rev() {
             let span = Span { start, end };
@@ -1166,71 +805,8 @@ impl<'a> Parser<'a> {
                     };
                     self.push_spanned(Expr::Lambda(param, ann, body), span)
                 }
-                PendingBinder::Data { type_name, ctors, brand } => {
-                    // A constructor's fields count as "named" only when
-                    // EVERY one of them has a name -- a partially-named
-                    // constructor (mixing `field: Int` with a bare `Int`)
-                    // just gets no entry here, so FieldAccess later
-                    // reports "no such field" for it rather than guessing
-                    // which position an unnamed field occupies.
-                    let info = DataInfo {
-                        type_name: type_name.clone(),
-                        ctors: ctors
-                            .iter()
-                            .map(|(name, fields)| {
-                                let field_names = if fields.iter().all(|(n, _)| n.is_some()) {
-                                    fields.iter().map(|(n, _)| n.clone().unwrap()).collect()
-                                } else {
-                                    Vec::new()
-                                };
-                                (name.clone(), field_names)
-                            })
-                            .collect(),
-                        ctor_types: ctors
-                            .iter()
-                            .map(|(name, fields)| (name.clone(), fields.iter().map(|(_, ty)| ty.clone()).collect()))
-                            .collect(),
-                        brand,
-                    };
-                    let mut body = result;
-                    for (name, field_tys) in ctors.into_iter().rev() {
-                        let val = self.build_ctor_value(&name, &field_tys, brand, span);
-                        let ty = Some(ctor_type(&type_name, &field_tys, brand));
-                        body = self.push_spanned(Expr::Let(name, ty, val, body), span);
-                    }
-                    self.push_spanned(Expr::DataGroup(Rc::new(info), body), span)
-                }
             };
         }
-        // Undo every branded_ctors change this atom() call made, in
-        // reverse (LIFO), now that its own body -- the only scope any of
-        // those `data` blocks' brands were ever meant to cover -- is fully
-        // parsed. Without this, a `data` block nested anywhere inside this
-        // body (a let-bound sub-expression, a parenthesized atom, ...)
-        // would permanently clobber an outer, still-in-scope declaration's
-        // brand for the rest of the file.
-        for (name, old) in branded_restore.into_iter().rev() {
-            match old {
-                Some(id) => {
-                    self.branded_ctors.insert(name, id);
-                }
-                None => {
-                    self.branded_ctors.remove(&name);
-                }
-            }
-        }
-        // Same restore, same reasoning, for `type_brands`.
-        for (name, old) in type_brand_restore.into_iter().rev() {
-            match old {
-                Some(id) => {
-                    self.type_brands.insert(name, id);
-                }
-                None => {
-                    self.type_brands.remove(&name);
-                }
-            }
-        }
-        // Same restore, same reasoning, for `type_aliases`.
         for (name, old) in type_alias_restore.into_iter().rev() {
             match old {
                 Some(ty) => {
@@ -1242,46 +818,6 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(result)
-    }
-
-    // ADTs are sugar over renno's existing native List: a constructed value
-    // IS a List whose first element is a Str tag (the constructor name)
-    // and whose remaining elements are the fields -- e.g. `Some(5)` is
-    // `["Some", 5]`, `None` is `["None"]`. That's a plain value with no new
-    // Value representation, and it's exactly the shape pattern_atom's
-    // constructor-pattern case (above) already expects, so match "just
-    // works" with zero changes to typecheck.rs or machine.rs. A 0-arity
-    // constructor is that List literal directly; an n-arity one is a chain
-    // of n curried Lambdas (annotated with the declared field types, so
-    // e.g. `Some("x")` is rejected statically) ending in the List literal.
-    // These nodes are entirely synthesized (no distinct source text of
-    // their own), so they all just inherit the enclosing `data` block's
-    // own span rather than getting a more precise one.
-    //
-    // `brand`, when Some, appends ONE more trailing element -- the block's
-    // hidden runtime tag (see DataInfo::brand) -- after every visible
-    // field. Every pattern that can ever match this constructor's value
-    // (positional, via pattern_atom's `branded_ctors` lookup; named, via
-    // typecheck::resolve_pattern; FieldAccess's own synthetic pattern)
-    // gets the identical trailing element appended, so machine.rs's
-    // ordinary exact-length List matching (unchanged) naturally rejects a
-    // value whose hidden tag doesn't match -- including one from an
-    // unrelated `data` block that merely shares this one's name and shape.
-    fn build_ctor_value(&mut self, name: &str, field_tys: &[(Option<String>, Type)], brand: Option<u64>, span: Span) -> ExprRef {
-        let tag = self.push_spanned(Expr::Str(name.to_string()), span);
-        let mut items = vec![tag];
-        let params: Vec<String> = (0..field_tys.len()).map(|i| format!("_{i}")).collect();
-        for p in &params {
-            items.push(self.push_spanned(Expr::Var(p.clone()), span));
-        }
-        if let Some(id) = brand {
-            items.push(self.push_spanned(Expr::Token(id), span));
-        }
-        let mut value = self.push_spanned(Expr::ListLit(items), span);
-        for (p, (_, ty)) in params.iter().zip(field_tys.iter()).rev() {
-            value = self.push_spanned(Expr::Lambda(p.clone(), Some(ty.clone()), value), span);
-        }
-        value
     }
 
     // `let name: T where pred = val in body` -- "gradual verification":
@@ -1328,15 +864,7 @@ impl<'a> Parser<'a> {
         self.push_spanned(Expr::If(pred, body, fail_call), span)
     }
 
-    // One field inside a `Ctor { field: expr, ... }` construction.
-    fn parse_named_arg(&mut self) -> Result<(String, ExprRef), String> {
-        let name = self.ident()?;
-        self.expect(&Token::Colon)?;
-        let val = self.expr()?;
-        Ok((name, val))
-    }
-
-    // Every atom form except `let`/`fun`/`data`, which `atom` handles
+    // Every atom form except `let`/`fun`/`type`, which `atom` handles
     // iteratively above. Reached only once no more chain prefix remains.
     fn atom_leaf(&mut self) -> Result<ExprRef, String> {
         let start = self.span_at().start;
@@ -1359,29 +887,8 @@ impl<'a> Parser<'a> {
             // Dyn, so structural comparison alone tells two such fields
             // apart.
             Some(Token::Opaque) => Ok(self.push_spanned(Expr::Token(start as u64), Span { start, end: self.span_before().end })),
-            // `Ident { field: expr, ... }` -- named-field construction,
-            // ONLY meaningful once typechecked (see Expr::NamedCall's own
-            // doc comment); a bare `Ident` not followed by `{` is just an
-            // ordinary variable reference, unchanged.
             Some(Token::Ident(name)) => {
-                let callee_span = Span { start, end: self.span_before().end };
-                if matches!(self.peek(), Some(Token::LBrace)) {
-                    self.bump();
-                    let mut fields = Vec::new();
-                    if !matches!(self.peek(), Some(Token::RBrace)) {
-                        fields.push(self.parse_named_arg()?);
-                        while matches!(self.peek(), Some(Token::Comma)) {
-                            self.bump();
-                            fields.push(self.parse_named_arg()?);
-                        }
-                    }
-                    self.expect(&Token::RBrace)?;
-                    let callee = self.push_spanned(Expr::Var(name), callee_span);
-                    let span = Span { start, end: self.span_before().end };
-                    Ok(self.push_spanned(Expr::NamedCall(callee, Rc::new(fields)), span))
-                } else {
-                    Ok(self.push_spanned(Expr::Var(name), callee_span))
-                }
+                Ok(self.push_spanned(Expr::Var(name), Span { start, end: self.span_before().end }))
             }
 
             // [e1, e2, ...] -- no trailing comma, no empty-element gaps.

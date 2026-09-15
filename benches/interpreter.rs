@@ -57,16 +57,14 @@ fn recursive_match_source(n: i64) -> String {
     format!("let rec sum = fun n -> match n with | 0 -> 0 | _ -> n + sum(n - 1) in sum({n})")
 }
 
-// Same shape, but each step also constructs a `data` value and reads two
-// fields back off it (Point(n)(n) -- a curried constructor call, elaborated
-// into nested Lambda/ListLit -- then p.x + p.y, each field access
-// desugared by typecheck into its own single-arm Match). Exercises
-// construction and FieldAccess's desugared-Match path together, since
-// ADTs/named fields also had zero benchmark coverage before now.
-fn adt_field_access_source(n: i64) -> String {
+// Same shape, but each step also constructs a tuple and reads both fields
+// back off it via a single-arm match destructure ((n, n) -- a Tuple
+// literal -- then match (n, n) with | (x, y) -> x + y). Exercises
+// construction and destructure together, since tuples had zero benchmark
+// coverage before now.
+fn tuple_construction_source(n: i64) -> String {
     format!(
-        "data Point = Point(x: Int, y: Int) in \
-         let rec sum = fun n -> match n with | 0 -> 0 | _ -> (let p = Point(n)(n) in p.x + p.y) + sum(n - 1) in \
+        "let rec sum = fun n -> match n with | 0 -> 0 | _ -> (match (n, n) with | (x, y) -> x + y) + sum(n - 1) in \
          sum({n})"
     )
 }
@@ -122,10 +120,10 @@ fn recursive_match(c: &mut Criterion) {
     group.finish();
 }
 
-fn adt_field_access(c: &mut Criterion) {
-    let mut group = c.benchmark_group("adt_field_access");
+fn tuple_construction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tuple_construction");
     for n in [10i64, 100, 1000] {
-        let src = adt_field_access_source(n);
+        let src = tuple_construction_source(n);
         group.bench_with_input(BenchmarkId::from_parameter(n), &src, |b, src| {
             b.iter(|| run_source(black_box(src)).unwrap())
         });
@@ -140,6 +138,6 @@ criterion_group!(
     multishot_resume,
     deep_reinstall,
     recursive_match,
-    adt_field_access
+    tuple_construction
 );
 criterion_main!(benches);

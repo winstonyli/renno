@@ -1,45 +1,37 @@
-// `data` types are STRUCTURAL by default: two DIFFERENTLY-named types with
-// the same constructor names and field types unify, the same way two
-// structurally-identical List or Fun types always have. Meters and Seconds
-// below are both just `Mk(Int)` -- so a Seconds value satisfies a
-// Meters-annotated parameter, no cast or conversion needed.
-data Meters = Mk(value: Int) in
-data Seconds = Mk(value: Int) in
+// Tuple types are STRUCTURAL by default: two DIFFERENTLY-named `type`
+// aliases for the same shape unify freely -- Meters and Seconds below are
+// both just aliases for (Int,), so a plain (Int,) value satisfies either
+// annotation with no cast or conversion needed. (types::consistent needs
+// no cycle-guard for this: Type::Tuple/Type::Union are always finite
+// trees -- an alias name is resolved once, at parse time, to the type
+// expression it names, not to a type that can refer back to itself.)
+type Meters = (Int,) in
+type Seconds = (Int,) in
 
 let identity_meters = fun x: Meters -> x in
-let five = identity_meters(Mk(5)) in   // Mk here is Seconds's own constructor
+let five = identity_meters((5,)) in   // (5,) freely satisfies either alias
 
-// Opt a type OUT of structural matching with an `opaque` field: no
-// parameter, no name -- but it IS a real hidden field, stamping one
-// invisible tag (unique to this `data` block's own source position) into
-// every value it constructs, and into every pattern that can match one.
-// Meters2/Seconds2 below have identical shape AND ctor name, but each
-// `opaque` field brands its own declaration distinctly, so they're never
-// consistent with each other, only with themselves -- checked statically
-// (below) AND at every construct/destructure (a value from the wrong
-// declaration simply fails to pattern-match, even if it somehow reached
-// this point despite the static check).
-data Meters2 = Mk2(Int, opaque) in
-data Seconds2 = Mk2(Int, opaque) in
+// Opt a value OUT of structural matching with `opaque`: a literal,
+// singleton per SOURCE POSITION (see types::Type::Token's own doc
+// comment) -- two tuples built by calling the SAME function twice carry
+// the identical token (`==` compares it like any other value); two
+// tuples from DIFFERENTLY-positioned `opaque` expressions never do, even
+// with an otherwise-identical shape and identical Int field. In fact
+// they're so different that typecheck can already tell their Tuple types
+// are never consistent -- comparing them directly is a STATIC type
+// error, not a runtime `false` (Type::Token has no surface spelling, so
+// there's no way to write that rejection down here as a demo -- try
+// deleting the two `dynify` calls below and rerunning to see it fire).
+// Erasing both sides to Dyn first defers the comparison to runtime,
+// where the real, still-distinct brands settle it instead.
+let dynify = fun x: Dyn -> x in
+let Meters2 = fun v -> (v, opaque) in
+let Seconds2 = fun v -> (v, opaque) in
 
-let identity_meters2 = fun x: Meters2 -> x in
-// identity_meters2(Mk2(5)) -- would be a static type error: Mk2(5) here
-// is a Seconds2 value, and Seconds2 no longer unifies with Meters2.
+let same_function_twice_is_equal = Meters2(5) == Meters2(5) in                             // true
+let different_functions_are_not_equal = dynify(Meters2(5)) == dynify(Seconds2(5)) in       // false
 
-// Structural comparison matches CONSTRUCTORS by name too, not just field
-// types -- so two multi-constructor types only unify when every
-// constructor tag lines up. ListA and ListB are shaped identically and
-// recursively (each constructor refers back to its own enclosing type by
-// name), which is exactly the case that needs cycle detection to
-// terminate: comparing them means comparing Cons's own recursive field,
-// which is comparing ListA against ListB all over again.
-data ListA = Nil | Cons(Int, ListA) in
-data ListB = Nil | Cons(Int, ListB) in
+let n = match five with | (v,) -> v in
 
-let rec sum = fun l: ListA ->
-  match l with
-  | Nil -> 0
-  | Cons(h, t) -> h + sum(t)
-in
-
-five.value + sum(Cons(1)(Cons(2)(Cons(3)(Nil))))   // 5 + 6 = 11
+n + (if same_function_twice_is_equal then 1 else 0) + (if different_functions_are_not_equal then 10 else 0)
+// 5 + 1 + 0 = 6

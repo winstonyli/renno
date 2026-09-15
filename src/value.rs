@@ -70,14 +70,6 @@ pub enum Builtin {
     // message at runtime (the actual runtime value's type isn't known
     // until then).
     TypeName,
-    // (Dyn, [[Str, Int]], Dyn) -> Bool -- the runtime half of
-    // typecheck::coerce's Data-target desugaring (see its own doc
-    // comment): does the first arg's tag+length match one of the witness
-    // list's (ctor name, expected total List length) pairs, and (when the
-    // third arg is a Token, not `false`) does its own trailing element
-    // carry that exact brand. Replaces the old dedicated CheckData AST
-    // node/Frame with an ordinary builtin call.
-    CheckDataShape,
 }
 
 impl Builtin {
@@ -94,7 +86,7 @@ impl Builtin {
             | Builtin::IsFun
             | Builtin::TypeName => 1,
             Builtin::Map | Builtin::Get => 2,
-            Builtin::Fold | Builtin::CheckDataShape => 3,
+            Builtin::Fold => 3,
         }
     }
 }
@@ -104,20 +96,18 @@ pub enum Value {
     Int(i64),
     Bool(bool),
     Str(Rc<str>),
-    // An `opaque` `data` constructor's hidden trailing brand tag (see
-    // parser::build_ctor_value) -- a DISTINCT kind from Int specifically
-    // so it can never be confused with (or forged as) a real Int field:
-    // Pattern::Int can never match it, and Pattern::Token can never match
-    // an ordinary Value::Int. Never produced by any surface syntax, never
-    // a legal type annotation target (none of is_int/is_bool/is_str/
-    // is_list/is_fun ever recognizes one -- see typecheck::
-    // build_boundary_check); purely an implementation-internal runtime tag.
+    // What an `opaque` expression evaluates to -- a DISTINCT kind from
+    // Int specifically so it can never be confused with (or forged as) a
+    // real Int value: Pattern::Int can never match it. Never a legal type
+    // annotation target (none of is_int/is_bool/is_str/is_list/is_fun
+    // ever recognizes one -- see typecheck::build_boundary_check;
+    // Type::Token itself has no surface spelling either).
     Token(u64),
     // Rc<Vec<Value>>, not a persistent cons-list: most list use in a
     // scripting language is indexing/iteration, which arrays serve better
-    // than cons-lists. Pattern matching (Pattern::List/Cons) and `data`
-    // (a tagged List, see types::Type::Data) both destructure this same
-    // representation.
+    // than cons-lists. Pattern matching (Pattern::List/Cons) and tuples
+    // (a fixed-arity List, see types::Type::Tuple) both destructure this
+    // same representation.
     List(Rc<Vec<Value>>),
     Closure(String, ExprRef, Env),
     // `let rec f = fun p -> body [and g = ... ...] in ...`: `group[i]` is

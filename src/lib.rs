@@ -83,8 +83,8 @@ mod tests {
     }
 
     // Walks the elaborated tree looking for a runtime boundary check.
-    // typecheck::coerce no longer builds a dedicated Check/CheckData AST
-    // node (see build_boundary_check's own doc comment) -- it desugars
+    // typecheck::coerce no longer builds a dedicated Check AST node (see
+    // build_boundary_check's own doc comment) -- it desugars
     // into `let __check_tmp = ... in if ... then ... else fail(...)`, so
     // detecting one now means detecting THAT Let's own fixed binder name
     // instead of a distinct node kind. Needed because arena-indexed
@@ -111,11 +111,6 @@ mod tests {
             Expr::MakeHandler { body, .. } => contains_check(arena, *body),
             Expr::Match(scrutinee, arms) => {
                 contains_check(arena, *scrutinee) || arms.iter().any(|(_, body)| contains_check(arena, *body))
-            }
-            Expr::DataGroup(_, body) => contains_check(arena, *body),
-            Expr::FieldAccess(target, _) => contains_check(arena, *target),
-            Expr::NamedCall(callee, args) => {
-                contains_check(arena, *callee) || args.iter().any(|(_, v)| contains_check(arena, *v))
             }
         }
     }
@@ -313,19 +308,6 @@ mod tests {
     }
 
     #[test]
-    fn dot_still_binds_to_the_whole_application_chain() {
-        // Consistent with pre-juxtaposition behavior: `.field` is a peer
-        // of application in the SAME left-to-right postfix loop, so it
-        // binds to whatever the chain has accumulated so far, not to a
-        // sub-atom -- `Ctor 5 .field` (juxtaposed construction) reads the
-        // same as the always-supported `Ctor(5).field`.
-        let src = "data P = P(x: Int) in let p = P 5 in p.x";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 5);
-    }
-
-    #[test]
     fn juxtaposition_works_with_curried_builtins() {
         let src = "fold (fun acc -> fun x -> acc + x) 0 (map (fun x -> x + x) [1, 2, 3])";
         assert_eq!(run_untyped(src).as_int(), 12);
@@ -382,9 +364,8 @@ mod tests {
     }
 
     #[test]
-    fn bare_fun_and_data_are_not_juxtaposable_arguments() {
+    fn bare_fun_is_not_a_juxtaposable_argument() {
         assert!(parser::parse("f fun x -> x").is_err());
-        assert!(parser::parse("f data X = Mk in X").is_err());
     }
 
     #[test]
@@ -782,15 +763,23 @@ mod tests {
         assert!(!machine::run(&arena, elaborated, Env::prelude(), &spans).as_bool());
     }
 
+    // Shared by every hand-rolled tagged-tuple list test below -- the tag
+    // is matched by ordinary literal-Str comparison in pattern position,
+    // not ctor-pattern sugar (there's no `data` declaration here).
+    // Factored into one constant so the convention (tag spelling, curried
+    // Cons) stays in exactly one place.
+    const NIL_CONS_PRELUDE: &str =
+        "let Nil = (\"Nil\",) in let Cons = fun h -> fun t -> (\"Cons\", h, t) in ";
+
     #[test]
-    fn mutual_recursion_composes_with_adt_and_match() {
-        let src = r#"
-            data List = Nil | Cons(Int, List) in
-            let rec sum = fun l -> match l with | Nil -> 0 | Cons(h, t) -> h + count(t)
-            and count = fun l -> match l with | Nil -> 0 | Cons(h, t) -> 1 + sum(t)
-            in sum(Cons(1)(Cons(2)(Cons(3)(Nil))))
-        "#;
-        assert_eq!(run_untyped(src).as_int(), 5);
+    fn mutual_recursion_composes_with_hand_rolled_tagged_tuples_and_match() {
+        let src = format!(
+            "{NIL_CONS_PRELUDE} \
+             let rec sum = fun l -> match l with | (\"Nil\",) -> 0 | (\"Cons\", h, t) -> h + count(t)
+             and count = fun l -> match l with | (\"Nil\",) -> 0 | (\"Cons\", h, t) -> 1 + sum(t)
+             in sum(Cons(1)(Cons(2)(Cons(3)(Nil))))"
+        );
+        assert_eq!(run_untyped(&src).as_int(), 5);
     }
 
     // --- pattern matching ---
@@ -848,251 +837,57 @@ mod tests {
         assert!(err.0.contains("can never match"), "unexpected message: {}", err.0);
     }
 
-    // --- ADTs (sugar over tagged Lists -- see parser::build_ctor_value) ---
+    // --- hand-rolled tagged tuples (a `data` declaration's replacement --
+    // see typecheck.rs's own module-level history for why: `data`'s
+    // pattern sugar was removed, so a same-arity tagged sum is now just an
+    // ordinary tuple whose first element is a literal Str tag, matched by
+    // ordinary value comparison in pattern position) ---
 
     #[test]
-    fn adt_nullary_and_unary_constructors_round_trip_through_match() {
-        let src = "data Option = None | Some(Int) in match Some(5) with | None -> 0 | Some(x) -> x";
+    fn hand_rolled_tagged_tuples_round_trip_through_match() {
+        let src = r#"
+            let None = ("None",) in
+            let Some = fun x -> ("Some", x) in
+            match Some(5) with | ("None",) -> 0 | ("Some", x) -> x
+        "#;
         assert_eq!(run_untyped(src).as_int(), 5);
     }
 
     #[test]
-    fn adt_nullary_constructor_matches_its_own_arm() {
-        let src = "data Option = None | Some(Int) in match None with | None -> 0 | Some(x) -> x";
+    fn hand_rolled_nullary_tag_matches_its_own_arm() {
+        let src = r#"
+            let None = ("None",) in
+            let Some = fun x -> ("Some", x) in
+            match None with | ("None",) -> 0 | ("Some", x) -> x
+        "#;
         assert_eq!(run_untyped(src).as_int(), 0);
     }
 
     #[test]
-    fn adt_self_referential_field_supports_recursive_structures() {
-        // `List`'s own name used as Cons's second field type -- resolves to
-        // Dyn (see parse_type's uppercase-Ident fallback), which is what
-        // makes a recursive type nameable at all with no name-resolution
-        // pass. Constructors are curried like every other multi-arg
-        // callable in renno (fold, map): Cons(1)(rest), not Cons(1, rest).
-        let src = r#"
-            data List = Nil | Cons(Int, List) in
-            let rec sum = fun l -> match l with | Nil -> 0 | Cons(h, t) -> h + sum(t) in
-            sum(Cons(1)(Cons(2)(Cons(3)(Nil))))
-        "#;
-        assert_eq!(run_untyped(src).as_int(), 6);
+    fn self_referential_tagged_tuple_value_supports_recursive_structures() {
+        // No recursive TYPE names this (Type::Tuple/Union are finite trees
+        // -- see types::consistent's own doc comment), but recursive
+        // VALUES need no type at all: an untyped Cons/Nil built from plain
+        // tuples nests to any depth, walked here by an ordinary `let rec`.
+        // Constructors are curried like every other multi-arg callable in
+        // renno (fold, map): Cons(1)(rest), not Cons(1, rest).
+        let src = format!(
+            "{NIL_CONS_PRELUDE} \
+             let rec sum = fun l -> match l with | (\"Nil\",) -> 0 | (\"Cons\", h, t) -> h + sum(t) in
+             sum(Cons(1)(Cons(2)(Cons(3)(Nil))))"
+        );
+        assert_eq!(run_untyped(&src).as_int(), 6);
     }
 
     #[test]
-    fn adt_constructor_argument_is_type_checked_statically() {
-        let src = r#"data Option = None | Some(Int) in Some("x")"#;
+    fn constructor_argument_is_type_checked_statically() {
+        // A hand-rolled "constructor" -- an ordinary typed function
+        // returning a tagged tuple -- gets the same static argument
+        // checking any other typed function does.
+        let src = r#"let Some = fun x: Int -> ("Some", x) in Some("x")"#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("expected Int, found Str"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn adt_lowercase_constructor_name_rejected_at_parse_time() {
-        let err = parser::parse("data Option = none | Some(Int) in None").unwrap_err();
-        assert!(err.contains("uppercase"), "unexpected message: {err}");
-    }
-
-    // --- ADT typing: structural by default, nominal opt-in via `opaque` ---
-
-    #[test]
-    fn distinct_ctor_names_are_not_interchangeable_even_with_identical_field_shapes() {
-        // Celsius and Fahrenheit both wrap a single Int, but their
-        // constructors are named DIFFERENTLY (MkC vs MkF) -- structural
-        // comparison matches constructors by name, so these still don't
-        // unify, the same way two records with differently-named fields
-        // wouldn't. See distinct_data_types_with_identical_shape_and_ctor_name_ARE_interchangeable
-        // for the case that actually exercises structural equivalence.
-        let src = "data Celsius = MkC(Int) in\ndata Fahrenheit = MkF(Int) in\nlet f = fun x: Celsius -> x in\nf(MkF(100))";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("expected Celsius, found Fahrenheit"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn distinct_data_types_with_identical_shape_and_ctor_name_are_interchangeable() {
-        // Meters and Seconds both wrap a single Int under a constructor
-        // named `Mk` -- structurally identical AND same ctor name, so
-        // (unlike Celsius/Fahrenheit above) these DO unify: a Seconds
-        // value satisfies a `Meters`-annotated parameter. `Mk` here
-        // resolves to Seconds's own constructor (the most recently
-        // declared `Mk` in scope) -- it's the VALUE's inferred type
-        // (Seconds) crossing into the Meters annotation that's under test,
-        // not which `Mk` gets called.
-        let src = "data Meters = Mk(Int) in\ndata Seconds = Mk(Int) in\nlet f = fun x: Meters -> x in\nf(Mk(100))";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[Mk, 100]");
-    }
-
-    #[test]
-    fn opaque_field_makes_an_otherwise_identical_type_nominal() {
-        // Same shape, same ctor name, as the interchangeable case above --
-        // but both types now carry an `opaque` field, opting them OUT of
-        // structural matching. Two DIFFERENT `data` blocks each get their
-        // own brand id (even with identical spelling), so they're never
-        // consistent with each other, only with themselves.
-        let src = "data Meters = Mk(Int, opaque) in\ndata Seconds = Mk(Int, opaque) in\nlet f = fun x: Meters -> x in\nf(Mk(100))";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("expected Meters, found Seconds"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn opaque_field_still_accepts_its_own_type() {
-        let src = "data Meters = Mk(Int, opaque) in let f = fun x: Meters -> x in f(Mk(100))";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        match machine::run(&arena, elaborated, Env::prelude(), &spans) {
-            Value::List(items) => {
-                assert_eq!(items.len(), 3, "expected tag + field + hidden brand");
-                assert_eq!(items[0].to_string(), "Mk");
-                assert_eq!(items[1].as_int(), 100);
-            }
-            other => panic!("expected a list, got {other}"),
-        }
-    }
-
-    #[test]
-    fn opaque_field_adds_a_hidden_runtime_tag() {
-        // `opaque` is a REAL hidden field now, not a purely static marker:
-        // a branded constructor's value carries one more trailing element
-        // (the brand id) than an unbranded one with the same real fields.
-        // This is what lets construct/destructure actually enforce "must
-        // be the corresponding declaration" at runtime -- see
-        // opaque_pattern_rejects_a_value_from_a_shadowing_redeclaration.
-        let branded = run_untyped("data Meters = Mk(Int, opaque) in Mk(5)");
-        let plain = run_untyped("data Meters2 = Mk2(Int) in Mk2(5)");
-        match (branded, plain) {
-            (Value::List(b), Value::List(p)) => assert_eq!(b.len(), p.len() + 1),
-            (b, p) => panic!("expected two lists, got {b} and {p}"),
-        }
-    }
-
-    #[test]
-    fn opaque_brand_tag_is_a_distinct_value_kind_not_a_plain_int() {
-        // Before Value::Token existed, this trailing element was a bare
-        // Value::Int -- indistinguishable from a real Int field (a
-        // Pattern::Int could accidentally match it, or vice versa).
-        // Confirms it's now its own runtime kind.
-        let branded = run_untyped("data Meters = Mk(Int, opaque) in Mk(5)");
-        match branded {
-            Value::List(items) => {
-                let tail = items.last().map(|v| v.to_string());
-                assert!(matches!(items.last(), Some(Value::Token(_))), "expected a trailing Value::Token, got {tail:?}");
-            }
-            v => panic!("expected a list, got {v}"),
-        }
-    }
-
-    #[test]
-    fn opaque_brand_tag_prints_as_a_marker_not_a_raw_number() {
-        // Regression test for the Display leak the README used to flag:
-        // a branded value's hidden tag is still visible when printed
-        // (Value's Display has no way to know it should hide it), but it
-        // no longer shows the meaningless numeric id -- Value::Token's
-        // own Display renders a fixed `<brand>` marker instead.
-        let outcome = run_source("data Meters = Mk(Int, opaque) in Mk(5)").unwrap();
-        assert_eq!(outcome.to_string(), "[Mk, 5, <brand>]");
-    }
-
-    #[test]
-    fn opaque_must_appear_in_every_constructor_or_none() {
-        let err = parser::parse("data Shape = Circle(Int) | Square(Int, opaque) in Circle(1)").unwrap_err();
-        assert!(err.contains("opaque"), "unexpected message: {err}");
-        assert!(err.contains("Square"), "unexpected message: {err}");
-        assert!(err.contains("Circle"), "unexpected message: {err}");
-    }
-
-    #[test]
-    #[should_panic(expected = "match failed")]
-    fn opaque_pattern_rejects_a_value_from_a_shadowing_redeclaration() {
-        // `a` is built by the FIRST Foo's Mk -- carrying the first
-        // declaration's own brand id. By the time the match runs, `Mk(x)`
-        // resolves (via Parser::branded_ctors) against the SECOND Foo's
-        // brand id instead (ordinary lexical shadowing), so the pattern's
-        // hidden tag doesn't match `a`'s -- machine.rs's exact-length List
-        // match fails, same as any other non-matching pattern.
-        let src = r#"
-            data Foo = Mk(Int, opaque) in
-            let a = Mk(1) in
-            data Foo = Mk(Int, opaque) in
-            match a with | Mk(x) -> x
-        "#;
-        run_untyped(src);
-    }
-
-    #[test]
-    fn opaque_shadowing_redeclaration_now_rejected_statically() {
-        // Companion to opaque_pattern_rejects_a_value_from_a_shadowing_
-        // redeclaration just above, which only ever caught this at
-        // RUNTIME (the hidden brand tag failing to pattern-match). Now
-        // that Type::Data itself carries the brand id (Parser::
-        // type_brands), the same mismatch is caught statically instead:
-        // `f`'s annotation resolves to the FIRST Foo's brand, `Mk(1)`'s
-        // inferred type resolves to the SECOND (shadowing) Foo's --
-        // different brands, identical printed name, no longer consistent
-        // (types::consistent_inner).
-        let src = r#"
-            data Foo = Mk(Int, opaque) in
-            let f = fun x: Foo -> x in
-            data Foo = Mk(Int, opaque) in
-            f(Mk(1))
-        "#;
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("type mismatch"), "unexpected message: {}", err.0);
-        assert!(err.0.contains("separately-declared"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn opaque_named_field_pattern_and_access_still_work_on_a_branded_type() {
-        let src = r#"
-            data Point = Point(x: Int, y: Int, opaque) in
-            let p = Point { x: 3, y: 4 } in
-            let sum = match p with | Point { y: b, x: a } -> a + b in
-            sum + p.x
-        "#;
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 10);
-    }
-
-    #[test]
-    fn named_construction_uses_the_shadowing_declarations_own_field_order() {
-        // Two `data Point` blocks with DIFFERENT declared field order.
-        // `Point { x: 1, y: 2 }` in the SECOND block's body must reorder
-        // its args using the SECOND declaration's own order (y, x) --
-        // using the first (shadowed) declaration's order would silently
-        // swap x and y. Regression test for elaborate_node's NamedCall
-        // arm, which looked up `fields` by first match rather than
-        // lexically-current (same bug already fixed for resolve_pattern's
-        // NamedCtor arm and FieldAccess's lookup).
-        let src = r#"
-            data Point = Point(x: Int, y: Int) in
-            data Point = Point(y: Int, x: Int) in
-            let p = Point { x: 1, y: 2 } in
-            match p with | Point { x: a, y: b } -> a * 10 + b
-        "#;
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 12);
-    }
-
-    #[test]
-    fn structurally_equivalent_recursive_types_with_different_names_unify() {
-        // ListA and ListB are mutually-shaped recursive types with
-        // different NAMES but the same ctor names/arities -- comparing
-        // them structurally means comparing Cons's own recursive field,
-        // which is comparing ListA against ListB all over again. Without
-        // the cycle-breaking `seen` set in consistent_inner, this would
-        // recurse forever; with it, it terminates and accepts.
-        let src = r#"
-            data ListA = Nil | Cons(Int, ListA) in
-            data ListB = Nil | Cons(Int, ListB) in
-            let f = fun x: ListA -> x in
-            f(Cons(1)(Nil))
-        "#;
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        assert!(typecheck::check(&mut arena, root, &spans).is_ok());
     }
 
     #[test]
@@ -1127,7 +922,7 @@ mod tests {
         use types::{consistent, Type};
         let a = Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Token(1)]));
         let b = Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Token(2)]));
-        assert!(!consistent(&a, &b, &[]));
+        assert!(!consistent(&a, &b));
     }
 
     #[test]
@@ -1135,7 +930,7 @@ mod tests {
         use types::{consistent, Type};
         let a = Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Token(7)]));
         let b = Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Token(7)]));
-        assert!(consistent(&a, &b, &[]));
+        assert!(consistent(&a, &b));
     }
 
     #[test]
@@ -1270,7 +1065,12 @@ mod tests {
     fn union_of_tuples_exhaustiveness_needs_every_alternative_covered() {
         // Unlike a single Tuple type, a Union's alternatives are
         // independent -- one arm per alternative is exhaustive even
-        // though no SINGLE arm covers the whole union.
+        // though no SINGLE arm covers the whole union. This is also the
+        // shape a hand-rolled `Option` replacement takes: a Union of
+        // differently-arity tagged tuples, e.g. `(Str,) | (Str, Int)` for
+        // `None`/`Some(Int)` -- the tag itself isn't checked statically,
+        // only each alternative's arity (see missing_case's own doc
+        // comment).
         let src = r#"
             type Pair = (Int,) | (Int, Int) in
             let f = fun p: Pair ->
@@ -1321,302 +1121,6 @@ mod tests {
         assert!(err.contains("expected Bool, found Int"), "unexpected message: {err}");
     }
 
-    #[test]
-    fn same_data_type_annotation_accepted() {
-        let src = "data Celsius = MkC(Int) in let f = fun x: Celsius -> x in f(MkC(100))";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[MkC, 100]");
-    }
-
-    #[test]
-    fn dyn_boundary_rejects_a_shape_that_is_not_even_tagged() {
-        // Before CheckData, matches_type's Data case only asked "is this
-        // a non-empty List at all" -- a plain, untagged `[1, 2, 3]` would
-        // have satisfied a `Point` annotation with zero runtime error.
-        // `y` is Dyn (sourced from a handled effect) specifically so this
-        // reaches the runtime check instead of being caught statically.
-        let src = r#"
-            data Point = Mk(Int, Int) in
-            handle
-              let y = perform choose(0) in
-              let f = fun p: Point -> p in
-              f(y)
-            with handler choose(p, resume) -> resume([1, 2, 3])
-        "#;
-        let err = run_source(src).unwrap_err();
-        assert!(err.contains("expected Point, found List"), "unexpected message: {err}");
-    }
-
-    #[test]
-    fn dyn_boundary_rejects_the_wrong_constructor_tag() {
-        // Same story, but the Dyn value IS a real tagged data value --
-        // just from a DIFFERENT data type (Option's Some, not Point's
-        // Mk). The old shallow check ("some tagged value") would have
-        // accepted this; CheckData's shape witness (ctor name + arity)
-        // does not.
-        let src = r#"
-            data Option = None | Some(Int) in
-            data Point = Mk(Int, Int) in
-            handle
-              let y = perform choose(0) in
-              let f = fun p: Point -> p in
-              f(y)
-            with handler choose(p, resume) -> resume(Some(5))
-        "#;
-        let err = run_source(src).unwrap_err();
-        assert!(err.contains("expected Point, found List"), "unexpected message: {err}");
-    }
-
-    #[test]
-    fn dyn_boundary_rejects_the_right_tag_with_the_wrong_arity() {
-        // `Wrong`'s Mk shares Point's own tag name ("Mk") but only takes
-        // ONE field, not two -- CheckData's shape witness records total
-        // List length per ctor, not just the tag name, so this is still
-        // caught even though the tag string alone would match.
-        let src = r#"
-            data Point = Mk(Int, Int) in
-            data Wrong = Mk(Int) in
-            handle
-              let y = perform choose(0) in
-              let f = fun p: Point -> p in
-              f(y)
-            with handler choose(p, resume) -> resume(Mk(5))
-        "#;
-        let err = run_source(src).unwrap_err();
-        assert!(err.contains("expected Point, found List"), "unexpected message: {err}");
-    }
-
-    #[test]
-    fn dyn_boundary_still_accepts_a_structurally_equivalent_differently_named_type() {
-        // Celsius and Fahrenheit are intentionally interchangeable
-        // (structural typing default, no `opaque`) -- CheckData's shape
-        // witness is built from the ANNOTATED type's own ctor list (name
-        // + arity only), so a same-shaped value from a DIFFERENT
-        // declaration still passes, same as it always has.
-        let src = r#"
-            data Celsius = Mk(Int) in
-            data Fahrenheit = Mk(Int) in
-            handle
-              let y = perform choose(0) in
-              let f = fun p: Celsius -> p in
-              f(y)
-            with handler choose(p, resume) -> resume(Mk(212))
-        "#;
-        let outcome = run_source(src).unwrap();
-        assert_eq!(outcome.to_string(), "[Mk, 212]");
-    }
-
-    #[test]
-    fn dyn_boundary_rejects_a_same_shaped_value_from_a_different_opaque_type() {
-        // Unlike Celsius/Fahrenheit above, Meters and Seconds are BOTH
-        // opaque -- same ctor name ("Mk"), same arity, so tag+length alone
-        // can't tell them apart (they'd produce the identical shape
-        // witness). CheckData also checks the value's own trailing brand
-        // tag against the ANNOTATED type's brand whenever it's opaque, so
-        // a Dyn-sourced Seconds value still can't pass as a Meters.
-        let src = r#"
-            data Meters = Mk(Int, opaque) in
-            data Seconds = Mk(Int, opaque) in
-            handle
-              let y = perform choose(0) in
-              let f = fun p: Meters -> p in
-              f(y)
-            with handler choose(p, resume) -> resume(Mk(5))
-        "#;
-        let err = run_source(src).unwrap_err();
-        assert!(err.contains("expected Meters, found List"), "unexpected message: {err}");
-    }
-
-    #[test]
-    fn self_referential_field_gets_real_nominal_checking() {
-        // Cons's second field is typed List (its own enclosing data type,
-        // per parser::ctor_type/Type::Data) -- passing a non-List there is
-        // now a static error, not silently accepted as Dyn would allow.
-        let src = "data List = Nil | Cons(Int, List) in Cons(1)(5)";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("expected List, found Int"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn self_referential_field_still_accepts_correct_recursive_structures() {
-        let src = r#"
-            data List = Nil | Cons(Int, List) in
-            let rec sum = fun l -> match l with | Nil -> 0 | Cons(h, t) -> h + sum(t) in
-            sum(Cons(1)(Cons(2)(Cons(3)(Nil))))
-        "#;
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 6);
-    }
-
-    #[test]
-    fn dyn_sourced_value_flowing_into_a_data_annotation_gets_a_runtime_check() {
-        // check_data_shape (typecheck::build_boundary_check's Data arm)
-        // rejects a bare Int outright -- it's not even a List, let alone
-        // one with a matching tag and length.
-        let src = r#"
-            data Option = None | Some(Int) in
-            let f = fun x: Option -> x in
-            handle f(perform choose(0)) with handler choose(p, resume) -> resume(42)
-        "#;
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            machine::run(&arena, elaborated, Env::prelude(), &spans)
-        }));
-        assert!(result.is_err(), "expected a panic: 42 doesn't match Data(\"Option\")'s shallow shape check");
-    }
-
-    // --- named-field access ---
-
-    #[test]
-    fn named_field_access_reads_the_right_field() {
-        let src = "data Point = Point(x: Int, y: Int) in let p = Point(1)(2) in p.x + p.y";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 3);
-    }
-
-    #[test]
-    fn named_field_access_on_three_field_record() {
-        let src = "data Point = Point(x: Int, y: Int, z: Int) in let p = Point(1)(2)(3) in p.z";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 3);
-    }
-
-    #[test]
-    fn unknown_field_name_rejected_statically() {
-        let src = "data Point = Point(x: Int, y: Int) in let p = Point(1)(2) in p.z";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("no field named `z`"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn field_access_on_multi_constructor_type_rejected_statically() {
-        let src = "data Option = None | Some(x: Int) in let p = Some(5) in p.x";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("exactly one constructor"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn field_access_on_unnamed_constructor_rejected_statically() {
-        let src = "data Pair = Pair(Int, Int) in let p = Pair(1)(2) in p.x";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("no named fields"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn field_access_on_non_data_type_rejected_statically() {
-        let (mut arena, spans, root) = parser::parse("5.x").unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("expected a `data` type"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    #[should_panic(expected = "requires typechecking")]
-    fn field_access_on_the_untyped_path_panics_clearly() {
-        run_untyped("data Point = Point(x: Int, y: Int) in Point(1)(2).x");
-    }
-
-    // --- named-field construction and patterns ---
-
-    #[test]
-    fn named_construction_and_named_pattern_round_trip() {
-        let src = r#"
-            data Point = Point(x: Int, y: Int) in
-            match Point { x: 3, y: 4 } with
-            | Point { x: a, y: b } -> a * a + b * b
-        "#;
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 25);
-    }
-
-    #[test]
-    fn named_construction_field_order_does_not_matter() {
-        let src = "data Point = Point(x: Int, y: Int) in \
-                    let p = Point { y: 4, x: 3 } in p.x * p.x + p.y * p.y";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 25);
-    }
-
-    #[test]
-    fn named_pattern_field_order_does_not_matter() {
-        // Positional construction, named pattern in the OPPOSITE order --
-        // confirms reordering happens on both sides independently.
-        let src = "data Point = Point(x: Int, y: Int) in \
-                    match Point(3)(4) with | Point { y: b, x: a } -> a - b";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), -1);
-    }
-
-    #[test]
-    fn named_construction_missing_field_rejected_statically() {
-        let (mut arena, spans, root) = parser::parse("data Point = Point(x: Int, y: Int) in Point { x: 1 }").unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("missing field `y`"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn named_construction_unknown_field_rejected_statically() {
-        let src = "data Point = Point(x: Int, y: Int) in Point { x: 1, y: 2, z: 3 }";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("no field named `z`"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn named_construction_duplicate_field_rejected_statically() {
-        let src = "data Point = Point(x: Int, y: Int) in Point { x: 1, x: 2 }";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("given more than once"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn named_construction_on_multi_constructor_type_rejected_statically() {
-        let src = "data Option = None | Some(x: Int) in Some { x: 1 }";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("not exactly one"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn named_construction_field_type_still_checked() {
-        let src = "data Point = Point(x: Int, y: Int) in Point { x: true, y: 2 }";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("expected Int, found Bool"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn named_pattern_missing_field_rejected_statically() {
-        let src = "data Point = Point(x: Int, y: Int) in match Point(1)(2) with | Point { x: a } -> a";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("missing field `y`"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    #[should_panic(expected = "requires typechecking")]
-    fn named_construction_on_the_untyped_path_panics_clearly() {
-        run_untyped("data Point = Point(x: Int, y: Int) in Point { x: 1, y: 2 }");
-    }
-
-    #[test]
-    #[should_panic(expected = "requires typechecking")]
-    fn named_pattern_on_the_untyped_path_panics_clearly() {
-        run_untyped("data Point = Point(x: Int, y: Int) in match Point(1)(2) with | Point { x: a, y: b } -> a");
-    }
-
     // --- match exhaustiveness ---
 
     #[test]
@@ -1656,21 +1160,6 @@ mod tests {
         // every non-empty list -- so this must still be rejected even
         // though a Cons pattern is present.
         let (mut arena, spans, root) = parser::parse("match [2, 3] with | [] -> 0 | 1 :: t -> 1").unwrap();
-        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
-    }
-
-    #[test]
-    fn exhaustive_adt_match_typechecks() {
-        let src = "data Option = None | Some(Int) in match Some(5) with | None -> 0 | Some(x) -> x";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        assert!(typecheck::check(&mut arena, root, &spans).is_ok());
-    }
-
-    #[test]
-    fn non_exhaustive_adt_match_rejected_statically() {
-        let src = "data Option = None | Some(Int) in match Some(5) with | None -> 0";
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
     }
@@ -1830,27 +1319,17 @@ mod tests {
         assert!(err.contains("division by zero"), "unexpected message: {err}");
     }
 
-    #[test]
-    fn match_failed_panic_reports_the_matchs_location() {
-        // Exhaustiveness passes statically (None/Some cover every
-        // constructor `data Option` declared) -- but `x` actually comes
-        // from a handler resuming with a bare Int, not a tagged List, so
-        // match_pattern finds no arm at runtime despite that. Confirms a
-        // panic from machine.rs's OWN code (not env.rs/value.rs) is
-        // located the same way.
-        let src = r#"
-            data Option = None | Some(Int) in
-            handle
-              let x = perform choose(0) in
-              match x with
-              | None -> 0
-              | Some(y) -> y
-            with deep(handler choose(p, resume) -> resume(42))
-        "#;
-        let err = run_source(src).unwrap_err();
-        assert!(err.contains("match failed: no pattern matched the value"), "unexpected message: {err}");
-        assert!(err.contains("line 5"), "unexpected message: {err}");
-    }
+    // A statically-exhaustive match can no longer fail at runtime with "no
+    // pattern matched" at all: every coverage rule missing_case accepts
+    // (a Var arm, both Bool literals, []/h::t, a fully-covering Tuple/
+    // Union shape) is one match_pattern is ALSO guaranteed to satisfy for
+    // any value of that shape -- unlike the old `data`-era ctor_tag check,
+    // which proved exhaustiveness from the declared constructor SET,
+    // decoupled from the scrutinee's own runtime shape. There is
+    // consequently no test here for "typechecks but panics with no arm
+    // matched" -- match_with_no_matching_arm_panics (above) covers the
+    // panic itself, for a match that (correctly) never claimed to be
+    // exhaustive in the first place.
 
     // --- row polymorphism ---
 

@@ -174,31 +174,6 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     cont = Cont::cons(Frame::MatchArms { arms: arms.clone(), env: env.clone() }, cont);
                     control = Control::Eval(*scrutinee, env);
                 }
-                // Pure compile-time marker for typecheck (see Expr's doc
-                // comment on this variant) -- a typechecked program never
-                // has one (elaborate unwraps it), but the untyped path
-                // (e.g. tests' run_untyped) runs the parser's raw output
-                // directly, so this still needs to evaluate straight
-                // through to `body`.
-                Expr::DataGroup(_, body) => control = Control::Eval(*body, env),
-                // Unlike DataGroup, a typechecked program never leaves one
-                // of these behind EITHER (typecheck::elaborate_node
-                // resolves it into an ordinary Match) -- but resolving it
-                // needs static type information (which `data` type does
-                // the target belong to, and which field index does `name`
-                // mean) that has nowhere to come from at runtime, so
-                // there's no sensible fallback the way DataGroup's plain
-                // passthrough is. The untyped path (e.g. tests'
-                // run_untyped) just can't use field access.
-                Expr::FieldAccess(_, field) => {
-                    panic!("field access `.{field}` requires typechecking (run through typecheck::check, not raw parser output)")
-                }
-                // Same story as FieldAccess, for the same reason: needs
-                // the constructor's declared field order, which only
-                // exists statically.
-                Expr::NamedCall(..) => {
-                    panic!("named-field construction requires typechecking (run through typecheck::check, not raw parser output)")
-                }
                 Expr::MakeHandler { effect, payload_var, resume_var, body } => {
                     control = Control::Apply(Value::Handler(Rc::new(HandlerData {
                         effect: effect.clone(),
@@ -609,35 +584,6 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             Some(v) => Value::Str(Rc::from(v.type_name())),
             None => panic!("type_name expects one argument"),
         },
-        // See Builtin::CheckDataShape's own doc comment for the argument
-        // shapes. `brand` is `Value::Bool(false)` (never a real Bool
-        // otherwise -- coerce only ever builds this literal or a
-        // Value::Token here) for an unbranded target, so it's never
-        // mistaken for an actual failed brand check.
-        Builtin::CheckDataShape => {
-            let (brand, witness, value) = (args.pop(), args.pop(), args.pop());
-            let ok = match (value, witness) {
-                (Some(Value::List(items)), Some(Value::List(pairs))) => match items.first() {
-                    Some(Value::Str(tag)) => {
-                        let shape_ok = pairs.iter().any(|pair| match pair {
-                            Value::List(kv) if kv.len() == 2 => {
-                                matches!(&kv[0], Value::Str(name) if name.as_ref() == tag.as_ref())
-                                    && matches!(&kv[1], Value::Int(len) if *len as usize == items.len())
-                            }
-                            _ => false,
-                        });
-                        shape_ok
-                            && match brand {
-                                Some(Value::Token(b)) => matches!(items.last(), Some(Value::Token(n)) if *n == b),
-                                _ => true,
-                            }
-                    }
-                    _ => false,
-                },
-                _ => false,
-            };
-            Value::Bool(ok)
-        }
         Builtin::Map => {
             let (list, f) = (args.pop(), args.pop());
             match (f, list) {
@@ -684,7 +630,6 @@ fn match_pattern(pat: &Pattern, value: &Value, env: Env) -> Option<Env> {
         Pattern::Int(n) => matches!(value, Value::Int(v) if v == n).then_some(env),
         Pattern::Bool(b) => matches!(value, Value::Bool(v) if v == b).then_some(env),
         Pattern::Str(s) => matches!(value, Value::Str(v) if &**v == s.as_str()).then_some(env),
-        Pattern::Token(id) => matches!(value, Value::Token(v) if v == id).then_some(env),
         Pattern::List(pats) => match value {
             Value::List(items) if items.len() == pats.len() => {
                 let mut env = env;
@@ -703,14 +648,6 @@ fn match_pattern(pat: &Pattern, value: &Value, env: Env) -> Option<Env> {
             }
             _ => None,
         },
-        // typecheck::resolve_pattern always rewrites this into Pattern::List
-        // before a Match reaches an elaborated program; only the untyped
-        // path (e.g. tests' run_untyped) could ever hand one to
-        // match_pattern directly, and it has no field-order information to
-        // match against anyway (see Expr::NamedCall's own doc comment).
-        Pattern::NamedCtor(tag, _) => {
-            panic!("named-field pattern `{tag} {{ ... }}` requires typechecking (run through typecheck::check, not raw parser output)")
-        }
     }
 }
 

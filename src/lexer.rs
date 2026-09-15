@@ -16,13 +16,11 @@ pub enum Token {
     And,
     #[token("where")]
     Where,
-    #[token("data")]
-    Data,
-    // A constructor field that carries no value and can't be supplied by
-    // a caller -- see parser.rs's `data` field-list parsing. Writing one
-    // anywhere in a `data` block opts that TYPE out of structural
-    // consistency (the default) and into nominal: never consistent with
-    // any other type, however identically shaped, only with itself.
+    // A literal, evaluating to a token unique to its own source position
+    // (see Expr::Token's own doc comment) -- combined with tuples, this
+    // builds a hand-rolled nominal type: two tuples carrying the SAME
+    // `opaque`'s token are only ever consistent with each other, never
+    // with a same-shaped tuple carrying a DIFFERENT `opaque`'s.
     #[token("opaque")]
     Opaque,
     // `type Name = TypeExpr in body` -- names a type expression (see

@@ -27,7 +27,6 @@ impl PList<Value> {
             .bind("is_list", Value::Builtin(Builtin::IsList))
             .bind("is_fun", Value::Builtin(Builtin::IsFun))
             .bind("type_name", Value::Builtin(Builtin::TypeName))
-            .bind("check_data_shape", Value::Builtin(Builtin::CheckDataShape))
     }
 
     pub fn lookup(&self, name: &str) -> Value {

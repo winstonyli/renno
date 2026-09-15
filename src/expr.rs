@@ -37,36 +37,19 @@ pub type SpanMap = PrimaryMap<ExprRef, Span>;
 // Patterns destructure the value shapes renno has natively: literals
 // (matched by equality), List's two structural forms (fixed-length and
 // cons), and Var, which matches anything and binds it -- "_" is just an
-// ordinary (unused) Var name, not a special token. A POSITIONAL `data`-
-// declared ADT constructor (parser::pattern_atom's `Ctor(p1, p2)` form)
-// desugars into a plain List/Str shape too, so there's no separate
-// variant for it -- but a NAMED one (`Ctor { field: p, ... }`) can't
-// desugar until typecheck knows the constructor's declared field ORDER
-// (see typecheck::resolve_pattern), so it keeps its own shape until then.
+// ordinary (unused) Var name, not a special token. A tuple pattern (`(p,
+// q)`) is sugar over List -- see parser::pattern_atom's LParen arm --
+// so there's no separate variant for it either.
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Var(String),
     Int(i64),
     Bool(bool),
     Str(String),
-    // Matches only a Value::Token carrying this exact id -- the trailing
-    // element an `opaque` constructor's own pattern (positional, named,
-    // or FieldAccess's synthetic one) matches its hidden brand tag
-    // against. A DISTINCT variant from Int (not just a matching integer
-    // literal) so a real Int field can never accidentally satisfy a brand
-    // slot, or vice versa -- see Value::Token's own doc comment.
-    Token(u64),
     // [], [p1, p2, ...] -- matches only a list of exactly this length.
     List(Vec<Pattern>),
     // `head :: tail` -- matches a non-empty list of any length.
     Cons(Box<Pattern>, Box<Pattern>),
-    // `Ctor { field: pat, ... }`, fields in whatever order they're
-    // written (typecheck reorders them). Never reaches machine.rs's
-    // match_pattern -- typecheck::resolve_pattern always rewrites it into
-    // an ordinary Pattern::List before a Match is elaborated, the same
-    // way FieldAccess resolves into a Match rather than becoming a new
-    // runtime shape.
-    NamedCtor(String, Vec<(String, Pattern)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -105,23 +88,19 @@ pub enum Expr {
     // A literal Value::Token(u64), unique per SOURCE POSITION (this u64
     // is that position) -- the same value every time this exact node
     // evaluates, no matter how many times (a plain literal, not a
-    // generator). Two sources: the surface `opaque` expression (parser::
-    // atom_leaf, any time a user writes it -- typed Type::Token(this id)
+    // generator). Produced by the surface `opaque` expression (parser::
+    // atom_leaf, any time a user writes it) -- typed Type::Token(this id)
     // by elaborate_node, so a tuple/field containing one gets real
-    // nominal identity from ordinary structural comparison), and parser::
-    // build_ctor_value's own auto-generated hidden trailing brand element
-    // for an `opaque` `data` constructor field (typed Type::Dyn there --
-    // see Pattern::Token's own doc comment for the pattern-matching side
-    // of that one).
+    // nominal identity from ordinary structural comparison, no separate
+    // brand-comparison mechanism needed.
     Token(u64),
     // `(a, b, c)` -- a fixed-arity product, elaborated with types::
     // Type::Tuple (per-position types, no widening, unlike ListLit just
     // below). Evaluates to a plain Value::List at runtime (machine.rs
-    // reuses ListLit's own Frame::ListElems machinery unchanged) -- same
-    // "no new Value kind" choice `data` already made for its own tagged
-    // values. Always 2+ items: parser::atom_leaf's LParen arm only builds
-    // this once it's seen a comma: a single parenthesized expression with
-    // no comma stays ordinary grouping.
+    // reuses ListLit's own Frame::ListElems machinery unchanged) -- no
+    // new Value kind needed. Always 2+ items: parser::atom_leaf's LParen
+    // arm only builds this once it's seen a comma: a single parenthesized
+    // expression with no comma stays ordinary grouping.
     Tuple(Vec<ExprRef>),
     // Variable-arity, unlike every other node -- elaborate/machine handle
     // it with a loop over the Vec rather than a fixed-shape match.
@@ -171,88 +150,4 @@ pub enum Expr {
     // resuming it more than once (multi-shot) would otherwise reclone the
     // whole arm list on every resume.
     Match(ExprRef, Rc<Vec<(Pattern, ExprRef)>>),
-    // Emitted only for a `data` declaration (see parser::build_ctor_value)
-    // -- purely a compile-time marker recording one type's constructor
-    // tags and field names, consumed by typecheck's Match exhaustiveness
-    // check (missing_case) and field access (FieldAccess, below), and
-    // otherwise fully transparent: evaluates straight through to `body`
-    // (see machine.rs), and typecheck's own elaborate unwraps it --
-    // doesn't re-emit it -- once DataInfo has been recorded, so it never
-    // reaches an already-typechecked program.
-    DataGroup(Rc<DataInfo>, ExprRef),
-    // `target.field` -- ONLY meaningful once typechecked: elaborate_node
-    // resolves it (using the DataInfo for target's own Data(name) type)
-    // into an ordinary Match against that type's sole constructor,
-    // reusing existing pattern-matching machinery entirely rather than
-    // adding any new Value representation or machine.rs opcode. A
-    // typechecked program never has one of these left in it (same as
-    // DataGroup) -- machine.rs's own arm for it exists only to give the
-    // untyped path (e.g. tests' run_untyped) a clear error instead of a
-    // silently wrong one, since resolving this needs static type
-    // information that has nowhere to come from at runtime (see
-    // Type::Data's own doc comment on why field names aren't stamped into
-    // values themselves).
-    FieldAccess(ExprRef, String),
-    // `Ctor { field: expr, ... }`, fields in whatever order they're
-    // written -- ONLY meaningful once typechecked, same story as
-    // FieldAccess: elaborate_node resolves it (using `callee`'s own
-    // Data(name) return type and its DataInfo) into the ordinary curried
-    // Application chain `Point(1)(2)` already produces, in the
-    // constructor's declared field order, reusing App's existing
-    // coercion logic entirely. `callee` is almost always a bare
-    // Expr::Var naming the constructor, but isn't required to be one.
-    NamedCall(ExprRef, Rc<Vec<(String, ExprRef)>>),
-}
-
-// What one `data Name = Ctor1(f1: T1, ...) | Ctor2(...) | ...` declared:
-// its own name, and each constructor's name plus field names (empty when
-// that constructor's fields are positional/unnamed -- `field_names.len()`
-// is either 0 or exactly that constructor's arity, never a partial list;
-// see parser::parse_ctor_field). Threaded through elaborate/elaborate_node
-// alongside Ctx, purely additively (see DataGroup) -- never mutated after
-// a `data` block is peeled, just consulted by missing_case (which only
-// needs the tag names), FieldAccess's desugaring (which needs the field
-// names and the constructor's own arity too), and types::consistent's
-// structural comparison (ctor_types, brand -- see their own doc comments).
-#[derive(Debug, Clone)]
-pub struct DataInfo {
-    pub type_name: String,
-    pub ctors: Vec<(String, Vec<String>)>,
-    // Parallel to `ctors` (same names, same order) but field TYPES instead
-    // of field NAMES -- what types::consistent compares two differently-
-    // named Data types' shapes with when deciding structural equivalence.
-    // Kept separate from `ctors` rather than folded in so every existing
-    // (String, Vec<String>) destructure of `ctors` -- named-field
-    // resolution, exhaustiveness's tag sets -- needed no changes.
-    pub ctor_types: Vec<(String, Vec<Type>)>,
-    // Some(id), unique per `data` declaration (its own `data` keyword's
-    // source byte offset), if ANY constructor in this block wrote an
-    // `opaque` field -- parser.rs requires it on EVERY constructor once
-    // any one has it, so this is a whole-TYPE property, not a per-
-    // constructor one. Two effects, one real value:
-    //   - static: consistent() rejects this type against every other
-    //     Data type except itself (types::consistent_inner), opting out
-    //     of the default structural comparison.
-    //   - runtime: `id` is genuinely stamped into every constructor's
-    //     built value as a trailing List element (see
-    //     parser::build_ctor_value), and into every pattern that can
-    //     match it (positional via Parser::branded_ctors, named via
-    //     typecheck::resolve_pattern, FieldAccess's own synthetic
-    //     pattern) -- so a value only ever successfully destructures
-    //     against the EXACT declaration that produced it, not merely one
-    //     with the same name and shape (see types::Type::Data's doc
-    //     comment for the shadowing case this does and doesn't cover).
-    //     "Hidden" only means invisible to ordinary pattern matching and
-    //     field access, NOT invisible to Value's own Display or its
-    //     Outcome conversion (value.rs) -- neither knows a value's static
-    //     type, so neither can tell "real field" from "brand tag" to
-    //     leave it out. A branded value printed or returned at the top
-    //     level shows an extra trailing `<brand>` element (Value::Token's
-    //     own Display -- the id itself is never printed, unlike before
-    //     Token existed as its own Value kind).
-    // None (the default) means fully structural and zero runtime
-    // footprint: two `data` types with the same set of constructor names
-    // and field types unify, regardless of their own names, the way two
-    // structurally-identical List/Fun types always have.
-    pub brand: Option<u64>,
 }
