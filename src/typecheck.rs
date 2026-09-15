@@ -591,6 +591,18 @@ fn pattern_could_match(pat: &Pattern, ty: &Type) -> bool {
         (Pattern::Record(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt)),
         (Pattern::Record(_), Type::Dyn) => true,
         (Pattern::Record(_), _) => false,
+        // Same story as Record just above, for the same reason: a fixed-
+        // length list pattern's own arity is real, provable information
+        // pattern_type's blind List(Dyn) throws away, and consistent()'s
+        // List/Tuple bridge has to allow ANY length through precisely
+        // because it can't see it -- so a genuinely mismatched-arity
+        // tuple pattern needs to be caught here, before that bridge ever
+        // runs. Type::List scrutinees still fall through to the generic
+        // consistent()-based catch-all below, correctly: an actual List
+        // type has no fixed arity to check a pattern's length against.
+        (Pattern::List(subpats), Type::Tuple(items)) => subpats.len() == items.len(),
+        (Pattern::List(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt)),
+        (Pattern::List(_), Type::Dyn) => true,
         _ => consistent(ty, &pattern_type(pat)),
     }
 }

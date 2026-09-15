@@ -923,6 +923,40 @@ mod tests {
     }
 
     #[test]
+    fn tuple_pattern_with_wrong_arity_rejected_statically() {
+        // Regression: pattern_type gives every fixed-length Pattern::List
+        // the same blind List(Dyn), discarding its actual length -- and
+        // consistent()'s own List/Tuple bridge has to allow ANY length
+        // through precisely because it can't see it. Without
+        // pattern_could_match's own Tuple-arity arm, a 2-element pattern
+        // against a 3-tuple scrutinee was silently "possibly matching,"
+        // never actually firing at runtime, with no diagnostic saying so.
+        let src = r#"
+            let t3: (Int, Int, Int) = (1, 2, 3) in
+            match t3 with | (a, b) -> a + b | _ -> 0
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("can never match"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn tuple_pattern_with_matching_arity_still_accepted() {
+        let src = "let t3: (Int, Int, Int) = (1, 2, 3) in match t3 with | (a, b, c) -> a + b + c";
+        assert_eq!(run_source(src).unwrap().as_int(), 6);
+    }
+
+    #[test]
+    fn list_pattern_of_any_length_still_accepted_against_a_real_list_type() {
+        // The arity fix is Tuple-specific -- a genuine List type has no
+        // fixed arity to check a pattern's length against, so this stays
+        // exactly as permissive as before: falls through to the wildcard
+        // at runtime, not rejected statically.
+        let src = "let f = fun xs: [Int] -> match xs with | [a, b] -> a + b | _ -> 0 in f([1, 2, 3])";
+        assert_eq!(run_source(src).unwrap().as_int(), 0);
+    }
+
+    #[test]
     fn tuple_containing_different_opaque_tokens_is_not_consistent() {
         // Two `opaque` occurrences at DIFFERENT source positions are
         // different Type::Token singletons -- a Tuple containing one is
