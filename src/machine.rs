@@ -457,14 +457,15 @@ fn combine_spans(a: Option<Span>, b: Option<Span>) -> Option<Span> {
 // must not overwrite on the way there). So e.g. `true + 1` blames `true`
 // specifically, not `1` (the last thing Eval'd before this call, and not
 // at fault here) -- and `10 / y` with `y` a Dyn-sourced 0 blames `y` via
-// that same untouched last-Eval fallback, not `10`.
+// that same untouched last-Eval fallback, not `10`. Delegates the actual
+// Int extraction (and its panic message) entirely to Value::as_int() --
+// only the shape check ahead of it is duplicated, so there's exactly one
+// place that knows how to pull an i64 out of a Value.
 fn as_int_at(v: &Value, span: Option<Span>) -> i64 {
-    if let Value::Int(n) = v {
-        *n
-    } else {
+    if !matches!(v, Value::Int(_)) {
         set_current_span(span);
-        v.as_int()
     }
+    v.as_int()
 }
 
 // Add/Sub/Mul/Div/Mod/Lt are Int-only -- wrong operand type panics via
