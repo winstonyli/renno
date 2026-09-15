@@ -95,7 +95,7 @@ mod tests {
         use expr::Expr;
         match &arena[root] {
             Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
-            Expr::ListLit(items) => items.iter().any(|i| contains_check(arena, *i)),
+            Expr::ListLit(items) | Expr::Tuple(items) => items.iter().any(|i| contains_check(arena, *i)),
             Expr::Lambda(_, _, body) => contains_check(arena, *body),
             Expr::App(f, a) => contains_check(arena, *f) || contains_check(arena, *a),
             Expr::Let(var, _, val, body) => {
@@ -1093,6 +1093,94 @@ mod tests {
         "#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         assert!(typecheck::check(&mut arena, root, &spans).is_ok());
+    }
+
+    #[test]
+    fn tuple_literal_and_destructure_round_trip() {
+        let src = "match (1, \"a\", true) with | (a, b, c) -> a";
+        assert_eq!(run_source(src).unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn plain_parens_without_a_comma_stay_ordinary_grouping() {
+        assert_eq!(run_source("(1 + 2) * 3").unwrap().as_int(), 9);
+    }
+
+    #[test]
+    fn nested_tuple_pattern_in_one_match_is_recognized_exhaustive() {
+        // Regression test: a single fully-nested pattern like `((p, q),
+        // x)` covers all of `((Int, Int), Int)` even though neither
+        // top-level sub-pattern is a bare Var -- missing_case's
+        // covers_tuple_position must recurse into the nested tuple
+        // position, not just check "all top-level subpatterns are Var".
+        let src = "match ((1, 2), 3) with | ((p, q), x) -> p + q + x";
+        assert_eq!(run_source(src).unwrap().as_int(), 6);
+    }
+
+    #[test]
+    fn tuple_containing_different_opaque_tokens_is_not_consistent() {
+        // Two `opaque` occurrences at DIFFERENT source positions are
+        // different Type::Token singletons -- a Tuple containing one is
+        // never consistent with an otherwise-identical Tuple containing
+        // the other, the static counterpart of Meters(n)/Seconds(n)'s
+        // own tuple values never comparing `==` at runtime either.
+        use types::{consistent, Type};
+        let a = Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Token(1)]));
+        let b = Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Token(2)]));
+        assert!(!consistent(&a, &b, &[]));
+    }
+
+    #[test]
+    fn tuple_containing_the_same_opaque_token_is_consistent() {
+        use types::{consistent, Type};
+        let a = Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Token(7)]));
+        let b = Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Token(7)]));
+        assert!(consistent(&a, &b, &[]));
+    }
+
+    #[test]
+    fn opaque_expression_and_tuples_compose_into_a_hand_rolled_nominal_type() {
+        // `Meters` isn't a `data` block at all here -- just an ordinary
+        // function returning a tagged-by-token tuple. `opaque` written in
+        // its body is a literal (see Expr::Token's own doc comment): the
+        // SAME token every call, since it's the same source position
+        // evaluated fresh each time, not a per-call generator -- so two
+        // separate Meters(_) values still destructure against the same
+        // pattern.
+        let src = r#"
+            let Meters = fun n -> (n, opaque) in
+            match Meters(5) with
+            | (n, t) -> n
+        "#;
+        let outcome = run_source(src).unwrap();
+        assert_eq!(outcome.as_int(), 5);
+    }
+
+    #[test]
+    fn two_opaque_tuple_values_from_the_same_function_carry_equal_tokens() {
+        let src = r#"
+            let Meters = fun n -> (n, opaque) in
+            let a = Meters(5) in
+            let b = Meters(10) in
+            match a with
+            | (an, at) -> match b with
+              | (bn, bt) -> at == bt
+        "#;
+        let outcome = run_source(src).unwrap();
+        assert!(outcome.as_bool());
+    }
+
+    #[test]
+    fn two_opaque_tuple_values_from_different_functions_carry_different_tokens() {
+        let src = r#"
+            let Meters = fun n -> (n, opaque) in
+            let Seconds = fun n -> (n, opaque) in
+            match Meters(5) with
+            | (an, at) -> match Seconds(5) with
+              | (bn, bt) -> at == bt
+        "#;
+        let outcome = run_source(src).unwrap();
+        assert!(!outcome.as_bool());
     }
 
     #[test]

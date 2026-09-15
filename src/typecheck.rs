@@ -84,7 +84,8 @@ fn free_row_vars(ty: &Type) -> BTreeSet<String> {
             vars
         }
         Type::List(elem) => free_row_vars(elem),
-        Type::Dyn | Type::Int | Type::Bool | Type::Str | Type::Data(_, _) => BTreeSet::new(),
+        Type::Tuple(items) => items.iter().flat_map(free_row_vars).collect(),
+        Type::Dyn | Type::Int | Type::Bool | Type::Str | Type::Data(_, _) | Type::Token(_) => BTreeSet::new(),
     }
 }
 
@@ -124,6 +125,7 @@ fn subst_type(ty: &Type, subst: &HashMap<String, EffectRow>) -> Type {
             Rc::new(subst_type(ret, subst)),
         ),
         Type::List(elem) => Type::List(Rc::new(subst_type(elem, subst))),
+        Type::Tuple(items) => Type::Tuple(Rc::new(items.iter().map(|t| subst_type(t, subst)).collect())),
         other => other.clone(),
     }
 }
@@ -246,8 +248,46 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, fields: &[Rc<D
             // else in this checker.
             None => build_shallow_check(arena, e, to, "is_list"),
         },
+        Type::Token(id) => build_token_check(arena, e, to, *id),
+        Type::Tuple(items) => build_tuple_check(arena, e, to, items.len()),
         Type::Dyn => unreachable!("coerce only calls this once *to != Type::Dyn is already established"),
     }
+}
+
+// A singleton: the only thing a Dyn-sourced value could ever satisfy this
+// against is the EXACT same Value::Token, so this reuses ordinary `==`
+// (BinOp::Eq, backed by machine::value_eq's own Token arm) against a
+// freshly-embedded literal of the same id, rather than a dedicated
+// predicate builtin.
+fn build_token_check(arena: &mut Arena, e: ExprRef, to: &Type, id: u64) -> ExprRef {
+    let tmp = "__check_tmp".to_string();
+    let tmp_ref = arena.push(Expr::Var(tmp.clone()));
+    let literal = arena.push(Expr::Token(id));
+    let eq = arena.push(Expr::BinOp(BinOp::Eq, tmp_ref, literal));
+    let fail_call = build_fail_call(arena, to, tmp_ref);
+    let if_expr = arena.push(Expr::If(eq, tmp_ref, fail_call));
+    arena.push(Expr::Let(tmp, None, e, if_expr))
+}
+
+// Shallow, like List(_) in build_boundary_check: confirms arity, not that
+// each position's own value matches ITS OWN element type -- a full
+// per-position recursive check (extract each element, apply
+// build_boundary_check to it, rebuild the tuple) is possible but not
+// built yet; this matches the same "confirm the shape, not deeper"
+// precedent every other Dyn boundary check here already sets.
+fn build_tuple_check(arena: &mut Arena, e: ExprRef, to: &Type, arity: usize) -> ExprRef {
+    let tmp = "__check_tmp".to_string();
+    let tmp_ref = arena.push(Expr::Var(tmp.clone()));
+    let fail_call = build_fail_call(arena, to, tmp_ref);
+    let is_list_var = arena.push(Expr::Var("is_list".to_string()));
+    let is_list_call = arena.push(Expr::App(is_list_var, tmp_ref));
+    let len_var = arena.push(Expr::Var("len".to_string()));
+    let len_call = arena.push(Expr::App(len_var, tmp_ref));
+    let arity_lit = arena.push(Expr::Int(arity as i64));
+    let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, arity_lit));
+    let inner_if = arena.push(Expr::If(len_eq, tmp_ref, fail_call));
+    let outer_if = arena.push(Expr::If(is_list_call, inner_if, fail_call));
+    arena.push(Expr::Let(tmp, None, e, outer_if))
 }
 
 // `let __check_tmp = e in if <predicate>(__check_tmp) then __check_tmp
@@ -544,10 +584,13 @@ fn first_unreachable(patterns: &[Pattern]) -> Option<usize> {
 // as everywhere else in this checker (effect rows, list-length arity):
 // stay silent and defer to match_pattern's own runtime panic rather than
 // try to enumerate an open domain (Int and Str literals, in particular,
-// never close). Four shapes are recognized as covering every possible
+// never close). Five shapes are recognized as covering every possible
 // value:
 //   - any Var (including "_") pattern present, anywhere -- matches
 //     everything by itself.
+//   - Tuple: a fixed-length, all-Var/wildcard pattern of exactly the
+//     scrutinee's own known arity (only meaningful when `scrut_ty` IS a
+//     Tuple -- its length is fixed and known, unlike a general List's).
 //   - Bool: both `true` and `false` literals present.
 //   - List: both `[]` and an unconstrained `h :: t` present (`h`/`t`
 //     themselves must be Var -- `1 :: t` only covers SOME non-empty
@@ -558,9 +601,48 @@ fn first_unreachable(patterns: &[Pattern]) -> Option<usize> {
 // Anything else is reported as possibly non-exhaustive: Int/Str literals
 // with no catch-all, a List match using only fixed-length patterns, or an
 // ADT match that doesn't cover every constructor its `data` declared.
-fn missing_case(patterns: &[Pattern], fields: &[Rc<DataInfo>]) -> Option<String> {
+//
+// Does `pat` cover every possible value at a position statically known to
+// have type `ty`? Only ever called with `ty` a Tuple (missing_case's own
+// guard), but recurses into NESTED tuple positions too: `((p, q), x)`
+// covers all of `((Int, Int), Int)` even though NEITHER top-level
+// sub-pattern is a bare Var, because the first one is itself a
+// fully-covering pattern for ITS OWN (also Tuple) position. Does NOT help
+// a scrutinee bound by an outer match/lambda pattern first (renno has no
+// pattern-driven type refinement -- see bind_pattern_vars's own doc
+// comment -- so that binding's own type is just Dyn, not the precise
+// Tuple type this needs): a fully-nested pattern in ONE match sidesteps
+// that, a match on a separately-destructured intermediate variable does
+// not.
+fn covers_tuple_position(pat: &Pattern, ty: &Type) -> bool {
+    match (pat, ty) {
+        (Pattern::Var(_), _) => true,
+        (Pattern::List(subpats), Type::Tuple(items)) if subpats.len() == items.len() => {
+            subpats.iter().zip(items.iter()).all(|(sp, t)| covers_tuple_position(sp, t))
+        }
+        _ => false,
+    }
+}
+
+fn missing_case(patterns: &[Pattern], fields: &[Rc<DataInfo>], scrut_ty: &Type) -> Option<String> {
     if patterns.iter().any(|p| matches!(p, Pattern::Var(_))) {
         return None;
+    }
+
+    // A Tuple's arity is fixed and known (unlike a general List, which
+    // could be any length) -- a fixed-length pattern of exactly that
+    // arity, whose every position either binds a Var (matches anything
+    // there) or is ITSELF a fully-covering nested tuple pattern for that
+    // position's own Tuple-typed field (covers_tuple_position recurses),
+    // covers every possible value -- the same way a bare Var arm does for
+    // anything else. Nested-but-not-fully-covering (e.g. a literal at
+    // some position) still falls through to "possibly non-exhaustive,"
+    // same as everywhere else this checker declines to enumerate.
+    if let Type::Tuple(_) = scrut_ty {
+        let covers_every_tuple = patterns.iter().any(|p| covers_tuple_position(p, scrut_ty));
+        if covers_every_tuple {
+            return None;
+        }
     }
 
     let has_true = patterns.iter().any(|p| matches!(p, Pattern::Bool(true)));
@@ -768,13 +850,34 @@ fn elaborate_node(
         Expr::Int(_) => Ok((Type::Int, EffectRow::pure(), expr)),
         Expr::Bool(_) => Ok((Type::Bool, EffectRow::pure(), expr)),
         Expr::Str(_) => Ok((Type::Str, EffectRow::pure(), expr)),
-        // Never written by a user (see Expr::Token's own doc comment) --
-        // Dyn since there's no surface Type it could ever mean; none of
-        // is_int/is_bool/is_str/is_list/is_fun ever recognizes a
-        // Value::Token as their own kind, so it fails every boundary
-        // check regardless (build_boundary_check).
-        Expr::Token(_) => Ok((Type::Dyn, EffectRow::pure(), expr)),
+        // A singleton per source position -- see Expr::Token's own doc
+        // comment. Also reached for the ctor-field-list marker's own
+        // auto-generated brand element (inside build_ctor_value's
+        // ListLit), where its precise type doesn't actually matter: that
+        // ListLit's own elem_ty already widens to Dyn from mixing the Str
+        // tag with the constructor's other field types in every case that
+        // arises in practice, so consistent_inner's List/Data bridging
+        // arm (Str/Dyn only) stays satisfied regardless of what this one
+        // trailing element types as.
+        Expr::Token(id) => Ok((Type::Token(id), EffectRow::pure(), expr)),
         Expr::Var(name) => Ok((lookup(ctx, &name), EffectRow::pure(), expr)),
+
+        // Per-position types, no widening -- unlike ListLit just below,
+        // which exists for a genuinely variable-length, conceptually
+        // homogeneous sequence. `(1, "a")` is `Type::Tuple([Int, Str])`,
+        // not widened to `List(Dyn)`.
+        Expr::Tuple(items) => {
+            let mut row = EffectRow::pure();
+            let mut tys = Vec::with_capacity(items.len());
+            let mut refs = Vec::with_capacity(items.len());
+            for item in items {
+                let (item_ty, item_row, item2) = elaborate(arena, item, ctx, fields, spans)?;
+                row = EffectRow::union(&row, &item_row);
+                tys.push(item_ty);
+                refs.push(item2);
+            }
+            Ok((Type::Tuple(Rc::new(tys)), row, arena.push(Expr::Tuple(refs))))
+        }
 
         Expr::ListLit(items) => {
             let mut row = EffectRow::pure();
@@ -1028,7 +1131,7 @@ fn elaborate_node(
                 });
                 new_arms.push((pat.clone(), body2));
             }
-            if let Some(missing) = missing_case(&pats, fields) {
+            if let Some(missing) = missing_case(&pats, fields, &scrut_ty) {
                 return Err(TypeError(format!("non-exhaustive match: {missing}"), spans[expr]));
             }
             Ok((result_ty.unwrap_or(Type::Dyn), row, arena.push(Expr::Match(scrutinee2, Rc::new(new_arms)))))

@@ -430,6 +430,26 @@ impl<'a> Parser<'a> {
             Some(Token::True) => Ok(Pattern::Bool(true)),
             Some(Token::False) => Ok(Pattern::Bool(false)),
             Some(Token::Str(s)) => Ok(Pattern::Str(s)),
+            // `(p)` stays ordinary grouping (unchanged); `(p, p, ...)` (a
+            // comma present) destructures a tuple -- tuples are plain
+            // Value::List at runtime (see Expr::Tuple's own doc comment),
+            // so this is just sugar for the same Pattern::List `[p, p,
+            // ...]` already matches lists with.
+            Some(Token::LParen) => {
+                let first = self.pattern()?;
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    let mut items = vec![first];
+                    while matches!(self.peek(), Some(Token::Comma)) {
+                        self.bump();
+                        items.push(self.pattern()?);
+                    }
+                    self.expect(&Token::RParen)?;
+                    Ok(Pattern::List(items))
+                } else {
+                    self.expect(&Token::RParen)?;
+                    Ok(first)
+                }
+            }
             // Case decides Var vs constructor, same convention as ML/
             // Haskell/OCaml: `x`/`_` bind, `Some`/`None`/`Cons` match a
             // tag. Positional (`Some(p)`, desugars right here to the same
@@ -1199,6 +1219,16 @@ impl<'a> Parser<'a> {
                 Ok(self.push_spanned(Expr::Bool(false), Span { start, end: self.span_before().end }))
             }
             Some(Token::Str(s)) => Ok(self.push_spanned(Expr::Str(s), Span { start, end: self.span_before().end })),
+            // A standalone `opaque` expression -- a literal Value::Token
+            // unique to THIS token's own position (`start`), same id
+            // scheme as the ctor-field-list marker's own auto-generated
+            // brand (see Expr::Token's own doc comment). First-class: can
+            // be bound, passed, compared (`==`, via machine::value_eq),
+            // and embedded in an ordinary tuple/list for real nominal
+            // identity -- typed Type::Token(start) by elaborate_node, not
+            // Dyn, so structural comparison alone tells two such fields
+            // apart.
+            Some(Token::Opaque) => Ok(self.push_spanned(Expr::Token(start as u64), Span { start, end: self.span_before().end })),
             // `Ident { field: expr, ... }` -- named-field construction,
             // ONLY meaningful once typechecked (see Expr::NamedCall's own
             // doc comment); a bare `Ident` not followed by `{` is just an
@@ -1292,10 +1322,23 @@ impl<'a> Parser<'a> {
                 ))
             }
 
+            // `(e)` stays ordinary grouping (unchanged); `(e, e, ...)`
+            // (a comma present) is a tuple literal -- see Expr::Tuple's
+            // own doc comment.
             Some(Token::LParen) => {
-                let e = self.expr()?;
-                self.expect(&Token::RParen)?;
-                Ok(e)
+                let first = self.expr()?;
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    let mut items = vec![first];
+                    while matches!(self.peek(), Some(Token::Comma)) {
+                        self.bump();
+                        items.push(self.expr()?);
+                    }
+                    self.expect(&Token::RParen)?;
+                    Ok(self.push_spanned(Expr::Tuple(items), Span { start, end: self.span_before().end }))
+                } else {
+                    self.expect(&Token::RParen)?;
+                    Ok(first)
+                }
             }
 
             // match <scrutinee> with (| pattern -> expr)+  -- the first "|"

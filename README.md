@@ -16,6 +16,8 @@ let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in fact(10)
 - **Pattern matching**: literals, lists (`[]`, `[a, b]`, `h :: t`), and ADT constructors, with static exhaustiveness and reachability checking wherever those are cheaply provable.
 - **ADTs**: `data Option = None | Some(Int) in ...`, desugared entirely into tagged lists and ordinary pattern matching — no new runtime representation for the common case. Constructors get real types (`Type::Data`), **structural by default** — two differently-named types with the same constructor names and field types unify — with an opt-in `opaque` field to make a type nominal: a hidden per-declaration tag, checked both statically and at every construct/destructure, so it's never interchangeable with anything but itself.
 - **Named fields**: `data Point = Point(x: Int, y: Int) in ...` supports `p.x` access, `Point { x: 1, y: 2 }` construction (any order), and `Point { x: a, y: b }` patterns (any order) — all sugar over ordinary positional construction and pattern matching, for any `data` type with exactly one constructor.
+- **Tuples**: `(a, b, c)` — a fixed-arity, per-position-typed product, distinct from a variable-length `List`. Desugars to a plain list at runtime (no new value representation), typed `Type::Tuple` for real positional structural comparison. `(p, q)` also works as a pattern, sugar for `[p, q]`.
+- **First-class `opaque`**: `opaque` is an expression, not just a `data`-block marker — writing it anywhere yields a token unique to that exact source position (the same token every time that code runs, since it's a literal, not a generator), bindable, passable, and comparable with `==`. Combined with tuples, this builds a hand-rolled nominal type with no `data` block at all: `let Meters = fun n -> (n, opaque) in ...` — two `Meters(_)` values always carry equal tokens, and a same-shaped tuple from anywhere else never does.
 - **Diagnostics**: every parse error, type error, and runtime panic reports a `line, column` location with a source snippet and a caret, not just a bare message.
 - **Multi-line REPL**: `let`/`match`/`data` blocks spanning multiple lines can be typed directly at the prompt.
 
@@ -140,6 +142,37 @@ let f = fun x: Meters -> x in f(Mk(5))   -- static error: each `opaque` type is 
 
 That static check is only half the story — the hidden tag also means a value that somehow reaches a branded type's pattern from the wrong declaration (e.g. crossing a `Dyn` boundary, or a shadowed same-named `data` redeclaration) fails to *match* at runtime instead of silently behaving like the wrong type.
 
+### Tuples and first-class `opaque`
+
+```
+let p = (1, "a", true) in
+match p with
+| (a, b, c) -> a   -- 1
+```
+
+`(a, b, ...)` is a fixed-arity product — typed positionally (`Type::Tuple`), not widened to a common element type the way `List` elements are. `(a)` with no comma stays ordinary parenthesized grouping; a tuple pattern `(p, q)` is sugar over the list pattern `[p, q]`, since a tuple is a plain list at runtime.
+
+`opaque` isn't only a `data`-block marker — it's an expression in its own right, evaluating to a token unique to wherever it's written:
+
+```
+let brand = opaque in
+brand == opaque   -- false: a DIFFERENT `opaque`, a different token
+brand == brand     -- true: same token, same binding
+```
+
+Combined with tuples, this builds a nominal type with no `data` block at all — `opaque`, written once inside a function body, is a literal: the same token every call, since it's the same source position evaluated fresh each time, not a fresh token per call:
+
+```
+let Meters = fun n -> (n, opaque) in
+let a = Meters(5) in
+let b = Meters(10) in
+match a with
+| (an, at) -> match b with
+  | (bn, bt) -> at == bt   -- true: same function, same embedded `opaque`
+```
+
+A same-shaped tuple built by a *different* function never compares equal, the same distinction `data`'s own `opaque` field draws — just reached through ordinary tuples and structural comparison instead of a dedicated brand mechanism.
+
 ### Effects
 
 ```
@@ -198,3 +231,4 @@ More complete examples for every feature above live in [`examples/`](examples/).
 - Match exhaustiveness and reachability are checked only where cheaply provable (see the doc comments on `missing_case`/`first_unreachable` in `typecheck.rs`); anything past that silently falls back to a runtime panic.
 - A runtime panic's reported location generally falls back to the last expression *evaluated*, not necessarily the exact sub-expression at fault a few steps later. Two common cases are threaded through precisely instead of relying on that fallback: `apply_binop`'s operand-type/div-by-zero/etc panics blame whichever operand is actually at fault (or their combined span, when neither alone explains it), and "attempt to call a non-function value" blames the callee, not an unrelated argument evaluated afterward. Everywhere else (builtin argument-type panics, match failure, ...) still uses the last-evaluated fallback.
 - `where` refinement predicates are limited to what `<`/`<=`/`>`/`>=`/`==`/`!=`, `&&`/`||`/`!`, and arithmetic can express. Proving is attempted only when the bound value reduces to a closed Int constant at parse time (`try_eval_closed_int`); a Lambda parameter's refinement is never proven statically, since its actual value is unknown until a caller supplies one.
+- A runtime type check at a `Dyn`-to-`Tuple` boundary confirms arity only (is this a list of the right length), not that each position's own value matches its own element type — a full per-position recursive check is possible but not built yet. There's no surface syntax to write `Type::Token` in a type annotation (only `opaque`-as-expression infers one); static rejection of a mismatched opaque-tuple value at an annotated boundary isn't reachable from source yet, though the underlying `consistent_inner` comparison and runtime `==` both already work. Match exhaustiveness for nested tuple patterns only recognizes a single, fully-nested pattern in ONE `match` (`((p, q), x)`) — a scrutinee first bound by an outer match/lambda pattern loses its precise Tuple type (renno has no pattern-driven type refinement), so chaining separate `match`es over the same value falls back to "possibly non-exhaustive."

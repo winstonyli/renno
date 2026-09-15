@@ -100,6 +100,17 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
                 Expr::Str(s) => control = Control::Apply(Value::Str(Rc::from(s.as_str()))),
                 Expr::Token(id) => control = Control::Apply(Value::Token(*id)),
+                // Always 2+ items (see Expr::Tuple's own doc comment), so
+                // unlike ListLit there's no empty-case to special-case --
+                // same left-to-right Frame::ListElems machinery either way,
+                // building a plain Value::List.
+                Expr::Tuple(items) => {
+                    let mut remaining = items.clone();
+                    remaining.reverse();
+                    let first = remaining.pop().expect("Expr::Tuple always has at least 2 items");
+                    cont = Cont::cons(Frame::ListElems { remaining, done: Vec::new(), env: env.clone() }, cont);
+                    control = Control::Eval(first, env);
+                }
                 Expr::ListLit(items) => {
                     if items.is_empty() {
                         control = Control::Apply(Value::List(Rc::new(Vec::new())));

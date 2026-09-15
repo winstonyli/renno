@@ -102,12 +102,27 @@ pub enum Expr {
     Int(i64),
     Bool(bool),
     Str(String),
-    // A literal Value::Token(u64) -- produced only by parser::
-    // build_ctor_value, for an `opaque` constructor's own hidden trailing
-    // brand element (never written directly by a user; there's no surface
-    // syntax for it). See Pattern::Token's own doc comment for why this
-    // is a distinct literal kind rather than reusing Int.
+    // A literal Value::Token(u64), unique per SOURCE POSITION (this u64
+    // is that position) -- the same value every time this exact node
+    // evaluates, no matter how many times (a plain literal, not a
+    // generator). Two sources: the surface `opaque` expression (parser::
+    // atom_leaf, any time a user writes it -- typed Type::Token(this id)
+    // by elaborate_node, so a tuple/field containing one gets real
+    // nominal identity from ordinary structural comparison), and parser::
+    // build_ctor_value's own auto-generated hidden trailing brand element
+    // for an `opaque` `data` constructor field (typed Type::Dyn there --
+    // see Pattern::Token's own doc comment for the pattern-matching side
+    // of that one).
     Token(u64),
+    // `(a, b, c)` -- a fixed-arity product, elaborated with types::
+    // Type::Tuple (per-position types, no widening, unlike ListLit just
+    // below). Evaluates to a plain Value::List at runtime (machine.rs
+    // reuses ListLit's own Frame::ListElems machinery unchanged) -- same
+    // "no new Value kind" choice `data` already made for its own tagged
+    // values. Always 2+ items: parser::atom_leaf's LParen arm only builds
+    // this once it's seen a comma: a single parenthesized expression with
+    // no comma stays ordinary grouping.
+    Tuple(Vec<ExprRef>),
     // Variable-arity, unlike every other node -- elaborate/machine handle
     // it with a loop over the Vec rather than a fixed-shape match.
     ListLit(Vec<ExprRef>),

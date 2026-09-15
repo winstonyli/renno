@@ -56,6 +56,25 @@ pub enum Type {
     // declared, same-named opaque `data` blocks (shadowing) apart by brand
     // instead of by name alone -- see consistent_inner's own doc comment.
     Data(String, Option<u64>),
+    // The static type of an `opaque` expression -- a singleton, one per
+    // SOURCE POSITION (the u64), never per evaluation: `opaque` written at
+    // one spot always has this same type no matter how many times that
+    // code runs (Expr::Token is a literal, not a fresh-each-call
+    // generator -- see its own doc comment). Two Token types are
+    // consistent only when their ids match exactly (consistent_inner);
+    // this is what lets a Token-typed tuple/record field carry real
+    // nominal identity using nothing but ordinary structural comparison,
+    // no separate brand-comparison machinery needed for values built this
+    // way (contrast with Data's own brand field above, which predates
+    // this and still has its own dedicated comparison arm).
+    Token(u64),
+    // Fixed-arity, per-position-typed product -- `(a, b, c)` syntax.
+    // Anonymous (no declared name, no registry lookup): unlike Data,
+    // consistent_inner compares two Tuple types directly, positionally,
+    // with nothing to look up. Runtime representation is a plain
+    // Value::List (see Expr::Tuple's own doc comment) -- same "no new
+    // Value kind" choice Data's own tagged-list encoding already made.
+    Tuple(Rc<Vec<Type>>),
 }
 
 // Closed effect row: an exact known set (Closed), "unknown, could be
@@ -179,6 +198,16 @@ fn consistent_inner(a: &Type, b: &Type, fields: &[Rc<DataInfo>], seen: &mut BTre
         (Type::Fun(a1, r1, b1), Type::Fun(a2, r2, b2)) => {
             consistent_inner(a1, a2, fields, seen) && consistent_inner(b1, b2, fields, seen) && row_consistent(r1, r2)
         }
+        // A singleton per source position -- consistent only with itself
+        // (and Dyn, already handled above). No registry lookup: the id
+        // alone says everything there is to say.
+        (Type::Token(a), Type::Token(b)) => a == b,
+        // Positional, structural, no name/registry involved -- same idea
+        // as List's own element comparison, just per-position instead of
+        // one shared element type.
+        (Type::Tuple(a), Type::Tuple(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| consistent_inner(x, y, fields, seen))
+        }
         // Either side opaque (Some brand): consistent ONLY when both carry
         // the EXACT SAME brand -- i.e. resolve to the identical `data`
         // declaration. This is what closes the shadowing gap this arm used
@@ -252,6 +281,15 @@ fn consistent_inner(a: &Type, b: &Type, fields: &[Rc<DataInfo>], seen: &mut BTre
         (Type::List(elem), Type::Data(_, _)) | (Type::Data(_, _), Type::List(elem)) => {
             matches!(**elem, Type::Str | Type::Dyn)
         }
+        // Every Tuple value IS, structurally, a List at runtime (see
+        // Type::Tuple's own doc comment) -- needed so a tuple pattern
+        // (parser::pattern_atom desugars `(p, q)` straight into
+        // Pattern::List, typed List(Dyn) by typecheck::pattern_type, same
+        // as any other List pattern) can match a Tuple-typed scrutinee.
+        // Narrowed to Dyn specifically (not Str too, unlike Data's own
+        // bridging arm above): a tuple pattern's desugared element type is
+        // always exactly List(Dyn), never List(Str).
+        (Type::List(elem), Type::Tuple(_)) | (Type::Tuple(_), Type::List(elem)) => matches!(**elem, Type::Dyn),
         _ => false,
     }
 }
@@ -279,6 +317,19 @@ impl fmt::Display for Type {
             // Brand never printed -- same "hidden" philosophy as the
             // runtime tag itself (see Type::Data's own doc comment).
             Type::Data(name, _) => write!(f, "{name}"),
+            // Id never printed -- same "hidden" philosophy as Data's own
+            // brand.
+            Type::Token(_) => write!(f, "Token"),
+            Type::Tuple(items) => {
+                write!(f, "(")?;
+                for (i, t) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{t}")?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
