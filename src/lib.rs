@@ -325,6 +325,68 @@ mod tests {
         assert_eq!(run_untyped(src).as_int(), 12);
     }
 
+    #[test]
+    fn juxtaposition_accepts_bool_and_str_literal_arguments() {
+        let src = "let f = fun x -> if x then 1 else 2 in f true + f false";
+        assert_eq!(run_untyped(src).as_int(), 3);
+        assert_eq!(run_untyped(r#"let len_of = fun s -> len(s) in len_of "hey""#).as_int(), 3);
+    }
+
+    #[test]
+    fn juxtaposition_accepts_a_perform_expression_as_an_argument() {
+        // Perform's own payload is "(" expr ")"-delimited, so it's safe
+        // to juxtapose (unlike If/Match/Let/Fun/Data/Handle -- see the
+        // next few tests): `f perform choose(0)` is one argument, ending
+        // exactly at the payload's closing paren.
+        let src = r#"
+            handle
+              let f = fun x -> x + 100 in
+              f perform choose(0)
+            with handler choose(p, resume) -> resume(5)
+        "#;
+        assert_eq!(run_untyped(src).as_int(), 105);
+    }
+
+    // A bare (unparenthesized) If/Match/Let/Fun/Data/Handle/HandlerKw is
+    // NOT eligible as a juxtaposed argument -- each ends in an unbounded
+    // self.expr() for its tail (an `if`'s else branch, a `let`'s body, a
+    // match arm's body, a handler expression, ...) with no delimiter of
+    // its own, so treating it as "just one argument" would silently
+    // swallow every FURTHER juxtaposed argument meant for the outer call
+    // instead of stopping at one atom (`f let x = 1 in x 2` would
+    // otherwise parse as `App(f, let x=1 in (x 2))`, one argument, not
+    // two). Excluding them makes that a parse error instead -- explicit
+    // parens route around it, see juxtaposed_argument_can_be_parenthesized.
+
+    #[test]
+    fn bare_let_is_not_a_juxtaposable_argument() {
+        assert!(parser::parse("f let x = 1 in x").is_err());
+        assert!(run_untyped("let f = fun x -> x in f (let x = 1 in x)").as_int() == 1);
+    }
+
+    #[test]
+    fn bare_if_is_not_a_juxtaposable_argument() {
+        assert!(parser::parse("f if true then 1 else 2").is_err());
+        assert!(run_untyped("let f = fun x -> x in f (if true then 1 else 2)").as_int() == 1);
+    }
+
+    #[test]
+    fn bare_match_is_not_a_juxtaposable_argument() {
+        assert!(parser::parse("f match x with | y -> y").is_err());
+    }
+
+    #[test]
+    fn bare_fun_and_data_are_not_juxtaposable_arguments() {
+        assert!(parser::parse("f fun x -> x").is_err());
+        assert!(parser::parse("f data X = Mk in X").is_err());
+    }
+
+    #[test]
+    fn bare_handle_and_handler_are_not_juxtaposable_arguments() {
+        assert!(parser::parse("f handle x with h").is_err());
+        assert!(parser::parse("f handler choose(p, resume) -> resume(1)").is_err());
+    }
+
     // --- String/List primitives ---
 
     #[test]

@@ -666,7 +666,7 @@ impl<'a> Parser<'a> {
                     let span = Span { start, end: self.span_before().end };
                     e = self.push_spanned(Expr::FieldAccess(e, field), span);
                 }
-                Some(tok) if Self::starts_atom(tok) => {
+                Some(tok) if Self::starts_juxtaposed_arg(tok) => {
                     let arg = self.atom()?;
                     let span = Span { start, end: self.span_before().end };
                     e = self.push_spanned(Expr::App(e, arg), span);
@@ -677,12 +677,27 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
-    // The First(atom) set -- every token an atom (see `atom`/`atom_leaf`)
-    // can start with. Used only to decide, inside postfix's loop, whether
-    // the next token begins a new JUXTAPOSED argument rather than ending
-    // the application chain; deliberately excludes every operator token
-    // (including unary `-`/`!`, which live one precedence level up).
-    fn starts_atom(tok: &Token) -> bool {
+    // NOT the full First(atom) set -- deliberately narrower. `atom`/
+    // `atom_leaf` also start on If/Match/Let/Fun/Data/Handle/HandlerKw,
+    // but every one of those ends in an UNBOUNDED `self.expr()` for its
+    // tail position (an `if`'s `else` branch, a `let`'s body, a `match`
+    // arm's body, a `handle`'s handler expression, ...) with no closing
+    // delimiter of its own -- so as a bare JUXTAPOSED argument, that tail
+    // would silently swallow every subsequent argument meant for the
+    // OUTER application instead of stopping at just one atom. Concretely,
+    // if these were included, `f let x = 1 in x 2` would parse as
+    // `App(f, (let x = 1 in (x 2)))` -- a single argument -- not
+    // `App(App(f, let x=1 in x), 2)` as "any atom-starting token is an
+    // argument boundary" would suggest; same story for `f if c then a
+    // else b 2`, `f match ... 2`, `f handle ... 2`. Excluding them here
+    // means that ambiguity is a parse error (trailing tokens) instead of
+    // a silent wrong grouping -- passing one of these as an argument
+    // still works, just needs explicit parens: `f (let x = 1 in x) 2`.
+    // They're still valid as postfix's OWN leading atom (the unrestricted
+    // `self.atom()` call before this loop even starts), and still valid
+    // as an explicitly-parenthesized argument (LParen stays included; the
+    // parens are exactly what makes the tail bounded again).
+    fn starts_juxtaposed_arg(tok: &Token) -> bool {
         matches!(
             tok,
             Token::Int(_)
@@ -692,14 +707,7 @@ impl<'a> Parser<'a> {
                 | Token::Ident(_)
                 | Token::LBracket
                 | Token::LParen
-                | Token::If
                 | Token::Perform
-                | Token::Handle
-                | Token::HandlerKw
-                | Token::Match
-                | Token::Let
-                | Token::Fun
-                | Token::Data
         )
     }
 
