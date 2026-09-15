@@ -111,6 +111,21 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     cont = Cont::cons(Frame::ListElems { remaining, done: Vec::new(), env: env.clone() }, cont);
                     control = Control::Eval(first, env);
                 }
+                // Reachable only if this tree skipped typecheck::check --
+                // elaborate_node's own Record arm rewrites every
+                // Expr::Record into a plain Expr::Tuple during
+                // elaboration (see Expr::Record's own doc comment), so a
+                // PROPERLY TYPECHECKED tree never has one left by the
+                // time it gets here. machine::run itself has no such
+                // guarantee, though: it's called on the raw parsed tree
+                // directly wherever a test wants machine.rs's own
+                // semantics without going through the typechecker (e.g.
+                // lib.rs's run_untyped) -- record syntax simply isn't
+                // supported on that untyped path, the same way a `data`
+                // declaration's old desugaring never was either.
+                Expr::Record(..) => unreachable!(
+                    "Expr::Record reached machine::run directly -- record syntax needs typecheck::check first, see its own doc comment"
+                ),
                 Expr::ListLit(items) => {
                     if items.is_empty() {
                         control = Control::Apply(Value::List(Rc::new(Vec::new())));

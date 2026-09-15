@@ -29,6 +29,19 @@ pub enum Type {
     // look up. Runtime representation is a plain Value::List (see
     // Expr::Tuple's own doc comment) -- no new Value kind needed.
     Tuple(Rc<Vec<Type>>),
+    // Fixed-arity, per-position-typed product, like Tuple -- but each
+    // position also carries a field name, and consistency additionally
+    // requires the names to match (not just the types). ALWAYS stored
+    // sorted by name (parser::parse_record_fields' job, for the type
+    // itself, a construction, and a pattern alike) -- that's what makes
+    // `{y: 2, x: 1}` and `{x: 1, y: 2}` the same type/value with zero
+    // runtime name-tracking: sort once at every site records appear, and
+    // a Record's runtime shape becomes indistinguishable from a Tuple's
+    // (see Expr::Record's own doc comment -- it desugars to Expr::Tuple
+    // during elaboration, no new Value kind). Anonymous, no registry:
+    // like Tuple, two Record types are compared directly, positionally
+    // (name then type), nothing to look up.
+    Record(Rc<Vec<(String, Type)>>),
     // "One of these" -- a self-contained sum, no registry/name lookup.
     // Typically each alternative is a Tuple whose first element is a
     // distinct Token (a hand-rolled sum: `Type::Union([Tuple([
@@ -157,6 +170,13 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         (Type::Tuple(a), Type::Tuple(b)) => {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| consistent(x, y))
         }
+        // Same idea as Tuple, plus each position's NAME must also match --
+        // both sides are always stored sorted by name (see Type::Record's
+        // own doc comment), so this is still a plain positional zip, not a
+        // set comparison.
+        (Type::Record(a), Type::Record(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|((n1, t1), (n2, t2))| n1 == n2 && consistent(t1, t2))
+        }
         // Two unions: consistent as SETS -- every alternative on each
         // side has a match on the other (order and duplicates don't
         // matter, only membership). Must come before the single-Union
@@ -177,6 +197,11 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         // Pattern::List, typed List(Dyn) by typecheck::pattern_type, same
         // as any other List pattern) can match a Tuple-typed scrutinee.
         (Type::List(elem), Type::Tuple(_)) | (Type::Tuple(_), Type::List(elem)) => matches!(**elem, Type::Dyn),
+        // Same bridge, for Record -- a `{x, y}` pattern desugars straight
+        // to Pattern::List too (see Type::Record's own doc comment), so it
+        // needs the identical List-typed-as-Dyn allowance to match a
+        // Record-typed scrutinee.
+        (Type::List(elem), Type::Record(_)) | (Type::Record(_), Type::List(elem)) => matches!(**elem, Type::Dyn),
         _ => false,
     }
 }
@@ -212,6 +237,16 @@ impl fmt::Display for Type {
                     write!(f, "{t}")?;
                 }
                 write!(f, ")")
+            }
+            Type::Record(fields) => {
+                write!(f, "{{")?;
+                for (i, (name, t)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name}: {t}")?;
+                }
+                write!(f, "}}")
             }
             Type::Union(alts) => {
                 for (i, t) in alts.iter().enumerate() {

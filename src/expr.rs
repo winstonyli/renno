@@ -102,6 +102,16 @@ pub enum Expr {
     // arm only builds this once it's seen a comma: a single parenthesized
     // expression with no comma stays ordinary grouping.
     Tuple(Vec<ExprRef>),
+    // `{y: 2, x: 1}` -- fields ALWAYS sorted by name by the parser (see
+    // Type::Record's own doc comment), so this and `{x: 1, y: 2}` produce
+    // identical nodes. Parser-emitted and typecheck-consumed ONLY:
+    // elaborate_node's own Record arm infers types::Type::Record from it,
+    // then immediately rewrites the node into a plain Expr::Tuple (its
+    // values, in the same sorted order) for everything downstream --
+    // machine.rs never evaluates an Expr::Record directly, the same way
+    // Type::Union has no runtime representation of its own. No new Value
+    // kind, no new machine.rs Eval arm.
+    Record(Rc<Vec<(String, ExprRef)>>),
     // Variable-arity, unlike every other node -- elaborate/machine handle
     // it with a loop over the Vec rather than a fixed-shape match.
     ListLit(Vec<ExprRef>),

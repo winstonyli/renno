@@ -112,6 +112,10 @@ mod tests {
             Expr::Match(scrutinee, arms) => {
                 contains_check(arena, *scrutinee) || arms.iter().any(|(_, body)| contains_check(arena, *body))
             }
+            // Never reaches here -- this walks an ELABORATED tree, and
+            // Expr::Record never survives elaboration (see its own doc
+            // comment).
+            Expr::Record(..) => unreachable!("Expr::Record never survives elaboration"),
         }
     }
 
@@ -1119,6 +1123,121 @@ mod tests {
         "#;
         let err = run_source(src).unwrap_err();
         assert!(err.contains("expected Bool, found Int"), "unexpected message: {err}");
+    }
+
+    // --- records: `{x: 1, y: 2}` -- fixed-arity, per-position-typed,
+    // NAMED product, a separate type from Tuple (see types::Type::Record's
+    // own doc comment for why: real record ergonomics need order-
+    // independent construction, which Tuple's strictly-positional
+    // comparison doesn't give). Desugars to a plain Expr::Tuple/Value::List
+    // at elaboration time -- no new Value kind, field names live at the
+    // type level only. Read back via destructuring only, no `.field`. ---
+
+    #[test]
+    fn record_construction_and_destructure_round_trip() {
+        let src = "match {x: 1, y: 2} with | {x: a, y: b} -> a + b";
+        assert_eq!(run_source(src).unwrap().as_int(), 3);
+    }
+
+    #[test]
+    fn record_field_order_does_not_matter_for_construction_or_pattern() {
+        // Fields are sorted by name at parse time everywhere records
+        // appear -- construction written in one order, pattern written in
+        // the OPPOSITE order, still line up correctly.
+        let src = "match {y: 2, x: 1} with | {x: a, y: b} -> a - b";
+        assert_eq!(run_source(src).unwrap().as_int(), -1);
+    }
+
+    #[test]
+    fn record_field_punning_works_in_construction_and_pattern() {
+        // `{x, y}` means `{x: x, y: y}` on both sides.
+        let src = "let x = 3 in let y = 4 in match {x, y} with | {x, y} -> x * x + y * y";
+        assert_eq!(run_source(src).unwrap().as_int(), 25);
+    }
+
+    #[test]
+    fn record_duplicate_field_rejected_at_parse_time() {
+        let err = parser::parse("{x: 1, x: 2}").unwrap_err();
+        assert!(err.contains("field `x` given more than once"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn record_type_duplicate_field_rejected_at_parse_time() {
+        let err = parser::parse("let f = fun p: {x: Int, x: Int} -> p in f").unwrap_err();
+        assert!(err.contains("field `x` given more than once"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn empty_record_rejected_at_parse_time() {
+        // Matches Tuple's own existing constraint, not a new one -- see
+        // parse_record_fields' own doc comment: Tuple has no
+        // representation for zero elements either.
+        let err = parser::parse("{}").unwrap_err();
+        assert!(err.contains("at least one field"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn record_type_annotation_accepts_matching_fields() {
+        let src = "let f = fun p: {x: Int, y: Str} -> p in f({x: 5, y: \"hi\"})";
+        assert_eq!(run_source(src).unwrap().to_string(), "[5, hi]");
+    }
+
+    #[test]
+    fn record_type_annotation_rejects_mismatched_field_names_statically() {
+        // Same arity, same field TYPES, different NAMES -- unlike two
+        // same-shaped Tuples (always interchangeable), a Record's names
+        // are part of its identity: consistent() compares them
+        // positionally alongside the types (both sides always sorted).
+        let src = "let f = fun p: {x: Int, y: Int} -> p in f({a: 1, b: 2})";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(
+            err.0.contains("expected {x: Int, y: Int}, found {a: Int, b: Int}"),
+            "unexpected message: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn dyn_boundary_to_record_only_checks_arity_not_field_names() {
+        // Documented, accepted limitation (same as Tuple's own boundary
+        // check): no new Value kind means field names exist only at the
+        // type level, so a Dyn-sourced value crossing a Record-typed
+        // boundary can only be checked for arity -- a same-arity record
+        // with entirely different field names passes right through.
+        let src = r#"
+            handle
+              let y = perform choose(0) in
+              let f = fun p: {x: Int, y: Int} -> p in
+              f(y)
+            with handler choose(p, resume) -> resume({a: 1, b: 2})
+        "#;
+        assert_eq!(run_source(src).unwrap().to_string(), "[1, 2]");
+    }
+
+    #[test]
+    fn record_as_one_alternative_of_a_union_with_exhaustiveness_checking() {
+        let src = r#"
+            type R = {x: Int} | {x: Int, y: Int} in
+            let f = fun p: R ->
+              match p with
+              | {x: a} -> a
+              | {x: a, y: b} -> a + b
+            in f({x: 1, y: 2}) + f({x: 5})
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 8);
+    }
+
+    #[test]
+    fn non_exhaustive_record_union_match_rejected_statically() {
+        let src = r#"
+            type R = {x: Int} | {x: Int, y: Int} in
+            let f = fun p: R -> match p with | {x: a} -> a
+            in f({x: 5})
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
     }
 
     // --- match exhaustiveness ---

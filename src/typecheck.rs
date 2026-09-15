@@ -85,6 +85,7 @@ fn free_row_vars(ty: &Type) -> BTreeSet<String> {
         }
         Type::List(elem) => free_row_vars(elem),
         Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(free_row_vars).collect(),
+        Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_row_vars(t)).collect(),
         Type::Dyn | Type::Int | Type::Bool | Type::Str | Type::Token(_) => BTreeSet::new(),
     }
 }
@@ -111,6 +112,9 @@ fn subst_type(ty: &Type, subst: &HashMap<String, EffectRow>) -> Type {
         ),
         Type::List(elem) => Type::List(Rc::new(subst_type(elem, subst))),
         Type::Tuple(items) => Type::Tuple(Rc::new(items.iter().map(|t| subst_type(t, subst)).collect())),
+        Type::Record(fields) => {
+            Type::Record(Rc::new(fields.iter().map(|(n, t)| (n.clone(), subst_type(t, subst))).collect()))
+        }
         other => other.clone(),
     }
 }
@@ -195,7 +199,8 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type) -> ExprRef {
         Type::List(_) => build_shallow_check(arena, e, to, "is_list"),
         Type::Fun(param_ty, _row, ret_ty) => wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone()),
         Type::Token(id) => build_token_check(arena, e, to, *id),
-        Type::Tuple(_) => build_tuple_check(arena, e, to),
+        Type::Tuple(_) => build_shape_check(arena, e, to),
+        Type::Record(_) => build_shape_check(arena, e, to),
         Type::Union(_) => build_union_check(arena, e, to),
         Type::Dyn => unreachable!("coerce only calls this once *to != Type::Dyn is already established"),
     }
@@ -231,6 +236,16 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type) -> ExprRef {
     arena.push(Expr::Let(tmp, None, e, result))
 }
 
+// Tuple and Record's shared "how many positions" -- only ever called
+// with `ty` already known to be one or the other.
+fn shape_arity(ty: &Type) -> usize {
+    match ty {
+        Type::Tuple(items) => items.len(),
+        Type::Record(fields) => fields.len(),
+        _ => unreachable!("shape_arity is only ever called with a Tuple or Record"),
+    }
+}
+
 // The bare boolean half of build_boundary_check's per-type dispatch --
 // "does `value_ref` shallowly look like `ty`," with no let-binding and no
 // fail() of its own, so build_union_check can OR several of these
@@ -249,11 +264,18 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type) -> Ex
             let lit = arena.push(Expr::Token(*id));
             arena.push(Expr::BinOp(BinOp::Eq, value_ref, lit))
         }
-        Type::Tuple(items) => {
+        // Record shares this arm with Tuple -- shape-wise it IS a Tuple
+        // (see Type::Record's own doc comment), just with names attached
+        // that this shallow check has no way to verify at runtime anyway
+        // (no new Value kind -- see Expr::Record's own doc comment).
+        // `shape_arity` reads the position count straight from whichever
+        // one `ty` actually is, so there's no second match here re-asking
+        // a question the outer one already answered.
+        Type::Tuple(_) | Type::Record(_) => {
             let is_list = build_predicate_call(arena, "is_list", value_ref);
             let len_var = arena.push(Expr::Var("len".to_string()));
             let len_call = arena.push(Expr::App(len_var, value_ref));
-            let arity_lit = arena.push(Expr::Int(items.len() as i64));
+            let arity_lit = arena.push(Expr::Int(shape_arity(ty) as i64));
             let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, arity_lit));
             let false_lit = arena.push(Expr::Bool(false));
             arena.push(Expr::If(is_list, len_eq, false_lit))
@@ -290,16 +312,22 @@ fn build_token_check(arena: &mut Arena, e: ExprRef, to: &Type, id: u64) -> ExprR
     arena.push(Expr::Let(tmp, None, e, if_expr))
 }
 
-// Shallow, like List(_) in build_boundary_check: confirms arity, not that
-// each position's own value matches ITS OWN element type -- a full
-// per-position recursive check (extract each element, apply
-// build_boundary_check to it, rebuild the tuple) is possible but not
-// built yet; this matches the same "confirm the shape, not deeper"
-// precedent every other Dyn boundary check here already sets. The shape
-// test itself is build_shape_predicate's own Tuple arm, not re-derived
-// here, so there's exactly one place that knows what "looks like a
-// Tuple" means.
-fn build_tuple_check(arena: &mut Arena, e: ExprRef, to: &Type) -> ExprRef {
+// Shallow, like List(_) in build_boundary_check: confirms arity only --
+// for a Record, NOT that the right field names are present (there's
+// nothing left at runtime to check that against: no new Value kind means
+// field names live only at the type level, see Type::Record's own doc
+// comment -- a same-arity value with entirely different field names
+// still passes) -- and not that each position's own value matches ITS
+// OWN element type either. A full per-position recursive check (extract
+// each element, apply build_boundary_check to it, rebuild the
+// tuple/record) is possible but not built yet; this matches the same
+// "confirm the shape, not deeper" precedent every other Dyn boundary
+// check here already sets. Entirely generic over `to` -- the actual
+// shape test is build_shape_predicate's own job, not re-derived here, so
+// this one function serves both Type::Tuple and Type::Record (a Record IS,
+// shape-wise, just a Tuple with names attached -- see Type::Record's own
+// doc comment) with no duplicated arity/is_list logic between them.
+fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type) -> ExprRef {
     let tmp = "__check_tmp".to_string();
     let tmp_ref = arena.push(Expr::Var(tmp.clone()));
     let pred = build_shape_predicate(arena, tmp_ref, to);
@@ -458,22 +486,30 @@ fn first_unreachable(patterns: &[&Pattern]) -> Option<usize> {
 }
 
 // Does `pat` cover every possible value at a position statically known to
-// have type `ty`? Only ever called with `ty` a Tuple (missing_case's own
-// guard, including per-alternative for a Union), but recurses into NESTED
-// tuple positions too: `((p, q), x)` covers all of `((Int, Int), Int)`
-// even though NEITHER top-level sub-pattern is a bare Var, because the
-// first one is itself a fully-covering pattern for ITS OWN (also Tuple)
-// position. Does NOT help a scrutinee bound by an outer match/lambda
-// pattern first (renno has no pattern-driven type refinement -- see
-// bind_pattern_vars's own doc comment -- so that binding's own type is
-// just Dyn, not the precise Tuple type this needs): a fully-nested
-// pattern in ONE match sidesteps that, a match on a separately-
-// destructured intermediate variable does not.
+// have type `ty`? Only ever called with `ty` a Tuple or Record
+// (missing_case's own guard, including per-alternative for a Union), but
+// recurses into NESTED tuple/record positions too: `((p, q), x)` covers
+// all of `((Int, Int), Int)` even though NEITHER top-level sub-pattern is
+// a bare Var, because the first one is itself a fully-covering pattern
+// for ITS OWN (also Tuple) position. Does NOT help a scrutinee bound by
+// an outer match/lambda pattern first (renno has no pattern-driven type
+// refinement -- see bind_pattern_vars's own doc comment -- so that
+// binding's own type is just Dyn, not the precise Tuple/Record type this
+// needs): a fully-nested pattern in ONE match sidesteps that, a match on
+// a separately-destructured intermediate variable does not.
 fn covers_tuple_position(pat: &Pattern, ty: &Type) -> bool {
     match (pat, ty) {
         (Pattern::Var(_), _) => true,
         (Pattern::List(subpats), Type::Tuple(items)) if subpats.len() == items.len() => {
             subpats.iter().zip(items.iter()).all(|(sp, t)| covers_tuple_position(sp, t))
+        }
+        // A `{x: a, y: b}` pattern desugars straight to Pattern::List (see
+        // parser::pattern_atom's own LBrace arm) -- covering a Record is
+        // the same arity-zip as Tuple, just reading each field's TYPE
+        // (its name doesn't matter here: pattern content isn't
+        // name-checked, only shape).
+        (Pattern::List(subpats), Type::Record(fields)) if subpats.len() == fields.len() => {
+            subpats.iter().zip(fields.iter()).all(|(sp, (_, t))| covers_tuple_position(sp, t))
         }
         _ => false,
     }
@@ -515,7 +551,10 @@ fn missing_case(patterns: &[&Pattern], scrut_ty: &Type) -> Option<String> {
     // anything else. Nested-but-not-fully-covering (e.g. a literal at
     // some position) still falls through to "possibly non-exhaustive,"
     // same as everywhere else this checker declines to enumerate.
-    if let Type::Tuple(_) = scrut_ty {
+    // A Record's arity is fixed and known too -- same story as Tuple,
+    // just also carrying field names that (per covers_tuple_position's
+    // own doc comment) don't matter for this particular check.
+    if let Type::Tuple(_) | Type::Record(_) = scrut_ty {
         let covers_every_tuple = patterns.iter().copied().any(|p| covers_tuple_position(p, scrut_ty));
         if covers_every_tuple {
             return None;
@@ -718,6 +757,26 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
                 refs.push(item2);
             }
             Ok((Type::Tuple(Rc::new(tys)), row, arena.push(Expr::Tuple(refs))))
+        }
+
+        // Parser-emitted only (see Expr::Record's own doc comment) --
+        // fields already arrive sorted by name, so elaborating them in
+        // the order given is elaborating (and evaluating) them in
+        // canonical order, no extra reordering needed. Infers the precise
+        // types::Type::Record, then rewrites straight into a plain
+        // Expr::Tuple -- everything past this point (machine.rs included)
+        // only ever sees an ordinary Tuple, never Expr::Record.
+        Expr::Record(fields) => {
+            let mut row = EffectRow::pure();
+            let mut field_tys = Vec::with_capacity(fields.len());
+            let mut refs = Vec::with_capacity(fields.len());
+            for (name, field_expr) in fields.iter() {
+                let (field_ty, field_row, field2) = elaborate(arena, *field_expr, ctx, spans)?;
+                row = EffectRow::union(&row, &field_row);
+                field_tys.push((name.clone(), field_ty));
+                refs.push(field2);
+            }
+            Ok((Type::Record(Rc::new(field_tys)), row, arena.push(Expr::Tuple(refs))))
         }
 
         Expr::ListLit(items) => {

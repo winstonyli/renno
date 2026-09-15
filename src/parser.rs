@@ -208,6 +208,86 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // Parses "ident (":" parse_value)? ("," ident (":" parse_value)?)*"
+    // up to (and consuming) the closing "}" -- the opening "{" is assumed
+    // already consumed, same convention as every other bracketed form
+    // here (e.g. atom_leaf's own LParen arm). Sorts the result by field
+    // name and rejects a duplicate, so records are ALWAYS canonically
+    // ordered from the moment they're parsed -- whether this is a record
+    // TYPE, a construction, or a pattern, that's what lets `{y: 2, x: 1}`
+    // and `{x: 1, y: 2}` mean the exact same thing with zero runtime
+    // name-tracking (see types::Type::Record's own doc comment). Shared
+    // by all three call sites so this bookkeeping -- and its error
+    // message -- lives in exactly one place, instead of being hand-rolled
+    // three times.
+    //
+    // `default`, when present, makes the ":" optional: a bare `x` field
+    // puns to `default(self, "x")` (field-punning, for expression/pattern
+    // construction: `{x, y}` means `{x: x, y: y}`). `None` makes every
+    // field require an explicit ": T" -- used for record TYPES, which
+    // have no value of their own to pun with.
+    //
+    // At least one field is required -- `{}` is a parse error, not a
+    // zero-field record. This matches Tuple's own existing constraint,
+    // not a new one: a record desugars into Expr::Tuple/Type::Tuple's
+    // shape (see Type::Record's own doc comment), and Tuple has no
+    // representation for zero elements either -- `()` is ordinary
+    // grouping, and even the one-element case needs a trailing comma
+    // (`(x,)`) specifically to stay distinct from grouping. `{}` has no
+    // such ambiguity to resolve, so there's no reason to invent a
+    // zero-arity case Tuple itself doesn't support.
+    fn parse_record_fields<T>(
+        &mut self,
+        parse_value: fn(&mut Self) -> Result<T, String>,
+        default: Option<fn(&mut Self, String) -> T>,
+    ) -> Result<Vec<(String, T)>, String> {
+        if matches!(self.peek(), Some(Token::RBrace)) {
+            return Err(self.err_at(self.span_before(), "a record needs at least one field".to_string()));
+        }
+        let mut fields: Vec<(String, T)> = Vec::new();
+        loop {
+            let name = self.ident()?;
+            // Checked right here, before consuming anything else -- a
+            // duplicate is reported at the OFFENDING field's own name
+            // token (self.span_before() is still that ident, nothing has
+            // bumped since), not at the closing "}" a later post-hoc scan
+            // would only reach after the whole record (and its span) had
+            // already moved past every field.
+            if fields.iter().any(|(n, _)| n == &name) {
+                return Err(self.err_at(self.span_before(), format!("field `{name}` given more than once")));
+            }
+            let value = if matches!(self.peek(), Some(Token::Colon)) {
+                self.bump();
+                parse_value(self)?
+            } else {
+                match default {
+                    Some(d) => d(self, name.clone()),
+                    None => {
+                        return Err(self.err_at(
+                            self.span_before(),
+                            format!("field `{name}` needs a type: `{name}: T`"),
+                        ))
+                    }
+                }
+            };
+            fields.push((name, value));
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.bump();
+                if matches!(self.peek(), Some(Token::RBrace)) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        self.expect(&Token::RBrace)?;
+        // No further dedup pass needed -- the loop above already rejects
+        // a repeated name the moment it's seen, so `fields` is guaranteed
+        // unique here; only the canonical ordering is left to do.
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(fields)
+    }
+
     // Optional `: Type` annotation, e.g. after a param name or a let binder.
     // parse_type_atom_union, NOT parse_union_type -- same "don't chain ->
     // at this level" reasoning parse_type's own doc comment gives: `fun x:
@@ -310,6 +390,14 @@ impl<'a> Parser<'a> {
                     Ok(first)
                 }
             }
+            // "{" ident ":" type ("," ident ":" type)* "}"  -- see
+            // Type::Record's own doc comment for why every field needs an
+            // explicit ": T" here (no punning at the type level, there's
+            // no value to pun with) and why the result comes back sorted.
+            Some(Token::LBrace) => {
+                let fields = self.parse_record_fields(Self::parse_union_type, None)?;
+                Ok(Type::Record(Rc::new(fields)))
+            }
             // A capitalized name: a reference to a `type Name = ... in`
             // alias (Parser::type_aliases) currently in scope -- fully
             // resolved right here, not deferred. Unlike `data`'s own
@@ -327,6 +415,21 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // True iff the tokens right after the CURRENT position (not yet
+    // consumed) are exactly "{" ident "}" -- the row-variable shape
+    // (`->{e}`), which parse_fun_type must tell apart from a record TYPE
+    // that also happens to start with "{" right where a return type goes
+    // (`-> {x: Int}`). The two are distinguishable one token further in:
+    // a row variable's "{" is followed by exactly one ident then an
+    // IMMEDIATE "}", while a record type's ident is always followed by
+    // ":" (record types have no punning -- see parse_record_fields' own
+    // doc comment). Two-token lookahead is safe here since `tokens` is a
+    // plain pre-lexed Vec, not a stream.
+    fn peek_is_row_var(&self) -> bool {
+        matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(_)))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::RBrace))
+    }
+
     // fun_type := type ("->" ("{" ident "}")? fun_type)?  (right-assoc) --
     // only reachable from inside parens, where ")" unambiguously ends it.
     // The optional `{name}` after "->" names a row variable for row
@@ -334,12 +437,17 @@ impl<'a> Parser<'a> {
     // `let`, typecheck::lookup instantiates a fresh copy at each use). No
     // `{name}` -- the default, and the only option before this existed --
     // means EffectRow::Dyn (unknown effects, gradual default), consistent
-    // with every other unannotated position.
+    // with every other unannotated position. A "{" that ISN'T a row
+    // variable (peek_is_row_var says no) falls through to Dyn here and
+    // gets parsed as an ordinary return-type atom instead, by the
+    // recursive parse_fun_type -> parse_type call below -- which is
+    // exactly how a record type (`-> {x: Int}`) reaches parse_type's own
+    // LBrace arm rather than being swallowed as a malformed row variable.
     fn parse_fun_type(&mut self) -> Result<Type, String> {
         let atom = self.parse_type()?;
         if matches!(self.peek(), Some(Token::Arrow)) {
             self.bump();
-            let row = if matches!(self.peek(), Some(Token::LBrace)) {
+            let row = if matches!(self.peek(), Some(Token::LBrace)) && self.peek_is_row_var() {
                 self.bump();
                 let name = self.ident()?;
                 self.expect(&Token::RBrace)?;
@@ -399,6 +507,23 @@ impl<'a> Parser<'a> {
                     self.expect(&Token::RParen)?;
                     Ok(first)
                 }
+            }
+            // "{" ident (":" pattern)? ("," ident (":" pattern)?)* "}"  --
+            // record destructure. A bare `x` field puns to `x: x` (see
+            // parse_record_fields' own doc comment). Fields come back
+            // sorted by name, so -- exactly like the tuple-pattern arm
+            // above -- this is just sugar for Pattern::List over the
+            // canonical order; a Record-typed scrutinee's own consistency
+            // bridge (types::consistent) is what lets it match one.
+            Some(Token::LBrace) => {
+                // `{x, y}` means `{x: x, y: y}` in pattern position too --
+                // no arena/span bookkeeping needed (Pattern is a plain
+                // inline enum, not arena-indexed) -- takes `&mut Self`
+                // only because that's parse_record_fields' shared
+                // `default` parameter shape.
+                let fields =
+                    self.parse_record_fields(Self::pattern, Some(|_: &mut Self, name| Pattern::Var(name)))?;
+                Ok(Pattern::List(fields.into_iter().map(|(_, pat)| pat).collect()))
             }
             // No case distinction: with `data`-declared constructors gone,
             // any identifier here -- upper or lowercase, "_" included --
@@ -983,6 +1108,30 @@ impl<'a> Parser<'a> {
                     self.expect(&Token::RParen)?;
                     Ok(first)
                 }
+            }
+
+            // "{" ident (":" expr)? ("," ident (":" expr)?)* "}"  -- record
+            // construction. A bare `x` field puns to `x: x` (see
+            // parse_record_fields' own doc comment). Fields come back
+            // sorted by name, so this is just an Expr::Record over the
+            // canonical order -- elaborate_node infers types::Type::Record
+            // from it, then rewrites it into a plain Expr::Tuple; nothing
+            // past typecheck ever sees Expr::Record (see its own doc
+            // comment).
+            Some(Token::LBrace) => {
+                // `{x, y}` means `{x: x, y: y}` -- a punned field's
+                // default value is a fresh Expr::Var for its own name,
+                // spanned at the identifier just consumed
+                // (parse_record_fields calls this right after
+                // `self.ident()`, before bumping anything else).
+                let fields = self.parse_record_fields(
+                    Self::expr,
+                    Some(|p: &mut Self, name: String| {
+                        let span = p.span_before();
+                        p.push_spanned(Expr::Var(name), span)
+                    }),
+                )?;
+                Ok(self.push_spanned(Expr::Record(Rc::new(fields)), Span { start, end: self.span_before().end }))
             }
 
             // match <scrutinee> with (| pattern -> expr)+  -- the first "|"
