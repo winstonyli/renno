@@ -69,6 +69,19 @@ fn tuple_construction_source(n: i64) -> String {
     )
 }
 
+// Same shape again, but the product is a record instead of a tuple:
+// {x: n, y: n} constructed then destructured via match {x, y} -> x + y.
+// Exercises the extra work records pay that tuples don't -- Expr::Record
+// elaboration (name-keyed field typing, rewritten to Expr::Tuple) at
+// construction, same Pattern::List destructure at the pattern side --
+// since records had zero benchmark coverage before now.
+fn record_construction_source(n: i64) -> String {
+    format!(
+        "let rec sum = fun n -> match n with | 0 -> 0 | _ -> (match {{x: n, y: n}} with | {{x, y}} -> x + y) + sum(n - 1) in \
+         sum({n})"
+    )
+}
+
 fn full_pipeline(c: &mut Criterion) {
     let src = std::fs::read_to_string("examples/multi_shot.rn").expect("run from the repo root");
     c.bench_function("full_pipeline/multi_shot.rn", |b| {
@@ -131,6 +144,17 @@ fn tuple_construction(c: &mut Criterion) {
     group.finish();
 }
 
+fn record_construction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("record_construction");
+    for n in [10i64, 100, 1000] {
+        let src = record_construction_source(n);
+        group.bench_with_input(BenchmarkId::from_parameter(n), &src, |b, src| {
+            b.iter(|| run_source(black_box(src)).unwrap())
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     full_pipeline,
@@ -138,6 +162,7 @@ criterion_group!(
     multishot_resume,
     deep_reinstall,
     recursive_match,
-    tuple_construction
+    tuple_construction,
+    record_construction
 );
 criterion_main!(benches);
