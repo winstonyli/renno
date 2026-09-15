@@ -103,6 +103,25 @@ fn resolve_row(row: &EffectRow, subst: &HashMap<String, EffectRow>) -> EffectRow
     }
 }
 
+// Recurses into every Type variant free_row_vars also recurses into
+// (Fun/List/Tuple/Union/Record), so a row variable this function finds
+// reachable is also one this function can rename -- the two are meant to
+// stay in lockstep, since a variable extend_generalized captured (via
+// free_row_vars) but subst_type then failed to touch would keep its
+// literal original name at every instantiation instead of getting a
+// fresh one per reference, silently breaking per-reference row
+// polymorphism for whatever's inside that untouched variant.
+//
+// The Union and Record arms are UNVERIFIED by any test: no renno program
+// was found where a shared-vs-fresh row-var name inside a Union or
+// Record actually changes typecheck's verdict or runtime behavior --
+// row_consistent treats any EffectRow::Var as consistent with anything
+// regardless of name, and the only way to get a callable Fun back out of
+// a Union/Record is by pattern-matching it, which types the result Dyn
+// regardless of what precision subst_type preserved going in. Kept
+// anyway, on the same "recurse everywhere free_row_vars does" principle
+// the Fun/List/Tuple arms already establish -- correct by construction,
+// not by a failing case this fixed.
 fn subst_type(ty: &Type, subst: &HashMap<String, EffectRow>) -> Type {
     match ty {
         Type::Fun(param, row, ret) => Type::Fun(
@@ -112,6 +131,7 @@ fn subst_type(ty: &Type, subst: &HashMap<String, EffectRow>) -> Type {
         ),
         Type::List(elem) => Type::List(Rc::new(subst_type(elem, subst))),
         Type::Tuple(items) => Type::Tuple(Rc::new(items.iter().map(|t| subst_type(t, subst)).collect())),
+        Type::Union(alts) => Type::Union(Rc::new(alts.iter().map(|t| subst_type(t, subst)).collect())),
         Type::Record(fields) => {
             Type::Record(Rc::new(fields.iter().map(|(n, t)| (n.clone(), subst_type(t, subst))).collect()))
         }
