@@ -310,26 +310,51 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type) -> Ex
         // AROUND it) would let has_field run on a value that was never
         // confirmed to be a Record at all.
         Type::Record(fields) => {
-            let mut result = arena.push(Expr::Bool(true));
-            for (name, _) in fields.iter().rev() {
-                let has = build_has_field_call(arena, value_ref, name);
-                let false_lit = arena.push(Expr::Bool(false));
-                result = arena.push(Expr::If(has, result, false_lit));
-            }
+            let has_all =
+                fold_predicate(arena, fields, FoldOp::And, |arena, (name, _)| build_has_field_call(arena, value_ref, name));
             let is_record = build_predicate_call(arena, "is_record", value_ref);
             let false_lit = arena.push(Expr::Bool(false));
-            arena.push(Expr::If(is_record, result, false_lit))
+            arena.push(Expr::If(is_record, has_all, false_lit))
         }
         Type::Union(alts) => {
-            let mut result = arena.push(Expr::Bool(false));
-            for alt in alts.iter().rev() {
-                let p = build_shape_predicate(arena, value_ref, alt);
-                let true_lit = arena.push(Expr::Bool(true));
-                result = arena.push(Expr::If(p, true_lit, result));
-            }
-            result
+            fold_predicate(arena, alts, FoldOp::Or, |arena, alt| build_shape_predicate(arena, value_ref, alt))
         }
     }
+}
+
+// Whether fold_predicate combines its items with AND (every one must
+// hold) or OR (any one is enough).
+enum FoldOp {
+    And,
+    Or,
+}
+
+// Folds `items` right-to-left into a short-circuiting AND/OR of
+// `pred(item)`, built from ordinary If/Bool nodes -- shared by Union's
+// own "is it consistent with ANY alternative" fold above and Record's
+// own "does it have EVERY required field" fold just above that, which
+// differ only in which of AND/OR they each need.
+fn fold_predicate<T>(
+    arena: &mut Arena,
+    items: &[T],
+    op: FoldOp,
+    mut pred: impl FnMut(&mut Arena, &T) -> ExprRef,
+) -> ExprRef {
+    let mut result = arena.push(Expr::Bool(matches!(op, FoldOp::And)));
+    for item in items.iter().rev() {
+        let p = pred(arena, item);
+        result = match op {
+            FoldOp::And => {
+                let false_lit = arena.push(Expr::Bool(false));
+                arena.push(Expr::If(p, result, false_lit))
+            }
+            FoldOp::Or => {
+                let true_lit = arena.push(Expr::Bool(true));
+                arena.push(Expr::If(p, true_lit, result))
+            }
+        };
+    }
+    result
 }
 
 fn build_predicate_call(arena: &mut Arena, name: &str, value_ref: ExprRef) -> ExprRef {
@@ -346,19 +371,33 @@ fn build_has_field_call(arena: &mut Arena, value_ref: ExprRef, field_name: &str)
     arena.push(Expr::App(applied, name_lit))
 }
 
+// `let __check_tmp = e in if <cond(__check_tmp)> then __check_tmp else
+// fail("type error: expected {to}, found " ++ type_name(__check_tmp))` --
+// binding `e` once (not re-evaluating it for both the condition and the
+// passed-through result) is what makes this safe for an `e` with side
+// effects (an arbitrary expression, not necessarily a bare variable).
+// Shared skeleton behind build_token_check/build_shape_check/
+// build_shallow_check below -- each supplies its own `cond`, differing
+// only in what "looks like `to`" actually means for that kind of type.
+fn build_checked(arena: &mut Arena, e: ExprRef, to: &Type, cond: impl FnOnce(&mut Arena, ExprRef) -> ExprRef) -> ExprRef {
+    let tmp = "__check_tmp".to_string();
+    let tmp_ref = arena.push(Expr::Var(tmp.clone()));
+    let pred = cond(arena, tmp_ref);
+    let fail_call = build_fail_call(arena, to, tmp_ref);
+    let if_expr = arena.push(Expr::If(pred, tmp_ref, fail_call));
+    arena.push(Expr::Let(tmp, None, e, if_expr))
+}
+
 // A singleton: the only thing a Dyn-sourced value could ever satisfy this
 // against is the EXACT same Value::Token, so this reuses ordinary `==`
 // (BinOp::Eq, backed by machine::value_eq's own Token arm) against a
 // freshly-embedded literal of the same id, rather than a dedicated
 // predicate builtin.
 fn build_token_check(arena: &mut Arena, e: ExprRef, to: &Type, id: u64) -> ExprRef {
-    let tmp = "__check_tmp".to_string();
-    let tmp_ref = arena.push(Expr::Var(tmp.clone()));
-    let literal = arena.push(Expr::Token(id));
-    let eq = arena.push(Expr::BinOp(BinOp::Eq, tmp_ref, literal));
-    let fail_call = build_fail_call(arena, to, tmp_ref);
-    let if_expr = arena.push(Expr::If(eq, tmp_ref, fail_call));
-    arena.push(Expr::Let(tmp, None, e, if_expr))
+    build_checked(arena, e, to, |arena, v| {
+        let literal = arena.push(Expr::Token(id));
+        arena.push(Expr::BinOp(BinOp::Eq, v, literal))
+    })
 }
 
 // Shallow: confirms shape (arity for Tuple; field PRESENCE, width-
@@ -373,30 +412,15 @@ fn build_token_check(arena: &mut Arena, e: ExprRef, to: &Type, id: u64) -> ExprR
 // Type::Tuple and Type::Record with nothing Tuple/Record-specific of its
 // own.
 fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type) -> ExprRef {
-    let tmp = "__check_tmp".to_string();
-    let tmp_ref = arena.push(Expr::Var(tmp.clone()));
-    let pred = build_shape_predicate(arena, tmp_ref, to);
-    let fail_call = build_fail_call(arena, to, tmp_ref);
-    let if_expr = arena.push(Expr::If(pred, tmp_ref, fail_call));
-    arena.push(Expr::Let(tmp, None, e, if_expr))
+    build_checked(arena, e, to, |arena, v| build_shape_predicate(arena, v, to))
 }
 
-// `let __check_tmp = e in if <predicate>(__check_tmp) then __check_tmp
-// else fail("type error: expected {to}, found " ++ type_name(__check_tmp))`
-// -- binding `e` once (not re-evaluating it for both the predicate call
-// and the passed-through result) is what makes this safe for an `e` with
-// side effects (an arbitrary expression, not necessarily a bare
-// variable). `predicate` is looked up by name through the ordinary
-// prelude Env (`is_int`/`is_bool`/`is_str`/`is_list`/`is_fun`), the same
-// way `fail`/`type_name` already are -- see their own doc comments on the
+// `predicate` is looked up by name through the ordinary prelude Env
+// (`is_int`/`is_bool`/`is_str`/`is_list`/`is_fun`), the same way
+// `fail`/`type_name` already are -- see their own doc comments on the
 // (pre-existing, accepted) shadowing risk that implies.
 fn build_shallow_check(arena: &mut Arena, e: ExprRef, to: &Type, predicate: &str) -> ExprRef {
-    let tmp = "__check_tmp".to_string();
-    let tmp_ref = arena.push(Expr::Var(tmp.clone()));
-    let pred_call = build_predicate_call(arena, predicate, tmp_ref);
-    let fail_call = build_fail_call(arena, to, tmp_ref);
-    let if_expr = arena.push(Expr::If(pred_call, tmp_ref, fail_call));
-    arena.push(Expr::Let(tmp, None, e, if_expr))
+    build_checked(arena, e, to, |arena, v| build_predicate_call(arena, predicate, v))
 }
 
 // `fail("type error: expected {to}, found " ++ type_name(value_ref))` --
