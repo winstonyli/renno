@@ -255,25 +255,35 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, fields: &[Rc<D
     }
 }
 
-// `let __check_tmp = e in if <alt1-shape> || <alt2-shape> || ... then
-// __check_tmp else fail(...)` -- shallow, like every other check here:
-// confirms the value matches SOME alternative's own shape (Tuple's own
-// arity-only test, Data's own tag+length+brand test, etc, whichever
-// alternative it is), not a full recursive per-position verification.
-// Unlike the single-type check builders above, this can't just call
-// build_boundary_check per alternative and fall through on failure --
-// build_boundary_check's own fail() would abort the WHOLE check on the
-// first alternative that doesn't match, instead of trying the next one --
-// so this builds each alternative's bare boolean predicate (via
-// build_shape_predicate) and OR's them together first, deciding only
-// once, at the end, whether to pass the value through or fail.
+// `let __check_tmp = e in if <alt1-shape> then <alt1's OWN full check>
+// else if <alt2-shape> then <alt2's OWN full check> else ... else
+// fail(...)` -- tries each alternative's bare shape predicate
+// (build_shape_predicate) in turn, and only once ONE of them matches,
+// runs that SPECIFIC alternative's full build_boundary_check (not just
+// the shape test again) -- so a Fun alternative gets its real per-call
+// contract (wrap_fun_contract), a Data alternative its real brand check,
+// etc, the same rigor that type would get as a plain (non-union)
+// annotation, not just "shaped like something callable/tagged." Can't
+// simply call build_boundary_check per alternative and fall through on
+// its own failure -- its fail() would abort the whole check on the first
+// non-matching alternative instead of trying the next one -- so the
+// shape predicate decides WHICH alternative's full check to run, and
+// that full check (redundantly, but harmlessly) re-confirms the same
+// shape on its way to the real work.
 fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, fields: &[Rc<DataInfo>]) -> ExprRef {
+    let alts: Rc<Vec<Type>> = match to {
+        Type::Union(alts) => alts.clone(),
+        _ => unreachable!("build_union_check is only ever called with a Union target"),
+    };
     let tmp = "__check_tmp".to_string();
     let tmp_ref = arena.push(Expr::Var(tmp.clone()));
-    let pred = build_shape_predicate(arena, tmp_ref, to, fields);
-    let fail_call = build_fail_call(arena, to, tmp_ref);
-    let if_expr = arena.push(Expr::If(pred, tmp_ref, fail_call));
-    arena.push(Expr::Let(tmp, None, e, if_expr))
+    let mut result = build_fail_call(arena, to, tmp_ref);
+    for alt in alts.iter().rev() {
+        let pred = build_shape_predicate(arena, tmp_ref, alt, fields);
+        let checked = build_boundary_check(arena, tmp_ref, alt, fields);
+        result = arena.push(Expr::If(pred, checked, result));
+    }
+    arena.push(Expr::Let(tmp, None, e, result))
 }
 
 // The bare boolean half of build_boundary_check's per-type dispatch --

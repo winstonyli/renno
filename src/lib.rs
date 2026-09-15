@@ -1297,6 +1297,31 @@ mod tests {
     }
 
     #[test]
+    fn union_type_fun_alternative_gets_a_real_per_call_contract_not_just_is_fun() {
+        // Regression: build_union_check used to only run each
+        // alternative's bare shape predicate (is_fun for a Fun
+        // alternative), never the full build_boundary_check that
+        // installs wrap_fun_contract's real per-call argument/return
+        // checking. `y` is callable (Int -> Int) but doesn't match F's
+        // own (Int -> Bool) alternative's RETURN type -- only reachable
+        // via map's native `apply` (a statically Union-typed value can't
+        // be called directly -- App's typecheck only knows Fun/Dyn
+        // callees), which is exactly why the mismatch used to slip
+        // through silently instead of being caught at the boundary.
+        let src = r#"
+            type F = (Int -> Bool) | Str in
+            handle
+              let y = perform choose(0) in
+              let g = fun h: F -> h in
+              let wrapped = g(y) in
+              map(wrapped)([1])
+            with handler choose(p, resume) -> resume(fun a: Int -> a)
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected Bool, found Int"), "unexpected message: {err}");
+    }
+
+    #[test]
     fn same_data_type_annotation_accepted() {
         let src = "data Celsius = MkC(Int) in let f = fun x: Celsius -> x in f(MkC(100))";
         let (mut arena, spans, root) = parser::parse(src).unwrap();
