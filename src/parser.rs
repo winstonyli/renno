@@ -630,31 +630,77 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // postfix := atom (("(" expr ")") | ("." ident))*  -- curried calls
-    // f(a)(b), and field access p.x (only meaningful once typechecked --
-    // see Expr::FieldAccess's own doc comment).
+    // postfix := atom (("." ident) | atom)*  -- curried calls, either by
+    // juxtaposition (f a b) or explicit parens (f(a)(b) -- unaffected:
+    // "(" is itself an atom-starting token, so parsing the parenthesized
+    // expression as the argument atom produces the identical App chain
+    // either way), and field access p.x (only meaningful once
+    // typechecked -- see Expr::FieldAccess's own doc comment). Both cases
+    // are peers in this ONE left-to-right loop over the accumulating `e`,
+    // exactly as before juxtaposition existed: `f(a).field` still means
+    // `(f(a)).field` (dot binds to whatever the chain has built so far,
+    // not to the argument atom alone) -- and correspondingly `f x.field`
+    // means `(f x).field`, not `f(x.field)`. Different from e.g. OCaml
+    // (where `.field` binds tighter than application), but internally
+    // consistent with renno's own pre-existing rule and zero risk to
+    // every already-shipped `f(a).field` program.
+    //
+    // The juxtaposed-argument case parses just ONE atom (self.atom(), not
+    // self.expr()) for the same reason application binds tighter than
+    // every operator in ML/Haskell: `f a + b` must mean `(f a) + b`, not
+    // `f (a + b)`. Since unary `-` sits ABOVE postfix in this precedence
+    // chain (mul -> unary -> postfix), a bare `-` is never an atom-
+    // starting token here -- `f -1` therefore still parses as `f - 1`
+    // (Sub), matching Haskell/OCaml's own resolution of this exact
+    // ambiguity, but for free: nothing here special-cases it, the
+    // existing precedence already forces it. Negating an argument still
+    // needs explicit parens: `f (-1)`.
     fn postfix(&mut self) -> Result<ExprRef, String> {
         let start = self.span_at().start;
         let mut e = self.atom()?;
         loop {
             match self.peek() {
-                Some(Token::LParen) => {
-                    self.bump();
-                    let arg = self.expr()?;
-                    self.expect(&Token::RParen)?;
-                    let span = Span { start, end: self.span_before().end };
-                    e = self.push_spanned(Expr::App(e, arg), span);
-                }
                 Some(Token::Dot) => {
                     self.bump();
                     let field = self.ident()?;
                     let span = Span { start, end: self.span_before().end };
                     e = self.push_spanned(Expr::FieldAccess(e, field), span);
                 }
+                Some(tok) if Self::starts_atom(tok) => {
+                    let arg = self.atom()?;
+                    let span = Span { start, end: self.span_before().end };
+                    e = self.push_spanned(Expr::App(e, arg), span);
+                }
                 _ => break,
             }
         }
         Ok(e)
+    }
+
+    // The First(atom) set -- every token an atom (see `atom`/`atom_leaf`)
+    // can start with. Used only to decide, inside postfix's loop, whether
+    // the next token begins a new JUXTAPOSED argument rather than ending
+    // the application chain; deliberately excludes every operator token
+    // (including unary `-`/`!`, which live one precedence level up).
+    fn starts_atom(tok: &Token) -> bool {
+        matches!(
+            tok,
+            Token::Int(_)
+                | Token::True
+                | Token::False
+                | Token::Str(_)
+                | Token::Ident(_)
+                | Token::LBracket
+                | Token::LParen
+                | Token::If
+                | Token::Perform
+                | Token::Handle
+                | Token::HandlerKw
+                | Token::Match
+                | Token::Let
+                | Token::Fun
+                | Token::Data
+        )
     }
 
     // Peels off a run of leading `let ... in` / `fun ... ->` / `data ...

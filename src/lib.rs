@@ -259,6 +259,72 @@ mod tests {
         assert!(err.contains("refinement violated"), "unexpected message: {err}");
     }
 
+    // --- juxtaposition application (f a b, alongside f(a)(b)) ---
+
+    #[test]
+    fn juxtaposition_applies_like_explicit_parens() {
+        assert_eq!(run_untyped("let add = fun a -> fun b -> a + b in add 1 2").as_int(), 3);
+    }
+
+    #[test]
+    fn juxtaposition_and_explicit_parens_mix_freely() {
+        let src = "let add = fun a -> fun b -> a + b in add(1) 2";
+        assert_eq!(run_untyped(src).as_int(), 3);
+        let src2 = "let add = fun a -> fun b -> a + b in add 1 (2)";
+        assert_eq!(run_untyped(src2).as_int(), 3);
+    }
+
+    #[test]
+    fn juxtaposed_argument_can_be_parenthesized() {
+        assert_eq!(run_untyped("let f = fun x -> x + 1 in f (2 + 3)").as_int(), 6);
+    }
+
+    #[test]
+    fn juxtaposition_is_left_associative() {
+        // `f a b` == `(f a) b`, not `f (a b)` -- confirmed by a function
+        // that only type-checks under the LEFT grouping (b is discarded,
+        // a's own value is what's returned, doubled).
+        let src = "let f = fun a -> fun b -> a + a in f 5 999";
+        assert_eq!(run_untyped(src).as_int(), 10);
+    }
+
+    #[test]
+    fn unary_minus_still_binds_looser_than_application() {
+        // `-` sits above postfix in the precedence chain (mul -> unary ->
+        // postfix), so it's never an atom-starting token inside postfix's
+        // juxtaposition loop -- `f -1` still parses as `f - 1` (binary
+        // Sub), the same resolution Haskell/OCaml use for this exact
+        // ambiguity. Confirmed by a real subtraction (5 - 1 = 4): if `-1`
+        // had instead been swallowed as a juxtaposed, negated argument,
+        // this would be a type error (an Int applied to nothing) or a
+        // different result entirely, not 4.
+        assert_eq!(run_untyped("5 - 1").as_int(), 4);
+    }
+
+    #[test]
+    fn negating_a_juxtaposed_argument_needs_explicit_parens() {
+        assert_eq!(run_untyped("let f = fun x -> x in f (0 - 1)").as_int(), -1);
+    }
+
+    #[test]
+    fn dot_still_binds_to_the_whole_application_chain() {
+        // Consistent with pre-juxtaposition behavior: `.field` is a peer
+        // of application in the SAME left-to-right postfix loop, so it
+        // binds to whatever the chain has accumulated so far, not to a
+        // sub-atom -- `Ctor 5 .field` (juxtaposed construction) reads the
+        // same as the always-supported `Ctor(5).field`.
+        let src = "data P = P(x: Int) in let p = P 5 in p.x";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 5);
+    }
+
+    #[test]
+    fn juxtaposition_works_with_curried_builtins() {
+        let src = "fold (fun acc -> fun x -> acc + x) 0 (map (fun x -> x + x) [1, 2, 3])";
+        assert_eq!(run_untyped(src).as_int(), 12);
+    }
+
     // --- String/List primitives ---
 
     #[test]
@@ -1211,8 +1277,12 @@ mod tests {
     #[test]
     fn parse_error_reports_line_and_column() {
         // "in" missing after the let's value -- error should point at the
-        // token actually found in its place (line 2, where "y" starts).
-        let src = "let x = 1 in\nlet y = 2\ny";
+        // token actually found in its place. A stray ")" (not a plain
+        // identifier) here specifically because juxtaposition application
+        // now means an identifier right after "2" would just extend the
+        // VALUE expression (`2 y` == `App(2, y)`, a syntactically valid,
+        // if nonsensical, application) rather than leave "in" missing.
+        let src = "let x = 1 in\nlet y = 2\n)";
         let err = run_source(src).unwrap_err();
         assert!(err.starts_with("line 3, column 1:"), "unexpected message: {err}");
     }

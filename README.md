@@ -63,10 +63,11 @@ true && false || true    -- true (&& binds tighter than ||), both short-circuiti
 
 ### Functions, currying, `let`, `let rec`
 
-Functions are curried closures; `fun a -> fun b -> ...` and calling `f(a)(b)` are the normal shape:
+Functions are curried closures; `fun a -> fun b -> ...` and calling `f(a)(b)` are the normal shape. Application also works by juxtaposition, `f a b` — the two mix freely, and negating a juxtaposed argument needs its own parens (`f (-1)`, not `f -1`, the same resolution Haskell/OCaml use: unary `-` binds looser than application, so `f -1` parses as `f - 1`):
 
 ```
 let add = fun a -> fun b -> a + b in add(1)(2)   -- 3
+let add = fun a -> fun b -> a + b in add 1 2     -- 3, identical
 ```
 
 `let rec` makes a binding visible inside its own value, for recursion that an ordinary `let` can't express:
