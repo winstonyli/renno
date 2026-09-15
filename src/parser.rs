@@ -359,10 +359,6 @@ impl<'a> Parser<'a> {
     // freely be a function type without extra parens: `[Int -> Int]`.
     fn parse_type(&mut self) -> Result<Type, String> {
         match self.bump() {
-            Some(Token::TyInt) => Ok(Type::Int),
-            Some(Token::TyBool) => Ok(Type::Bool),
-            Some(Token::TyStr) => Ok(Type::Str),
-            Some(Token::TyDyn) => Ok(Type::Dyn),
             Some(Token::LBracket) => {
                 let elem = self.parse_fun_type()?;
                 self.expect(&Token::RBracket)?;
@@ -399,20 +395,43 @@ impl<'a> Parser<'a> {
                 let fields = self.parse_record_fields(Self::parse_union_type, None)?;
                 Ok(Type::Record(Rc::new(fields)))
             }
-            // A capitalized name: a reference to a `type Name = ... in`
-            // alias (Parser::type_aliases) currently in scope -- fully
-            // resolved right here, not deferred. Unlike `data`'s own
-            // former bare-Data(name) fallback, an unknown name is a
-            // static error immediately: there's no "maybe it resolves
-            // later" story left once every type must be a builtin, a
-            // Token/Tuple/Union, or a named alias.
+            // A capitalized name: either one of the four builtin type
+            // names (Int/Bool/Str/Dyn -- plain Idents, not reserved
+            // keywords, so they stay available as ordinary variable names
+            // everywhere outside a type position) or a reference to a
+            // `type Name = ... in` alias (Parser::type_aliases) currently
+            // in scope -- fully resolved right here, not deferred. Unlike
+            // `data`'s own former bare-Data(name) fallback, an unknown
+            // name is a static error immediately: there's no "maybe it
+            // resolves later" story left once every type must be a
+            // builtin, a Token/Tuple/Union, or a named alias.
             Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => {
-                match self.type_aliases.get(&name) {
-                    Some(ty) => Ok(ty.clone()),
-                    None => Err(self.err_at(self.span_before(), format!("unknown type: {name}"))),
+                match Self::builtin_type(&name) {
+                    Some(ty) => Ok(ty),
+                    None => match self.type_aliases.get(&name) {
+                        Some(ty) => Ok(ty.clone()),
+                        None => Err(self.err_at(self.span_before(), format!("unknown type: {name}"))),
+                    },
                 }
             }
             other => Err(self.err_at(self.span_before(), format!("expected a type, found {other:?}"))),
+        }
+    }
+
+    // The four builtin type names. Not reserved lexer keywords (unlike
+    // If/Let/Fun/...) since they're only ever meaningful inside a type
+    // position -- resolved contextually right here instead, which is what
+    // keeps them available as ordinary identifiers (`let Int = 5 in ...`)
+    // everywhere else. Shared between parse_type's own lookup and the
+    // `type Name = ...` alias binder's collision guard just below, so the
+    // two can't drift out of sync.
+    fn builtin_type(name: &str) -> Option<Type> {
+        match name {
+            "Int" => Some(Type::Int),
+            "Bool" => Some(Type::Bool),
+            "Str" => Some(Type::Str),
+            "Dyn" => Some(Type::Dyn),
+            _ => None,
         }
     }
 
@@ -846,6 +865,22 @@ impl<'a> Parser<'a> {
                     self.bump();
                     saw_type_alias = true;
                     let name = self.ident()?;
+                    if Self::builtin_type(&name).is_some() {
+                        // Int/Bool/Str/Dyn resolve contextually in
+                        // parse_type rather than being reserved lexer
+                        // keywords (see builtin_type's own doc comment) --
+                        // that frees them as plain variable names, but an
+                        // alias silently shadowing one would mean a later
+                        // `Int` in type position resolves to the OLD
+                        // builtin no matter what this alias says (parse_
+                        // type checks builtin_type before type_aliases),
+                        // silently discarding the alias. Reject it here
+                        // instead of leaving that footgun undiagnosed.
+                        return Err(self.err_at(
+                            self.span_before(),
+                            format!("cannot redefine builtin type {name} as an alias"),
+                        ));
+                    }
                     self.expect(&Token::Equals)?;
                     let ty = self.parse_union_type()?;
                     self.expect(&Token::In)?;

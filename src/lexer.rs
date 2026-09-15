@@ -50,14 +50,6 @@ pub enum Token {
     HandlerKw,
     #[token("match")]
     Match,
-    #[token("Int")]
-    TyInt,
-    #[token("Bool")]
-    TyBool,
-    #[token("Str")]
-    TyStr,
-    #[token("Dyn")]
-    TyDyn,
 
     #[token("(")]
     LParen,
