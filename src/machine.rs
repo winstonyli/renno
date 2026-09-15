@@ -151,17 +151,6 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     cont = Cont::cons(Frame::If { then_: *t, else_: *e, env: env.clone() }, cont);
                     control = Control::Eval(*c, env);
                 }
-                Expr::Check(ty, inner) => {
-                    cont = Cont::cons(Frame::CheckFrame { ty: ty.clone() }, cont);
-                    control = Control::Eval(*inner, env);
-                }
-                Expr::CheckData(ty, shape, brand, inner) => {
-                    cont = Cont::cons(
-                        Frame::CheckDataFrame { ty: ty.clone(), shape: shape.clone(), brand: *brand },
-                        cont,
-                    );
-                    control = Control::Eval(*inner, env);
-                }
                 Expr::Perform(effect, payload) => {
                     cont = Cont::cons(Frame::PerformPayload { effect: effect.clone() }, cont);
                     control = Control::Eval(*payload, env);
@@ -383,43 +372,6 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                             cont = rest;
                             control = Control::Eval(if value.as_bool() { then_ } else { else_ }, env);
                         }
-                        Frame::CheckFrame { ty } => {
-                            let ty = ty.clone();
-                            cont = rest;
-                            if value.matches_type(&ty) {
-                                control = Control::Apply(value);
-                            } else {
-                                panic!("type error: expected {ty}, found {}", value.type_name());
-                            }
-                        }
-                        Frame::CheckDataFrame { ty, shape, brand } => {
-                            let (ty, shape, brand) = (ty.clone(), shape.clone(), *brand);
-                            cont = rest;
-                            let matches = match &value {
-                                Value::List(items) => match items.first() {
-                                    Some(Value::Str(tag)) => {
-                                        shape.iter().any(|(name, len)| name.as_str() == &**tag && *len == items.len())
-                                            // Tag/length alone can't tell apart two
-                                            // same-shaped opaque types (Meters's
-                                            // Mk vs Seconds's Mk) -- when this
-                                            // declaration IS opaque, also require
-                                            // the value's own trailing brand tag
-                                            // (see build_ctor_value) to match.
-                                            && match brand {
-                                                Some(b) => matches!(items.last(), Some(Value::Token(n)) if *n == b),
-                                                None => true,
-                                            }
-                                    }
-                                    _ => false,
-                                },
-                                _ => false,
-                            };
-                            if matches {
-                                control = Control::Apply(value);
-                            } else {
-                                panic!("type error: expected {ty}, found {}", value.type_name());
-                            }
-                        }
                         // Vec clones here are O(remaining/done length) per
                         // element -- fine for typical list-literal sizes;
                         // a large literal would make this O(n^2) overall.
@@ -628,6 +580,52 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 }
                 _ => panic!("get expects a list and an int"),
             }
+        }
+        Builtin::IsInt => Value::Bool(matches!(args.pop(), Some(Value::Int(_)))),
+        Builtin::IsBool => Value::Bool(matches!(args.pop(), Some(Value::Bool(_)))),
+        Builtin::IsStr => Value::Bool(matches!(args.pop(), Some(Value::Str(_)))),
+        Builtin::IsList => Value::Bool(matches!(args.pop(), Some(Value::List(_)))),
+        // Same shallow "is it callable at all" story Value::matches_type's
+        // own Fun arm used to answer -- confirms a representation, not a
+        // specific signature (typecheck::coerce's higher-order contract,
+        // wrap_fun_contract, re-checks each call's actual argument/result
+        // types separately).
+        Builtin::IsFun => Value::Bool(matches!(
+            args.pop(),
+            Some(Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..))
+        )),
+        Builtin::TypeName => match args.pop() {
+            Some(v) => Value::Str(Rc::from(v.type_name())),
+            None => panic!("type_name expects one argument"),
+        },
+        // See Builtin::CheckDataShape's own doc comment for the argument
+        // shapes. `brand` is `Value::Bool(false)` (never a real Bool
+        // otherwise -- coerce only ever builds this literal or a
+        // Value::Token here) for an unbranded target, so it's never
+        // mistaken for an actual failed brand check.
+        Builtin::CheckDataShape => {
+            let (brand, witness, value) = (args.pop(), args.pop(), args.pop());
+            let ok = match (value, witness) {
+                (Some(Value::List(items)), Some(Value::List(pairs))) => match items.first() {
+                    Some(Value::Str(tag)) => {
+                        let shape_ok = pairs.iter().any(|pair| match pair {
+                            Value::List(kv) if kv.len() == 2 => {
+                                matches!(&kv[0], Value::Str(name) if name.as_ref() == tag.as_ref())
+                                    && matches!(&kv[1], Value::Int(len) if *len as usize == items.len())
+                            }
+                            _ => false,
+                        });
+                        shape_ok
+                            && match brand {
+                                Some(Value::Token(b)) => matches!(items.last(), Some(Value::Token(n)) if *n == b),
+                                _ => true,
+                            }
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            Value::Bool(ok)
         }
         Builtin::Map => {
             let (list, f) = (args.pop(), args.pop());

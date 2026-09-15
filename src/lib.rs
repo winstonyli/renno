@@ -82,19 +82,25 @@ mod tests {
         machine::run(&arena, root, Env::prelude(), &spans)
     }
 
-    // Walks the elaborated tree looking for a Check node. Needed because
-    // arena-indexed Expr's derived Debug only prints the immediate node
-    // (children are plain ExprRef indices now, not Rc<Expr>, so Debug no
-    // longer recurses through them the way it used to).
+    // Walks the elaborated tree looking for a runtime boundary check.
+    // typecheck::coerce no longer builds a dedicated Check/CheckData AST
+    // node (see build_boundary_check's own doc comment) -- it desugars
+    // into `let __check_tmp = ... in if ... then ... else fail(...)`, so
+    // detecting one now means detecting THAT Let's own fixed binder name
+    // instead of a distinct node kind. Needed because arena-indexed
+    // Expr's derived Debug only prints the immediate node (children are
+    // plain ExprRef indices now, not Rc<Expr>, so Debug no longer
+    // recurses through them the way it used to).
     fn contains_check(arena: &expr::Arena, root: expr::ExprRef) -> bool {
         use expr::Expr;
         match &arena[root] {
-            Expr::Check(..) | Expr::CheckData(..) => true,
             Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
             Expr::ListLit(items) => items.iter().any(|i| contains_check(arena, *i)),
             Expr::Lambda(_, _, body) => contains_check(arena, *body),
             Expr::App(f, a) => contains_check(arena, *f) || contains_check(arena, *a),
-            Expr::Let(_, _, val, body) => contains_check(arena, *val) || contains_check(arena, *body),
+            Expr::Let(var, _, val, body) => {
+                var == "__check_tmp" || contains_check(arena, *val) || contains_check(arena, *body)
+            }
             Expr::LetRec(bindings, body) => {
                 bindings.iter().any(|(_, _, val)| contains_check(arena, *val)) || contains_check(arena, *body)
             }
@@ -1221,10 +1227,9 @@ mod tests {
 
     #[test]
     fn dyn_sourced_value_flowing_into_a_data_annotation_gets_a_runtime_check() {
-        // Runtime check is necessarily shallow (see value::matches_type's
-        // Data arm): confirms "some tagged value", not "specifically this
-        // data type" -- a bare Int still fails it, which is the case that
-        // matters most (catching an obviously wrong value at the boundary).
+        // check_data_shape (typecheck::build_boundary_check's Data arm)
+        // rejects a bare Int outright -- it's not even a List, let alone
+        // one with a matching tag and length.
         let src = r#"
             data Option = None | Some(Int) in
             let f = fun x: Option -> x in

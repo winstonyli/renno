@@ -155,27 +155,22 @@ fn any_fun() -> Type {
     Type::Fun(Rc::new(Type::Dyn), EffectRow::Dyn, Rc::new(Type::Dyn))
 }
 
-// The only place a runtime Check gets inserted: `from` is Dyn (unknown
-// statically) and `to` is concrete. If both sides are concrete and
-// disagree, that's a real static error -- reject before running at all.
-// If `from` is already exactly consistent and concrete, no check needed:
-// zero overhead for fully-annotated code. The error, if any, points at
-// `span` -- the CALLER's job to have already looked up via the ORIGINAL
-// (pre-elaboration) ExprRef for the value in question, e.g. `spans[val]`
-// where `val` is a field straight off the un-elaborated node, NOT the
-// elaborated `e` this function receives to potentially wrap: elaborate_node
-// re-pushes almost every compound node it touches (App, BinOp, If, ...)
-// regardless of whether anything actually changed, so `e` itself is often
-// already a brand new ExprRef past the end of the parser-built SpanMap by
-// the time it reaches here -- indexing spans BY IT, not by the original,
-// was a latent bug (worked by coincidence whenever the mismatched value
-// happened to be a leaf that elaborate_node returns unchanged).
-//
-// Crossing into a Fun type is special: value::matches_type only confirms
-// "this is callable," not "callable with this exact signature" (a tag
-// check can't see inside a closure). So a Dyn value flowing into an
-// annotated Fun position gets wrapped in a real per-call contract instead
-// of a bare tag Check -- see wrap_fun_contract.
+// The only place a runtime boundary check gets built: `from` is Dyn
+// (unknown statically) and `to` is concrete. If both sides are concrete
+// and disagree, that's a real static error -- reject before running at
+// all. If `from` is already exactly consistent and concrete, no check
+// needed: zero overhead for fully-annotated code. The error, if any,
+// points at `span` -- the CALLER's job to have already looked up via the
+// ORIGINAL (pre-elaboration) ExprRef for the value in question, e.g.
+// `spans[val]` where `val` is a field straight off the un-elaborated
+// node, NOT the elaborated `e` this function receives to potentially
+// wrap: elaborate_node re-pushes almost every compound node it touches
+// (App, BinOp, If, ...) regardless of whether anything actually changed,
+// so `e` itself is often already a brand new ExprRef past the end of the
+// parser-built SpanMap by the time it reaches here -- indexing spans BY
+// IT, not by the original, was a latent bug (worked by coincidence
+// whenever the mismatched value happened to be a leaf that elaborate_node
+// returns unchanged).
 fn coerce(
     arena: &mut Arena,
     e: ExprRef,
@@ -201,17 +196,39 @@ fn coerce(
     if *from != Type::Dyn || *to == Type::Dyn {
         return Ok(e);
     }
+    Ok(build_boundary_check(arena, e, to, fields))
+}
+
+// Builds the actual runtime check for a definitely-Dyn-origin value
+// against concrete target type `to` -- shared between coerce's own
+// Dyn-to-concrete crossings and wrap_fun_contract's return-type check (a
+// higher-order contract's return value is ALSO always Dyn-origin, calling
+// an unknown wrapped function). Infallible: by the time this runs, `to`
+// is just "what runtime check to build," no static consistency question
+// left open (that's coerce's own job, checked before this is ever
+// called).
+//
+// Desugars into ordinary language machinery -- `if <predicate> then value
+// else fail(msg)` -- instead of a dedicated Check/CheckData AST node:
+// Int/Bool/Str/List get a single builtin predicate call (is_int, etc.);
+// Fun gets a real per-call contract (wrap_fun_contract, since a bare
+// callability tag can't see inside a closure -- "callable" isn't
+// "callable with this exact signature"); Data gets check_data_shape with
+// a witness built from the declaration's own ctor_types (Value::
+// matches_type's old Data case could only confirm "some non-empty tagged
+// List," not "specifically shaped like THIS declaration" -- see
+// types::Type::Data's doc comment on that gap). Every predicate call
+// (including Fun's nested contract) still panics with the exact same
+// "type error: expected X, found Y" text the old Check/CheckData Frames
+// produced, built at RUNTIME via the type_name builtin since the actual
+// mismatched value's type isn't known until then.
+fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, fields: &[Rc<DataInfo>]) -> ExprRef {
     match to {
-        Type::Fun(param_ty, _row, ret_ty) => Ok(wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone())),
-        // A Data target gets a shape-aware CheckData instead of a plain
-        // Check -- Value::matches_type's own Data case can only confirm
-        // "some non-empty tagged List," not "specifically shaped like
-        // THIS declaration" (see types::Type::Data's doc comment on that
-        // gap). `lookup_data` resolves the exact declaration this Type
-        // refers to (matching brand when opaque, else the lexically-
-        // current same-named one), and its ctor_types become the witness
-        // CheckData actually checks against at runtime -- built once
-        // here, not re-looked-up on every check.
+        Type::Int => build_shallow_check(arena, e, to, "is_int"),
+        Type::Bool => build_shallow_check(arena, e, to, "is_bool"),
+        Type::Str => build_shallow_check(arena, e, to, "is_str"),
+        Type::List(_) => build_shallow_check(arena, e, to, "is_list"),
+        Type::Fun(param_ty, _row, ret_ty) => wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone(), fields),
         Type::Data(name, brand) => match lookup_data(fields, name, *brand) {
             Some(info) => {
                 let shape: Vec<(String, usize)> = info
@@ -219,38 +236,109 @@ fn coerce(
                     .iter()
                     .map(|(cname, ctys)| (cname.clone(), 1 + ctys.len() + usize::from(info.brand.is_some())))
                     .collect();
-                Ok(arena.push(Expr::CheckData(to.clone(), Rc::new(shape), info.brand, e)))
+                build_data_check(arena, e, to, &shape, info.brand)
             }
             // Shouldn't normally happen once `fields` is the real registry
             // elaborate builds (every Type::Data comes from an actual
             // declaration) -- conservatively falls back to the old
-            // shallow check rather than panicking, same "can't prove it,
-            // don't crash" spirit as everywhere else in this checker.
-            None => Ok(arena.push(Expr::Check(to.clone(), e))),
+            // shallow "is this even a list" check rather than panicking,
+            // same "can't prove it, don't crash" spirit as everywhere
+            // else in this checker.
+            None => build_shallow_check(arena, e, to, "is_list"),
         },
-        _ => Ok(arena.push(Expr::Check(to.clone(), e))),
+        Type::Dyn => unreachable!("coerce only calls this once *to != Type::Dyn is already established"),
     }
+}
+
+// `let __check_tmp = e in if <predicate>(__check_tmp) then __check_tmp
+// else fail("type error: expected {to}, found " ++ type_name(__check_tmp))`
+// -- binding `e` once (not re-evaluating it for both the predicate call
+// and the passed-through result) is what makes this safe for an `e` with
+// side effects (an arbitrary expression, not necessarily a bare
+// variable). `predicate` is looked up by name through the ordinary
+// prelude Env (`is_int`/`is_bool`/`is_str`/`is_list`/`is_fun`), the same
+// way `fail`/`type_name` already are -- see their own doc comments on the
+// (pre-existing, accepted) shadowing risk that implies.
+fn build_shallow_check(arena: &mut Arena, e: ExprRef, to: &Type, predicate: &str) -> ExprRef {
+    let tmp = "__check_tmp".to_string();
+    let tmp_ref = arena.push(Expr::Var(tmp.clone()));
+    let pred_var = arena.push(Expr::Var(predicate.to_string()));
+    let pred_call = arena.push(Expr::App(pred_var, tmp_ref));
+    let fail_call = build_fail_call(arena, to, tmp_ref);
+    let if_expr = arena.push(Expr::If(pred_call, tmp_ref, fail_call));
+    arena.push(Expr::Let(tmp, None, e, if_expr))
+}
+
+// Same overall shape as build_shallow_check, but the predicate is
+// check_data_shape(value, witness, brand) instead of a single-argument
+// is_X -- `witness` (a literal `[[tag, len], ...]`) and `brand` (a
+// Value::Token literal, or `false` when unbranded) are built fresh here
+// from `shape`/`brand` and re-evaluated on every check (cheap: a handful
+// of small literals, only at a Dyn-to-Data boundary crossing, not on any
+// hot arithmetic path) rather than cached across calls.
+fn build_data_check(arena: &mut Arena, e: ExprRef, to: &Type, shape: &[(String, usize)], brand: Option<u64>) -> ExprRef {
+    let tmp = "__check_tmp".to_string();
+    let tmp_ref = arena.push(Expr::Var(tmp.clone()));
+
+    let pairs: Vec<ExprRef> = shape
+        .iter()
+        .map(|(name, len)| {
+            let tag = arena.push(Expr::Str(name.clone()));
+            let len_expr = arena.push(Expr::Int(*len as i64));
+            arena.push(Expr::ListLit(vec![tag, len_expr]))
+        })
+        .collect();
+    let witness = arena.push(Expr::ListLit(pairs));
+    let brand_expr = match brand {
+        Some(id) => arena.push(Expr::Token(id)),
+        None => arena.push(Expr::Bool(false)),
+    };
+
+    let pred_var = arena.push(Expr::Var("check_data_shape".to_string()));
+    let call1 = arena.push(Expr::App(pred_var, tmp_ref));
+    let call2 = arena.push(Expr::App(call1, witness));
+    let pred_call = arena.push(Expr::App(call2, brand_expr));
+
+    let fail_call = build_fail_call(arena, to, tmp_ref);
+    let if_expr = arena.push(Expr::If(pred_call, tmp_ref, fail_call));
+    arena.push(Expr::Let(tmp, None, e, if_expr))
+}
+
+// `fail("type error: expected {to}, found " ++ type_name(value_ref))` --
+// shared by both check builders above, so the message format (and the
+// exact wording every existing test asserts on) lives in exactly one
+// place.
+fn build_fail_call(arena: &mut Arena, to: &Type, value_ref: ExprRef) -> ExprRef {
+    let prefix = arena.push(Expr::Str(format!("type error: expected {to}, found ")));
+    let type_name_var = arena.push(Expr::Var("type_name".to_string()));
+    let type_name_call = arena.push(Expr::App(type_name_var, value_ref));
+    let msg = arena.push(Expr::BinOp(BinOp::Concat, prefix, type_name_call));
+    let fail_var = arena.push(Expr::Var("fail".to_string()));
+    arena.push(Expr::App(fail_var, msg))
 }
 
 // Wraps a Dyn-origin value in a fresh closure that, on every call: checks
 // the argument matches param_ty (via the wrapper's own declared param type
 // -- ordinary App-site coercion at the wrapper's call sites handles that),
 // confirms the wrapped value is actually callable, applies it, then checks
-// the result against ret_ty. This is a real higher-order contract (each
-// call re-validated), not a one-time tag check -- a value that merely
-// looks like a function can't smuggle a wrong return type through it.
-// Built entirely from existing Expr nodes (Let/Lambda/Check/App/Var), no
-// new Value representation needed. No span bookkeeping here: these nodes
-// are synthesized, not sourced from the program text, and typecheck never
-// looks up a span for them (see TypeError's doc comment).
-fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: Rc<Type>) -> ExprRef {
+// the result against ret_ty (via build_boundary_check, recursively -- a
+// higher-order function returning another Data/Fun value gets that same
+// value's own proper check, not just a shallow tag test). This is a real
+// higher-order contract (each call re-validated), not a one-time tag
+// check -- a value that merely looks like a function can't smuggle a
+// wrong return type through it. Built entirely from existing Expr nodes
+// (Let/Lambda/If/App/Var/BinOp), no new Value representation needed. No
+// span bookkeeping here: these nodes are synthesized, not sourced from
+// the program text, and typecheck never looks up a span for them (see
+// TypeError's doc comment).
+fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: Rc<Type>, fields: &[Rc<DataInfo>]) -> ExprRef {
     let fn_var = "__contract_fn".to_string();
     let arg_var = "__contract_arg".to_string();
     let fn_var_ref = arena.push(Expr::Var(fn_var.clone()));
     let arg_var_ref = arena.push(Expr::Var(arg_var.clone()));
-    let checked_fn = arena.push(Expr::Check(any_fun(), fn_var_ref));
+    let checked_fn = build_shallow_check(arena, fn_var_ref, &any_fun(), "is_fun");
     let call = arena.push(Expr::App(checked_fn, arg_var_ref));
-    let checked_call = arena.push(Expr::Check((*ret_ty).clone(), call));
+    let checked_call = build_boundary_check(arena, call, &ret_ty, fields);
     let lambda = arena.push(Expr::Lambda(arg_var, Some((*param_ty).clone()), checked_call));
     arena.push(Expr::Let(fn_var, None, e, lambda))
 }
@@ -681,8 +769,10 @@ fn elaborate_node(
         Expr::Bool(_) => Ok((Type::Bool, EffectRow::pure(), expr)),
         Expr::Str(_) => Ok((Type::Str, EffectRow::pure(), expr)),
         // Never written by a user (see Expr::Token's own doc comment) --
-        // Dyn since there's no surface Type it could ever mean; matches_type
-        // rejects it against every Type regardless.
+        // Dyn since there's no surface Type it could ever mean; none of
+        // is_int/is_bool/is_str/is_list/is_fun ever recognizes a
+        // Value::Token as their own kind, so it fails every boundary
+        // check regardless (build_boundary_check).
         Expr::Token(_) => Ok((Type::Dyn, EffectRow::pure(), expr)),
         Expr::Var(name) => Ok((lookup(ctx, &name), EffectRow::pure(), expr)),
 
@@ -731,11 +821,12 @@ fn elaborate_node(
                 }
                 Type::Dyn => {
                     // Unknown callee: still route "is this even callable"
-                    // through the same Check mechanism everything else
-                    // uses, rather than leaving it to a differently-worded
-                    // panic in machine.rs. Can't know what it might
-                    // perform, so the call contributes an unknown (Dyn) row.
-                    let f3 = arena.push(Expr::Check(any_fun(), f2));
+                    // through the same is_fun/fail desugaring
+                    // build_shallow_check uses everywhere else, rather
+                    // than leaving it to a differently-worded panic in
+                    // machine.rs. Can't know what it might perform, so the
+                    // call contributes an unknown (Dyn) row.
+                    let f3 = build_shallow_check(arena, f2, &any_fun(), "is_fun");
                     (EffectRow::Dyn, Type::Dyn, arena.push(Expr::App(f3, a2)))
                 }
                 other => return Err(TypeError(format!("cannot call a value of type {other}"), spans[f])),
@@ -821,13 +912,12 @@ fn elaborate_node(
                 }
                 // `h :: t`: `t` must be List-shaped (or Dyn -- checked no
                 // more precisely than that, same shallow "is this a list
-                // at all" story matches_type already tells everywhere
-                // else, e.g. ADT/FieldAccess's own List(Dyn) checks; a
-                // wrong-shaped Dyn value still fails at apply_binop, just
-                // without a location any more precise than
-                // machine::current_span already gives every other
-                // runtime panic). Result type widens to List(Dyn) unless
-                // `h`'s type and `t`'s element type actually agree.
+                // at all" story build_boundary_check's own is_list arm
+                // tells everywhere else; a wrong-shaped Dyn value still
+                // fails at apply_binop, just without a location any more
+                // precise than machine::current_span already gives every
+                // other runtime panic). Result type widens to List(Dyn)
+                // unless `h`'s type and `t`'s element type actually agree.
                 BinOp::Cons => {
                     let list_of_dyn = Type::List(Rc::new(Type::Dyn));
                     if !consistent(&r_ty, &list_of_dyn, fields) {
@@ -857,20 +947,6 @@ fn elaborate_node(
             // so the possible effects are the union of both.
             let row = EffectRow::union(&c_row, &EffectRow::union(&t_row, &e_row));
             Ok((result_ty, row, arena.push(Expr::If(c3, t2, e2))))
-        }
-
-        Expr::Check(ty, inner) => {
-            let (_, row, inner2) = elaborate(arena, inner, ctx, fields, spans)?;
-            let ty_ret = ty.clone();
-            Ok((ty_ret, row, arena.push(Expr::Check(ty, inner2))))
-        }
-
-        // Same passthrough shape as Check, for the same reason (a
-        // synthesized node re-entering elaborate).
-        Expr::CheckData(ty, shape, brand, inner) => {
-            let (_, row, inner2) = elaborate(arena, inner, ctx, fields, spans)?;
-            let ty_ret = ty.clone();
-            Ok((ty_ret, row, arena.push(Expr::CheckData(ty, shape, brand, inner2))))
         }
 
         // The effect this specific operation performs, plus whatever the

@@ -4,7 +4,6 @@ use std::rc::Rc;
 use crate::cont::Cont;
 use crate::env::Env;
 use crate::expr::ExprRef;
-use crate::types::Type;
 
 // A handler as data: which effect it handles, the clause body plus its two
 // binder names, the env it closes over, and whether it reinstalls itself
@@ -54,14 +53,48 @@ pub enum Builtin {
     // "a Dyn-sourced shape mismatch panics at the point of use" as this
     // interpreter's one error-handling story.
     Get,
+    // Dyn -> Bool, one per primitive tag. typecheck::coerce desugars a
+    // Dyn-to-primitive boundary Check into `if is_X(e) then e else
+    // fail(...)` using these, instead of a dedicated Check AST node/Frame
+    // -- see coerce's own doc comment. IsFun covers every callable
+    // representation (Closure/RecClosure/Continuation/Builtin/
+    // PartialBuiltin), the same shallow "is it callable at all" question
+    // Value::matches_type's own Fun arm used to answer.
+    IsInt,
+    IsBool,
+    IsStr,
+    IsList,
+    IsFun,
+    // Dyn -> Str: the same string Value::type_name() computes, exposed so
+    // a desugared boundary-check failure can build its own "found {type}"
+    // message at runtime (the actual runtime value's type isn't known
+    // until then).
+    TypeName,
+    // (Dyn, [[Str, Int]], Dyn) -> Bool -- the runtime half of
+    // typecheck::coerce's Data-target desugaring (see its own doc
+    // comment): does the first arg's tag+length match one of the witness
+    // list's (ctor name, expected total List length) pairs, and (when the
+    // third arg is a Token, not `false`) does its own trailing element
+    // carry that exact brand. Replaces the old dedicated CheckData AST
+    // node/Frame with an ordinary builtin call.
+    CheckDataShape,
 }
 
 impl Builtin {
     pub fn arity(self) -> usize {
         match self {
-            Builtin::Deep | Builtin::Shallow | Builtin::Len | Builtin::Fail => 1,
+            Builtin::Deep
+            | Builtin::Shallow
+            | Builtin::Len
+            | Builtin::Fail
+            | Builtin::IsInt
+            | Builtin::IsBool
+            | Builtin::IsStr
+            | Builtin::IsList
+            | Builtin::IsFun
+            | Builtin::TypeName => 1,
             Builtin::Map | Builtin::Get => 2,
-            Builtin::Fold => 3,
+            Builtin::Fold | Builtin::CheckDataShape => 3,
         }
     }
 }
@@ -76,8 +109,9 @@ pub enum Value {
     // so it can never be confused with (or forged as) a real Int field:
     // Pattern::Int can never match it, and Pattern::Token can never match
     // an ordinary Value::Int. Never produced by any surface syntax, never
-    // a legal type annotation target (matches_type always rejects it);
-    // purely an implementation-internal runtime tag.
+    // a legal type annotation target (none of is_int/is_bool/is_str/
+    // is_list/is_fun ever recognizes one -- see typecheck::
+    // build_boundary_check); purely an implementation-internal runtime tag.
     Token(u64),
     // Rc<Vec<Value>>, not a persistent cons-list: most list use in a
     // scripting language is indexing/iteration, which arrays serve better
@@ -128,46 +162,6 @@ impl Value {
         match self {
             Value::Str(s) => s,
             _ => panic!("expected string"),
-        }
-    }
-
-    // Runtime side of gradual typing: does this value's tag match the
-    // static Type it's being checked against? Fun matches any callable
-    // representation (Closure/Continuation/Builtin) -- Handler isn't
-    // callable via App, so it doesn't match Fun. This is deliberately a
-    // shallow "is it callable at all" check, not "does it have this exact
-    // signature" -- typecheck::coerce wraps Dyn-to-Fun crossings in a real
-    // per-call contract (checking each argument/result) instead of relying
-    // on this alone; this stays the innermost callability primitive that
-    // contract bottoms out on, the same role Int/Bool tag-checks play.
-    pub fn matches_type(&self, t: &Type) -> bool {
-        match (self, t) {
-            (_, Type::Dyn) => true,
-            (Value::Int(_), Type::Int) => true,
-            (Value::Bool(_), Type::Bool) => true,
-            (Value::Str(_), Type::Str) => true,
-            // Shallow, like Fun -- confirms "this is a list," not that its
-            // elements match the declared element type.
-            (Value::List(_), Type::List(_)) => true,
-            // Same shallowness as List above, for the DEFENSIVE fallback
-            // path only -- typecheck::coerce normally builds an
-            // Expr::CheckData instead of an ordinary Check for a Data
-            // target (see its own doc comment), which actually verifies
-            // the constructor tag, field count, and (when opaque) brand.
-            // This arm only fires if that lookup somehow failed to find
-            // the declaration, so it stays the same shallow "some
-            // tagged/ADT-shaped value" check CheckData was built to
-            // replace.
-            (Value::List(items), Type::Data(_, _)) => !items.is_empty(),
-            (Value::Closure(..), Type::Fun(_, _, _)) => true,
-            (Value::RecClosure(..), Type::Fun(_, _, _)) => true,
-            (Value::Continuation(_), Type::Fun(_, _, _)) => true,
-            (Value::Builtin(_), Type::Fun(_, _, _)) => true,
-            (Value::PartialBuiltin(..), Type::Fun(_, _, _)) => true,
-            // Never satisfies any surface annotation -- there's no syntax
-            // to even write a type that would mean "a brand tag."
-            (Value::Token(_), _) => false,
-            _ => false,
         }
     }
 

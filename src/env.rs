@@ -18,6 +18,16 @@ impl PList<Value> {
             .bind("fold", Value::Builtin(Builtin::Fold))
             .bind("fail", Value::Builtin(Builtin::Fail))
             .bind("get", Value::Builtin(Builtin::Get))
+            // Runtime half of typecheck::coerce's boundary-check
+            // desugaring (see its own doc comment) -- ordinary prelude
+            // builtins, not hidden, the same way `fail` already isn't.
+            .bind("is_int", Value::Builtin(Builtin::IsInt))
+            .bind("is_bool", Value::Builtin(Builtin::IsBool))
+            .bind("is_str", Value::Builtin(Builtin::IsStr))
+            .bind("is_list", Value::Builtin(Builtin::IsList))
+            .bind("is_fun", Value::Builtin(Builtin::IsFun))
+            .bind("type_name", Value::Builtin(Builtin::TypeName))
+            .bind("check_data_shape", Value::Builtin(Builtin::CheckDataShape))
     }
 
     pub fn lookup(&self, name: &str) -> Value {

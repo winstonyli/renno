@@ -39,10 +39,9 @@ pub enum Type {
     // match it -- positional, named, or FieldAccess's own synthetic one --
     // carries the identical tag, so an unrelated value simply fails to
     // pattern-match rather than being silently accepted as this type. A
-    // bare Dyn-boundary type annotation checks it too, via
-    // Expr::CheckData (built by typecheck::coerce, not matches_type,
-    // whose own Data case stays shallow -- "some non-empty tagged List,"
-    // no brand awareness at all): CheckData's witness carries the
+    // bare Dyn-boundary type annotation checks it too, via the
+    // check_data_shape builtin (typecheck::build_boundary_check's Data
+    // arm desugars into a call to it): its witness carries the
     // declaration's ctor shapes AND its brand id, so a same-shaped value
     // from a DIFFERENT opaque declaration (Meters's Mk vs Seconds's Mk)
     // is rejected there too, not just at an actual pattern-match/
