@@ -3,4 +3,10 @@
 // see fold's doc comment in value.rs. fold's callback is curried:
 // fold(f)(init)(list) applies f(acc)(item) once per element, left to right.
 let doubled = map(fun x -> x + x)([1, 2, 3, 4, 5]) in
-fold(fun acc -> fun x -> acc + x)(0)(doubled)
+
+// get(list)(i): indexing by function, curried like every other multi-arg
+// builtin here, rather than new `[]` syntax -- panics on a negative or
+// out-of-range index (renno has no Option/Result to return instead).
+let third = get(doubled)(2) in
+
+fold(fun acc -> fun x -> acc + x)(0)(doubled) + third

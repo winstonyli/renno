@@ -489,6 +489,19 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             Some(Value::Str(s)) => panic!("{s}"),
             _ => panic!("fail expects a string message"),
         },
+        Builtin::Get => {
+            let (i, list) = (args.pop(), args.pop());
+            match (list, i) {
+                (Some(Value::List(items)), Some(Value::Int(idx))) => {
+                    let idx = usize::try_from(idx).ok().filter(|&idx| idx < items.len());
+                    match idx {
+                        Some(idx) => items[idx].clone(),
+                        None => panic!("get: index out of bounds"),
+                    }
+                }
+                _ => panic!("get expects a list and an int"),
+            }
+        }
         Builtin::Map => {
             let (list, f) = (args.pop(), args.pop());
             match (f, list) {

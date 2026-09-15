@@ -535,6 +535,24 @@ mod tests {
     }
 
     #[test]
+    fn get_indexes_a_list() {
+        assert_eq!(run_untyped("get([10, 20, 30])(0)").as_int(), 10);
+        assert_eq!(run_untyped("get([10, 20, 30])(2)").as_int(), 30);
+    }
+
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn get_out_of_bounds_panics() {
+        run_untyped("get([10, 20, 30])(3)");
+    }
+
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn get_negative_index_panics() {
+        run_untyped("get([10, 20, 30])(0 - 1)");
+    }
+
+    #[test]
     fn list_equality_is_structural() {
         assert!(run_untyped("[1, 2, 3] == [1, 2, 3]").as_bool());
         assert!(!run_untyped("[1, 2] == [1, 2, 3]").as_bool());

@@ -46,13 +46,21 @@ pub enum Builtin {
     // `let n: Int = val in if P then body else fail("...")`, an ordinary
     // runtime check built entirely from existing If/App nodes.
     Fail,
+    // ([a], Int) -> a -- indexing by function rather than new `[]`
+    // syntax/BinOp, the same way structural list operations (map/fold)
+    // are already builtins, not operators. Panics on a negative or
+    // out-of-range index; renno has no Option/Result in the prelude to
+    // return instead, and match_pattern/apply_binop already establish
+    // "a Dyn-sourced shape mismatch panics at the point of use" as this
+    // interpreter's one error-handling story.
+    Get,
 }
 
 impl Builtin {
     pub fn arity(self) -> usize {
         match self {
             Builtin::Deep | Builtin::Shallow | Builtin::Len | Builtin::Fail => 1,
-            Builtin::Map => 2,
+            Builtin::Map | Builtin::Get => 2,
             Builtin::Fold => 3,
         }
     }
