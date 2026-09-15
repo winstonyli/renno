@@ -16,6 +16,7 @@ pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
         expr_spans: SpanMap::new(),
         src,
         branded_ctors: HashMap::new(),
+        type_brands: HashMap::new(),
     };
     let root = p.expr()?;
     if p.pos != p.tokens.len() {
@@ -43,6 +44,16 @@ struct Parser<'a> {
     // `data` block reusing a ctor name always overwrites (or clears) the
     // entry, modeling ordinary lexical shadowing.
     branded_ctors: HashMap<String, u64>,
+    // Type name -> brand id, for every `data` block parsed SO FAR whose
+    // constructors carry a hidden `opaque` runtime tag -- the STATIC
+    // counterpart of `branded_ctors`, consulted by parse_type's bare-
+    // identifier case (`x: Celsius`) so a type annotation resolves to the
+    // brand of whichever `data Celsius` is lexically in scope there, the
+    // same way `branded_ctors` lets a pattern learn its ctor's hidden tag.
+    // Scoped identically (updated/restored in lockstep with
+    // `branded_ctors`, same `data` arm in `atom`, same LIFO restore at its
+    // end) -- see that field's own doc comment for why.
+    type_brands: HashMap<String, u64>,
 }
 
 // A `let`/`fun`/`data` prefix collected while flattening a chain of them
@@ -87,8 +98,8 @@ enum PendingBinder {
 // = Mk(Int)`) are consistent with each other by default (structural, see
 // types::consistent) -- add an `opaque` field to either if they should
 // NOT be interchangeable. See types::Type::Data's own doc comment.
-fn ctor_type(type_name: &str, field_tys: &[(Option<String>, Type)]) -> Type {
-    let mut result = Type::Data(type_name.to_string());
+fn ctor_type(type_name: &str, field_tys: &[(Option<String>, Type)], brand: Option<u64>) -> Type {
+    let mut result = Type::Data(type_name.to_string(), brand);
     for (_, ty) in field_tys.iter().rev() {
         result = Type::Fun(Rc::new(ty.clone()), EffectRow::pure(), Rc::new(result));
     }
@@ -273,15 +284,26 @@ impl<'a> Parser<'a> {
                 Ok(t)
             }
             // A capitalized name that isn't one of the built-in type
-            // keywords: a reference to a `data`-declared type -- Type::Data
-            // is purely nominal (see its own doc comment), just a name
-            // compared for equality, so this needs no name-resolution pass
-            // to know whether "Option"/"List"/whatever was ever actually
-            // declared, or where. That's also what makes a self-referential
-            // field (`Cons(Int, List)` inside `data List` itself) work with
-            // no special-casing: `List` here is just the string "List",
-            // nothing to look up.
-            Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => Ok(Type::Data(name)),
+            // keywords: a reference to a `data`-declared type. Structural
+            // comparison still needs no name-resolution pass -- an
+            // undeclared/misspelled name is just never found in `fields`
+            // and conservatively rejected (types::consistent_inner) -- but
+            // opaque comparison does need to know WHICH declaration this
+            // name currently refers to, so `type_brands` (updated as each
+            // `data` block is parsed, restored when its scope ends -- see
+            // its own doc comment) is consulted here: None if the name
+            // isn't currently branded (either genuinely unbranded, or not
+            // actually declared -- both look the same to a bare type
+            // annotation, same as before this field existed). A self-
+            // referential field (`Cons(Int, List, opaque)` inside `data
+            // List` itself) still resolves correctly: the `data` arm below
+            // inserts `List`'s OWN (possibly tentative) brand into
+            // `type_brands` before parsing its constructor field list, for
+            // exactly this case.
+            Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => {
+                let brand = self.type_brands.get(&name).copied();
+                Ok(Type::Data(name, brand))
+            }
             other => Err(self.err_at(self.span_before(), format!("expected a type, found {other:?}"))),
         }
     }
@@ -351,6 +373,39 @@ impl<'a> Parser<'a> {
         } else {
             Ok(Some(self.parse_ctor_field()?))
         }
+    }
+
+    // Scans forward from the current position (right after `data Name =`,
+    // before any constructor is actually parsed) to check whether ANY
+    // constructor in this block writes an `opaque` field -- needed BEFORE
+    // parsing constructor field types, not just after: a self-referential
+    // field (`Cons(Int, List, opaque)`, `List` referring to this very
+    // declaration) must resolve via `type_brands` to the CORRECT brand
+    // while it's still being parsed (see the `data` arm in `atom`), not
+    // one filled in only once the whole block is done.
+    //
+    // Unambiguous without tracking exactly where each `(`/`)` "belongs":
+    // the constructor-list grammar is Type-only, and `opaque` is a
+    // dedicated token (Token::Opaque, not a generic Ident) that can never
+    // legitimately appear inside a Type -- so a plain scan for that one
+    // token, stopping at this block's own closing `in` (tracked via paren/
+    // bracket depth so a nested Fun-type paren or List-type bracket isn't
+    // mistaken for one), can't false-positive on anything else. `in` can
+    // only appear at depth 0 here: Type grammar has no `let`/`in` of its
+    // own, so the first depth-0 `in` reached IS this block's own
+    // terminator, never a later one from inside the block's body.
+    fn lookahead_any_opaque(&self) -> bool {
+        let mut depth = 0i32;
+        for tok in &self.tokens[self.pos..] {
+            match tok {
+                Token::LParen | Token::LBracket => depth += 1,
+                Token::RParen | Token::RBracket => depth -= 1,
+                Token::In if depth <= 0 => return false,
+                Token::Opaque => return true,
+                _ => {}
+            }
+        }
+        false
     }
 
     // pattern := pattern_atom ("::" pattern)?  (right-assoc, `h :: t`)
@@ -729,6 +784,11 @@ impl<'a> Parser<'a> {
         // Env binding already is, not left dangling for the rest of the
         // file. See the `Some(Token::Data)` arm below.
         let mut branded_restore: Vec<(String, Option<u64>)> = Vec::new();
+        // Same restore-on-scope-exit story as `branded_restore`, but for
+        // `type_brands` (type NAME -> brand id) instead of ctor name ->
+        // brand id -- one entry per `data` block, pushed/restored at the
+        // same points.
+        let mut type_brand_restore: Vec<(String, Option<u64>)> = Vec::new();
         loop {
             match self.peek() {
                 Some(Token::Let) => {
@@ -792,6 +852,28 @@ impl<'a> Parser<'a> {
                     self.bump();
                     let type_name = self.ident()?;
                     self.expect(&Token::Equals)?;
+
+                    // Resolve (tentatively) whether THIS block ends up
+                    // opaque, and record its brand into `type_brands`,
+                    // BEFORE parsing its own constructor field types below
+                    // -- so a self-referential field annotation resolves
+                    // to the correct brand while it's parsed, not left
+                    // unresolved until this block is fully done (see
+                    // lookahead_any_opaque's own doc comment). Confirmed
+                    // against the REAL per-constructor scan below
+                    // (`any_opaque`) once that's available.
+                    let will_be_opaque = self.lookahead_any_opaque();
+                    let tentative_brand = will_be_opaque.then_some(start as u64);
+                    type_brand_restore.push((type_name.clone(), self.type_brands.get(&type_name).copied()));
+                    match tentative_brand {
+                        Some(id) => {
+                            self.type_brands.insert(type_name.clone(), id);
+                        }
+                        None => {
+                            self.type_brands.remove(type_name.as_str());
+                        }
+                    }
+
                     let mut ctors = Vec::new();
                     // Whether EACH constructor (same order/length as
                     // `ctors`) wrote an `opaque` field -- checked for
@@ -887,6 +969,10 @@ impl<'a> Parser<'a> {
                     // pattern_atom for where this id is actually stamped
                     // into (and matched against) runtime values.
                     let brand = any_opaque.then_some(start as u64);
+                    debug_assert_eq!(
+                        brand, tentative_brand,
+                        "lookahead_any_opaque disagreed with the real per-constructor scan"
+                    );
                     for (name, _) in &ctors {
                         // Record what this name mapped to BEFORE this block
                         // touches it, so it can be put back once this
@@ -970,7 +1056,7 @@ impl<'a> Parser<'a> {
                     let mut body = result;
                     for (name, field_tys) in ctors.into_iter().rev() {
                         let val = self.build_ctor_value(&name, &field_tys, brand, span);
-                        let ty = Some(ctor_type(&type_name, &field_tys));
+                        let ty = Some(ctor_type(&type_name, &field_tys, brand));
                         body = self.push_spanned(Expr::Let(name, ty, val, body), span);
                     }
                     self.push_spanned(Expr::DataGroup(Rc::new(info), body), span)
@@ -991,6 +1077,17 @@ impl<'a> Parser<'a> {
                 }
                 None => {
                     self.branded_ctors.remove(&name);
+                }
+            }
+        }
+        // Same restore, same reasoning, for `type_brands`.
+        for (name, old) in type_brand_restore.into_iter().rev() {
+            match old {
+                Some(id) => {
+                    self.type_brands.insert(name, id);
+                }
+                None => {
+                    self.type_brands.remove(&name);
                 }
             }
         }

@@ -84,7 +84,22 @@ fn free_row_vars(ty: &Type) -> BTreeSet<String> {
             vars
         }
         Type::List(elem) => free_row_vars(elem),
-        Type::Dyn | Type::Int | Type::Bool | Type::Str | Type::Data(_) => BTreeSet::new(),
+        Type::Dyn | Type::Int | Type::Bool | Type::Str | Type::Data(_, _) => BTreeSet::new(),
+    }
+}
+
+// Finds the DataInfo a resolved Type::Data(name, brand) refers to. When
+// `brand` is Some, that's exact -- match the declaration with the SAME
+// brand, not just the same name (two shadowed opaque `data Foo` blocks
+// share a name but never a brand, see types::consistent_inner's own doc
+// comment). When `brand` is None (unbranded/structural), name is all
+// there is -- `.rev()` picks the lexically-current (most recently
+// declared) `data Name` on a shadowing collision, not the first/outer
+// one, same reasoning as every other `fields` lookup in this codebase.
+fn lookup_data<'a>(fields: &'a [Rc<DataInfo>], name: &str, brand: Option<u64>) -> Option<&'a Rc<DataInfo>> {
+    match brand {
+        Some(b) => fields.iter().rev().find(|f| f.type_name == name && f.brand == Some(b)),
+        None => fields.iter().rev().find(|f| f.type_name == name),
     }
 }
 
@@ -170,13 +185,49 @@ fn coerce(
     fields: &[Rc<DataInfo>],
 ) -> Result<ExprRef, TypeError> {
     if !consistent(from, to, fields) {
-        return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span));
+        // Same printed name, different brand: Display never shows a brand
+        // (it's meant to stay hidden -- see Type::Data's own doc comment),
+        // so "expected Meters, found Meters" alone would be genuinely
+        // confusing -- name a likely cause instead of leaving the reader
+        // to guess why two identically-printed types disagree.
+        let note = match (from, to) {
+            (Type::Data(fname, fbrand), Type::Data(tname, tbrand)) if fname == tname && fbrand != tbrand => {
+                " (two separately-declared `data` blocks reusing this name -- not the same declaration)"
+            }
+            _ => "",
+        };
+        return Err(TypeError(format!("type mismatch: expected {to}, found {from}{note}"), span));
     }
     if *from != Type::Dyn || *to == Type::Dyn {
         return Ok(e);
     }
     match to {
         Type::Fun(param_ty, _row, ret_ty) => Ok(wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone())),
+        // A Data target gets a shape-aware CheckData instead of a plain
+        // Check -- Value::matches_type's own Data case can only confirm
+        // "some non-empty tagged List," not "specifically shaped like
+        // THIS declaration" (see types::Type::Data's doc comment on that
+        // gap). `lookup_data` resolves the exact declaration this Type
+        // refers to (matching brand when opaque, else the lexically-
+        // current same-named one), and its ctor_types become the witness
+        // CheckData actually checks against at runtime -- built once
+        // here, not re-looked-up on every check.
+        Type::Data(name, brand) => match lookup_data(fields, name, *brand) {
+            Some(info) => {
+                let shape: Vec<(String, usize)> = info
+                    .ctor_types
+                    .iter()
+                    .map(|(cname, ctys)| (cname.clone(), 1 + ctys.len() + usize::from(info.brand.is_some())))
+                    .collect();
+                Ok(arena.push(Expr::CheckData(to.clone(), Rc::new(shape), info.brand, e)))
+            }
+            // Shouldn't normally happen once `fields` is the real registry
+            // elaborate builds (every Type::Data comes from an actual
+            // declaration) -- conservatively falls back to the old
+            // shallow check rather than panicking, same "can't prove it,
+            // don't crash" spirit as everywhere else in this checker.
+            None => Ok(arena.push(Expr::Check(to.clone(), e))),
+        },
         _ => Ok(arena.push(Expr::Check(to.clone(), e))),
     }
 }
@@ -805,6 +856,14 @@ fn elaborate_node(
             Ok((ty_ret, row, arena.push(Expr::Check(ty, inner2))))
         }
 
+        // Same passthrough shape as Check, for the same reason (a
+        // synthesized node re-entering elaborate).
+        Expr::CheckData(ty, shape, brand, inner) => {
+            let (_, row, inner2) = elaborate(arena, inner, ctx, fields, spans)?;
+            let ty_ret = ty.clone();
+            Ok((ty_ret, row, arena.push(Expr::CheckData(ty, shape, brand, inner2))))
+        }
+
         // The effect this specific operation performs, plus whatever the
         // payload expression itself might perform.
         Expr::Perform(effect, payload) => {
@@ -917,8 +976,8 @@ fn elaborate_node(
         // knowing they're already correct).
         Expr::FieldAccess(target, field) => {
             let (target_ty, target_row, target2) = elaborate(arena, target, ctx, fields, spans)?;
-            let type_name = match &target_ty {
-                Type::Data(name) => name.clone(),
+            let (type_name, brand) = match &target_ty {
+                Type::Data(name, brand) => (name.clone(), *brand),
                 other => {
                     return Err(TypeError(
                         format!("cannot access field `{field}` on a value of type {other} (expected a `data` type)"),
@@ -926,11 +985,7 @@ fn elaborate_node(
                     ))
                 }
             };
-            // `.rev()`: pick the lexically-current (most recently
-            // declared) `data Name` when one shadows an earlier same-named
-            // block, not the first/outer one -- same reasoning as
-            // resolve_pattern's NamedCtor arm.
-            let info = fields.iter().rev().find(|f| f.type_name == type_name).ok_or_else(|| {
+            let info = lookup_data(fields, &type_name, brand).ok_or_else(|| {
                 TypeError(format!("cannot access field `{field}`: no known fields for type {type_name}"), spans[target])
             })?;
             if info.ctors.len() != 1 {
@@ -987,13 +1042,13 @@ fn elaborate_node(
             let (callee_ty, callee_row, callee2) = elaborate(arena, callee, ctx, fields, spans)?;
             let mut param_tys = Vec::new();
             let mut cur_ty = &callee_ty;
-            let type_name = loop {
+            let (type_name, brand) = loop {
                 match cur_ty {
                     Type::Fun(p, _, ret) => {
                         param_tys.push((**p).clone());
                         cur_ty = ret.as_ref();
                     }
-                    Type::Data(name) => break name.clone(),
+                    Type::Data(name, brand) => break (name.clone(), *brand),
                     other => {
                         return Err(TypeError(
                             format!("cannot use `{{ field: value, ... }}` syntax on a value of type {other} (expected a `data` constructor)"),
@@ -1002,10 +1057,7 @@ fn elaborate_node(
                     }
                 }
             };
-            // `.rev()`: same reasoning as resolve_pattern's NamedCtor arm
-            // and FieldAccess's own lookup -- pick the lexically-current
-            // `data Name`, not the first (possibly already-shadowed) one.
-            let info = fields.iter().rev().find(|f| f.type_name == type_name).ok_or_else(|| {
+            let info = lookup_data(fields, &type_name, brand).ok_or_else(|| {
                 TypeError(format!("cannot use `{{ ... }}` syntax: no known fields for type {type_name}"), spans[callee])
             })?;
             if info.ctors.len() != 1 {
@@ -1048,7 +1100,7 @@ fn elaborate_node(
                 row = EffectRow::union(&row, &a_row);
                 result = arena.push(Expr::App(result, a3));
             }
-            Ok((Type::Data(type_name), row, result))
+            Ok((Type::Data(type_name, brand), row, result))
         }
     }
 }

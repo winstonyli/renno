@@ -141,13 +141,16 @@ impl Value {
             // Shallow, like Fun -- confirms "this is a list," not that its
             // elements match the declared element type.
             (Value::List(_), Type::List(_)) => true,
-            // Same shallowness, for the same reason: every `data` value IS
-            // a List (see types::Type::Data's doc comment), but nothing at
-            // runtime stamps WHICH data type it came from, so this can only
-            // confirm "this is some tagged/ADT-shaped value" -- a non-empty
-            // list, tag included -- not "specifically a Name, not some
-            // other data type reusing one of its constructor tags."
-            (Value::List(items), Type::Data(_)) => !items.is_empty(),
+            // Same shallowness as List above, for the DEFENSIVE fallback
+            // path only -- typecheck::coerce normally builds an
+            // Expr::CheckData instead of an ordinary Check for a Data
+            // target (see its own doc comment), which actually verifies
+            // the constructor tag, field count, and (when opaque) brand.
+            // This arm only fires if that lookup somehow failed to find
+            // the declaration, so it stays the same shallow "some
+            // tagged/ADT-shaped value" check CheckData was built to
+            // replace.
+            (Value::List(items), Type::Data(_, _)) => !items.is_empty(),
             (Value::Closure(..), Type::Fun(_, _, _)) => true,
             (Value::RecClosure(..), Type::Fun(_, _, _)) => true,
             (Value::Continuation(_), Type::Fun(_, _, _)) => true,

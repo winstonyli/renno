@@ -50,6 +50,8 @@ pub enum Frame {
     // not-yet-evaluated; `done` accumulates results in order.
     ListElems { remaining: Vec<ExprRef>, done: Vec<Value>, env: Env },
     CheckFrame { ty: Type },
+    // Frame for Expr::CheckData -- see that variant's own doc comment.
+    CheckDataFrame { ty: Type, shape: Rc<Vec<(String, usize)>>, brand: Option<u64> },
     PerformPayload { effect: String },
     // `handle body with handler_expr`: handler_expr has just evaluated to a
     // Value::Handler -- next step installs it as a HandlerMark and evals body.

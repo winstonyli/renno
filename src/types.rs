@@ -37,15 +37,26 @@ pub enum Type {
     // constructor of a branded type stamps one hidden trailing tag into
     // its value (parser::build_ctor_value), and every pattern that can
     // match it -- positional, named, or FieldAccess's own synthetic one --
-    // carries the identical tag, so an unrelated value (or one from a
-    // SHADOWED same-named `data` redeclaration -- see consistent_inner's
-    // own doc comment on that gap) simply fails to pattern-match rather
-    // than being silently accepted as this type. matches_type's own
-    // Dyn-boundary check stays shallow regardless (a value is still just a
-    // tagged List, with no way to inspect its hidden tag from a bare type
-    // annotation without evaluating a pattern against it) -- the brand's
-    // real enforcement point is construction/destructuring, not that check.
-    Data(String),
+    // carries the identical tag, so an unrelated value simply fails to
+    // pattern-match rather than being silently accepted as this type. A
+    // bare Dyn-boundary type annotation checks it too, via
+    // Expr::CheckData (built by typecheck::coerce, not matches_type,
+    // whose own Data case stays shallow -- "some non-empty tagged List,"
+    // no brand awareness at all): CheckData's witness carries the
+    // declaration's ctor shapes AND its brand id, so a same-shaped value
+    // from a DIFFERENT opaque declaration (Meters's Mk vs Seconds's Mk)
+    // is rejected there too, not just at an actual pattern-match/
+    // field-access site.
+    //
+    // The second field is that same brand id, mirrored onto the STATIC
+    // type (None for an unbranded/structural type) -- not just carried at
+    // runtime in Value. Every place a Type::Data is built (parser::
+    // ctor_type, parser::parse_type's bare-identifier case) fills it in
+    // from whichever `data Name` declaration is lexically in scope there
+    // (Parser::type_brands), so consistent_inner can tell two SEPARATELY-
+    // declared, same-named opaque `data` blocks (shadowing) apart by brand
+    // instead of by name alone -- see consistent_inner's own doc comment.
+    Data(String, Option<u64>),
 }
 
 // Closed effect row: an exact known set (Closed), "unknown, could be
@@ -169,32 +180,36 @@ fn consistent_inner(a: &Type, b: &Type, fields: &[Rc<DataInfo>], seen: &mut BTre
         (Type::Fun(a1, r1, b1), Type::Fun(a2, r2, b2)) => {
             consistent_inner(a1, a2, fields, seen) && consistent_inner(b1, b2, fields, seen) && row_consistent(r1, r2)
         }
-        // Same name: always consistent (a type is always consistent with
-        // itself, brand or no brand) -- also what lets an ordinary
+        // Either side opaque (Some brand): consistent ONLY when both carry
+        // the EXACT SAME brand -- i.e. resolve to the identical `data`
+        // declaration. This is what closes the shadowing gap this arm used
+        // to have: two SEPARATELY-declared, same-named opaque `data Foo`
+        // blocks now carry DIFFERENT brand ids (Parser::type_brands is
+        // reset per-declaration, see its own doc comment), so they're
+        // never consistent with each other even though their names are
+        // textually identical -- matching how they already behaved at
+        // runtime (mismatched brand tag fails to pattern-match). A branded
+        // type is also never consistent with an unbranded one, no matter
+        // how identical the shapes look, same as before this fix (that
+        // part didn't change, just how it's decided -- directly from the
+        // type's own brand field now, no `fields` lookup needed).
+        (Type::Data(_, a_brand), Type::Data(_, b_brand)) if a_brand.is_some() || b_brand.is_some() => {
+            a_brand == b_brand
+        }
+        // Neither side opaque: same name is always consistent (a type is
+        // always consistent with itself) -- also what lets an ordinary
         // self-referential `data` type (`Cons(Int, List)` inside `data
         // List` itself) compare cheaply with no lookup at all. Different
         // names: structural by default -- same set of constructor names,
-        // each with pairwise-consistent field types -- UNLESS either side
-        // opted into nominal distinctness via an `opaque` field
-        // (DataInfo::brand), which makes two differently-named types never
-        // consistent no matter how identical their shapes are. Either
-        // name failing to resolve in `fields` (shouldn't happen once
-        // `fields` is the real registry elaborate builds) conservatively
-        // rejects rather than guesses.
-        //
-        // Known gap: `a_name == b_name` short-circuits below with NO brand
-        // lookup at all, so two SEPARATELY-declared `data Foo` blocks
-        // (shadowing -- one branded, one not, or both branded differently)
-        // are still statically treated as the same type. Type::Data is
-        // name-only, with no notion of "which declaration"; fixing this
-        // properly would mean giving every `data` block a real identity
-        // baked into Type::Data itself, touched everywhere a type is
-        // looked up by name. Not fixed here -- but the runtime brand
-        // (Type::Data's own doc comment) bounds the damage: a value from
-        // the wrong declaration still fails to pattern-match/field-access
-        // once actually used, rather than silently behaving as the wrong
-        // type forever.
-        (Type::Data(a_name), Type::Data(b_name)) => {
+        // each with pairwise-consistent field types. Either name failing
+        // to resolve in `fields` (shouldn't happen once `fields` is the
+        // real registry elaborate builds) conservatively rejects rather
+        // than guesses. `.rev()`: an unbranded name can still be shadowed
+        // by an unrelated (differently-shaped) redeclaration reusing the
+        // same name -- pick the lexically-current one, same reasoning as
+        // every other `fields` lookup in this codebase (see e.g.
+        // typecheck::elaborate_node's FieldAccess arm).
+        (Type::Data(a_name, _), Type::Data(b_name, _)) => {
             if a_name == b_name {
                 return true;
             }
@@ -204,11 +219,8 @@ fn consistent_inner(a: &Type, b: &Type, fields: &[Rc<DataInfo>], seen: &mut BTre
                 return true;
             }
             let result = (|| {
-                let a_info = fields.iter().find(|f| &f.type_name == a_name)?;
-                let b_info = fields.iter().find(|f| &f.type_name == b_name)?;
-                if a_info.brand.is_some() || b_info.brand.is_some() {
-                    return Some(false);
-                }
+                let a_info = fields.iter().rev().find(|f| &f.type_name == a_name)?;
+                let b_info = fields.iter().rev().find(|f| &f.type_name == b_name)?;
                 if a_info.ctor_types.len() != b_info.ctor_types.len() {
                     return Some(false);
                 }
@@ -238,7 +250,7 @@ fn consistent_inner(a: &Type, b: &Type, fields: &[Rc<DataInfo>], seen: &mut BTre
         // legitimate ctor body, so it's no longer accepted here either --
         // closes a real gap where an arbitrary `[Int]` value satisfied any
         // Data-annotated parameter with zero runtime check.
-        (Type::List(elem), Type::Data(_)) | (Type::Data(_), Type::List(elem)) => {
+        (Type::List(elem), Type::Data(_, _)) | (Type::Data(_, _), Type::List(elem)) => {
             matches!(**elem, Type::Str | Type::Dyn)
         }
         _ => false,
@@ -265,7 +277,9 @@ impl fmt::Display for Type {
             // (unannotated-row) Fun type exactly as before this existed.
             Type::Fun(a, EffectRow::Dyn, b) => write!(f, "({a} -> {b})"),
             Type::Fun(a, row, b) => write!(f, "({a} ->{row} {b})"),
-            Type::Data(name) => write!(f, "{name}"),
+            // Brand never printed -- same "hidden" philosophy as the
+            // runtime tag itself (see Type::Data's own doc comment).
+            Type::Data(name, _) => write!(f, "{name}"),
         }
     }
 }

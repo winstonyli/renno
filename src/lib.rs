@@ -89,7 +89,7 @@ mod tests {
     fn contains_check(arena: &expr::Arena, root: expr::ExprRef) -> bool {
         use expr::Expr;
         match &arena[root] {
-            Expr::Check(..) => true,
+            Expr::Check(..) | Expr::CheckData(..) => true,
             Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) => false,
             Expr::ListLit(items) => items.iter().any(|i| contains_check(arena, *i)),
             Expr::Lambda(_, _, body) => contains_check(arena, *body),
@@ -988,6 +988,29 @@ mod tests {
     }
 
     #[test]
+    fn opaque_shadowing_redeclaration_now_rejected_statically() {
+        // Companion to opaque_pattern_rejects_a_value_from_a_shadowing_
+        // redeclaration just above, which only ever caught this at
+        // RUNTIME (the hidden brand tag failing to pattern-match). Now
+        // that Type::Data itself carries the brand id (Parser::
+        // type_brands), the same mismatch is caught statically instead:
+        // `f`'s annotation resolves to the FIRST Foo's brand, `Mk(1)`'s
+        // inferred type resolves to the SECOND (shadowing) Foo's --
+        // different brands, identical printed name, no longer consistent
+        // (types::consistent_inner).
+        let src = r#"
+            data Foo = Mk(Int, opaque) in
+            let f = fun x: Foo -> x in
+            data Foo = Mk(Int, opaque) in
+            f(Mk(1))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("type mismatch"), "unexpected message: {}", err.0);
+        assert!(err.0.contains("separately-declared"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
     fn opaque_named_field_pattern_and_access_still_work_on_a_branded_type() {
         let src = r#"
             data Point = Point(x: Int, y: Int, opaque) in
@@ -1045,6 +1068,105 @@ mod tests {
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[MkC, 100]");
+    }
+
+    #[test]
+    fn dyn_boundary_rejects_a_shape_that_is_not_even_tagged() {
+        // Before CheckData, matches_type's Data case only asked "is this
+        // a non-empty List at all" -- a plain, untagged `[1, 2, 3]` would
+        // have satisfied a `Point` annotation with zero runtime error.
+        // `y` is Dyn (sourced from a handled effect) specifically so this
+        // reaches the runtime check instead of being caught statically.
+        let src = r#"
+            data Point = Mk(Int, Int) in
+            handle
+              let y = perform choose(0) in
+              let f = fun p: Point -> p in
+              f(y)
+            with handler choose(p, resume) -> resume([1, 2, 3])
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected Point, found List"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn dyn_boundary_rejects_the_wrong_constructor_tag() {
+        // Same story, but the Dyn value IS a real tagged data value --
+        // just from a DIFFERENT data type (Option's Some, not Point's
+        // Mk). The old shallow check ("some tagged value") would have
+        // accepted this; CheckData's shape witness (ctor name + arity)
+        // does not.
+        let src = r#"
+            data Option = None | Some(Int) in
+            data Point = Mk(Int, Int) in
+            handle
+              let y = perform choose(0) in
+              let f = fun p: Point -> p in
+              f(y)
+            with handler choose(p, resume) -> resume(Some(5))
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected Point, found List"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn dyn_boundary_rejects_the_right_tag_with_the_wrong_arity() {
+        // `Wrong`'s Mk shares Point's own tag name ("Mk") but only takes
+        // ONE field, not two -- CheckData's shape witness records total
+        // List length per ctor, not just the tag name, so this is still
+        // caught even though the tag string alone would match.
+        let src = r#"
+            data Point = Mk(Int, Int) in
+            data Wrong = Mk(Int) in
+            handle
+              let y = perform choose(0) in
+              let f = fun p: Point -> p in
+              f(y)
+            with handler choose(p, resume) -> resume(Mk(5))
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected Point, found List"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn dyn_boundary_still_accepts_a_structurally_equivalent_differently_named_type() {
+        // Celsius and Fahrenheit are intentionally interchangeable
+        // (structural typing default, no `opaque`) -- CheckData's shape
+        // witness is built from the ANNOTATED type's own ctor list (name
+        // + arity only), so a same-shaped value from a DIFFERENT
+        // declaration still passes, same as it always has.
+        let src = r#"
+            data Celsius = Mk(Int) in
+            data Fahrenheit = Mk(Int) in
+            handle
+              let y = perform choose(0) in
+              let f = fun p: Celsius -> p in
+              f(y)
+            with handler choose(p, resume) -> resume(Mk(212))
+        "#;
+        let outcome = run_source(src).unwrap();
+        assert_eq!(outcome.to_string(), "[Mk, 212]");
+    }
+
+    #[test]
+    fn dyn_boundary_rejects_a_same_shaped_value_from_a_different_opaque_type() {
+        // Unlike Celsius/Fahrenheit above, Meters and Seconds are BOTH
+        // opaque -- same ctor name ("Mk"), same arity, so tag+length alone
+        // can't tell them apart (they'd produce the identical shape
+        // witness). CheckData also checks the value's own trailing brand
+        // tag against the ANNOTATED type's brand whenever it's opaque, so
+        // a Dyn-sourced Seconds value still can't pass as a Meters.
+        let src = r#"
+            data Meters = Mk(Int, opaque) in
+            data Seconds = Mk(Int, opaque) in
+            handle
+              let y = perform choose(0) in
+              let f = fun p: Meters -> p in
+              f(y)
+            with handler choose(p, resume) -> resume(Mk(5))
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected Meters, found List"), "unexpected message: {err}");
     }
 
     #[test]

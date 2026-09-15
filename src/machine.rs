@@ -154,6 +154,13 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     cont = Cont::cons(Frame::CheckFrame { ty: ty.clone() }, cont);
                     control = Control::Eval(*inner, env);
                 }
+                Expr::CheckData(ty, shape, brand, inner) => {
+                    cont = Cont::cons(
+                        Frame::CheckDataFrame { ty: ty.clone(), shape: shape.clone(), brand: *brand },
+                        cont,
+                    );
+                    control = Control::Eval(*inner, env);
+                }
                 Expr::Perform(effect, payload) => {
                     cont = Cont::cons(Frame::PerformPayload { effect: effect.clone() }, cont);
                     control = Control::Eval(*payload, env);
@@ -379,6 +386,34 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                             let ty = ty.clone();
                             cont = rest;
                             if value.matches_type(&ty) {
+                                control = Control::Apply(value);
+                            } else {
+                                panic!("type error: expected {ty}, found {}", value.type_name());
+                            }
+                        }
+                        Frame::CheckDataFrame { ty, shape, brand } => {
+                            let (ty, shape, brand) = (ty.clone(), shape.clone(), *brand);
+                            cont = rest;
+                            let matches = match &value {
+                                Value::List(items) => match items.first() {
+                                    Some(Value::Str(tag)) => {
+                                        shape.iter().any(|(name, len)| name.as_str() == &**tag && *len == items.len())
+                                            // Tag/length alone can't tell apart two
+                                            // same-shaped opaque types (Meters's
+                                            // Mk vs Seconds's Mk) -- when this
+                                            // declaration IS opaque, also require
+                                            // the value's own trailing brand tag
+                                            // (see build_ctor_value) to match.
+                                            && match brand {
+                                                Some(b) => matches!(items.last(), Some(Value::Int(n)) if *n == b as i64),
+                                                None => true,
+                                            }
+                                    }
+                                    _ => false,
+                                },
+                                _ => false,
+                            };
+                            if matches {
                                 control = Control::Apply(value);
                             } else {
                                 panic!("type error: expected {ty}, found {}", value.type_name());

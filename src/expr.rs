@@ -124,6 +124,32 @@ pub enum Expr {
     // before passing it through -- inserted only where a Dyn-typed value
     // flows into an annotated position, so unannotated code pays nothing.
     Check(Type, ExprRef),
+    // A Check specialized for a Data(name, brand) target: verifies the
+    // inner value's tag (its List's own first element) AND element count
+    // both match one of THIS declaration's own constructors, instead of
+    // Check's ordinary Data handling (Value::matches_type: "is this a
+    // non-empty tagged List at all," accepting any data-shaped value
+    // whatsoever). The `Type` (always the same Data(name, brand) an
+    // ordinary Check would have carried) is kept only for the panic
+    // message's sake, reusing Type's own Display rather than inventing a
+    // second name format; the witness -- a (ctor name, expected total
+    // List length) pair per constructor the declaration actually has --
+    // is what's actually checked, built once by coerce (which already has
+    // the full DataInfo in scope) and carried here rather than
+    // re-looked-up on every check.
+    //
+    // The trailing `Option<u64>` is the declaration's OWN brand (mirrors
+    // DataInfo::brand) -- checked against the value's own trailing tag
+    // element (see build_ctor_value) whenever Some, so this ALSO catches
+    // an opaque value from a DIFFERENT, same-shaped opaque declaration
+    // (`Seconds`'s `Mk(5)` reaching a `Meters` boundary): tag and length
+    // alone can't tell those apart when both types happen to share a
+    // ctor name and arity, only the brand can. Unbranded, this is None
+    // and only tag+length are checked, same as before this field existed.
+    // See coerce's own doc comment on when this is built instead of a
+    // plain Check, and types::Type::Data's doc comment for the boundary-
+    // precision gap this closes.
+    CheckData(Type, Rc<Vec<(String, usize)>>, Option<u64>, ExprRef),
     // cond must evaluate to Bool.
     If(ExprRef, ExprRef, ExprRef),
     Perform(String, ExprRef),
