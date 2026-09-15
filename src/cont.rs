@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use crate::env::Env;
 use crate::expr::{BinOp, ExprRef, Pattern};
+use crate::span::Span;
 use crate::types::Type;
 use crate::value::{HandlerData, Value};
 
@@ -10,8 +11,18 @@ use crate::value::{HandlerData, Value};
 // possible: a captured Cont is an immutable, cheaply-clonable value.
 #[derive(Clone)]
 pub enum Frame {
-    AppFunc { arg: ExprRef, env: Env },
-    AppArg { func: Value },
+    // `callee_span` is the CALLEE sub-expression's own span (`f` in `f(a)`),
+    // not the whole App -- Some when it came from an ordinary Eval of an
+    // App expr; None for AppArg frames built directly by machine::apply's
+    // native re-entrant call, e.g. fold/map's callback -- there's no App
+    // expr behind that, so CURRENT_SPAN is just left alone, same fallback
+    // as before this field existed. Carried from AppFunc into AppArg so a
+    // "not a function" panic blames `f` itself, not whatever the
+    // argument's own span happened to be (the last thing Eval'd before the
+    // panic fires, evaluated strictly after `f` and unrelated to why `f`
+    // isn't callable).
+    AppFunc { arg: ExprRef, env: Env, callee_span: Option<Span> },
+    AppArg { func: Value, callee_span: Option<Span> },
     LetBody { var: String, body: ExprRef, env: Env },
     // Evaluating one `let rec` group's binding values left to right
     // (Lambdas in practice, but evaluated properly rather than assumed --
@@ -22,8 +33,18 @@ pub enum Frame {
     LetRecBody { names: Rc<Vec<String>>, remaining: Vec<ExprRef>, done: Vec<Value>, body: ExprRef, env: Env },
     // Scrutinee has just been evaluated to `value` -- try `arms` in order.
     MatchArms { arms: Rc<Vec<(Pattern, ExprRef)>>, env: Env },
-    BinOpL { op: BinOp, rhs: ExprRef, env: Env },
-    BinOpR { op: BinOp, lhs: Value },
+    // `l_span`/`r_span` are the two operands' own spans, carried from
+    // BinOpL into BinOpR and into apply_binop, which picks whichever one
+    // actually explains a given panic (see apply_binop's own doc comment):
+    // the operand that's actually the wrong type when that's knowable, or
+    // a combination of both when neither operand alone accounts for the
+    // failure (e.g. `++` with both sides Dyn and wrong-typed). This is
+    // deliberately NOT always `r_span` (the last thing Eval'd before
+    // apply_binop runs) -- that fallback would wrongly blame a perfectly
+    // fine right operand whenever the LEFT one is actually at fault
+    // (`true + 1`, say).
+    BinOpL { op: BinOp, rhs: ExprRef, env: Env, l_span: Option<Span>, r_span: Option<Span> },
+    BinOpR { op: BinOp, lhs: Value, l_span: Option<Span>, r_span: Option<Span> },
     If { then_: ExprRef, else_: ExprRef, env: Env },
     // Evaluates a list literal's elements left to right. `remaining` are
     // not-yet-evaluated; `done` accumulates results in order.

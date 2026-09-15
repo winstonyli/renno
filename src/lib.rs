@@ -1401,6 +1401,56 @@ mod tests {
     }
 
     #[test]
+    fn non_function_call_panic_blames_the_callee_not_the_argument() {
+        // `y` is Dyn (sourced from a handled effect) and turns out to be an
+        // Int, not callable. The naive "last thing Eval'd" fallback would
+        // blame the ARGUMENT `1` (evaluated after `y`, right before the
+        // panic) -- machine.rs's Frame::AppFunc/AppArg thread the callee's
+        // own span through instead, so this blames `y`.
+        let src = "handle\n  let y = perform choose(0) in\n  y(1)\nwith handler choose(p, resume) -> resume(5)";
+        let err = run_source(src).unwrap_err();
+        assert!(err.starts_with("line 3, column 3:"), "unexpected message: {err}");
+        assert!(err.contains("expected (Dyn -> Dyn), found Int"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn concat_type_mismatch_blames_the_wrong_operand_when_only_one_is_bad() {
+        // Both `a` and `b` are Dyn -- typecheck.rs's Concat arm only
+        // inserts a runtime Check when exactly ONE side is statically Dyn
+        // (see its own doc comment), so with both sides Dyn this reaches
+        // apply_binop's own runtime check. `a` (Int) is the actual
+        // culprit; `b` (Str) is fine -- blame `a` specifically, not `b`
+        // (evaluated last) and not the whole `a ++ b`.
+        let src = "handle\n  let a = perform choose(0) in\n  let b = perform choose(1) in\n  a ++ b\nwith deep(handler choose(p, resume) -> if p == 0 then resume(1) else resume(\"x\"))";
+        let err = run_source(src).unwrap_err();
+        assert!(err.starts_with("line 4, column 3:"), "unexpected message: {err}");
+        assert!(err.contains("++ expects two strings or two lists"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn concat_type_mismatch_blames_the_whole_expression_when_both_operands_are_bad() {
+        // Same shape as above, but BOTH `a` and `b` are Int -- neither
+        // operand alone explains the failure, so this blames the combined
+        // `a ++ b` span rather than arbitrarily picking one side.
+        let src = "handle\n  let a = perform choose(0) in\n  let b = perform choose(1) in\n  a ++ b\nwith deep(handler choose(p, resume) -> if p == 0 then resume(1) else resume(2))";
+        let err = run_source(src).unwrap_err();
+        assert!(err.starts_with("line 4, column 3:"), "unexpected message: {err}");
+        assert!(err.contains("++ expects two strings or two lists"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn division_by_zero_blames_the_divisor() {
+        // `d` is Dyn but statically Int-consistent, so typecheck inserts a
+        // Check(Int, d) -- that passes at runtime (0 IS an Int), so this
+        // reaches apply_binop's own zero check. Blames `d` (the divisor),
+        // not `10` (the dividend, which is perfectly fine).
+        let src = "handle\n  let d = perform choose(0) in\n  10 / d\nwith handler choose(p, resume) -> resume(0)";
+        let err = run_source(src).unwrap_err();
+        assert!(err.starts_with("line 3, column 8:"), "unexpected message: {err}");
+        assert!(err.contains("division by zero"), "unexpected message: {err}");
+    }
+
+    #[test]
     fn match_failed_panic_reports_the_matchs_location() {
         // Exhaustiveness passes statically (None/Some cover every
         // constructor `data Option` declared) -- but `x` actually comes

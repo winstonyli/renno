@@ -24,13 +24,24 @@ thread_local! {
     // no Span parameter threaded into any of them.
     //
     // Not perfectly precise: a panic several steps removed from the last
-    // Eval (deep inside apply_binop or Value::as_int, say) reports the
-    // last EXPRESSION evaluated, not necessarily the exact sub-part at
-    // fault -- e.g. `1 + true` reports `true`'s own span (the last thing
-    // evaluated before apply_binop's as_int() panics on it), not the
-    // whole `1 + true`. Always in the neighborhood, never wildly off,
-    // without threading a Span through every Frame variant and Value
-    // accessor -- the same 80/20 trade this checker already makes
+    // Eval still reports the last EXPRESSION evaluated, not necessarily the
+    // exact sub-part at fault, wherever nothing more specific was threaded
+    // through. Two cases common enough to be worth the extra Span fields
+    // are handled precisely instead, by threading the RELEVANT
+    // sub-expression's own span (not just "whatever Eval'd last") through
+    // the Frame that eventually panics: apply_binop's operand-type/
+    // div-by-zero/etc panics (Frame::BinOpL/BinOpR carry both operands'
+    // spans plus the whole BinOp's; apply_binop picks whichever operand is
+    // actually the wrong type, e.g. `true + 1` blames `true` even though
+    // `1` was Eval'd more recently) and "attempt to call a non-function
+    // value" (Frame::AppFunc/AppArg carry the CALLEE's own span, so `f(1)`
+    // with `f` not callable blames `f`, not the unrelated argument `1` --
+    // the naive last-Eval fallback would wrongly blame the ARGUMENT, since
+    // it's evaluated after `f` and right before the panic fires).
+    // Everywhere else (builtin argument-type panics, match failure, ...)
+    // still falls back to last-Eval, always in the neighborhood, never
+    // wildly off, without threading a Span through every Frame variant and
+    // Value accessor -- the same 80/20 trade this checker already makes
     // elsewhere (see typecheck::TypeError's doc comment, missing_case).
     static CURRENT_SPAN: Cell<Option<Span>> = const { Cell::new(None) };
 }
@@ -65,7 +76,7 @@ pub fn run(arena: &Arena, expr: ExprRef, env: Env, spans: &SpanMap) -> Value {
 // this is the expected shape for a structural-recursion primitive anyway
 // -- fold/map are conventionally pure transformations.
 pub fn apply(arena: &Arena, func: Value, arg: Value, spans: &SpanMap) -> Value {
-    run_loop(arena, Control::Apply(arg), Cont::cons(Frame::AppArg { func }, Cont::nil()), spans)
+    run_loop(arena, Control::Apply(arg), Cont::cons(Frame::AppArg { func, callee_span: None }, Cont::nil()), spans)
 }
 
 fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap) -> Value {
@@ -109,7 +120,8 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     control = Control::Apply(Value::Closure(param.clone(), *body, env));
                 }
                 Expr::App(f, a) => {
-                    cont = Cont::cons(Frame::AppFunc { arg: *a, env: env.clone() }, cont);
+                    let callee_span = spans.get(*f).copied();
+                    cont = Cont::cons(Frame::AppFunc { arg: *a, env: env.clone(), callee_span }, cont);
                     control = Control::Eval(*f, env);
                 }
                 Expr::Let(var, _ann, val_expr, body) => {
@@ -130,7 +142,8 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     control = Control::Eval(first, env);
                 }
                 Expr::BinOp(op, l, r) => {
-                    cont = Cont::cons(Frame::BinOpL { op: *op, rhs: *r, env: env.clone() }, cont);
+                    let (l_span, r_span) = (spans.get(*l).copied(), spans.get(*r).copied());
+                    cont = Cont::cons(Frame::BinOpL { op: *op, rhs: *r, env: env.clone(), l_span, r_span }, cont);
                     control = Control::Eval(*l, env);
                 }
                 Expr::If(c, t, e) => {
@@ -205,12 +218,13 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     // while still reading through the old borrow doesn't
                     // typecheck, even though it would be sound.
                     match frame {
-                        Frame::AppFunc { arg, env } => {
-                            let (arg, env) = (*arg, env.clone());
-                            cont = Cont::cons(Frame::AppArg { func: value }, rest);
+                        Frame::AppFunc { arg, env, callee_span } => {
+                            let (arg, env, callee_span) = (*arg, env.clone(), *callee_span);
+                            cont = Cont::cons(Frame::AppArg { func: value, callee_span }, rest);
                             control = Control::Eval(arg, env);
                         }
-                        Frame::AppArg { func } => {
+                        Frame::AppArg { func, callee_span } => {
+                            let callee_span = *callee_span;
                             let func = func.clone();
                             cont = rest;
                             match func {
@@ -256,7 +270,10 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                     let args = (*prev_args).clone();
                                     control = Control::Apply(collect_builtin_arg(arena, b, args, value, spans));
                                 }
-                                _ => panic!("attempt to call a non-function value"),
+                                _ => {
+                                    set_current_span(callee_span);
+                                    panic!("attempt to call a non-function value")
+                                }
                             }
                         }
                         Frame::InstallHandler { body, env } => {
@@ -343,15 +360,15 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                 None => panic!("match failed: no pattern matched the value"),
                             }
                         }
-                        Frame::BinOpL { op, rhs, env } => {
-                            let (op, rhs, env) = (*op, *rhs, env.clone());
-                            cont = Cont::cons(Frame::BinOpR { op, lhs: value }, rest);
+                        Frame::BinOpL { op, rhs, env, l_span, r_span } => {
+                            let (op, rhs, env, l_span, r_span) = (*op, *rhs, env.clone(), *l_span, *r_span);
+                            cont = Cont::cons(Frame::BinOpR { op, lhs: value, l_span, r_span }, rest);
                             control = Control::Eval(rhs, env);
                         }
-                        Frame::BinOpR { op, lhs } => {
-                            let (op, lhs) = (*op, lhs.clone());
+                        Frame::BinOpR { op, lhs, l_span, r_span } => {
+                            let (op, lhs, l_span, r_span) = (*op, lhs.clone(), *l_span, *r_span);
                             cont = rest;
-                            control = Control::Apply(apply_binop(op, lhs, value));
+                            control = Control::Apply(apply_binop(op, lhs, value, l_span, r_span));
                         }
                         Frame::If { then_, else_, env } => {
                             let (then_, else_, env) = (*then_, *else_, env.clone());
@@ -408,35 +425,93 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
     }
 }
 
-// Add/Lt are Int-only -- wrong operand type panics via as_int(). Eq is
-// structural: it compares whatever tags the two values actually carry
-// (typecheck.rs only requires the two operand types to be consistent with
-// each other, not both Int), so it dispatches on Value directly instead of
-// projecting through as_int(). Concat (++) is Str/Str or List/List only --
-// typecheck.rs rejects anything else statically when it can tell, so a
-// runtime panic here only fires for a Dyn-sourced value of the wrong tag.
-fn apply_binop(op: BinOp, lhs: Value, rhs: Value) -> Value {
+fn set_current_span(span: Option<Span>) {
+    if let Some(s) = span {
+        CURRENT_SPAN.with(|c| c.set(Some(s)));
+    }
+}
+
+// Widest span covering both -- used only where a panic can't be pinned on
+// either operand alone (Concat with BOTH sides wrong-typed). Not the
+// original BinOp node's own span: that node no longer exists in `spans`
+// once typecheck::elaborate has run (it always rebuilds a BinOp node via
+// arena.push, even when neither operand needed a Check -- see elaborate's
+// own doc comment on spans only covering parser-produced nodes), so this
+// reconstructs the same "whole expression" span from its two operands'
+// (still-original, still-tracked) spans instead.
+fn combine_spans(a: Option<Span>, b: Option<Span>) -> Option<Span> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(Span { start: a.start.min(b.start), end: a.end.max(b.end) }),
+        (Some(s), None) | (None, Some(s)) => Some(s),
+        (None, None) => None,
+    }
+}
+
+// Only touches CURRENT_SPAN on the FAILING path (never on a successful
+// as_int()) -- setting it unconditionally would clobber whatever the last
+// real Eval left behind with this operand's own span even when this
+// operand is perfectly fine, which is wrong the moment `span` itself is
+// None (an elaborated, Check-wrapped Dyn operand has no span of its own
+// in `spans` -- see combine_spans's doc comment -- so the CORRECT blame
+// for a later failure is exactly "whatever Eval ran last", which this
+// must not overwrite on the way there). So e.g. `true + 1` blames `true`
+// specifically, not `1` (the last thing Eval'd before this call, and not
+// at fault here) -- and `10 / y` with `y` a Dyn-sourced 0 blames `y` via
+// that same untouched last-Eval fallback, not `10`.
+fn as_int_at(v: &Value, span: Option<Span>) -> i64 {
+    if let Value::Int(n) = v {
+        *n
+    } else {
+        set_current_span(span);
+        v.as_int()
+    }
+}
+
+// Add/Sub/Mul/Div/Mod/Lt are Int-only -- wrong operand type panics via
+// as_int_at(), which blames whichever operand's own span was passed in
+// (left evaluated, thus blamed, before right, matching apply_binop's
+// call sites below). Div/Mod-by-zero pass `r_span` -- it's always the
+// right operand that's zero, never a type question about either side --
+// but like any operand span, that's only the RIGHT OPERAND'S OWN span
+// when it's a simple, still-tracked node (a var or literal); a nested
+// sub-expression divisor (`10 / (2 - 2)`) gets its own fresh, untracked
+// BinOp node from elaborate, so `r_span` is None there too and this falls
+// back to whatever Eval ran last inside it -- still somewhere inside the
+// divisor, just not the divisor's own span as a whole. Eq is structural: it compares whatever tags
+// the two values actually carry (typecheck.rs only requires the two
+// operand types to be consistent with each other, not both Int), so it
+// dispatches on Value directly instead of projecting through as_int_at(),
+// and never panics. Concat (++) and Cons (::) typecheck.rs statically
+// rejects when it can tell; a runtime panic here only fires for a
+// Dyn-sourced operand of the wrong tag, in which case the fallback arm
+// below picks the specific operand's span that's actually responsible
+// (both, via combine_spans, only for `++` when NEITHER side was
+// statically known -- see typecheck.rs's own doc comment on that gap, and
+// on Cons's `t` being the only operand `::` can ever blame).
+fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: Option<Span>) -> Value {
     match op {
-        BinOp::Add => Value::Int(lhs.as_int() + rhs.as_int()),
-        BinOp::Sub => Value::Int(lhs.as_int() - rhs.as_int()),
-        BinOp::Mul => Value::Int(lhs.as_int() * rhs.as_int()),
+        BinOp::Add => Value::Int(as_int_at(&lhs, l_span) + as_int_at(&rhs, r_span)),
+        BinOp::Sub => Value::Int(as_int_at(&lhs, l_span) - as_int_at(&rhs, r_span)),
+        BinOp::Mul => Value::Int(as_int_at(&lhs, l_span) * as_int_at(&rhs, r_span)),
         BinOp::Div => {
-            let (l, r) = (lhs.as_int(), rhs.as_int());
+            let (l, r) = (as_int_at(&lhs, l_span), as_int_at(&rhs, r_span));
             if r == 0 {
+                set_current_span(r_span);
                 panic!("division by zero");
             }
             Value::Int(l / r)
         }
         BinOp::Mod => {
-            let (l, r) = (lhs.as_int(), rhs.as_int());
+            let (l, r) = (as_int_at(&lhs, l_span), as_int_at(&rhs, r_span));
             if r == 0 {
+                set_current_span(r_span);
                 panic!("modulo by zero");
             }
             Value::Int(l % r)
         }
-        BinOp::Lt => Value::Bool(lhs.as_int() < rhs.as_int()),
+        BinOp::Lt => Value::Bool(as_int_at(&lhs, l_span) < as_int_at(&rhs, r_span)),
         BinOp::Eq => Value::Bool(value_eq(&lhs, &rhs)),
-        BinOp::Concat => match (lhs, rhs) {
+        BinOp::Concat => match (&lhs, &rhs) {
             (Value::Str(a), Value::Str(b)) => Value::Str(Rc::from(format!("{a}{b}"))),
             (Value::List(a), Value::List(b)) => {
                 let mut v = Vec::with_capacity(a.len() + b.len());
@@ -444,16 +519,31 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value) -> Value {
                 v.extend(b.iter().cloned());
                 Value::List(Rc::new(v))
             }
-            _ => panic!("++ expects two strings or two lists"),
+            _ => {
+                // Whichever operand isn't Str/List is the actual culprit;
+                // if both are (e.g. an Int and a Bool), neither operand
+                // alone explains it, so blame the whole `l ++ r` instead.
+                let l_ok = matches!(lhs, Value::Str(_) | Value::List(_));
+                let r_ok = matches!(rhs, Value::Str(_) | Value::List(_));
+                set_current_span(match (l_ok, r_ok) {
+                    (false, true) => l_span,
+                    (true, false) => r_span,
+                    _ => combine_spans(l_span, r_span),
+                });
+                panic!("++ expects two strings or two lists")
+            }
         },
-        BinOp::Cons => match rhs {
+        BinOp::Cons => match &rhs {
             Value::List(items) => {
                 let mut v = Vec::with_capacity(items.len() + 1);
                 v.push(lhs);
                 v.extend(items.iter().cloned());
                 Value::List(Rc::new(v))
             }
-            _ => panic!(":: expects a list on the right"),
+            _ => {
+                set_current_span(r_span);
+                panic!(":: expects a list on the right")
+            }
         },
     }
 }
