@@ -1184,6 +1184,119 @@ mod tests {
     }
 
     #[test]
+    fn tuple_type_annotation_accepts_matching_shape() {
+        let src = r#"let f = fun p: (Int, Str) -> p in f((5, "hi"))"#;
+        assert_eq!(run_source(src).unwrap().to_string(), "[5, hi]");
+    }
+
+    #[test]
+    fn single_element_tuple_needs_a_trailing_comma_to_close() {
+        // Regression: without trailing-comma support, `,` always required
+        // a following expression/pattern/type, so a 1-tuple could never
+        // be written at all -- `(x,)` used to be a parse error.
+        let src = "match (5,) with | (n,) -> n";
+        assert_eq!(run_source(src).unwrap().as_int(), 5);
+    }
+
+    #[test]
+    fn type_alias_names_an_arbitrary_type_expression() {
+        let src = "type MyInt = Int in let f = fun x: MyInt -> x in f(5)";
+        assert_eq!(run_source(src).unwrap().as_int(), 5);
+    }
+
+    #[test]
+    fn type_alias_stays_in_scope_across_sibling_atoms_not_just_the_first_one() {
+        // Regression: `type` pushes nothing to `atom`'s own `pending`
+        // (unlike `let`/`fun`/`data`, which always do), so without
+        // `saw_type_alias` tracking this separately, `type X = ... in
+        // BODY` parsed BODY as a single atom_leaf() atom instead of a
+        // full expr() whenever `type` was the chain's only prefix --
+        // meaning the alias got restored the moment the FIRST atom
+        // finished, before a LATER sibling atom in the same expression
+        // (here, the juxtaposed argument) ever saw it. Both lambdas below
+        // reference `MyInt`; the second is parsed in a SEPARATE atom()
+        // call from the first (as the application's argument) -- if the
+        // scope were too narrow, `MyInt` there would silently fall back
+        // to an undeclared Data type, and the two (Int -> Int) function
+        // types would then fail to unify.
+        let src = "type MyInt = Int in (fun f: (MyInt -> Int) -> f(5)) (fun x: MyInt -> x)";
+        assert_eq!(run_source(src).unwrap().as_int(), 5);
+    }
+
+    #[test]
+    fn union_type_annotation_accepts_either_alternative() {
+        let src = "type IntOrStr = Int | Str in let f = fun x: IntOrStr -> x in f(5)";
+        assert_eq!(run_source(src).unwrap().as_int(), 5);
+        let src2 = r#"type IntOrStr = Int | Str in let f = fun x: IntOrStr -> x in f("hi")"#;
+        assert_eq!(run_source(src2).unwrap().to_string(), "hi");
+    }
+
+    #[test]
+    fn union_type_annotation_rejects_neither_alternative_statically() {
+        let src = "type IntOrStr = Int | Str in let f = fun x: IntOrStr -> x in f(true)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected Int | Str, found Bool"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn union_type_dyn_boundary_accepts_a_matching_alternative_at_runtime() {
+        let src = r#"
+            type IntOrStr = Int | Str in
+            handle
+              let y = perform choose(0) in
+              let f = fun x: IntOrStr -> x in
+              f(y)
+            with handler choose(p, resume) -> resume("passed")
+        "#;
+        assert_eq!(run_source(src).unwrap().to_string(), "passed");
+    }
+
+    #[test]
+    fn union_type_dyn_boundary_rejects_no_matching_alternative_at_runtime() {
+        let src = r#"
+            type IntOrStr = Int | Str in
+            handle
+              let y = perform choose(0) in
+              let f = fun x: IntOrStr -> x in
+              f(y)
+            with handler choose(p, resume) -> resume(true)
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected Int | Str, found Bool"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn union_of_tuples_exhaustiveness_needs_every_alternative_covered() {
+        // Unlike a single Tuple type, a Union's alternatives are
+        // independent -- one arm per alternative is exhaustive even
+        // though no SINGLE arm covers the whole union.
+        let src = r#"
+            type Pair = (Int,) | (Int, Int) in
+            let f = fun p: Pair ->
+              match p with
+              | (n,) -> n
+            in f((5,))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn union_of_tuples_exhaustive_when_every_alternative_is_covered() {
+        let src = r#"
+            type Pair = (Int,) | (Int, Int) in
+            let f = fun p: Pair ->
+              match p with
+              | (n,) -> n
+              | (n, m) -> n + m
+            in f((5,))
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 5);
+    }
+
+    #[test]
     fn same_data_type_annotation_accepted() {
         let src = "data Celsius = MkC(Int) in let f = fun x: Celsius -> x in f(MkC(100))";
         let (mut arena, spans, root) = parser::parse(src).unwrap();

@@ -25,6 +25,11 @@ pub enum Token {
     // any other type, however identically shaped, only with itself.
     #[token("opaque")]
     Opaque,
+    // `type Name = TypeExpr in body` -- names a type expression (see
+    // parser::Parser::type_aliases), a pure compile-time directive with
+    // no runtime effect of its own.
+    #[token("type")]
+    TypeKw,
     #[token("in")]
     In,
     #[token("if")]

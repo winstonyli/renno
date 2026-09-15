@@ -17,6 +17,7 @@ pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
         src,
         branded_ctors: HashMap::new(),
         type_brands: HashMap::new(),
+        type_aliases: HashMap::new(),
     };
     let root = p.expr()?;
     if p.pos != p.tokens.len() {
@@ -54,6 +55,15 @@ struct Parser<'a> {
     // `branded_ctors`, same `data` arm in `atom`, same LIFO restore at its
     // end) -- see that field's own doc comment for why.
     type_brands: HashMap<String, u64>,
+    // Type name -> the fully-resolved Type it stands for -- `type Name =
+    // TypeExpr in body` (see atom's own `Some(Token::TypeKw)` arm), a pure
+    // compile-time directive with no runtime effect of its own. Consulted
+    // by parse_type's bare-identifier case BEFORE falling back to
+    // Type::Data(name, ...) -- a name found here is substituted in
+    // directly, fully resolved at the point of use, not deferred. Scoped
+    // the same way as type_brands/branded_ctors: updated when a `type`
+    // binder is parsed, restored (LIFO) once its own `in <body>` ends.
+    type_aliases: HashMap<String, Type>,
 }
 
 // A `let`/`fun`/`data` prefix collected while flattening a chain of them
@@ -249,13 +259,66 @@ impl<'a> Parser<'a> {
     }
 
     // Optional `: Type` annotation, e.g. after a param name or a let binder.
+    // parse_type_atom_union, NOT parse_union_type -- same "don't chain ->
+    // at this level" reasoning parse_type's own doc comment gives: `fun x:
+    // T -> body` must not let `T` swallow that `->` as its own (an
+    // unparenthesized function type still needs explicit parens here,
+    // `fun x: (A -> B) -> body`), and that restriction has to extend to
+    // `|` too, or `fun x: A | B -> body` would ambiguously let `B`'s
+    // alternative reach for the arrow the same way a bare function type
+    // would.
     fn opt_annotation(&mut self) -> Result<Option<Type>, String> {
         if matches!(self.peek(), Some(Token::Colon)) {
             self.bump();
-            Ok(Some(self.parse_type()?))
+            Ok(Some(self.parse_type_atom_union()?))
         } else {
             Ok(None)
         }
+    }
+
+    // type_atom_union := type ("|" type)*  -- parse_type's own ATOM level
+    // (no "->"), unioned. Used where a trailing "->" must NOT be consumed
+    // as part of the type (opt_annotation -- see its own doc comment); a
+    // function type still needs explicit parens there, same as before
+    // union types existed, and now so does a function type as one union
+    // alternative (`fun x: (A -> B) | C -> body`).
+    fn parse_type_atom_union(&mut self) -> Result<Type, String> {
+        let first = self.parse_type()?;
+        if !matches!(self.peek(), Some(Token::Pipe)) {
+            return Ok(first);
+        }
+        let mut alts = vec![first];
+        while matches!(self.peek(), Some(Token::Pipe)) {
+            self.bump();
+            alts.push(self.parse_type()?);
+        }
+        Ok(Type::Union(Rc::new(alts)))
+    }
+
+    // union_type := fun_type ("|" fun_type)*  (left-associative in surface
+    // syntax, though Type::Union itself is an unordered set -- order in
+    // the Vec never matters to consistent_inner). `|` binds LOOSER than
+    // `->` (parse_fun_type's own right-recursion is greedy, so `A -> B | C`
+    // parses as `(A -> B) | C`, not `A -> (B | C)`). Used everywhere a
+    // trailing `->` couldn't be ambiguous with something else that follows
+    // (unlike opt_annotation -- see parse_type_atom_union): inside `[...]`/
+    // `(...)`, and a `type` alias's own RHS (terminated by `in`, not `->`/
+    // `=`). Deliberately NOT threaded into parse_ctor_field: a `data`
+    // block's own `|` already separates constructors at the OUTER level,
+    // and allowing it inside one field's type too would be needlessly
+    // confusing right next to that existing meaning, for no real use case
+    // yet.
+    fn parse_union_type(&mut self) -> Result<Type, String> {
+        let first = self.parse_fun_type()?;
+        if !matches!(self.peek(), Some(Token::Pipe)) {
+            return Ok(first);
+        }
+        let mut alts = vec![first];
+        while matches!(self.peek(), Some(Token::Pipe)) {
+            self.bump();
+            alts.push(self.parse_fun_type()?);
+        }
+        Ok(Type::Union(Rc::new(alts)))
     }
 
     // Bare, atom-only: "Int" | "Bool" | "Str" | "Dyn" | "[" fun_type "]" |
@@ -278,14 +341,34 @@ impl<'a> Parser<'a> {
                 self.expect(&Token::RBracket)?;
                 Ok(Type::List(Rc::new(elem)))
             }
+            // `(T)` stays ordinary grouping; `(T, T, ...)` (a comma
+            // present) is a tuple TYPE -- Type::Tuple, matching Expr::
+            // Tuple's own comma-means-tuple rule on the expression side.
+            // Trailing comma allowed (needed to write a single-element
+            // tuple type `(T,)` at all, same reason as expressions).
             Some(Token::LParen) => {
-                let t = self.parse_fun_type()?;
-                self.expect(&Token::RParen)?;
-                Ok(t)
+                let first = self.parse_union_type()?;
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    let mut items = vec![first];
+                    while matches!(self.peek(), Some(Token::Comma)) {
+                        self.bump();
+                        if matches!(self.peek(), Some(Token::RParen)) {
+                            break;
+                        }
+                        items.push(self.parse_union_type()?);
+                    }
+                    self.expect(&Token::RParen)?;
+                    Ok(Type::Tuple(Rc::new(items)))
+                } else {
+                    self.expect(&Token::RParen)?;
+                    Ok(first)
+                }
             }
-            // A capitalized name that isn't one of the built-in type
-            // keywords: a reference to a `data`-declared type. Structural
-            // comparison still needs no name-resolution pass -- an
+            // A capitalized name: either a known `type` alias
+            // (Parser::type_aliases -- checked FIRST, and if found,
+            // substituted in directly, fully resolved, not deferred) or a
+            // reference to a `data`-declared type. Structural comparison
+            // still needs no name-resolution pass for the latter -- an
             // undeclared/misspelled name is just never found in `fields`
             // and conservatively rejected (types::consistent_inner) -- but
             // opaque comparison does need to know WHICH declaration this
@@ -301,6 +384,9 @@ impl<'a> Parser<'a> {
             // `type_brands` before parsing its constructor field list, for
             // exactly this case.
             Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => {
+                if let Some(ty) = self.type_aliases.get(&name) {
+                    return Ok(ty.clone());
+                }
                 let brand = self.type_brands.get(&name).copied();
                 Ok(Type::Data(name, brand))
             }
@@ -420,10 +506,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // pattern_atom := Int | true | false | Str | ident | "[" (pattern ("," pattern)*)? "]"
-    // No parens for grouping yet -- every pattern shape renno currently
-    // needs (literals, Var, fixed-length list, cons) is expressible without
-    // them; add if a real program needs `(h :: t) :: rest`-style nesting.
+    // pattern_atom := Int | true | false | Str | ident
+    //               | "[" (pattern ("," pattern)*)? "]"
+    //               | "(" pattern ("," pattern)* ","? ")"
     fn pattern_atom(&mut self) -> Result<Pattern, String> {
         match self.bump() {
             Some(Token::Int(n)) => Ok(Pattern::Int(n)),
@@ -441,6 +526,11 @@ impl<'a> Parser<'a> {
                     let mut items = vec![first];
                     while matches!(self.peek(), Some(Token::Comma)) {
                         self.bump();
+                        // Trailing comma allowed -- without it a single-
+                        // element tuple pattern `(p,)` could never close.
+                        if matches!(self.peek(), Some(Token::RParen)) {
+                            break;
+                        }
                         items.push(self.pattern()?);
                     }
                     self.expect(&Token::RParen)?;
@@ -809,8 +899,37 @@ impl<'a> Parser<'a> {
         // brand id -- one entry per `data` block, pushed/restored at the
         // same points.
         let mut type_brand_restore: Vec<(String, Option<u64>)> = Vec::new();
+        // Same restore-on-scope-exit story, for `type_aliases`.
+        let mut type_alias_restore: Vec<(String, Option<Type>)> = Vec::new();
+        // `type` pushes NOTHING to `pending` (no AST node to fold back --
+        // see the arm below), so `pending.is_empty()` alone can't tell the
+        // terminal-parsing branch below "a prefix WAS seen" the way it can
+        // for Let/Fun/Data (which always push one). Without this, `type X
+        // = ... in BODY` where BODY starts with anything other than
+        // Let/Fun/Data/TypeKw would parse BODY as a single atom_leaf()
+        // atom instead of a full self.expr() -- meaning `type_aliases`
+        // gets restored (see the end of this function) the moment that
+        // ONE atom finishes, before any LATER sibling atom in the same
+        // expression (a juxtaposed argument, say) gets a chance to see the
+        // alias still in scope.
+        let mut saw_type_alias = false;
         loop {
             match self.peek() {
+                Some(Token::TypeKw) => {
+                    // `type Name = TypeExpr in body` -- a pure compile-time
+                    // directive: no wrapped AST node, no PendingBinder
+                    // entry (nothing to fold back), just a scoped update to
+                    // `type_aliases` before continuing this same peeling
+                    // loop (parsing the next prefix, or the terminal body).
+                    self.bump();
+                    saw_type_alias = true;
+                    let name = self.ident()?;
+                    self.expect(&Token::Equals)?;
+                    let ty = self.parse_union_type()?;
+                    self.expect(&Token::In)?;
+                    type_alias_restore.push((name.clone(), self.type_aliases.get(&name).cloned()));
+                    self.type_aliases.insert(name, ty);
+                }
                 Some(Token::Let) => {
                     let start = self.span_at().start;
                     self.bump();
@@ -1018,7 +1137,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let mut result = if pending.is_empty() { self.atom_leaf()? } else { self.expr()? };
+        let mut result = if pending.is_empty() && !saw_type_alias { self.atom_leaf()? } else { self.expr()? };
         // Every wrapping binder shares this same END position (the
         // terminal body's own end) -- only its START differs (where its
         // own `let`/`fun`/`data` keyword began). `let x = 1 in let y = 2
@@ -1108,6 +1227,17 @@ impl<'a> Parser<'a> {
                 }
                 None => {
                     self.type_brands.remove(&name);
+                }
+            }
+        }
+        // Same restore, same reasoning, for `type_aliases`.
+        for (name, old) in type_alias_restore.into_iter().rev() {
+            match old {
+                Some(ty) => {
+                    self.type_aliases.insert(name, ty);
+                }
+                None => {
+                    self.type_aliases.remove(&name);
                 }
             }
         }
@@ -1331,6 +1461,13 @@ impl<'a> Parser<'a> {
                     let mut items = vec![first];
                     while matches!(self.peek(), Some(Token::Comma)) {
                         self.bump();
+                        // Trailing comma allowed (also what makes a
+                        // single-element tuple `(x,)` writable at all --
+                        // without it, `,` would always need a following
+                        // expression, so a 1-tuple could never close).
+                        if matches!(self.peek(), Some(Token::RParen)) {
+                            break;
+                        }
                         items.push(self.expr()?);
                     }
                     self.expect(&Token::RParen)?;

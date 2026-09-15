@@ -75,6 +75,16 @@ pub enum Type {
     // Value::List (see Expr::Tuple's own doc comment) -- same "no new
     // Value kind" choice Data's own tagged-list encoding already made.
     Tuple(Rc<Vec<Type>>),
+    // "One of these" -- a self-contained sum, no registry/name lookup
+    // (contrast with Data, which needs one). Typically each alternative
+    // is a Tuple whose first element is a distinct Token (a hand-rolled
+    // sum: `Type::Union([Tuple([Token(id_none)]), Tuple([Token(id_some),
+    // Int])])`), but nothing here requires that shape -- any two types
+    // can be unioned. Named via `type Name = A | B in ...`
+    // (Parser::type_aliases); the union itself has no runtime
+    // representation of its own, only whatever VALUE actually flows
+    // through ends up being one alternative's own shape.
+    Union(Rc<Vec<Type>>),
 }
 
 // Closed effect row: an exact known set (Closed), "unknown, could be
@@ -208,6 +218,23 @@ fn consistent_inner(a: &Type, b: &Type, fields: &[Rc<DataInfo>], seen: &mut BTre
         (Type::Tuple(a), Type::Tuple(b)) => {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| consistent_inner(x, y, fields, seen))
         }
+        // Two unions: consistent as SETS -- every alternative on each
+        // side has a match on the other (order and duplicates don't
+        // matter, only membership). Must come before the single-Union
+        // arm below (Rust checks patterns top to bottom; that arm's
+        // `other: &Type` would otherwise also match a Union on the other
+        // side).
+        (Type::Union(a), Type::Union(b)) => {
+            a.iter().all(|x| b.iter().any(|y| consistent_inner(x, y, fields, seen)))
+                && b.iter().all(|y| a.iter().any(|x| consistent_inner(x, y, fields, seen)))
+        }
+        // One union, one concrete type: consistent if the concrete side
+        // matches ANY ONE alternative -- "is this one of the possible
+        // shapes," the same question a runtime value crossing a
+        // Union-typed boundary would need answered.
+        (Type::Union(alts), other) | (other, Type::Union(alts)) => {
+            alts.iter().any(|alt| consistent_inner(alt, other, fields, seen))
+        }
         // Either side opaque (Some brand): consistent ONLY when both carry
         // the EXACT SAME brand -- i.e. resolve to the identical `data`
         // declaration. This is what closes the shadowing gap this arm used
@@ -329,6 +356,15 @@ impl fmt::Display for Type {
                     write!(f, "{t}")?;
                 }
                 write!(f, ")")
+            }
+            Type::Union(alts) => {
+                for (i, t) in alts.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{t}")?;
+                }
+                Ok(())
             }
         }
     }

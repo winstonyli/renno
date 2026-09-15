@@ -84,7 +84,7 @@ fn free_row_vars(ty: &Type) -> BTreeSet<String> {
             vars
         }
         Type::List(elem) => free_row_vars(elem),
-        Type::Tuple(items) => items.iter().flat_map(free_row_vars).collect(),
+        Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(free_row_vars).collect(),
         Type::Dyn | Type::Int | Type::Bool | Type::Str | Type::Data(_, _) | Type::Token(_) => BTreeSet::new(),
     }
 }
@@ -250,8 +250,107 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, fields: &[Rc<D
         },
         Type::Token(id) => build_token_check(arena, e, to, *id),
         Type::Tuple(items) => build_tuple_check(arena, e, to, items.len()),
+        Type::Union(_) => build_union_check(arena, e, to, fields),
         Type::Dyn => unreachable!("coerce only calls this once *to != Type::Dyn is already established"),
     }
+}
+
+// `let __check_tmp = e in if <alt1-shape> || <alt2-shape> || ... then
+// __check_tmp else fail(...)` -- shallow, like every other check here:
+// confirms the value matches SOME alternative's own shape (Tuple's own
+// arity-only test, Data's own tag+length+brand test, etc, whichever
+// alternative it is), not a full recursive per-position verification.
+// Unlike the single-type check builders above, this can't just call
+// build_boundary_check per alternative and fall through on failure --
+// build_boundary_check's own fail() would abort the WHOLE check on the
+// first alternative that doesn't match, instead of trying the next one --
+// so this builds each alternative's bare boolean predicate (via
+// build_shape_predicate) and OR's them together first, deciding only
+// once, at the end, whether to pass the value through or fail.
+fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, fields: &[Rc<DataInfo>]) -> ExprRef {
+    let tmp = "__check_tmp".to_string();
+    let tmp_ref = arena.push(Expr::Var(tmp.clone()));
+    let pred = build_shape_predicate(arena, tmp_ref, to, fields);
+    let fail_call = build_fail_call(arena, to, tmp_ref);
+    let if_expr = arena.push(Expr::If(pred, tmp_ref, fail_call));
+    arena.push(Expr::Let(tmp, None, e, if_expr))
+}
+
+// The bare boolean half of build_boundary_check's per-type dispatch --
+// "does `value_ref` shallowly look like `ty`," with no let-binding and no
+// fail() of its own, so build_union_check can OR several of these
+// together before deciding anything. Mirrors build_boundary_check's own
+// arms exactly (same shallow-check precedent each one sets), just
+// stopping short of wrapping the result in Let/If/fail.
+fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, fields: &[Rc<DataInfo>]) -> ExprRef {
+    match ty {
+        Type::Dyn => arena.push(Expr::Bool(true)),
+        Type::Int => build_predicate_call(arena, "is_int", value_ref),
+        Type::Bool => build_predicate_call(arena, "is_bool", value_ref),
+        Type::Str => build_predicate_call(arena, "is_str", value_ref),
+        Type::List(_) => build_predicate_call(arena, "is_list", value_ref),
+        Type::Fun(..) => build_predicate_call(arena, "is_fun", value_ref),
+        Type::Token(id) => {
+            let lit = arena.push(Expr::Token(*id));
+            arena.push(Expr::BinOp(BinOp::Eq, value_ref, lit))
+        }
+        Type::Tuple(items) => {
+            let is_list = build_predicate_call(arena, "is_list", value_ref);
+            let len_var = arena.push(Expr::Var("len".to_string()));
+            let len_call = arena.push(Expr::App(len_var, value_ref));
+            let arity_lit = arena.push(Expr::Int(items.len() as i64));
+            let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, arity_lit));
+            let false_lit = arena.push(Expr::Bool(false));
+            arena.push(Expr::If(is_list, len_eq, false_lit))
+        }
+        Type::Data(name, brand) => match lookup_data(fields, name, *brand) {
+            Some(info) => {
+                let shape: Vec<(String, usize)> = info
+                    .ctor_types
+                    .iter()
+                    .map(|(cname, ctys)| (cname.clone(), 1 + ctys.len() + usize::from(info.brand.is_some())))
+                    .collect();
+                build_data_predicate(arena, value_ref, &shape, info.brand)
+            }
+            None => build_predicate_call(arena, "is_list", value_ref),
+        },
+        Type::Union(alts) => {
+            let mut result = arena.push(Expr::Bool(false));
+            for alt in alts.iter().rev() {
+                let p = build_shape_predicate(arena, value_ref, alt, fields);
+                let true_lit = arena.push(Expr::Bool(true));
+                result = arena.push(Expr::If(p, true_lit, result));
+            }
+            result
+        }
+    }
+}
+
+fn build_predicate_call(arena: &mut Arena, name: &str, value_ref: ExprRef) -> ExprRef {
+    let v = arena.push(Expr::Var(name.to_string()));
+    arena.push(Expr::App(v, value_ref))
+}
+
+// Same witness-building as build_data_check, but returns just the
+// check_data_shape CALL (a Bool), not the surrounding let/if/fail.
+fn build_data_predicate(arena: &mut Arena, value_ref: ExprRef, shape: &[(String, usize)], brand: Option<u64>) -> ExprRef {
+    let pairs: Vec<ExprRef> = shape
+        .iter()
+        .map(|(name, len)| {
+            let tag = arena.push(Expr::Str(name.clone()));
+            let len_expr = arena.push(Expr::Int(*len as i64));
+            arena.push(Expr::ListLit(vec![tag, len_expr]))
+        })
+        .collect();
+    let witness = arena.push(Expr::ListLit(pairs));
+    let brand_expr = match brand {
+        Some(id) => arena.push(Expr::Token(id)),
+        None => arena.push(Expr::Bool(false)),
+    };
+    let pred_var = arena.push(Expr::Var("check_data_shape".to_string()));
+    let call1 = arena.push(Expr::App(pred_var, value_ref));
+    let call2 = arena.push(Expr::App(call1, witness));
+    arena.push(Expr::App(call2, brand_expr))
 }
 
 // A singleton: the only thing a Dyn-sourced value could ever satisfy this
@@ -641,6 +740,19 @@ fn missing_case(patterns: &[Pattern], fields: &[Rc<DataInfo>], scrut_ty: &Type) 
     if let Type::Tuple(_) = scrut_ty {
         let covers_every_tuple = patterns.iter().any(|p| covers_tuple_position(p, scrut_ty));
         if covers_every_tuple {
+            return None;
+        }
+    }
+
+    // A Union's alternatives are independent -- unlike Tuple, no SINGLE
+    // pattern needs to cover the whole thing; exhaustive means every
+    // alternative has SOME pattern (not necessarily the same one) that
+    // fully covers it. `type Option = (Token,) | (Token, Int) in ... |
+    // (t,) -> ... | (t, x) -> ...` is exhaustive this way even though
+    // neither arm alone would satisfy Tuple's own single-pattern check.
+    if let Type::Union(alts) = scrut_ty {
+        let covers_every_alt = alts.iter().all(|alt| patterns.iter().any(|p| covers_tuple_position(p, alt)));
+        if covers_every_alt {
             return None;
         }
     }
