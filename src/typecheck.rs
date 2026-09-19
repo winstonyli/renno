@@ -1651,15 +1651,20 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 let (item_ty, item_row, item2) = elaborate(arena, item, ctx, spans, infer)?;
                 row = EffectRow::union(&row, &item_row);
                 refs.push(item2);
-                // Same rule as If's branches: differing concrete element
-                // types aren't an error (no union types) -- widen to Dyn.
                 elem_ty = Some(match elem_ty {
                     None => item_ty,
-                    Some(t) if t == item_ty => t,
-                    Some(_) => Type::Dyn,
+                    Some(t) => match unify(&t, &item_ty, infer, spans[item]) {
+                        Ok(()) => infer.resolve_deep(&t),
+                        Err(_) => Type::Dyn,
+                    },
                 });
             }
-            let list_ty = Type::List(Rc::new(elem_ty.unwrap_or(Type::Dyn)));
+            // Empty list: a fresh Type::Var, not Type::Dyn -- so a
+            // combining site elsewhere (Match's own cross-arm
+            // combination, right below) has something real to unify
+            // against instead of a Dyn that would otherwise immediately
+            // flatten the whole result.
+            let list_ty = Type::List(Rc::new(elem_ty.unwrap_or_else(|| infer.fresh_var("elem"))));
             Ok((list_ty, row, arena.push(Expr::ListLit(refs))))
         }
 
@@ -1958,9 +1963,14 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans[c])?;
             let (t_ty, t_row, t2) = elaborate(arena, t, ctx, spans, infer)?;
             let (e_ty, e_row, e2) = elaborate(arena, e, ctx, spans, infer)?;
-            // Branches with differing concrete types aren't an error here
-            // (no union types) -- just widen to Dyn rather than reject.
-            let result_ty = if t_ty == e_ty { t_ty } else { Type::Dyn };
+            // Try unify first (resolves open type variables when
+            // possible); fall back to today's exact widen-to-Dyn
+            // behavior on genuine failure, never a new rejection -- see
+            // this plan's own Global Constraints.
+            let result_ty = match unify(&t_ty, &e_ty, infer, spans[expr]) {
+                Ok(()) => infer.resolve_deep(&t_ty),
+                Err(_) => Type::Dyn,
+            };
             // Only one branch runs, but which one isn't known statically,
             // so the possible effects are the union of both.
             let row = EffectRow::union(&c_row, &EffectRow::union(&t_row, &e_row));
@@ -2046,12 +2056,12 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 };
                 let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, spans, infer)?;
                 row = EffectRow::union(&row, &arm_row);
-                // Same widen-to-Dyn-on-disagreement rule as If's branches
-                // and ListLit's elements -- no union types.
                 result_ty = Some(match result_ty {
                     None => arm_ty,
-                    Some(t) if t == arm_ty => t,
-                    Some(_) => Type::Dyn,
+                    Some(t) => match unify(&t, &arm_ty, infer, spans[expr]) {
+                        Ok(()) => infer.resolve_deep(&t),
+                        Err(_) => Type::Dyn,
+                    },
                 });
                 new_arms.push((pat.clone(), guard2, body2));
             }

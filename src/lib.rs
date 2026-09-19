@@ -609,6 +609,111 @@ mod tests {
         machine::run(&arena, elaborated, Env::prelude(), &spans);
     }
 
+    #[test]
+    fn my_map_shaped_structural_recursion_is_precisely_typed() {
+        // THE motivating example from the design spec's own Motivation
+        // section, finally working end-to-end: pattern-binding (Task 3)
+        // correlates h with xs's element type, App's new case (Task 4)
+        // learns f's shape from f(h), Cons (Task 5) unifies f(h)'s
+        // result with the recursive call's own result, and (this task)
+        // the [] and h :: t arms combine into List(elem) instead of
+        // collapsing to Dyn. The callback's own parameter is annotated
+        // (`fun x: Int -> ...`, not bare `fun x -> ...`) DELIBERATELY --
+        // my_map's own `f` parameter (inside my_map's own definition,
+        // still fully unannotated) is what exercises this task's actual
+        // mechanism, and doesn't care whether the CONCRETE function
+        // passed to it has its own parameter annotated or inferred; what
+        // DOES care is arithmetic on an unannotated operand, which the
+        // design spec's own Non-goals already, deliberately, explicitly
+        // decided NOT to upgrade ("arithmetic itself is explicitly not
+        // being upgraded to real unification this round") -- an
+        // unannotated `x + 1` keeps its Task-2-era runtime check
+        // regardless of anything this whole plan builds, by design, so
+        // asserting full check-freedom with a bare `fun x -> x + 1`
+        // would test a Non-goal, not this task's own actual scope.
+        let src = r#"
+            let rec my_map = fun f -> fun xs ->
+                match xs
+                | [] -> []
+                | h :: t -> f(h) :: my_map(f)(t)
+            in let g = fun ys: [Int] -> ys
+            in g(my_map(fun x: Int -> x + 1)([1, 2, 3]))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(!contains_check(&arena, elaborated), "my_map's own result should already be [Int] -- no runtime check needed");
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[2, 3, 4]");
+    }
+
+    #[test]
+    fn filter_shaped_structural_recursion_is_also_precisely_typed() {
+        // A second, genuinely different hand-rolled example beyond
+        // my_map itself, per the design spec's own Testing strategy --
+        // confirms this isn't narrowly special-cased to my_map's exact
+        // shape. Exercises If's own branch combination (this task) in
+        // addition to everything my_map's own test already covers.
+        //
+        // Unlike my_map's test, this one does NOT assert !contains_check
+        // -- confirmed (by hand-tracing a genuine failure, not assumed)
+        // that it can't, for a reason outside this task's own scope. Not
+        // `n`'s own arithmetic (that's annotated, same reasoning as
+        // my_map's own fix, above): it's `pred`'s own USE inside
+        // `if pred(h) then ...`. `pred`'s own RETURN type is genuinely
+        // unknowable at the point my_filter's own body is elaborated --
+        // my_filter is checked EXACTLY ONCE, monomorphically, at
+        // definition time, not re-elaborated per call site, so `pred`'s
+        // return type is still a bare, uninstantiated Type::Var when
+        // `Expr::If`'s own PRE-EXISTING, UNCHANGED condition coercion
+        // (`coerce(c2, &c_ty, &Type::Bool, ...)` -- the CONDITION's own
+        // check, not the BRANCH combination this task actually rewrites)
+        // runs. That coercion inserts a runtime check because a bare
+        // Type::Var reaching a hardcoded-concrete-type (Bool) target is
+        // exactly as blind as coerce's Type::Var-as-Dyn treatment
+        // anywhere else (Task 4's own App-arm fix addressed the
+        // analogous issue for coerce's PARAMETER-type target, not its
+        // CONDITION-type target here -- a different call site, out of
+        // this task's own "ListLit/If's branch combination/Match's
+        // cross-arm" scope). This is a genuine, deeper architectural
+        // ceiling of single-pass, non-specializing elaboration applied
+        // to a higher-order PREDICATE specifically (a value flowing into
+        // a hardcoded-target coercion, not a unification site) -- not
+        // something Tasks 1-6 claim to solve. The list-combining
+        // structure itself IS precisely typed (confirmed: the runtime
+        // result is correct, and my_map's own analogous structure is
+        // fully check-free) -- only pred's own condition-use carries
+        // this separate, pre-existing limitation.
+        let src = r#"
+            let rec my_filter = fun pred -> fun xs ->
+                match xs
+                | [] -> []
+                | h :: t -> if pred(h) then h :: my_filter(pred)(t) else my_filter(pred)(t)
+            in let g = fun ys: [Int] -> ys
+            in g(my_filter(fun n: Int -> n > 2)([1, 2, 3, 4]))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[3, 4]");
+    }
+
+    #[test]
+    fn mismatched_if_branches_still_widen_to_dyn_not_a_new_rejection() {
+        // Global Constraint: unify()'s failure at If/Match/ListLit falls
+        // back to today's exact widening, never a new static error.
+        let src = "if 1 < 2 then 1 else true";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root, &spans).is_ok(), "a genuinely mismatched If branch pair must still widen to Dyn, not newly reject");
+    }
+
+    #[test]
+    fn mismatched_match_arms_still_widen_to_dyn_not_a_new_rejection() {
+        // Same Global Constraint, Match's own cross-arm combination
+        // specifically (a separate code edit from If's, in this same
+        // task) -- must not be accidentally missed.
+        let src = "match 1 | 1 -> 1 | _ -> true";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root, &spans).is_ok(), "genuinely mismatched Match arms must still widen to Dyn, not newly reject");
+    }
+
     // --- gradual verification (`where` refinements) ---
 
     #[test]
