@@ -46,8 +46,8 @@ pub fn run_source(src: &str) -> Result<Outcome, String> {
 }
 
 fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
-    let (mut arena, spans, root) = parser::parse(src)?;
-    let elaborated = typecheck::check(&mut arena, root, &spans).map_err(|e| e.1.format_error(src, &e.0))?;
+    let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src)?;
+    let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).map_err(|e| e.1.format_error(src, &e.0))?;
     std::panic::catch_unwind(|| machine::run(&arena, elaborated, Env::prelude(), &spans)).map_err(|payload| {
         // Recover the panic's own message (downcast_ref covers both a
         // string-literal `panic!("...")` and a `panic!("{}", format!(...))`
@@ -3276,5 +3276,74 @@ mod tests {
             }
         }
         assert!(sees_int_tuple && sees_str_tuple, "expected both scopes' own definitions preserved independently");
+    }
+
+    #[test]
+    fn coerce_accepts_a_tuple_literal_against_a_named_type_via_a_one_level_unfold() {
+        // xs: List is a CONCRETE annotation, not Dyn -- the tuple
+        // literal's own inferred type is a plain Type::Tuple, never
+        // itself Type::Named, so this exercises coerce()'s own new
+        // unfold-and-retry rescue (Step 3), not a runtime boundary
+        // check at all. Confirmed statically accepted with zero
+        // wrapping: if this compiles and runs to completion, the
+        // rescue worked; a wrong implementation would surface as a
+        // static "type mismatch" error from check_with_named_types
+        // instead.
+        let src = r#"
+            type List = (Int, List) | Bool in
+            let f = fun xs: List -> xs in
+            f((1, (2, opaque)))
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
+        // Value has no as_tuple() method -- tuples are Value::List at
+        // runtime (see value.rs's own doc comment: "a fixed-arity
+        // List"). Match on Value::List directly instead.
+        match &result {
+            Value::List(items) => assert_eq!(items[0].as_int(), 1),
+            other => panic!("expected a tuple (Value::List), got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_genuinely_dyn_sourced_value_is_checked_at_runtime_against_a_named_type_one_level_deep() {
+        // g's own parameter is explicitly Dyn -- it stays Dyn all the
+        // way to `f(v)` inside g's body, so THAT call genuinely
+        // crosses a real Dyn boundary at runtime (build_boundary_check
+        // via coerce's own Dyn/Var early-return-turned-real-check
+        // path), not coerce's static rescue.
+        let src = r#"
+            type List = (Int, List) | Bool in
+            let f = fun xs: List -> xs in
+            let g = fun v: Dyn -> f(v) in
+            g((1, (2, opaque)))
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
+        // Value has no as_tuple() method -- tuples are Value::List at
+        // runtime (see value.rs's own doc comment: "a fixed-arity
+        // List"). Match on Value::List directly instead.
+        match &result {
+            Value::List(items) => assert_eq!(items[0].as_int(), 1),
+            other => panic!("expected a tuple (Value::List), got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_genuinely_dyn_sourced_value_with_the_wrong_shape_is_rejected_at_runtime() {
+        let src = r#"
+            type List = (Int, List) | Bool in
+            let f = fun xs: List -> xs in
+            let g = fun v: Dyn -> f(v) in
+            g("not a list at all")
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            machine::run(&arena, elaborated, Env::prelude(), &spans)
+        }));
+        assert!(outcome.is_err(), "expected the runtime boundary check to reject a Str where List is required");
     }
 }
