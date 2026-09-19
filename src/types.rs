@@ -18,6 +18,18 @@ pub enum Type {
     // can't quietly widen unrelated Tuple/Record/List/Fun consistency
     // checks elsewhere in the checker.
     Float,
+    // A generalized value-type variable -- see typecheck::Scheme's own
+    // doc comment for the full generalize-at-`let`/instantiate-at-use
+    // story (mirrors EffectRow::Var exactly, just for ordinary types
+    // instead of effect rows). Only ever produced by typecheck's own
+    // inference (typecheck::passthrough_generalizable_params), never
+    // written by a user -- there is no surface syntax for this. Treated
+    // exactly like Type::Dyn by `consistent`/`coerce` everywhere except
+    // typecheck::bind_type_vars, which is what actually recovers
+    // precision: at a call site, an instantiated Type::Var naming the
+    // callee's parameter gets bound to the caller's own concrete argument
+    // type, and that binding is substituted into the return type.
+    Var(String),
     Bool,
     Str,
     // Element type. renno's List is a native primitive (Value::List,
@@ -170,6 +182,11 @@ impl fmt::Display for EffectRow {
 pub fn consistent(a: &Type, b: &Type) -> bool {
     match (a, b) {
         (Type::Dyn, _) | (_, Type::Dyn) => true,
+        // Treated exactly like Dyn here -- the one place it behaves
+        // differently is typecheck::bind_type_vars, a call-SITE binding
+        // step, not a change to this general relation. See Type::Var's
+        // own doc comment.
+        (Type::Var(_), _) | (_, Type::Var(_)) => true,
         (Type::Int, Type::Int) => true,
         // Deliberately NOT (Type::Int, Type::Float) => true -- see
         // Type::Float's own doc comment on why that interop stays local
@@ -260,6 +277,12 @@ impl fmt::Display for Type {
             Type::Dyn => write!(f, "Dyn"),
             Type::Int => write!(f, "Int"),
             Type::Float => write!(f, "Float"),
+            // The name is internal bookkeeping (see Type::Var's own doc
+            // comment) -- never shown to a user, since nothing surfaces
+            // it: there's no annotation syntax that could produce one,
+            // and every error message a Type::Var could appear in would
+            // only ever fire from typecheck's own bugs, not user code.
+            Type::Var(_) => write!(f, "<generic>"),
             Type::Bool => write!(f, "Bool"),
             Type::Str => write!(f, "Str"),
             Type::List(elem) => write!(f, "[{elem}]"),

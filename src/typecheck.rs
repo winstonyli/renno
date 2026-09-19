@@ -18,22 +18,27 @@ use crate::util::find_field;
 #[derive(Debug)]
 pub struct TypeError(pub String, pub Span);
 
-// A binding's type, plus the row-variable names (from explicit `->{e}`
-// annotations reachable in it) that are generalized -- quantified fresh at
-// every use, the way ML/Haskell generalize a `let`-bound type. Row
-// variables never come from inference (renno has none for value types),
-// only from what the user wrote, so this is simple name substitution, not
-// a unification engine: extend_generalized computes the row_vars once at
-// the `let`, lookup renames them to fresh names at each reference.
+// A binding's type, plus the row-variable AND value-type-variable names
+// generalized over it -- quantified fresh at every use, the way ML/
+// Haskell generalize a `let`-bound type. Row variables only ever come
+// from what the user wrote (an explicit `->{e}` annotation) -- renno has
+// no unification engine, so there's nothing here that infers one from
+// scratch. Type variables (`type_vars`) are the opposite: manufactured
+// purely by typecheck::passthrough_generalizable_params's own inference,
+// never written by a user -- see Type::Var's own doc comment. Either way,
+// this stays simple name substitution (extend_generalized computes both
+// sets once at the `let`, lookup renames them to fresh names at each
+// reference), not a general unification engine.
 #[derive(Clone)]
 struct Scheme {
     row_vars: Vec<String>,
+    type_vars: Vec<String>,
     ty: Type,
 }
 
 impl Scheme {
     fn mono(ty: Type) -> Scheme {
-        Scheme { row_vars: Vec::new(), ty }
+        Scheme { row_vars: Vec::new(), type_vars: Vec::new(), ty }
     }
 }
 
@@ -44,14 +49,16 @@ fn lookup(ctx: &Ctx, name: &str) -> Type {
     // `unbound variable` panic at runtime is the right place for that.
     match ctx.get(name) {
         None => Type::Dyn,
-        Some(scheme) if scheme.row_vars.is_empty() => scheme.ty,
+        Some(scheme) if scheme.row_vars.is_empty() && scheme.type_vars.is_empty() => scheme.ty,
         Some(scheme) => {
-            let subst: HashMap<String, EffectRow> = scheme
+            let row_subst: HashMap<String, EffectRow> = scheme
                 .row_vars
                 .iter()
                 .map(|v| (v.clone(), EffectRow::Var(fresh_row_name(v))))
                 .collect();
-            subst_type(&scheme.ty, &subst)
+            let type_subst: HashMap<String, Type> =
+                scheme.type_vars.iter().map(|v| (v.clone(), Type::Var(fresh_type_name(v)))).collect();
+            subst_type(&scheme.ty, &row_subst, &type_subst)
         }
     }
 }
@@ -71,7 +78,8 @@ fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // wrongly be forced to agree on one row.
 fn extend_generalized(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
     let row_vars: Vec<String> = free_row_vars(&ty).into_iter().collect();
-    ctx.bind(name, Scheme { row_vars, ty })
+    let type_vars: Vec<String> = free_type_vars(&ty).into_iter().collect();
+    ctx.bind(name, Scheme { row_vars, type_vars, ty })
 }
 
 fn free_row_vars(ty: &Type) -> BTreeSet<String> {
@@ -87,11 +95,135 @@ fn free_row_vars(ty: &Type) -> BTreeSet<String> {
         Type::List(elem) => free_row_vars(elem),
         Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(free_row_vars).collect(),
         Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_row_vars(t)).collect(),
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Var(_) => BTreeSet::new(),
+    }
+}
+
+// Same idea as free_row_vars, for ordinary Type::Var names instead of
+// EffectRow::Var ones -- kept as a separate function (not folded into
+// free_row_vars, which would need to return two sets) so each stays a
+// simple, single-purpose BTreeSet<String> walk.
+fn free_type_vars(ty: &Type) -> BTreeSet<String> {
+    match ty {
+        Type::Var(name) => {
+            let mut vars = BTreeSet::new();
+            vars.insert(name.clone());
+            vars
+        }
+        Type::Fun(param, _row, ret) => {
+            let mut vars = free_type_vars(param);
+            vars.extend(free_type_vars(ret));
+            vars
+        }
+        Type::List(elem) => free_type_vars(elem),
+        Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(free_type_vars).collect(),
+        Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_type_vars(t)).collect(),
         Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) => BTreeSet::new(),
     }
 }
 
+// Conservative, purely syntactic: does `param` (an unannotated lambda
+// parameter's name) only ever appear, within `body`, in a position that's
+// safe to generalize? See the design spec's "The passthrough rule" for
+// the full intended rule set -- this implements a NARROWER subset (see
+// this plan's own "Before you start"): only (a) the function's own tail
+// return expression being exactly a (possibly let-aliased) reference to
+// the tracked parameter, or (b) the parameter simply never appearing at
+// all. `tracked` starts as `{param}` and grows through simple
+// `let name2 = <tracked> in body` aliasing as the walk descends -- this
+// is what lets `let f = fun x -> let y = x in y in ...` still generalize.
+// Anything else touching a tracked name (an operator, an `if`/`match`,
+// being passed as an argument, being bound via anything but a plain
+// `let`, ...) disqualifies it. `is_tail` marks whether `e` is currently in
+// the function's own return position -- only there does a bare tracked
+// reference count as "the value flows out," which is what
+// passthrough_generalizable_params below actually needs to know.
+fn is_passthrough_safe(arena: &Arena, e: ExprRef, tracked: &BTreeSet<String>, is_tail: bool) -> bool {
+    match &arena[e] {
+        Expr::Var(name) => !tracked.contains(name) || is_tail,
+        Expr::Let(var, _ann, val, body) => {
+            let val_is_bare_alias = matches!(&arena[*val], Expr::Var(n) if tracked.contains(n));
+            if val_is_bare_alias {
+                let mut widened = tracked.clone();
+                widened.insert(var.clone());
+                is_passthrough_safe(arena, *body, &widened, is_tail)
+            } else {
+                !mentions_any(arena, *val, tracked) && is_passthrough_safe(arena, *body, tracked, is_tail)
+            }
+        }
+        _ => !mentions_any(arena, e, tracked),
+    }
+}
+
+// Does `e`'s whole expression tree reference any name in `tracked`,
+// anywhere? Shared by is_passthrough_safe's own conservative default arm
+// (anything that isn't a bare Var or a plain Let is disqualified the
+// moment it touches a tracked name anywhere within it) -- same "walk the
+// whole Expr grammar" shape as parser::contains_perform, for the same
+// reason: a flat, exhaustive match over every variant, not a partial one.
+fn mentions_any(arena: &Arena, e: ExprRef, tracked: &BTreeSet<String>) -> bool {
+    match &arena[e] {
+        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) => false,
+        Expr::Var(name) => tracked.contains(name),
+        Expr::Tuple(items) | Expr::ListLit(items) => items.iter().any(|i| mentions_any(arena, *i, tracked)),
+        Expr::Record(fields) => fields.iter().any(|(_, v)| mentions_any(arena, *v, tracked)),
+        Expr::FieldAccess(target, _) => mentions_any(arena, *target, tracked),
+        Expr::Lambda(_, _, body) => mentions_any(arena, *body, tracked),
+        Expr::App(f, a) => mentions_any(arena, *f, tracked) || mentions_any(arena, *a, tracked),
+        Expr::Let(_, _, val, body) => mentions_any(arena, *val, tracked) || mentions_any(arena, *body, tracked),
+        Expr::LetRec(bindings, body) => {
+            bindings.iter().any(|(_, _, v)| mentions_any(arena, *v, tracked)) || mentions_any(arena, *body, tracked)
+        }
+        Expr::BinOp(_, l, r) => mentions_any(arena, *l, tracked) || mentions_any(arena, *r, tracked),
+        Expr::If(c, t, e) => mentions_any(arena, *c, tracked) || mentions_any(arena, *t, tracked) || mentions_any(arena, *e, tracked),
+        Expr::Perform(_, payload) => mentions_any(arena, *payload, tracked),
+        Expr::Handle { body, handler } => mentions_any(arena, *body, tracked) || mentions_any(arena, *handler, tracked),
+        Expr::MakeHandler { body, .. } => mentions_any(arena, *body, tracked),
+        Expr::Match(scrutinee, arms) => {
+            mentions_any(arena, *scrutinee, tracked)
+                || arms.iter().any(|(_, guard, body)| {
+                    guard.is_some_and(|g| mentions_any(arena, g, tracked)) || mentions_any(arena, *body, tracked)
+                })
+        }
+    }
+}
+
+// `val` is known to be (a curried chain of) Expr::Lambda -- peels every
+// UNANNOTATED parameter off in order (an already-annotated one is never a
+// candidate: this design never overrides an explicit annotation) and
+// classifies each independently against the function's own final body via
+// is_passthrough_safe, starting fresh from `{that parameter's own name}`
+// each time (one parameter's generalizability never depends on another's).
+fn passthrough_generalizable_params(arena: &Arena, val: ExprRef) -> Vec<bool> {
+    let mut params = Vec::new();
+    let mut cur = val;
+    while let Expr::Lambda(param, ann, body) = &arena[cur] {
+        params.push((param.clone(), ann.is_none()));
+        cur = *body;
+    }
+    let final_body = cur;
+    params
+        .iter()
+        .map(|(name, unannotated)| {
+            *unannotated && {
+                let tracked: BTreeSet<String> = std::iter::once(name.clone()).collect();
+                is_passthrough_safe(arena, final_body, &tracked, true)
+            }
+        })
+        .collect()
+}
+
 fn fresh_row_name(base: &str) -> String {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{base}#{n}")
+}
+
+// Same idea as fresh_row_name, its own separate counter -- a Type::Var's
+// namespace is unrelated to an EffectRow::Var's, so there's no reason to
+// share one (and every reason not to, in case they're ever compared or
+// logged together during debugging).
+fn fresh_type_name(base: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{base}#{n}")
@@ -123,18 +255,19 @@ fn resolve_row(row: &EffectRow, subst: &HashMap<String, EffectRow>) -> EffectRow
 // anyway, on the same "recurse everywhere free_row_vars does" principle
 // the Fun/List/Tuple arms already establish -- correct by construction,
 // not by a failing case this fixed.
-fn subst_type(ty: &Type, subst: &HashMap<String, EffectRow>) -> Type {
+fn subst_type(ty: &Type, row_subst: &HashMap<String, EffectRow>, type_subst: &HashMap<String, Type>) -> Type {
     match ty {
+        Type::Var(name) => type_subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Fun(param, row, ret) => Type::Fun(
-            Rc::new(subst_type(param, subst)),
-            resolve_row(row, subst),
-            Rc::new(subst_type(ret, subst)),
+            Rc::new(subst_type(param, row_subst, type_subst)),
+            resolve_row(row, row_subst),
+            Rc::new(subst_type(ret, row_subst, type_subst)),
         ),
-        Type::List(elem) => Type::List(Rc::new(subst_type(elem, subst))),
-        Type::Tuple(items) => Type::Tuple(Rc::new(items.iter().map(|t| subst_type(t, subst)).collect())),
-        Type::Union(alts) => Type::Union(Rc::new(alts.iter().map(|t| subst_type(t, subst)).collect())),
+        Type::List(elem) => Type::List(Rc::new(subst_type(elem, row_subst, type_subst))),
+        Type::Tuple(items) => Type::Tuple(Rc::new(items.iter().map(|t| subst_type(t, row_subst, type_subst)).collect())),
+        Type::Union(alts) => Type::Union(Rc::new(alts.iter().map(|t| subst_type(t, row_subst, type_subst)).collect())),
         Type::Record(fields) => {
-            Type::Record(Rc::new(fields.iter().map(|(n, t)| (n.clone(), subst_type(t, subst))).collect()))
+            Type::Record(Rc::new(fields.iter().map(|(n, t)| (n.clone(), subst_type(t, row_subst, type_subst))).collect()))
         }
         other => other.clone(),
     }
@@ -157,6 +290,31 @@ fn bind_row_vars(param: &Type, arg: &Type, subst: &mut HashMap<String, EffectRow
         }
         bind_row_vars(p1, a1, subst);
         bind_row_vars(p2, a2, subst);
+    }
+}
+
+// Same idea as bind_row_vars, for ordinary Type::Var instead of
+// EffectRow::Var: `param` is the callee's OWN (already-instantiated,
+// possibly Type::Var-containing) declared parameter type; `arg` is the
+// caller's actual argument's inferred type. Where `param`'s structure
+// names a bare Type::Var and `arg`'s matching position is something more
+// concrete, bind it -- the caller substitutes that into the return type
+// so a generalized function's result is precisely typed once its
+// argument's own type is known, not just Type::Var (which would render
+// exactly like Dyn -- see Type::Var's own doc comment). This is what
+// turns `id(5)`'s call-site type from Dyn into Int.
+fn bind_type_vars(param: &Type, arg: &Type, subst: &mut HashMap<String, Type>) {
+    match (param, arg) {
+        (Type::Var(name), _) => {
+            if !matches!(arg, Type::Var(_)) {
+                subst.entry(name.clone()).or_insert_with(|| arg.clone());
+            }
+        }
+        (Type::Fun(p1, _, p2), Type::Fun(a1, _, a2)) => {
+            bind_type_vars(p1, a1, subst);
+            bind_type_vars(p2, a2, subst);
+        }
+        _ => {}
     }
 }
 
@@ -199,7 +357,7 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span) -> 
         }
         return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span));
     }
-    if *from != Type::Dyn || *to == Type::Dyn {
+    if *from != Type::Dyn || *to == Type::Dyn || matches!(to, Type::Var(_)) {
         return Ok(e);
     }
     Ok(build_boundary_check(arena, e, to))
@@ -257,6 +415,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type) -> ExprRef {
         Type::Record(_) => build_shape_check(arena, e, to),
         Type::Union(_) => build_union_check(arena, e, to),
         Type::Dyn => unreachable!("coerce only calls this once *to != Type::Dyn is already established"),
+        Type::Var(_) => unreachable!("coerce only calls this once *to != Type::Var is already established"),
     }
 }
 
@@ -299,6 +458,7 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type) -> ExprRef {
 fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type) -> ExprRef {
     match ty {
         Type::Dyn => arena.push(Expr::Bool(true)),
+        Type::Var(_) => arena.push(Expr::Bool(true)),
         Type::Int => build_predicate_call(arena, "is_int", value_ref),
         Type::Float => build_predicate_call(arena, "is_float", value_ref),
         Type::Bool => build_predicate_call(arena, "is_bool", value_ref),
@@ -810,6 +970,60 @@ fn missing_case(patterns: &[&Pattern], scrut_ty: &Type) -> Option<String> {
     })
 }
 
+// If `val` is (a curried chain of) Lambda ending in some body, elaborates
+// it with each passthrough-generalizable unannotated parameter bound to a
+// fresh Type::Var instead of Type::Dyn. This peels the SAME Lambda chain
+// passthrough_generalizable_params already walked, binding each param's
+// name to its (possibly generalized) type and recording it, then
+// elaborates the final (post-Lambda) body once against that context and
+// wraps the result back up in Fun/Lambda layers itself -- the same
+// PendingElab::Fun reconstruction `elaborate`'s own peeling loop does.
+// This can't simply re-bind ctx and fall through to a plain recursive
+// `elaborate(arena, val, ...)` call on the whole chain: that call's own
+// peeling loop would re-walk these SAME (still-unannotated in the AST)
+// Lambda nodes and re-extend each name to Type::Dyn again, which --
+// PList::get's own most-recent-binding-wins semantics -- would shadow the
+// fresh Type::Var this function just bound, silently losing it. Returns
+// None (falls back to plain `elaborate`) whenever `val` isn't a Lambda at
+// all, or none of its parameters qualify -- so this is always a strict
+// superset of today's behavior, never a change to it.
+fn elaborate_generalizing_passthrough(
+    arena: &mut Arena,
+    val: ExprRef,
+    ctx: &Ctx,
+    spans: &SpanMap,
+) -> Option<Result<(Type, EffectRow, ExprRef), TypeError>> {
+    if !matches!(arena[val], Expr::Lambda(..)) {
+        return None;
+    }
+    let generalizable = passthrough_generalizable_params(arena, val);
+    if !generalizable.iter().any(|g| *g) {
+        return None;
+    }
+    let mut cur_ctx = ctx.clone();
+    let mut cur = val;
+    let mut frames: Vec<(String, Type)> = Vec::new();
+    for is_generalizable in generalizable {
+        match &arena[cur] {
+            Expr::Lambda(param, ann, body) => {
+                let param_ty = if is_generalizable { Type::Var(fresh_type_name(param)) } else { ann.clone().unwrap_or(Type::Dyn) };
+                cur_ctx = extend(&cur_ctx, param, param_ty.clone());
+                frames.push((param.clone(), param_ty));
+                cur = *body;
+            }
+            _ => unreachable!("generalizable.len() matches the Lambda chain passthrough_generalizable_params walked"),
+        }
+    }
+    Some(elaborate(arena, cur, &cur_ctx, spans).map(|(mut result_ty, mut result_row, mut result_expr)| {
+        for (param, param_ty) in frames.into_iter().rev() {
+            result_ty = Type::Fun(Rc::new(param_ty.clone()), result_row, Rc::new(result_ty));
+            result_row = EffectRow::pure();
+            result_expr = arena.push(Expr::Lambda(param, Some(param_ty), result_expr));
+        }
+        (result_ty, result_row, result_expr)
+    }))
+}
+
 // Bidirectional-lite synthesis: walks the tree once, producing the
 // inferred Type, the inferred EffectRow (closed, no polymorphism -- just
 // the union of effect names this expression's evaluation might perform),
@@ -850,7 +1064,10 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) -> Re
         let node = arena[cur_expr].clone();
         match node {
             Expr::Let(var, ann, val, body) => {
-                let (val_ty, val_row, val2) = elaborate(arena, val, &cur_ctx, spans)?;
+                let (val_ty, val_row, val2) = match elaborate_generalizing_passthrough(arena, val, &cur_ctx, spans) {
+                    Some(result) => result?,
+                    None => elaborate(arena, val, &cur_ctx, spans)?,
+                };
                 let (bound_ty, val3) = match ann {
                     Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t, spans[val])?),
                     None => (val_ty, val2),
@@ -879,7 +1096,10 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) -> Re
                 }
                 let mut elaborated = Vec::with_capacity(bindings.len());
                 for (name, ann, val) in bindings.iter() {
-                    let (val_ty, val_row, val2) = elaborate(arena, *val, &val_ctx, spans)?;
+                    let (val_ty, val_row, val2) = match elaborate_generalizing_passthrough(arena, *val, &val_ctx, spans) {
+                        Some(result) => result?,
+                        None => elaborate(arena, *val, &val_ctx, spans)?,
+                    };
                     let (bound_ty, val3) = match ann {
                         Some(t) => (t.clone(), coerce(arena, val2, &val_ty, t, spans[*val])?),
                         None => (val_ty, val2),
@@ -1064,11 +1284,16 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
                     // matching position, bind it -- and carry that binding
                     // into the return type and this call's own row, so a
                     // row-polymorphic function's result is precisely typed
-                    // once its callback is known, not just Dyn.
-                    let mut subst = HashMap::new();
-                    bind_row_vars(param_ty, &a_ty, &mut subst);
-                    let ret_ty2 = subst_type(ret_ty, &subst);
-                    let call_row2 = resolve_row(call_row, &subst);
+                    // once its callback is known, not just Dyn. Same idea,
+                    // same call site, for ordinary Type::Var (see
+                    // bind_type_vars's own doc comment) -- one combined
+                    // subst_type call resolves both kinds together.
+                    let mut row_subst = HashMap::new();
+                    bind_row_vars(param_ty, &a_ty, &mut row_subst);
+                    let mut type_subst = HashMap::new();
+                    bind_type_vars(param_ty, &a_ty, &mut type_subst);
+                    let ret_ty2 = subst_type(ret_ty, &row_subst, &type_subst);
+                    let call_row2 = resolve_row(call_row, &row_subst);
                     (call_row2, ret_ty2, arena.push(Expr::App(f2, a3)))
                 }
                 Type::Dyn => {

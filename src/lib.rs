@@ -945,6 +945,45 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_identity_function_is_precisely_typed_per_call() {
+        // id's parameter merely passes through untouched -- this should
+        // generalize into a real polymorphic type, so id(1)'s OWN result
+        // type is precisely Int (not Dyn), observable exactly the way
+        // match_result_type_check observes Match's own result precision:
+        // feeding it into an Int-annotated call must need NO runtime
+        // boundary check.
+        let src = "let id = fun x -> x in let f = fun y: Int -> y + 1 in f(id(1))";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(!contains_check(&arena, elaborated), "id(1) should already be Int -- no runtime check needed");
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 2);
+    }
+
+    #[test]
+    fn passthrough_identity_function_still_works_at_other_types() {
+        // Same id, called at Str this time -- confirms generalization
+        // means EACH call is independently instantiated, not that id got
+        // pinned to Int by the previous test's own call.
+        let src = r#"let id = fun x -> x in id("hi")"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_str(), "hi");
+    }
+
+    #[test]
+    fn passthrough_const_generalizes_its_returned_parameter() {
+        // const's SECOND parameter (y) is simply unused and stays Dyn in
+        // this implementation (see the plan's own "Before you start") --
+        // only the FIRST parameter (x), which is the curried chain's own
+        // tail return, needs to generalize for this to be precisely typed.
+        let src = r#"let const = fun x -> fun y -> x in let f = fun n: Int -> n + 1 in f(const(1)("ignored"))"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(!contains_check(&arena, elaborated), "const(1)(_) should already be Int -- no runtime check needed");
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 2);
+    }
+
+    #[test]
     fn match_rejects_impossible_pattern_statically() {
         let (mut arena, spans, root) = parser::parse("match 5 | true -> 1 | _ -> 2").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
