@@ -3070,4 +3070,24 @@ mod tests {
         );
         assert!(!fits(&required, &actual));
     }
+
+    #[test]
+    fn eq_still_rejects_fun_values_that_fit_but_are_not_consistent() {
+        // Regression guard for this whole plan's own Global Constraint:
+        // consistent()'s own semantics must not change anywhere else.
+        // Two Fun-typed values that ARE fits()-compatible (one accepts
+        // a narrower record than the other requires) but are NOT
+        // consistent()-equal (different, non-matching field sets) must
+        // still be rejected by ==, exactly as they already are today --
+        // fits()-style tolerance must never leak into consistent()'s
+        // own equivalence relation.
+        let src = r#"
+            let f: (({x: Int, y: Int}) -> Int) = fun r -> r.x in
+            let g: (({x: Int}) -> Int) = fun r -> r.x in
+            f == g
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("cannot compare") || err.0.contains("type mismatch"), "unexpected message: {}", err.0);
+    }
 }
