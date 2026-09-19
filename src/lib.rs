@@ -3019,6 +3019,27 @@ mod tests {
     }
 
     #[test]
+    fn unify_fits_accepts_a_tuple_argument_for_a_dyn_list_parameter_like_coerce_does() {
+        // Final whole-branch review, Critical: unify() has no arm bridging
+        // Type::List(Dyn) and Type::Tuple, but consistent() does (see
+        // types.rs, the Type::List/Type::Tuple arm with the Dyn check) --
+        // so coerce() (via fits() -> consistent()) correctly accepts a
+        // tuple argument at a [Dyn] parameter, but unify_fits used to hard-
+        // reject the very same call right after, since its old catch-all
+        // delegated to plain unify() with no consistent() rescue. This
+        // program worked before this whole plan and is also the ONLY test
+        // in this file where unify_fits's own rejection logic (rather than
+        // coerce()'s) is what's actually being exercised, since coerce()
+        // already accepts this call before unify_fits ever runs.
+        let src = r#"
+            let f = fun xs: [Dyn] -> len(xs) in f((1, 2))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 2);
+    }
+
+    #[test]
     fn fits_accepts_a_callback_requiring_a_narrower_record_than_required() {
         // The actual motivating case: a Fun requiring {x: Int, y: Int}
         // as its own param is satisfied by an actual Fun that only
@@ -3068,6 +3089,32 @@ mod tests {
             EffectRow::Dyn,
             std::rc::Rc::new(Type::Int),
         );
+        assert!(!fits(&required, &actual));
+    }
+
+    #[test]
+    fn fits_accepts_a_callback_whose_return_type_is_narrower_than_required() {
+        // Final whole-branch review, Important #2: every other fits()/
+        // coerce()/unify_fits() test in this plan uses Int on BOTH sides
+        // of the return type, so a covariant-vs-contravariant bug in the
+        // return-type check specifically (e.g. fits(req_ret, act_ret)
+        // silently swapped to fits(act_ret, req_ret)) would pass the whole
+        // suite undetected. Covariant return: a callback promising to
+        // return an Int (a MORE PRECISE, narrower promise) can stand in
+        // for one that only promised to return Dyn (a WIDER, less precise
+        // promise) -- the opposite direction from the param check.
+        use types::{fits, EffectRow, Type};
+        let required = Type::Fun(std::rc::Rc::new(Type::Int), EffectRow::Dyn, std::rc::Rc::new(Type::Dyn));
+        let actual = Type::Fun(std::rc::Rc::new(Type::Int), EffectRow::Dyn, std::rc::Rc::new(Type::Int));
+        assert!(fits(&required, &actual));
+    }
+
+    #[test]
+    fn fits_rejects_a_callback_whose_return_type_is_wrong() {
+        // Companion rejection case for the covariance test above.
+        use types::{fits, EffectRow, Type};
+        let required = Type::Fun(std::rc::Rc::new(Type::Int), EffectRow::Dyn, std::rc::Rc::new(Type::Int));
+        let actual = Type::Fun(std::rc::Rc::new(Type::Int), EffectRow::Dyn, std::rc::Rc::new(Type::Str));
         assert!(!fits(&required, &actual));
     }
 

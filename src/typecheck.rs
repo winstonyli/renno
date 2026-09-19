@@ -216,10 +216,13 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
 // walk, but since this IS a unification (not just a static check), it
 // also resolves and BINDS any free Type::Var it finds along the way --
 // exactly like unify() does, via the same delegation to unify() itself
-// for every case that isn't specifically Fun or Record (which is also
-// where unify()'s own occurs-check and infer.subst.insert actually
-// live -- unify_fits doesn't duplicate that logic, it reaches it
-// through the catch-all below).
+// for every case that isn't specifically Fun or Record. That delegation
+// first tries unify_trial (binds Type::Vars on success, leaves no trace
+// on failure); if that trial fails, the pair is still accepted when
+// consistent() would accept it, mirroring whatever coerce()/fits() already
+// granted -- unify_fits must never be stricter than coerce() itself, since
+// it runs right after coerce() as a pure add-on (binding Vars), not a
+// second gate. See the catch-all below.
 fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
     let required = infer.resolve(required);
     let actual = infer.resolve(actual);
@@ -241,21 +244,25 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
             }
             Ok(())
         }
-        // ponytail: no Type::Var binding via consistent() -- mirrors fits()'s own
-        // Union handling but consistent() performs no unification. If a Type::Var
-        // is only resolvable via one specific Union alternative, it stays unbound
-        // (reads as Dyn via the unresolved Var) -- same permissive-fallback ceiling
-        // this feature area already documents elsewhere (e.g. If/Match/ListLit
-        // branch combination), not a regression, just not newly closed by this fix.
-        // Upgrade if real programs need tighter Union constraint binding.
-        (Type::Union(_), _) | (_, Type::Union(_)) => {
-            if consistent(&required, &actual) {
-                Ok(())
-            } else {
-                Err(TypeError(format!("type mismatch: expected {required}, found {actual}"), span))
+        // ponytail: no Type::Var binding via the consistent() rescue path below --
+        // unify_trial is tried first and binds Vars on success, but a Var
+        // reachable ONLY through consistent() accepting the pair (e.g. only
+        // resolvable through one alternative of a Union, or only through the
+        // List(Dyn)/Tuple bridge) stays unbound (reads as Dyn via the unresolved
+        // Var) -- same permissive-fallback ceiling this feature area already
+        // documents elsewhere (e.g. If/Match/ListLit branch combination), not a
+        // regression, just not newly closed by this fix. Upgrade if real programs
+        // need tighter constraint binding through these rescue-only paths.
+        _ => match unify_trial(&required, &actual, infer, span) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if consistent(&required, &actual) {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
             }
-        }
-        _ => unify(&required, &actual, infer, span),
+        },
     }
 }
 
