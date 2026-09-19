@@ -63,6 +63,160 @@ impl Scheme {
 
 type Ctx = PList<Scheme>;
 
+// The real, threaded state a Hindley-Milner-style unifier needs, carried
+// through every elaborate()/elaborate_node() call as `&mut InferCtx` --
+// see the design spec's own "Data model" section for the full rationale
+// (functional substitution over union-find). Generalization does NOT
+// live here -- no level counter, no birth-level tracking -- it reuses
+// the ctx-wide technique a concurrent row-variable fix already proved
+// in this codebase (see Task 7); this struct is just a substitution.
+//
+// #[allow(dead_code)]: nothing calls unify() from a real decision point
+// yet (that's Tasks 4-6), so `subst` and most of these methods are
+// genuinely unread by this task alone -- lift this once a later task
+// wires them in.
+#[allow(dead_code)]
+struct InferCtx {
+    // Grows monotonically as unify() binds variables; never shrinks --
+    // no backtracking, matching this checker's existing single-pass
+    // character everywhere else.
+    subst: HashMap<String, Type>,
+}
+
+#[allow(dead_code)]
+impl InferCtx {
+    fn new() -> InferCtx {
+        InferCtx { subst: HashMap::new() }
+    }
+
+    // Mints a fresh Type::Var -- every unannotated binding site (Lambda
+    // params, Pattern::Var, LetRec self-reference) and every
+    // unify()-driven "this must be some List/Fun shape, but we don't
+    // know its element/param/return type yet" moment goes through this,
+    // never Type::Var(name) built by hand. Reuses the EXISTING
+    // fresh_type_name counter (already in this file, used by `lookup`'s
+    // own instantiation) rather than a second, separate one -- there's
+    // no reason a fresh name minted here and one minted by instantiating
+    // a generalized scheme should draw from different namespaces.
+    fn fresh_var(&mut self, base: &str) -> Type {
+        Type::Var(fresh_type_name(base))
+    }
+
+    // Walks `ty` through the current substitution ONE STEP -- following
+    // it to whatever it now points to, recursively, until reaching
+    // either an unbound variable or a concrete shape, but NOT recursing
+    // into a Fun/List/Tuple/Record's own NESTED positions. This is what
+    // `unify`'s own structural recursion needs internally at each level
+    // (mirroring how little `subst_type`/`resolve_row` already resolve
+    // at a time) -- it is NOT enough on its own to hand back a complete,
+    // fully-substituted result type to some OTHER caller; see
+    // `resolve_deep` for that.
+    fn resolve(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Var(name) => match self.subst.get(name) {
+                Some(bound) => self.resolve(bound),
+                None => ty.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    // Like `resolve`, but recursively rebuilds a FULLY substituted Type,
+    // walking every nested position (the same recursive shape
+    // `subst_type` already has, just consulting `self.subst` instead of
+    // a passed-in map). Used anywhere a caller hands back a *complete*
+    // result type rather than continuing to unify against it
+    // structurally: Expr::App's own return type (Task 4), and the
+    // result types BinOp::Cons/If/Match/ListLit hand back after their
+    // own unify() calls succeed (Tasks 5-6), and generalization's own
+    // free-variable collection (Task 7).
+    fn resolve_deep(&self, ty: &Type) -> Type {
+        match self.resolve(ty) {
+            Type::Fun(param, row, ret) => {
+                Type::Fun(Rc::new(self.resolve_deep(&param)), row, Rc::new(self.resolve_deep(&ret)))
+            }
+            Type::List(elem) => Type::List(Rc::new(self.resolve_deep(&elem))),
+            Type::Tuple(items) => Type::Tuple(Rc::new(items.iter().map(|t| self.resolve_deep(t)).collect())),
+            Type::Union(items) => Type::Union(Rc::new(items.iter().map(|t| self.resolve_deep(t)).collect())),
+            Type::Record(fields) => {
+                Type::Record(Rc::new(fields.iter().map(|(n, t)| (n.clone(), self.resolve_deep(t))).collect()))
+            }
+            other => other,
+        }
+    }
+}
+
+// Does `name` (a Type::Var's own name, already confirmed unbound) appear
+// free anywhere inside `ty`? Resolves through infer's substitution as it
+// recurses, so an already-bound variable's own target is checked too --
+// this is what an occurs-check needs to actually catch a genuinely
+// infinite type (e.g. attempting to unify `a` with `List(a)`), not just
+// a syntactically-obvious one.
+//
+// #[allow(dead_code)]: only called from unify(), which nothing calls yet.
+#[allow(dead_code)]
+fn occurs_in(name: &str, ty: &Type, infer: &InferCtx) -> bool {
+    match infer.resolve(ty) {
+        Type::Var(n) => n == name,
+        Type::List(elem) => occurs_in(name, &elem, infer),
+        Type::Fun(param, _row, ret) => occurs_in(name, &param, infer) || occurs_in(name, &ret, infer),
+        Type::Tuple(items) | Type::Union(items) => items.iter().any(|t| occurs_in(name, t, infer)),
+        Type::Record(fields) => fields.iter().any(|(_, t)| occurs_in(name, t, infer)),
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) => false,
+    }
+}
+
+// The real unifier. Resolves both sides through infer.subst first, then:
+// an unbound Type::Var on either side gets BOUND (after an occurs-check)
+// to the other, already-resolved side; Type::Dyn on either side succeeds
+// trivially with no new binding (this is what keeps Dyn's own "consistent
+// with everything" story intact inside the new engine -- unify never
+// forces a Dyn-sourced value's shape); two matching concrete shapes
+// recurse structurally; anything else is a real type mismatch.
+//
+// #[allow(dead_code)]: not yet called from any real decision point --
+// Tasks 4-6 wire it into Expr::App/BinOp::Cons/If/Match/ListLit.
+#[allow(dead_code)]
+fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
+    let t1 = infer.resolve(t1);
+    let t2 = infer.resolve(t2);
+    match (&t1, &t2) {
+        (Type::Var(n1), Type::Var(n2)) if n1 == n2 => Ok(()),
+        (Type::Var(name), other) | (other, Type::Var(name)) => {
+            if occurs_in(name, other, infer) {
+                return Err(TypeError(format!("infinite type: {name} occurs in {other}"), span));
+            }
+            infer.subst.insert(name.clone(), other.clone());
+            Ok(())
+        }
+        (Type::Dyn, _) | (_, Type::Dyn) => Ok(()),
+        (Type::Int, Type::Int) | (Type::Float, Type::Float) | (Type::Bool, Type::Bool) | (Type::Str, Type::Str) => Ok(()),
+        (Type::Token(a), Type::Token(b)) if a == b => Ok(()),
+        (Type::List(a), Type::List(b)) => unify(a, b, infer, span),
+        (Type::Fun(p1, _r1, ret1), Type::Fun(p2, _r2, ret2)) => {
+            unify(p1, p2, infer, span)?;
+            unify(ret1, ret2, infer, span)
+            // Row unification is out of scope here -- effect rows already
+            // have their own, separate, unrelated generalize/instantiate
+            // mechanism (bind_row_vars/resolve_row), untouched by this
+            // plan; two Fun types unify on their param/return shape only.
+        }
+        (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
+            a.iter().zip(b.iter()).try_for_each(|(x, y)| unify(x, y, infer, span))
+        }
+        (Type::Record(a), Type::Record(b)) if a.len() == b.len() => {
+            for (name, ty_a) in a.iter() {
+                match find_field(b, name) {
+                    Some(ty_b) => unify(ty_a, ty_b, infer, span)?,
+                    None => return Err(TypeError(format!("type mismatch: expected {t2}, found {t1}"), span)),
+                }
+            }
+            Ok(())
+        }
+        _ => Err(TypeError(format!("type mismatch: expected {t2}, found {t1}"), span)),
+    }
+}
+
 fn lookup(ctx: &Ctx, name: &str) -> Type {
     // Unbound at typecheck time: don't error here, machine::run's own
     // `unbound variable` panic at runtime is the right place for that.
@@ -1099,6 +1253,7 @@ fn elaborate_generalizing_passthrough(
     val: ExprRef,
     ctx: &Ctx,
     spans: &SpanMap,
+    infer: &mut InferCtx,
 ) -> GeneralizingPassthroughResult {
     if !matches!(arena[val], Expr::Lambda(..)) {
         return None;
@@ -1128,7 +1283,7 @@ fn elaborate_generalizing_passthrough(
             _ => unreachable!("generalizable.len() matches the Lambda chain passthrough_generalizable_params walked"),
         }
     }
-    Some(elaborate(arena, cur, &cur_ctx, spans).map(|(mut result_ty, mut result_row, mut result_expr)| {
+    Some(elaborate(arena, cur, &cur_ctx, spans, infer).map(|(mut result_ty, mut result_row, mut result_expr)| {
         for (param, param_ty) in frames.into_iter().rev() {
             result_ty = Type::Fun(Rc::new(param_ty.clone()), result_row, Rc::new(result_ty));
             result_row = EffectRow::pure();
@@ -1155,7 +1310,7 @@ fn elaborate_generalizing_passthrough(
 // sound: check() below rejects a program only when it can prove an effect
 // is never discharged, and stays silent (deferring to today's runtime
 // panic) whenever it can't prove either way.
-fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) -> Result<(Type, EffectRow, ExprRef), TypeError> {
+fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     // Peels off a run of leading `let`/`fun` prefixes iteratively -- a
     // match per iteration, not a recursive call -- so a long chain of
     // either (sequential `let`s, or a deeply curried `fun a -> fun b ->
@@ -1178,10 +1333,10 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) -> Re
         let node = arena[cur_expr].clone();
         match node {
             Expr::Let(var, ann, val, body) => {
-                let (val_ty, val_row, val2, extra_type_vars) = match elaborate_generalizing_passthrough(arena, val, &cur_ctx, spans) {
+                let (val_ty, val_row, val2, extra_type_vars) = match elaborate_generalizing_passthrough(arena, val, &cur_ctx, spans, infer) {
                     Some(result) => result?,
                     None => {
-                        let (ty, row, e) = elaborate(arena, val, &cur_ctx, spans)?;
+                        let (ty, row, e) = elaborate(arena, val, &cur_ctx, spans, infer)?;
                         (ty, row, e, Vec::new())
                     }
                 };
@@ -1220,10 +1375,10 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) -> Re
                 let mut elaborated = Vec::with_capacity(bindings.len());
                 let mut extra_type_vars_per_binding = Vec::with_capacity(bindings.len());
                 for (name, ann, val) in bindings.iter() {
-                    let (val_ty, val_row, val2, extra_type_vars) = match elaborate_generalizing_passthrough(arena, *val, &val_ctx, spans) {
+                    let (val_ty, val_row, val2, extra_type_vars) = match elaborate_generalizing_passthrough(arena, *val, &val_ctx, spans, infer) {
                         Some(result) => result?,
                         None => {
-                            let (ty, row, e) = elaborate(arena, *val, &val_ctx, spans)?;
+                            let (ty, row, e) = elaborate(arena, *val, &val_ctx, spans, infer)?;
                             (ty, row, e, Vec::new())
                         }
                     };
@@ -1254,7 +1409,7 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) -> Re
         }
     }
 
-    let (mut result_ty, mut result_row, mut result_expr) = elaborate_node(arena, cur_expr, &cur_ctx, spans)?;
+    let (mut result_ty, mut result_row, mut result_expr) = elaborate_node(arena, cur_expr, &cur_ctx, spans, infer)?;
 
     for frame in pending.into_iter().rev() {
         match frame {
@@ -1296,7 +1451,7 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) -> Re
 // `spans[expr]` is a valid, always-available "point at this whole
 // construct" location for any error an arm below doesn't have a more
 // specific sub-expression to blame instead.
-fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) -> Result<(Type, EffectRow, ExprRef), TypeError> {
+fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     let node = arena[expr].clone();
     match node {
         Expr::Int(_) => Ok((Type::Int, EffectRow::pure(), expr)),
@@ -1317,7 +1472,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
             let mut tys = Vec::with_capacity(items.len());
             let mut refs = Vec::with_capacity(items.len());
             for item in items {
-                let (item_ty, item_row, item2) = elaborate(arena, item, ctx, spans)?;
+                let (item_ty, item_row, item2) = elaborate(arena, item, ctx, spans, infer)?;
                 row = EffectRow::union(&row, &item_row);
                 tys.push(item_ty);
                 refs.push(item2);
@@ -1338,7 +1493,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
             let mut field_tys = Vec::with_capacity(fields.len());
             let mut field_refs = Vec::with_capacity(fields.len());
             for (name, field_expr) in fields.iter() {
-                let (field_ty, field_row, field2) = elaborate(arena, *field_expr, ctx, spans)?;
+                let (field_ty, field_row, field2) = elaborate(arena, *field_expr, ctx, spans, infer)?;
                 row = EffectRow::union(&row, &field_row);
                 field_tys.push((name.clone(), field_ty));
                 field_refs.push((name.clone(), field2));
@@ -1363,7 +1518,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
         // differently-styled) panic instead of this file's ordinary
         // fail()+type_name() message.
         Expr::FieldAccess(target, name) => {
-            let (target_ty, target_row, target2) = elaborate(arena, target, ctx, spans)?;
+            let (target_ty, target_row, target2) = elaborate(arena, target, ctx, spans, infer)?;
             let field_ty = match &target_ty {
                 Type::Dyn => Type::Dyn,
                 ty if record_shaped(ty) => record_field_type(ty, &name)
@@ -1385,7 +1540,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
             let mut elem_ty: Option<Type> = None;
             let mut refs = Vec::with_capacity(items.len());
             for item in items {
-                let (item_ty, item_row, item2) = elaborate(arena, item, ctx, spans)?;
+                let (item_ty, item_row, item2) = elaborate(arena, item, ctx, spans, infer)?;
                 row = EffectRow::union(&row, &item_row);
                 refs.push(item2);
                 // Same rule as If's branches: differing concrete element
@@ -1405,8 +1560,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
         }
 
         Expr::App(f, a) => {
-            let (f_ty, f_row, f2) = elaborate(arena, f, ctx, spans)?;
-            let (a_ty, a_row, a2) = elaborate(arena, a, ctx, spans)?;
+            let (f_ty, f_row, f2) = elaborate(arena, f, ctx, spans, infer)?;
+            let (a_ty, a_row, a2) = elaborate(arena, a, ctx, spans, infer)?;
             let (call_row, ret_ty, app2) = match &f_ty {
                 Type::Fun(param_ty, call_row, ret_ty) => {
                     let a3 = coerce(arena, a2, &a_ty, param_ty, spans[a])?;
@@ -1445,8 +1600,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
         }
 
         Expr::BinOp(op, l, r) => {
-            let (l_ty, l_row, l2) = elaborate(arena, l, ctx, spans)?;
-            let (r_ty, r_row, r2) = elaborate(arena, r, ctx, spans)?;
+            let (l_ty, l_row, l2) = elaborate(arena, l, ctx, spans, infer)?;
+            let (r_ty, r_row, r2) = elaborate(arena, r, ctx, spans, infer)?;
             let row = EffectRow::union(&l_row, &r_row);
             match op {
                 // Arithmetic and ordering: both operands must be Int or
@@ -1569,10 +1724,10 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
         }
 
         Expr::If(c, t, e) => {
-            let (c_ty, c_row, c2) = elaborate(arena, c, ctx, spans)?;
+            let (c_ty, c_row, c2) = elaborate(arena, c, ctx, spans, infer)?;
             let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans[c])?;
-            let (t_ty, t_row, t2) = elaborate(arena, t, ctx, spans)?;
-            let (e_ty, e_row, e2) = elaborate(arena, e, ctx, spans)?;
+            let (t_ty, t_row, t2) = elaborate(arena, t, ctx, spans, infer)?;
+            let (e_ty, e_row, e2) = elaborate(arena, e, ctx, spans, infer)?;
             // Branches with differing concrete types aren't an error here
             // (no union types) -- just widen to Dyn rather than reject.
             let result_ty = if t_ty == e_ty { t_ty } else { Type::Dyn };
@@ -1585,14 +1740,14 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
         // The effect this specific operation performs, plus whatever the
         // payload expression itself might perform.
         Expr::Perform(effect, payload) => {
-            let (_, payload_row, payload2) = elaborate(arena, payload, ctx, spans)?;
+            let (_, payload_row, payload2) = elaborate(arena, payload, ctx, spans, infer)?;
             let row = EffectRow::union(&payload_row, &EffectRow::single(&effect));
             Ok((Type::Dyn, row, arena.push(Expr::Perform(effect, payload2))))
         }
 
         Expr::Handle { body, handler } => {
-            let (_, body_row, body2) = elaborate(arena, body, ctx, spans)?;
-            let (handler_ty, handler_row, handler2) = elaborate(arena, handler, ctx, spans)?;
+            let (_, body_row, body2) = elaborate(arena, body, ctx, spans, infer)?;
+            let (handler_ty, handler_row, handler2) = elaborate(arena, handler, ctx, spans, infer)?;
             // types.rs has no Type::Handler -- but every handler-producing
             // expression (MakeHandler, or deep(...)/shallow(...) applied
             // to one, or a var bound from either) synthesizes Dyn by this
@@ -1632,7 +1787,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
                 ));
             }
 
-            let (scrut_ty, scrut_row, scrutinee2) = elaborate(arena, scrutinee, ctx, spans)?;
+            let (scrut_ty, scrut_row, scrutinee2) = elaborate(arena, scrutinee, ctx, spans, infer)?;
             let mut row = scrut_row;
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
@@ -1652,14 +1807,14 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
                 // everywhere else Dyn meets an expected concrete type.
                 let guard2 = match guard {
                     Some(g) => {
-                        let (guard_ty, guard_row, g2) = elaborate(arena, *g, &arm_ctx, spans)?;
+                        let (guard_ty, guard_row, g2) = elaborate(arena, *g, &arm_ctx, spans, infer)?;
                         let g3 = coerce(arena, g2, &guard_ty, &Type::Bool, spans[*g])?;
                         row = EffectRow::union(&row, &guard_row);
                         Some(g3)
                     }
                     None => None,
                 };
-                let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, spans)?;
+                let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, spans, infer)?;
                 row = EffectRow::union(&row, &arm_row);
                 // Same widen-to-Dyn-on-disagreement rule as If's branches
                 // and ListLit's elements -- no union types.
@@ -1692,7 +1847,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
         // see the doc comment on `elaborate`.
         Expr::MakeHandler { effect, payload_var, resume_var, body } => {
             let inner_ctx = extend(&extend(ctx, &payload_var, Type::Dyn), &resume_var, Type::Dyn);
-            let (_, _, body2) = elaborate(arena, body, &inner_ctx, spans)?;
+            let (_, _, body2) = elaborate(arena, body, &inner_ctx, spans, infer)?;
             Ok((
                 Type::Dyn,
                 EffectRow::pure(),
@@ -1703,7 +1858,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
 }
 
 pub fn check(arena: &mut Arena, root: ExprRef, spans: &SpanMap) -> Result<ExprRef, TypeError> {
-    let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), spans)?;
+    let mut infer = InferCtx::new();
+    let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), spans, &mut infer)?;
     match row {
         EffectRow::Closed(unhandled) if !unhandled.is_empty() => {
             let names: Vec<_> = unhandled.into_iter().collect();
