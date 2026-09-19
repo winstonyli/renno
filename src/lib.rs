@@ -2991,4 +2991,57 @@ mod tests {
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("type mismatch"), "unexpected message: {}", err.0);
     }
+
+    #[test]
+    fn fits_accepts_a_callback_requiring_a_narrower_record_than_required() {
+        // The actual motivating case: a Fun requiring {x: Int, y: Int}
+        // as its own param is satisfied by an actual Fun that only
+        // requires {x: Int} -- contravariant parameter subtyping.
+        // Swapped on purpose: fits(required, actual) checks
+        // fits(actual_param, required_param), not the other way
+        // around -- get this backwards and the test below (which
+        // checks the REJECT direction) would also wrongly pass.
+        use types::{fits, EffectRow, Type};
+        let required = Type::Fun(
+            std::rc::Rc::new(Type::Record(std::rc::Rc::new(vec![
+                ("x".to_string(), Type::Int),
+                ("y".to_string(), Type::Int),
+            ]))),
+            EffectRow::Dyn,
+            std::rc::Rc::new(Type::Int),
+        );
+        let actual = Type::Fun(
+            std::rc::Rc::new(Type::Record(std::rc::Rc::new(vec![("x".to_string(), Type::Int)]))),
+            EffectRow::Dyn,
+            std::rc::Rc::new(Type::Int),
+        );
+        assert!(fits(&required, &actual));
+    }
+
+    #[test]
+    fn fits_rejects_a_callback_requiring_a_field_that_does_not_exist_in_what_is_required() {
+        // The narrower callback must still name a field that's ACTUALLY
+        // present in what the wider requirement supplies. Careful with
+        // the exact shape here: {y: Int} alone WOULD correctly fit
+        // {x: Int, y: Int} (it's a genuinely valid narrower requirement
+        // -- any value satisfying {x, y} also has field y) -- that's
+        // NOT the case this test is for. This test uses {z: Int}, a
+        // field {x: Int, y: Int} doesn't have AT ALL, to test genuine
+        // non-substitutability, not just "a different single field."
+        use types::{fits, EffectRow, Type};
+        let required = Type::Fun(
+            std::rc::Rc::new(Type::Record(std::rc::Rc::new(vec![
+                ("x".to_string(), Type::Int),
+                ("y".to_string(), Type::Int),
+            ]))),
+            EffectRow::Dyn,
+            std::rc::Rc::new(Type::Int),
+        );
+        let actual = Type::Fun(
+            std::rc::Rc::new(Type::Record(std::rc::Rc::new(vec![("z".to_string(), Type::Int)]))),
+            EffectRow::Dyn,
+            std::rc::Rc::new(Type::Int),
+        );
+        assert!(!fits(&required, &actual));
+    }
 }
