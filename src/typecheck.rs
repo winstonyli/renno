@@ -76,9 +76,40 @@ fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // reference gets its own fresh instantiation -- otherwise two calls to the
 // same row-polymorphic function with different concrete callbacks would
 // wrongly be forced to agree on one row.
+//
+// Deliberately does NOT auto-derive type_vars from free_type_vars(&ty), even
+// though it auto-derives row_vars that way. Row variables are safe to
+// harvest wherever they're found because an EffectRow::Var only ever comes
+// from a closed, already-fully-written user annotation -- never from a
+// still-open, in-scope binding. Type::Var is different: it's manufactured by
+// elaborate_generalizing_passthrough for a lambda parameter WHILE that
+// parameter's own function body is still being elaborated, so a plain
+// alias-only `let` nested inside that body (e.g. `let y = x in y`) would, if
+// this function auto-harvested free Type::Vars the way it auto-harvests row
+// vars, wrongly re-generalize over the still-open outer parameter's own
+// fresh name -- disconnecting `y`'s uses from `x`'s (each `lookup` of `y`
+// would mint yet another fresh name instead of sharing the parameter's).
+// See extend_generalized_with_type_vars for the one call site that's allowed
+// to introduce type_vars, via an explicit caller-supplied list instead of
+// this kind of auto-derivation. Ordinary extend_generalized must never gain
+// this behavior back.
 fn extend_generalized(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
     let row_vars: Vec<String> = free_row_vars(&ty).into_iter().collect();
-    let type_vars: Vec<String> = free_type_vars(&ty).into_iter().collect();
+    ctx.bind(name, Scheme { row_vars, type_vars: Vec::new(), ty })
+}
+
+// Identical to extend_generalized except type_vars is supplied by the
+// caller instead of auto-derived -- see extend_generalized's own doc
+// comment for why auto-derivation is unsafe for Type::Var in general. The
+// only caller that may use this is the `Expr::Let`/`Expr::LetRec` wiring for
+// a binding whose value came back from elaborate_generalizing_passthrough
+// (and only when there's no explicit annotation on the binding): that
+// function can hand back exactly the fresh Type::Var names IT just
+// introduced for this value's own generalizable parameters, which are safe
+// to generalize by construction (they don't leak from some other, still-open
+// enclosing scope the way an incidentally-encountered Type::Var might).
+fn extend_generalized_with_type_vars(ctx: &Ctx, name: &str, ty: Type, type_vars: Vec<String>) -> Ctx {
+    let row_vars: Vec<String> = free_row_vars(&ty).into_iter().collect();
     ctx.bind(name, Scheme { row_vars, type_vars, ty })
 }
 
@@ -96,29 +127,6 @@ fn free_row_vars(ty: &Type) -> BTreeSet<String> {
         Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(free_row_vars).collect(),
         Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_row_vars(t)).collect(),
         Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Var(_) => BTreeSet::new(),
-    }
-}
-
-// Same idea as free_row_vars, for ordinary Type::Var names instead of
-// EffectRow::Var ones -- kept as a separate function (not folded into
-// free_row_vars, which would need to return two sets) so each stays a
-// simple, single-purpose BTreeSet<String> walk.
-fn free_type_vars(ty: &Type) -> BTreeSet<String> {
-    match ty {
-        Type::Var(name) => {
-            let mut vars = BTreeSet::new();
-            vars.insert(name.clone());
-            vars
-        }
-        Type::Fun(param, _row, ret) => {
-            let mut vars = free_type_vars(param);
-            vars.extend(free_type_vars(ret));
-            vars
-        }
-        Type::List(elem) => free_type_vars(elem),
-        Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(free_type_vars).collect(),
-        Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_type_vars(t)).collect(),
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) => BTreeSet::new(),
     }
 }
 
@@ -987,12 +995,26 @@ fn missing_case(patterns: &[&Pattern], scrut_ty: &Type) -> Option<String> {
 // None (falls back to plain `elaborate`) whenever `val` isn't a Lambda at
 // all, or none of its parameters qualify -- so this is always a strict
 // superset of today's behavior, never a change to it.
+//
+// Also hands back the exact fresh Type::Var names this call introduced (one
+// per generalizable parameter), so the caller can generalize the OUTER
+// binding over exactly those names via extend_generalized_with_type_vars --
+// never via extend_generalized's own auto-derivation, which would wrongly
+// also pick up any OTHER Type::Var merely encountered inside `val`'s body
+// (e.g. a still-open enclosing parameter's own name, reached through a
+// nested ordinary `let` alias). See extend_generalized's doc comment.
+//
+// The Vec<String> is the fresh Type::Var names this call introduced --
+// named as its own alias (clippy's own type_complexity threshold) purely
+// to keep this signature readable, not a semantically meaningful type.
+type GeneralizingPassthroughResult = Option<Result<(Type, EffectRow, ExprRef, Vec<String>), TypeError>>;
+
 fn elaborate_generalizing_passthrough(
     arena: &mut Arena,
     val: ExprRef,
     ctx: &Ctx,
     spans: &SpanMap,
-) -> Option<Result<(Type, EffectRow, ExprRef), TypeError>> {
+) -> GeneralizingPassthroughResult {
     if !matches!(arena[val], Expr::Lambda(..)) {
         return None;
     }
@@ -1003,10 +1025,17 @@ fn elaborate_generalizing_passthrough(
     let mut cur_ctx = ctx.clone();
     let mut cur = val;
     let mut frames: Vec<(String, Type)> = Vec::new();
+    let mut fresh_type_vars: Vec<String> = Vec::new();
     for is_generalizable in generalizable {
         match &arena[cur] {
             Expr::Lambda(param, ann, body) => {
-                let param_ty = if is_generalizable { Type::Var(fresh_type_name(param)) } else { ann.clone().unwrap_or(Type::Dyn) };
+                let param_ty = if is_generalizable {
+                    let fresh_name = fresh_type_name(param);
+                    fresh_type_vars.push(fresh_name.clone());
+                    Type::Var(fresh_name)
+                } else {
+                    ann.clone().unwrap_or(Type::Dyn)
+                };
                 cur_ctx = extend(&cur_ctx, param, param_ty.clone());
                 frames.push((param.clone(), param_ty));
                 cur = *body;
@@ -1020,7 +1049,7 @@ fn elaborate_generalizing_passthrough(
             result_row = EffectRow::pure();
             result_expr = arena.push(Expr::Lambda(param, Some(param_ty), result_expr));
         }
-        (result_ty, result_row, result_expr)
+        (result_ty, result_row, result_expr, fresh_type_vars)
     }))
 }
 
@@ -1064,15 +1093,24 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) -> Re
         let node = arena[cur_expr].clone();
         match node {
             Expr::Let(var, ann, val, body) => {
-                let (val_ty, val_row, val2) = match elaborate_generalizing_passthrough(arena, val, &cur_ctx, spans) {
+                let (val_ty, val_row, val2, extra_type_vars) = match elaborate_generalizing_passthrough(arena, val, &cur_ctx, spans) {
                     Some(result) => result?,
-                    None => elaborate(arena, val, &cur_ctx, spans)?,
+                    None => {
+                        let (ty, row, e) = elaborate(arena, val, &cur_ctx, spans)?;
+                        (ty, row, e, Vec::new())
+                    }
                 };
+                let ann_is_none = ann.is_none();
                 let (bound_ty, val3) = match ann {
                     Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t, spans[val])?),
                     None => (val_ty, val2),
                 };
-                cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone());
+                let extra_type_vars = if ann_is_none { extra_type_vars } else { Vec::new() };
+                cur_ctx = if extra_type_vars.is_empty() {
+                    extend_generalized(&cur_ctx, &var, bound_ty.clone())
+                } else {
+                    extend_generalized_with_type_vars(&cur_ctx, &var, bound_ty.clone(), extra_type_vars)
+                };
                 pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3 });
                 cur_expr = body;
             }
@@ -1095,19 +1133,28 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) -> Re
                     val_ctx = extend(&val_ctx, name, ann.clone().unwrap_or(Type::Dyn));
                 }
                 let mut elaborated = Vec::with_capacity(bindings.len());
+                let mut extra_type_vars_per_binding = Vec::with_capacity(bindings.len());
                 for (name, ann, val) in bindings.iter() {
-                    let (val_ty, val_row, val2) = match elaborate_generalizing_passthrough(arena, *val, &val_ctx, spans) {
+                    let (val_ty, val_row, val2, extra_type_vars) = match elaborate_generalizing_passthrough(arena, *val, &val_ctx, spans) {
                         Some(result) => result?,
-                        None => elaborate(arena, *val, &val_ctx, spans)?,
+                        None => {
+                            let (ty, row, e) = elaborate(arena, *val, &val_ctx, spans)?;
+                            (ty, row, e, Vec::new())
+                        }
                     };
                     let (bound_ty, val3) = match ann {
                         Some(t) => (t.clone(), coerce(arena, val2, &val_ty, t, spans[*val])?),
                         None => (val_ty, val2),
                     };
+                    extra_type_vars_per_binding.push(if ann.is_none() { extra_type_vars } else { Vec::new() });
                     elaborated.push((name.clone(), bound_ty, val_row, val3));
                 }
-                for (name, bound_ty, _, _) in &elaborated {
-                    cur_ctx = extend_generalized(&cur_ctx, name, bound_ty.clone());
+                for ((name, bound_ty, _, _), extra_type_vars) in elaborated.iter().zip(extra_type_vars_per_binding) {
+                    cur_ctx = if extra_type_vars.is_empty() {
+                        extend_generalized(&cur_ctx, name, bound_ty.clone())
+                    } else {
+                        extend_generalized_with_type_vars(&cur_ctx, name, bound_ty.clone(), extra_type_vars)
+                    };
                 }
                 pending.push(PendingElab::LetRec { bindings: elaborated });
                 cur_expr = body;

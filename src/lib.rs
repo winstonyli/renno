@@ -984,6 +984,50 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_alias_shadowing_does_not_disconnect_the_generalized_variable() {
+        // Regression for a real bug: extend_generalized used to
+        // auto-generalize over ANY free Type::Var it found, including one
+        // that was actually the still-open outer parameter's own name --
+        // so z's use here got a disconnected fresh name instead of the
+        // SAME name x's own type carries, and the whole thing was
+        // wrongly, statically rejected as non-numeric.
+        let src = r#"let f = fun x -> let z = x in let x = "surprise" in z in f(1) + 2"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 3);
+    }
+
+    #[test]
+    fn passthrough_alias_boundary_mismatch_is_caught_cleanly() {
+        // Same root cause as above, the OTHER symptom. Under the bug, f's
+        // wrapped type was INCOHERENT -- Fun(Var(x#0), row, Var(x#0#1)),
+        // two disconnected names -- so f("oops")'s result stayed an
+        // uninstantiated, unresolved Type::Var by the time it reached g's
+        // boundary; coerce's early-return only guards `to` against
+        // Type::Var, not `from`, so that stray Type::Var skipped building
+        // a runtime check entirely and the wrong-typed Str value crashed
+        // raw arithmetic with an unrelated "expected a number" panic
+        // (machine.rs) instead of any kind of clean type error.
+        //
+        // Fixed, f's type is fully COHERENT (Fun(Var(x#0), row, Var(x#0))
+        // -- one connected name), so f("oops") resolves PRECISELY to Str
+        // at its own call site -- same per-call precision
+        // passthrough_identity_function_is_precisely_typed_per_call checks
+        // for Int -- and feeding a precisely-known Str into g's
+        // Int-annotated parameter is now a genuine, provable STATIC type
+        // mismatch, caught before the program ever runs. That's a
+        // stronger outcome than a runtime boundary check would have been
+        // (which is what a half-connected fix would produce instead), not
+        // a regression: the crash is what's fixed here, and this is
+        // fixed even more cleanly, one step earlier, than a bare runtime
+        // check would be.
+        let src = r#"let f = fun x -> let y = x in y in let g = fun n: Int -> n + 1 in g(f("oops"))"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected Int") && err.0.contains("Str"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
     fn match_rejects_impossible_pattern_statically() {
         let (mut arena, spans, root) = parser::parse("match 5 | true -> 1 | _ -> 2").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
