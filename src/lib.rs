@@ -1290,6 +1290,59 @@ mod tests {
     }
 
     #[test]
+    fn my_map_is_callable_at_two_different_element_types_in_one_program() {
+        // Both callbacks are annotated (`fun x: Int -> ...`, `fun x: Str
+        // -> ...`), same reasoning as Task 6's own my_map test: an
+        // unannotated numeric/concat operand always keeps its Task-2-era
+        // runtime check (coerce_numeric's/Concat's own Type::Var
+        // treatment), a deliberate, already-settled Non-goal unrelated to
+        // generalization. my_map's OWN `f` parameter (inside my_map's own
+        // definition) stays fully unannotated either way, so this still
+        // fully exercises what THIS test is actually for: calling the
+        // SAME generalized my_map at two DIFFERENT concrete element
+        // types in one program.
+        let src = r#"
+            let rec my_map = fun f -> fun xs ->
+                match xs
+                | [] -> []
+                | h :: t -> f(h) :: my_map(f)(t)
+            in
+            let use_ints = fun ys: [Int] -> ys in
+            let use_strs = fun zs: [Str] -> zs in
+            (use_ints(my_map(fun x: Int -> x + 1)([1, 2, 3])), use_strs(my_map(fun x: Str -> x ++ "!")(["a", "b"])))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(!contains_check(&arena, elaborated), "both my_map calls should already be precisely typed -- no runtime checks needed for either");
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[[2, 3, 4], [a!, b!]]");
+    }
+
+    #[test]
+    fn a_still_open_enclosing_type_variable_is_not_wrongly_re_generalized() {
+        // The exact bug class the passthrough feature's own final review
+        // found and fixed (see docs/superpowers/specs/2026-09-19-
+        // passthrough-polymorphism-design.md) and the concurrent
+        // row-variable fix found again for EffectRow::Var: a nested
+        // let-alias inside a still-open function body must NOT
+        // re-generalize the outer, still-open type variable it merely
+        // touches.
+        let src = r#"let f = fun x -> let y: Int = x in y in f("oops")"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        // Either a clean static rejection or a clean runtime boundary
+        // panic is acceptable -- what must NOT happen is silent success
+        // with the wrong value (the original critical bug).
+        match typecheck::check(&mut arena, root, &spans) {
+            Err(e) => assert!(e.0.contains("Int") && e.0.contains("Str"), "unexpected static error: {}", e.0),
+            Ok(elaborated) => {
+                let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    machine::run(&arena, elaborated, Env::prelude(), &spans)
+                }));
+                assert!(panic_result.is_err(), "f(\"oops\") must fail, not silently succeed with a Str where Int was declared");
+            }
+        }
+    }
+
+    #[test]
     fn match_rejects_impossible_pattern_statically() {
         let (mut arena, spans, root) = parser::parse("match 5 | true -> 1 | _ -> 2").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();

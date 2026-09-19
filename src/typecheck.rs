@@ -21,33 +21,31 @@ pub struct TypeError(pub String, pub Span);
 // A binding's type, plus the row-variable AND value-type-variable names
 // generalized over it -- quantified fresh at every use, the way ML/
 // Haskell generalize a `let`-bound type. Row variables only ever come
-// from what the user wrote (an explicit `->{e}` annotation) -- renno has
-// no unification engine, so there's nothing here that infers one from
-// scratch. Type variables (`type_vars`) are the opposite: manufactured
-// purely by typecheck::passthrough_generalizable_params's own inference,
-// never written by a user -- see Type::Var's own doc comment. Either way,
-// this stays simple name substitution (extend_generalized computes both
-// sets once at the `let`, lookup renames them to fresh names at each
-// reference), not a general unification engine.
+// from what the user wrote (an explicit `->{e}` annotation); type
+// variables (`type_vars`) are manufactured by real unification (`unify`,
+// via `InferCtx::fresh_var`) at many sites, never written by a user --
+// see Type::Var's own doc comment. Either way, this stays simple name
+// substitution (extend_generalized computes both sets once at the `let`,
+// lookup renames them to fresh names at each reference), not a
+// second unification engine of its own.
 //
-// A row variable being user-written rather than manufactured does NOT
-// make it safe to generalize wherever free_row_vars finds it -- see
-// generalizable_row_vars's own doc comment for why it still needs a
-// ctx-wide "is this still open in an enclosing scope" check, the same
-// class of hazard Type::Var has (just reachable through ordinary
-// annotations instead of only through passthrough inference).
+// Neither kind of variable is safe to generalize wherever its own
+// free-variable collector finds it -- see generalizable_row_vars's and
+// generalizable_type_vars's own doc comments for why each needs a
+// ctx-wide "is this still open in an enclosing scope" check.
 //
 // The general rule behind BOTH exclusions, stated once here so a future
 // THIRD kind of variable needing this treatment has one place to read it
 // instead of re-deriving it: generalize(ctx, ty) = freevars(ty) MINUS
 // freevars(ctx) -- never quantify over a name that's still free somewhere
-// still open in the enclosing scope. `extend_generalized_with_type_vars`'s
-// caller-supplied list is just an optimization of that same rule, valid
-// only when there's exactly one call site that manufactures the variable
-// and so can hand back precisely which names are its own (Type::Var's
-// case); with no such single manufacturer (EffectRow::Var's case, born
-// from any annotation anywhere), the rule has to be applied directly via a
-// ctx-wide scan (generalizable_row_vars/free_row_vars_in_ctx below).
+// still open in the enclosing scope. Applied directly via a ctx-wide scan
+// for both kinds (generalizable_row_vars/free_row_vars_in_ctx and
+// generalizable_type_vars/free_type_vars_in_ctx below) -- there is no
+// longer a caller-supplied-list shortcut for either (Type::Var's own used
+// to have one, extend_generalized_with_type_vars, back when it had
+// exactly one manufacturing call site; real unification mints it at many,
+// so that shortcut no longer applies -- see the design spec's own "Data
+// model" section).
 #[derive(Clone)]
 struct Scheme {
     row_vars: Vec<String>,
@@ -71,11 +69,9 @@ type Ctx = PList<Scheme>;
 // the ctx-wide technique a concurrent row-variable fix already proved
 // in this codebase (see Task 7); this struct is just a substitution.
 //
-// #[allow(dead_code)]: nothing calls unify() from a real decision point
-// yet (that's Tasks 4-6), so `subst` and most of these methods are
-// genuinely unread by this task alone -- lift this once a later task
-// wires them in.
-#[allow(dead_code)]
+// `unify` is now called unconditionally from Expr::App/BinOp::Cons/If/
+// Match/ListLit (Tasks 4-6), so `subst` and every method below are live
+// on every elaboration, not just exercised by this file's own tests.
 struct InferCtx {
     // Grows monotonically as unify() binds variables; never shrinks --
     // no backtracking, matching this checker's existing single-pass
@@ -83,7 +79,6 @@ struct InferCtx {
     subst: HashMap<String, Type>,
 }
 
-#[allow(dead_code)]
 impl InferCtx {
     fn new() -> InferCtx {
         InferCtx { subst: HashMap::new() }
@@ -153,8 +148,8 @@ impl InferCtx {
 // infinite type (e.g. attempting to unify `a` with `List(a)`), not just
 // a syntactically-obvious one.
 //
-// #[allow(dead_code)]: only called from unify(), which nothing calls yet.
-#[allow(dead_code)]
+// Called from unify(), itself called unconditionally from Expr::App/
+// BinOp::Cons/If/Match/ListLit (Tasks 4-6) -- live on every elaboration.
 fn occurs_in(name: &str, ty: &Type, infer: &InferCtx) -> bool {
     match infer.resolve(ty) {
         Type::Var(n) => n == name,
@@ -174,9 +169,9 @@ fn occurs_in(name: &str, ty: &Type, infer: &InferCtx) -> bool {
 // forces a Dyn-sourced value's shape); two matching concrete shapes
 // recurse structurally; anything else is a real type mismatch.
 //
-// #[allow(dead_code)]: not yet called from any real decision point --
-// Tasks 4-6 wire it into Expr::App/BinOp::Cons/If/Match/ListLit.
-#[allow(dead_code)]
+// Called unconditionally from Expr::App/BinOp::Cons/If/Match/ListLit
+// (Tasks 4-6) -- a real decision point on every elaboration, not a
+// not-yet-wired-in mechanism.
 fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
     let t1 = infer.resolve(t1);
     let t2 = infer.resolve(t2);
@@ -217,7 +212,7 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
     }
 }
 
-fn lookup(ctx: &Ctx, name: &str) -> Type {
+fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
     // Unbound at typecheck time: don't error here, machine::run's own
     // `unbound variable` panic at runtime is the right place for that.
     match ctx.get(name) {
@@ -230,7 +225,7 @@ fn lookup(ctx: &Ctx, name: &str) -> Type {
                 .map(|v| (v.clone(), EffectRow::Var(fresh_row_name(v))))
                 .collect();
             let type_subst: HashMap<String, Type> =
-                scheme.type_vars.iter().map(|v| (v.clone(), Type::Var(fresh_type_name(v)))).collect();
+                scheme.type_vars.iter().map(|v| (v.clone(), infer.fresh_var(v))).collect();
             subst_type(&scheme.ty, &row_subst, &type_subst)
         }
     }
@@ -248,12 +243,7 @@ fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // `->{e}` annotation somewhere in it), generalize over them so each
 // reference gets its own fresh instantiation -- otherwise two calls to the
 // same row-polymorphic function with different concrete callbacks would
-// wrongly be forced to agree on one row.
-//
-// Deliberately does NOT auto-derive type_vars from free_type_vars(&ty) --
-// see extend_generalized_with_type_vars for why, and why type_vars needs a
-// narrower fix (a caller-supplied list) instead of what row_vars gets below
-// (a ctx-wide exclusion check). row_vars still auto-derives from
+// wrongly be forced to agree on one row. row_vars auto-derives from
 // free_row_vars(&ty), but only picks up a name if generalizable_row_vars
 // confirms it ISN'T also free somewhere still open in `ctx` -- see that
 // function's own doc comment for why an EffectRow::Var needs this
@@ -261,45 +251,50 @@ fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // in f(fun y -> perform choose(y))(0)` used to typecheck clean and only
 // panic at runtime -- "e" leaking from cb's still-open annotation into g's
 // generalized scheme, then getting freshly (and wrongly) renamed on every
-// `g` reference, exactly like the Type::Var bug this mirrors). Delegates to
-// extend_generalized_with_type_vars (with an empty type_vars) rather than
-// repeating its body: the two are identical apart from that one field, and
-// a hand-copied second implementation is exactly the kind of thing that
-// silently drifts out of sync with the first the next time either changes.
-fn extend_generalized(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
-    extend_generalized_with_type_vars(ctx, name, ty, Vec::new())
-}
-
-// Identical to extend_generalized except type_vars is supplied by the
-// caller instead of auto-derived -- Type::Var is only ever manufactured by
-// ONE place (elaborate_generalizing_passthrough, for a lambda parameter
-// WHILE that parameter's own function body is still being elaborated), so a
-// plain alias-only `let` nested inside that body (e.g. `let y = x in y`)
-// auto-harvesting free Type::Vars the way row_vars harvests row vars would
-// wrongly re-generalize over the still-open outer parameter's own fresh
-// name -- disconnecting `y`'s uses from `x`'s (each `lookup` of `y` would
-// mint yet another fresh name instead of sharing the parameter's). Because
-// there's exactly one source, the caller can hand back the EXACT fresh
-// names it just introduced, which are safe to generalize by construction.
-// row_vars has no single source like that (any annotation currently in
-// scope can introduce one), so it uses generalizable_row_vars's ctx-wide
-// check instead -- see that function's own doc comment. The only caller
-// that may supply `type_vars` here is the `Expr::Let`/`Expr::LetRec` wiring
-// for a binding whose value came back from elaborate_generalizing_passthrough
-// (and only when there's no explicit annotation on the binding).
-fn extend_generalized_with_type_vars(ctx: &Ctx, name: &str, ty: Type, type_vars: Vec<String>) -> Ctx {
+// `g` reference, exactly like the Type::Var bug generalizable_type_vars
+// guards against below).
+//
+// Resolve deeply before storing, not just for the free-variable scan:
+// unify() can bind one Type::Var to ANOTHER Type::Var (e.g. Cons's own
+// unify(&l_ty, &elem_ty, ...) when both sides are still bare vars),
+// leaving the stored type's own param positions naming the OLD alias
+// rather than the canonical variable generalizable_type_vars actually
+// generalizes over. lookup's own instantiation only renames a
+// Type::Var node whose LITERAL name is a generalized one -- an
+// aliased-but-not-literally-renamed position would silently keep
+// resolving to the ORIGINAL (never freshened) variable forever,
+// producing an incoherent instantiated type. Resolving once here
+// ensures every position that means the same variable also LITERALLY
+// names it. Safe to snapshot: this runs after the value's own
+// elaboration is fully complete, and the stored type is never itself
+// unified against anything again -- only its freshly-instantiated
+// copies (built at each use) are. resolve_deep leaves EffectRow
+// untouched (it only walks Type positions), so this doesn't affect
+// row-variable generalization at all.
+//
+// `let`-binding: generalizes over both row variables (via the existing
+// generalizable_row_vars, unchanged) and type variables (via
+// generalizable_type_vars, new) symmetrically -- there is no longer a
+// separate caller-supplied-list variant to keep in sync with this one
+// (that mechanism, extend_generalized_with_type_vars, only worked when
+// Type::Var had exactly one manufacturing call site; real unification
+// mints it at many, so it no longer applies -- see the design spec's own
+// "Data model" section).
+fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &InferCtx) -> Ctx {
+    let ty = infer.resolve_deep(&ty);
     let row_vars = generalizable_row_vars(ctx, &ty);
+    let type_vars = generalizable_type_vars(ctx, &ty, infer);
     ctx.bind(name, Scheme { row_vars, type_vars, ty })
 }
 
 // Row-variable names free in `ty` that are actually safe to generalize
 // over: free_row_vars(ty) MINUS whatever's ALSO free somewhere still open
-// in `ctx`. Unlike Type::Var (see extend_generalized_with_type_vars's doc
-// comment), an EffectRow::Var has no single manufacturing call site whose
-// caller could hand back a safe list -- it comes from ANY `->{e}`
-// annotation anywhere currently in scope (a lambda parameter's own
-// annotation, bound via plain `extend`, stays open for that parameter's
-// entire body). A nested `let` that merely happens to mention that same
+// in `ctx`. An EffectRow::Var has no single manufacturing call site --
+// it comes from ANY `->{e}` annotation anywhere currently in scope (a
+// lambda parameter's own annotation, bound via plain `extend`, stays open
+// for that parameter's entire body) -- generalizable_type_vars needs the
+// identical ctx-wide check for the same reason, just for Type::Var
+// instead. A nested `let` that merely happens to mention that same
 // row-var name (most often through a bare alias like `let g = cb in g`,
 // but any value whose type structurally embeds it -- a tuple, a record --
 // works the same way) must not re-generalize over it, for exactly the
@@ -368,95 +363,58 @@ fn free_row_vars(ty: &Type) -> BTreeSet<String> {
     }
 }
 
-// Conservative, purely syntactic: does `param` (an unannotated lambda
-// parameter's name) only ever appear, within `body`, in a position that's
-// safe to generalize? See the design spec's "The passthrough rule" for
-// the full intended rule set -- this implements a NARROWER subset (see
-// this plan's own "Before you start"): only (a) the function's own tail
-// return expression being exactly a (possibly let-aliased) reference to
-// the tracked parameter, or (b) the parameter simply never appearing at
-// all. `tracked` starts as `{param}` and grows through simple
-// `let name2 = <tracked> in body` aliasing as the walk descends -- this
-// is what lets `let f = fun x -> let y = x in y in ...` still generalize.
-// Anything else touching a tracked name (an operator, an `if`/`match`,
-// being passed as an argument, being bound via anything but a plain
-// `let`, ...) disqualifies it. `is_tail` marks whether `e` is currently in
-// the function's own return position -- only there does a bare tracked
-// reference count as "the value flows out," which is what
-// passthrough_generalizable_params below actually needs to know.
-fn is_passthrough_safe(arena: &Arena, e: ExprRef, tracked: &BTreeSet<String>, is_tail: bool) -> bool {
-    match &arena[e] {
-        Expr::Var(name) => !tracked.contains(name) || is_tail,
-        Expr::Let(var, ann, val, body) => {
-            let val_is_bare_alias = ann.is_none() && matches!(&arena[*val], Expr::Var(n) if tracked.contains(n));
-            if val_is_bare_alias {
-                let mut widened = tracked.clone();
-                widened.insert(var.clone());
-                is_passthrough_safe(arena, *body, &widened, is_tail)
-            } else {
-                !mentions_any(arena, *val, tracked) && is_passthrough_safe(arena, *body, tracked, is_tail)
-            }
+// Collects `ty`'s own free Type::Var names, resolved through infer's
+// current substitution first -- a variable already bound to something
+// concrete isn't "free" any more. Unlike free_row_vars, this needs
+// infer: an EffectRow::Var is never bound by anything except generalize/
+// instantiate itself, but a Type::Var can be bound at any point during
+// elaboration by unify().
+fn free_type_vars_resolved(ty: &Type, infer: &InferCtx) -> BTreeSet<String> {
+    match infer.resolve(ty) {
+        Type::Var(name) => {
+            let mut vars = BTreeSet::new();
+            vars.insert(name);
+            vars
         }
-        _ => !mentions_any(arena, e, tracked),
+        Type::Fun(param, _row, ret) => {
+            let mut vars = free_type_vars_resolved(&param, infer);
+            vars.extend(free_type_vars_resolved(&ret, infer));
+            vars
+        }
+        Type::List(elem) => free_type_vars_resolved(&elem, infer),
+        Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(|t| free_type_vars_resolved(t, infer)).collect(),
+        Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_type_vars_resolved(t, infer)).collect(),
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) => BTreeSet::new(),
     }
 }
 
-// Does `e`'s whole expression tree reference any name in `tracked`,
-// anywhere? Shared by is_passthrough_safe's own conservative default arm
-// (anything that isn't a bare Var or a plain Let is disqualified the
-// moment it touches a tracked name anywhere within it) -- same "walk the
-// whole Expr grammar" shape as parser::contains_perform, for the same
-// reason: a flat, exhaustive match over every variant, not a partial one.
-fn mentions_any(arena: &Arena, e: ExprRef, tracked: &BTreeSet<String>) -> bool {
-    match &arena[e] {
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) => false,
-        Expr::Var(name) => tracked.contains(name),
-        Expr::Tuple(items) | Expr::ListLit(items) => items.iter().any(|i| mentions_any(arena, *i, tracked)),
-        Expr::Record(fields) => fields.iter().any(|(_, v)| mentions_any(arena, *v, tracked)),
-        Expr::FieldAccess(target, _) => mentions_any(arena, *target, tracked),
-        Expr::Lambda(_, _, body) => mentions_any(arena, *body, tracked),
-        Expr::App(f, a) => mentions_any(arena, *f, tracked) || mentions_any(arena, *a, tracked),
-        Expr::Let(_, _, val, body) => mentions_any(arena, *val, tracked) || mentions_any(arena, *body, tracked),
-        Expr::LetRec(bindings, body) => {
-            bindings.iter().any(|(_, _, v)| mentions_any(arena, *v, tracked)) || mentions_any(arena, *body, tracked)
-        }
-        Expr::BinOp(_, l, r) => mentions_any(arena, *l, tracked) || mentions_any(arena, *r, tracked),
-        Expr::If(c, t, e) => mentions_any(arena, *c, tracked) || mentions_any(arena, *t, tracked) || mentions_any(arena, *e, tracked),
-        Expr::Perform(_, payload) => mentions_any(arena, *payload, tracked),
-        Expr::Handle { body, handler } => mentions_any(arena, *body, tracked) || mentions_any(arena, *handler, tracked),
-        Expr::MakeHandler { body, .. } => mentions_any(arena, *body, tracked),
-        Expr::Match(scrutinee, arms) => {
-            mentions_any(arena, *scrutinee, tracked)
-                || arms.iter().any(|(_, guard, body)| {
-                    guard.is_some_and(|g| mentions_any(arena, g, tracked)) || mentions_any(arena, *body, tracked)
-                })
-        }
-    }
+// Type::Var's own analog of free_row_vars_in_ctx: every type-variable
+// name free in any type currently bound in `ctx`, excluding each visited
+// scheme's own (sealed) type_vars -- see free_row_vars_in_ctx's own doc
+// comment for why the exclusion matters (a name a scheme already
+// generalized over is dead, not still open).
+fn free_type_vars_in_ctx(ctx: &Ctx, infer: &InferCtx) -> BTreeSet<String> {
+    let mut vars = BTreeSet::new();
+    ctx.for_each(|scheme: &Scheme| {
+        let sealed: BTreeSet<String> = scheme.type_vars.iter().cloned().collect();
+        vars.extend(free_type_vars_resolved(&scheme.ty, infer).difference(&sealed).cloned());
+    });
+    vars
 }
 
-// `val` is known to be (a curried chain of) Expr::Lambda -- peels every
-// UNANNOTATED parameter off in order (an already-annotated one is never a
-// candidate: this design never overrides an explicit annotation) and
-// classifies each independently against the function's own final body via
-// is_passthrough_safe, starting fresh from `{that parameter's own name}`
-// each time (one parameter's generalizability never depends on another's).
-fn passthrough_generalizable_params(arena: &Arena, val: ExprRef) -> Vec<bool> {
-    let mut params = Vec::new();
-    let mut cur = val;
-    while let Expr::Lambda(param, ann, body) = &arena[cur] {
-        params.push((param.clone(), ann.is_none()));
-        cur = *body;
+// Type::Var's own analog of generalizable_row_vars: free_type_vars_resolved(ty)
+// MINUS whatever's also free somewhere still open in `ctx`. Skips the ctx
+// walk when `ty` has no type vars at all, same short-circuit
+// generalizable_row_vars uses for the same reason (keep the overwhelmingly
+// common case -- a binding whose type mentions no type variable at all --
+// at O(1) instead of paying an O(ctx depth) scan on every single let).
+fn generalizable_type_vars(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<String> {
+    let candidates = free_type_vars_resolved(ty, infer);
+    if candidates.is_empty() {
+        return Vec::new();
     }
-    let final_body = cur;
-    params
-        .iter()
-        .map(|(name, unannotated)| {
-            *unannotated && {
-                let tracked: BTreeSet<String> = std::iter::once(name.clone()).collect();
-                is_passthrough_safe(arena, final_body, &tracked, true)
-            }
-        })
-        .collect()
+    let still_open = free_type_vars_in_ctx(ctx, infer);
+    candidates.difference(&still_open).cloned().collect()
 }
 
 fn fresh_row_name(base: &str) -> String {
@@ -536,37 +494,6 @@ fn bind_row_vars(param: &Type, arg: &Type, subst: &mut HashMap<String, EffectRow
         }
         bind_row_vars(p1, a1, subst);
         bind_row_vars(p2, a2, subst);
-    }
-}
-
-// Same idea as bind_row_vars, for ordinary Type::Var instead of
-// EffectRow::Var: `param` is the callee's OWN (already-instantiated,
-// possibly Type::Var-containing) declared parameter type; `arg` is the
-// caller's actual argument's inferred type. Where `param`'s structure
-// names a bare Type::Var and `arg`'s matching position is something more
-// concrete, bind it -- the caller substitutes that into the return type
-// so a generalized function's result is precisely typed once its
-// argument's own type is known, not just Type::Var (which would render
-// exactly like Dyn -- see Type::Var's own doc comment). This is what
-// turns `id(5)`'s call-site type from Dyn into Int.
-//
-// #[allow(dead_code)]: its only caller (Expr::App's Fun-callee arm) now
-// uses unify()+resolve_deep instead, which supersede it -- the function
-// itself is deleted in Task 7, alongside the rest of the passthrough-era
-// machinery it belongs to.
-#[allow(dead_code)]
-fn bind_type_vars(param: &Type, arg: &Type, subst: &mut HashMap<String, Type>) {
-    match (param, arg) {
-        (Type::Var(name), _) => {
-            if !matches!(arg, Type::Var(_)) {
-                subst.entry(name.clone()).or_insert_with(|| arg.clone());
-            }
-        }
-        (Type::Fun(p1, _, p2), Type::Fun(a1, _, a2)) => {
-            bind_type_vars(p1, a1, subst);
-            bind_type_vars(p2, a2, subst);
-        }
-        _ => {}
     }
 }
 
@@ -1325,82 +1252,6 @@ fn missing_case(patterns: &[&Pattern], scrut_ty: &Type) -> Option<String> {
     })
 }
 
-// If `val` is (a curried chain of) Lambda ending in some body, elaborates
-// it with each passthrough-generalizable unannotated parameter bound to a
-// fresh Type::Var instead of Type::Dyn. This peels the SAME Lambda chain
-// passthrough_generalizable_params already walked, binding each param's
-// name to its (possibly generalized) type and recording it, then
-// elaborates the final (post-Lambda) body once against that context and
-// wraps the result back up in Fun/Lambda layers itself -- the same
-// PendingElab::Fun reconstruction `elaborate`'s own peeling loop does.
-// This can't simply re-bind ctx and fall through to a plain recursive
-// `elaborate(arena, val, ...)` call on the whole chain: that call's own
-// peeling loop would re-walk these SAME (still-unannotated in the AST)
-// Lambda nodes and re-extend each name to Type::Dyn again, which --
-// PList::get's own most-recent-binding-wins semantics -- would shadow the
-// fresh Type::Var this function just bound, silently losing it. Returns
-// None (falls back to plain `elaborate`) whenever `val` isn't a Lambda at
-// all, or none of its parameters qualify -- so this is always a strict
-// superset of today's behavior, never a change to it.
-//
-// Also hands back the exact fresh Type::Var names this call introduced (one
-// per generalizable parameter), so the caller can generalize the OUTER
-// binding over exactly those names via extend_generalized_with_type_vars --
-// never via extend_generalized's own auto-derivation, which would wrongly
-// also pick up any OTHER Type::Var merely encountered inside `val`'s body
-// (e.g. a still-open enclosing parameter's own name, reached through a
-// nested ordinary `let` alias). See extend_generalized's doc comment.
-//
-// The Vec<String> is the fresh Type::Var names this call introduced --
-// named as its own alias (clippy's own type_complexity threshold) purely
-// to keep this signature readable, not a semantically meaningful type.
-type GeneralizingPassthroughResult = Option<Result<(Type, EffectRow, ExprRef, Vec<String>), TypeError>>;
-
-fn elaborate_generalizing_passthrough(
-    arena: &mut Arena,
-    val: ExprRef,
-    ctx: &Ctx,
-    spans: &SpanMap,
-    infer: &mut InferCtx,
-) -> GeneralizingPassthroughResult {
-    if !matches!(arena[val], Expr::Lambda(..)) {
-        return None;
-    }
-    let generalizable = passthrough_generalizable_params(arena, val);
-    if !generalizable.iter().any(|g| *g) {
-        return None;
-    }
-    let mut cur_ctx = ctx.clone();
-    let mut cur = val;
-    let mut frames: Vec<(String, Type)> = Vec::new();
-    let mut fresh_type_vars: Vec<String> = Vec::new();
-    for is_generalizable in generalizable {
-        match &arena[cur] {
-            Expr::Lambda(param, ann, body) => {
-                let param_ty = if is_generalizable {
-                    let fresh_name = fresh_type_name(param);
-                    fresh_type_vars.push(fresh_name.clone());
-                    Type::Var(fresh_name)
-                } else {
-                    ann.clone().unwrap_or(Type::Dyn)
-                };
-                cur_ctx = extend(&cur_ctx, param, param_ty.clone());
-                frames.push((param.clone(), param_ty));
-                cur = *body;
-            }
-            _ => unreachable!("generalizable.len() matches the Lambda chain passthrough_generalizable_params walked"),
-        }
-    }
-    Some(elaborate(arena, cur, &cur_ctx, spans, infer).map(|(mut result_ty, mut result_row, mut result_expr)| {
-        for (param, param_ty) in frames.into_iter().rev() {
-            result_ty = Type::Fun(Rc::new(param_ty.clone()), result_row, Rc::new(result_ty));
-            result_row = EffectRow::pure();
-            result_expr = arena.push(Expr::Lambda(param, Some(param_ty), result_expr));
-        }
-        (result_ty, result_row, result_expr, fresh_type_vars)
-    }))
-}
-
 // Bidirectional-lite synthesis: walks the tree once, producing the
 // inferred Type, the inferred EffectRow (closed, no polymorphism -- just
 // the union of effect names this expression's evaluation might perform),
@@ -1441,24 +1292,12 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
         let node = arena[cur_expr].clone();
         match node {
             Expr::Let(var, ann, val, body) => {
-                let (val_ty, val_row, val2, extra_type_vars) = match elaborate_generalizing_passthrough(arena, val, &cur_ctx, spans, infer) {
-                    Some(result) => result?,
-                    None => {
-                        let (ty, row, e) = elaborate(arena, val, &cur_ctx, spans, infer)?;
-                        (ty, row, e, Vec::new())
-                    }
-                };
-                let ann_is_none = ann.is_none();
+                let (val_ty, val_row, val2) = elaborate(arena, val, &cur_ctx, spans, infer)?;
                 let (bound_ty, val3) = match ann {
                     Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t, spans[val])?),
                     None => (val_ty, val2),
                 };
-                let extra_type_vars = if ann_is_none { extra_type_vars } else { Vec::new() };
-                cur_ctx = if extra_type_vars.is_empty() {
-                    extend_generalized(&cur_ctx, &var, bound_ty.clone())
-                } else {
-                    extend_generalized_with_type_vars(&cur_ctx, &var, bound_ty.clone(), extra_type_vars)
-                };
+                cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone(), infer);
                 pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3 });
                 cur_expr = body;
             }
@@ -1481,28 +1320,16 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
                     val_ctx = extend(&val_ctx, name, ann.clone().unwrap_or_else(|| infer.fresh_var(name)));
                 }
                 let mut elaborated = Vec::with_capacity(bindings.len());
-                let mut extra_type_vars_per_binding = Vec::with_capacity(bindings.len());
                 for (name, ann, val) in bindings.iter() {
-                    let (val_ty, val_row, val2, extra_type_vars) = match elaborate_generalizing_passthrough(arena, *val, &val_ctx, spans, infer) {
-                        Some(result) => result?,
-                        None => {
-                            let (ty, row, e) = elaborate(arena, *val, &val_ctx, spans, infer)?;
-                            (ty, row, e, Vec::new())
-                        }
-                    };
+                    let (val_ty, val_row, val2) = elaborate(arena, *val, &val_ctx, spans, infer)?;
                     let (bound_ty, val3) = match ann {
                         Some(t) => (t.clone(), coerce(arena, val2, &val_ty, t, spans[*val])?),
                         None => (val_ty, val2),
                     };
-                    extra_type_vars_per_binding.push(if ann.is_none() { extra_type_vars } else { Vec::new() });
                     elaborated.push((name.clone(), bound_ty, val_row, val3));
                 }
-                for ((name, bound_ty, _, _), extra_type_vars) in elaborated.iter().zip(extra_type_vars_per_binding) {
-                    cur_ctx = if extra_type_vars.is_empty() {
-                        extend_generalized(&cur_ctx, name, bound_ty.clone())
-                    } else {
-                        extend_generalized_with_type_vars(&cur_ctx, name, bound_ty.clone(), extra_type_vars)
-                    };
+                for (name, bound_ty, _, _) in elaborated.iter() {
+                    cur_ctx = extend_generalized(&cur_ctx, name, bound_ty.clone(), infer);
                 }
                 pending.push(PendingElab::LetRec { bindings: elaborated });
                 cur_expr = body;
@@ -1569,7 +1396,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         // A singleton per source position -- see Expr::Token's own doc
         // comment.
         Expr::Token(id) => Ok((Type::Token(id), EffectRow::pure(), expr)),
-        Expr::Var(name) => Ok((lookup(ctx, &name), EffectRow::pure(), expr)),
+        Expr::Var(name) => Ok((lookup(ctx, &name, infer), EffectRow::pure(), expr)),
 
         // Per-position types, no widening -- unlike ListLit just below,
         // which exists for a genuinely variable-length, conceptually
@@ -1902,8 +1729,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         ));
                     }
                     let result_ty = match (&l_ty, &r_ty) {
-                        (Type::Dyn, Type::Dyn) => Type::Dyn,
-                        (Type::Dyn, t) | (t, Type::Dyn) => t.clone(),
+                        (Type::Dyn | Type::Var(_), Type::Dyn | Type::Var(_)) => Type::Dyn,
+                        (Type::Dyn | Type::Var(_), t) | (t, Type::Dyn | Type::Var(_)) => t.clone(),
                         (Type::Str, Type::Str) => Type::Str,
                         (Type::List(_), Type::List(_)) => l_ty.clone(),
                         _ => {
