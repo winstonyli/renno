@@ -21,14 +21,12 @@ pub enum Type {
     // A generalized value-type variable -- see typecheck::Scheme's own
     // doc comment for the full generalize-at-`let`/instantiate-at-use
     // story (mirrors EffectRow::Var exactly, just for ordinary types
-    // instead of effect rows). Only ever produced by typecheck's own
-    // inference (typecheck::passthrough_generalizable_params), never
-    // written by a user -- there is no surface syntax for this. Treated
-    // exactly like Type::Dyn by `consistent`/`coerce` everywhere except
-    // typecheck::bind_type_vars, which is what actually recovers
-    // precision: at a call site, an instantiated Type::Var naming the
-    // callee's parameter gets bound to the caller's own concrete argument
-    // type, and that binding is substituted into the return type.
+    // instead of effect rows). Minted at many binding sites via
+    // InferCtx::fresh_var, never written by a user -- there is no surface
+    // syntax for this. Treated exactly like Type::Dyn by
+    // `consistent`/`coerce` everywhere except unify(), which binds it
+    // into infer.subst. Precision is recovered via InferCtx::resolve/
+    // resolve_deep reading that binding back to substitute a concrete type.
     // IS surfaced to a user: an unresolved Type::Var can appear in a
     // static type-mismatch message (e.g. `id(id) + 1`). Its Display impl
     // renders it identically to Type::Dyn ("Dyn") rather than some
@@ -190,8 +188,8 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
     match (a, b) {
         (Type::Dyn, _) | (_, Type::Dyn) => true,
         // Treated exactly like Dyn here -- the one place it behaves
-        // differently is typecheck::bind_type_vars, a call-SITE binding
-        // step, not a change to this general relation. See Type::Var's
+        // differently is unify(), which binds it into infer.subst,
+        // not a change to this general relation. See Type::Var's
         // own doc comment.
         (Type::Var(_), _) | (_, Type::Var(_)) => true,
         (Type::Int, Type::Int) => true,
