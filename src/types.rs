@@ -52,6 +52,32 @@ pub enum Type {
     // identity using nothing but ordinary structural comparison -- no
     // separate name-registry/brand-comparison mechanism needed.
     Token(u64),
+    // A reference to a genuinely self-referential `type` alias's own
+    // definition -- `type List = (Int, List) | Unit in ...` -- rather
+    // than the ordinary, fully-expanded structural value every OTHER
+    // (non-recursive) alias resolves to directly. The string is always
+    // a gensym'd unique id in the shape "Base#N" (see parser::atom's
+    // own `Token::TypeKw` arm), never the bare user-typed name --
+    // aliases in different, unrelated scopes can share a surface name,
+    // and the registry this leaf is looked up in (InferCtx's own
+    // `named_types`, populated once by the parser) has to survive
+    // past the parser's OWN scoped/LIFO-restored `type_aliases`, so it
+    // needs a name that can never collide across scopes.
+    //
+    // A lightweight, non-expanding leaf, in the same spirit as
+    // Type::Var/Type::Token: a tag consulted on demand, never
+    // something requiring evaluation or unfolding to construct.
+    // Comparison (consistent()/unify()) is purely nominal, by id --
+    // see their own new arms -- so nothing here ever needs to unfold
+    // what this id actually stands for, and no cycle-detection is
+    // needed anywhere in this file's own structural recursion, even
+    // though a registry entry for a genuinely recursive alias
+    // structurally contains this SAME leaf pointing at itself.
+    // build_shape_predicate/build_boundary_check/pattern_could_match
+    // (typecheck.rs) are the only consumers that ever look up what a
+    // Named id stands for, and only one level at a time -- see their
+    // own doc comments (Task 3/4 of this plan).
+    Named(String),
     // Fixed-arity, per-position-typed product -- `(a, b, c)` syntax.
     // Anonymous (no declared name, no registry lookup): consistent_inner
     // compares two Tuple types directly, positionally, with nothing to
@@ -207,6 +233,13 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         // (and Dyn, already handled above). No registry lookup: the id
         // alone says everything there is to say.
         (Type::Token(a), Type::Token(b)) => a == b,
+        // Nominal, not structural -- same singleton-by-id precedent
+        // Token's own arm just above already sets. Two Named types are
+        // consistent only when their ids match exactly; a Named type
+        // is never consistent with anything structurally identical to
+        // what it (or any other Named type) unfolds to. Never unfolds
+        // the registry -- see Type::Named's own doc comment.
+        (Type::Named(a), Type::Named(b)) => a == b,
         // Positional, structural, no name/registry involved -- same idea
         // as List's own element comparison, just per-position instead of
         // one shared element type.
@@ -315,6 +348,13 @@ impl fmt::Display for Type {
             // identically to Type::Dyn, which is what a Type::Var
             // actually behaves like everywhere it's observable.
             Type::Var(_) => write!(f, "Dyn"),
+            // Shows the clean surface name, not the internal gensym'd
+            // id -- mirrors Type::Var's own precedent just above
+            // (hiding its internal name, always showing "Dyn" instead)
+            // of not exposing machinery the user never wrote. The
+            // surface name is always the part before the first "#" --
+            // see the id's own construction in parser::atom.
+            Type::Named(id) => write!(f, "{}", id.split('#').next().unwrap_or(id)),
             Type::Bool => write!(f, "Bool"),
             Type::Str => write!(f, "Str"),
             Type::List(elem) => write!(f, "[{elem}]"),

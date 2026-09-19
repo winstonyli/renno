@@ -157,7 +157,11 @@ fn occurs_in(name: &str, ty: &Type, infer: &InferCtx) -> bool {
         Type::Fun(param, _row, ret) => occurs_in(name, &param, infer) || occurs_in(name, &ret, infer),
         Type::Tuple(items) | Type::Union(items) => items.iter().any(|t| occurs_in(name, t, infer)),
         Type::Record(fields) => fields.iter().any(|(_, t)| occurs_in(name, t, infer)),
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) => false,
+        // A Named reference is a fixed nominal leaf (see its own doc
+        // comment) -- it never structurally contains a nested Type, so
+        // it can never contain `name` as a free Type::Var either, same
+        // as Type::Token right next to it here.
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) => false,
     }
 }
 
@@ -187,6 +191,10 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
         (Type::Dyn, _) | (_, Type::Dyn) => Ok(()),
         (Type::Int, Type::Int) | (Type::Float, Type::Float) | (Type::Bool, Type::Bool) | (Type::Str, Type::Str) => Ok(()),
         (Type::Token(a), Type::Token(b)) if a == b => Ok(()),
+        // Same nominal-by-id precedent as consistent()'s own new arm
+        // (types.rs) -- never unfolds, never binds a Type::Var as a
+        // side effect of comparing two Named ids.
+        (Type::Named(a), Type::Named(b)) if a == b => Ok(()),
         (Type::List(a), Type::List(b)) => unify(a, b, infer, span),
         (Type::Fun(p1, _r1, ret1), Type::Fun(p2, _r2, ret2)) => {
             unify(p1, p2, infer, span)?;
@@ -441,7 +449,7 @@ fn free_row_vars(ty: &Type) -> BTreeSet<String> {
         Type::List(elem) => free_row_vars(elem),
         Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(free_row_vars).collect(),
         Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_row_vars(t)).collect(),
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Var(_) => BTreeSet::new(),
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) | Type::Var(_) => BTreeSet::new(),
     }
 }
 
@@ -466,7 +474,7 @@ fn free_type_vars_resolved(ty: &Type, infer: &InferCtx) -> BTreeSet<String> {
         Type::List(elem) => free_type_vars_resolved(&elem, infer),
         Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(|t| free_type_vars_resolved(t, infer)).collect(),
         Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_type_vars_resolved(t, infer)).collect(),
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) => BTreeSet::new(),
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) => BTreeSet::new(),
     }
 }
 
@@ -685,6 +693,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type) -> ExprRef {
         Type::Union(_) => build_union_check(arena, e, to),
         Type::Dyn => unreachable!("coerce only calls this once *to != Type::Dyn is already established"),
         Type::Var(_) => e,
+        Type::Named(_) => unreachable!("Task 3 wires in the real one-level unfold; unreachable until then"),
     }
 }
 
@@ -771,6 +780,7 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type) -> Ex
         Type::Union(alts) => {
             fold_predicate(arena, alts, FoldOp::Or, |arena, alt| build_shape_predicate(arena, value_ref, alt))
         }
+        Type::Named(_) => unreachable!("Task 3 wires in the real one-level unfold; unreachable until then"),
     }
 }
 

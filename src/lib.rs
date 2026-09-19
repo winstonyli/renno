@@ -3137,4 +3137,48 @@ mod tests {
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("cannot compare") || err.0.contains("type mismatch"), "unexpected message: {}", err.0);
     }
+
+    #[test]
+    fn consistent_treats_two_named_types_with_the_same_id_as_consistent() {
+        use types::{consistent, Type};
+        let a = Type::Named("List#3".to_string());
+        let b = Type::Named("List#3".to_string());
+        assert!(consistent(&a, &b));
+    }
+
+    #[test]
+    fn consistent_rejects_two_named_types_with_different_ids() {
+        // Nominal, not structural: two DIFFERENT ids are never
+        // consistent, even though this test never gives either one a
+        // real registry definition to compare structurally against --
+        // that's the whole point, comparison never looks at what a
+        // Named type unfolds to.
+        use types::{consistent, Type};
+        let a = Type::Named("List#3".to_string());
+        let b = Type::Named("Tree#7".to_string());
+        assert!(!consistent(&a, &b));
+    }
+
+    #[test]
+    fn consistent_rejects_a_named_type_against_a_structurally_identical_concrete_type() {
+        // Pure nominal comparison: a Named type is never consistent
+        // with anything other than another Named type sharing its
+        // exact id, even a hand-built value that happens to look
+        // exactly like what it (hypothetically) unfolds to.
+        use types::{consistent, EffectRow, Type};
+        let named = Type::Named("List#3".to_string());
+        let concrete = Type::Union(std::rc::Rc::new(vec![
+            Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Dyn])),
+            Type::Int,
+        ]));
+        let _ = EffectRow::Dyn; // silence unused-import if EffectRow isn't otherwise needed here
+        assert!(!consistent(&named, &concrete));
+    }
+
+    #[test]
+    fn named_type_displays_as_its_own_clean_surface_name() {
+        use types::Type;
+        let ty = Type::Named("List#3".to_string());
+        assert_eq!(format!("{ty}"), "List");
+    }
 }
