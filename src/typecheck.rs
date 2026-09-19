@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
 use crate::plist::PList;
 use crate::span::Span;
-use crate::types::{consistent, fits, EffectRow, Type};
+use crate::types::{consistent, fits, row_consistent, EffectRow, Type};
 use crate::util::find_field;
 
 // The Span is always an ORIGINAL (pre-elaboration) node's -- the one whose
@@ -209,6 +209,46 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
             Ok(())
         }
         _ => Err(TypeError(format!("type mismatch: expected {t2}, found {t1}"), span)),
+    }
+}
+
+// The unification-flavored counterpart to fits(): same directional
+// walk, but since this IS a unification (not just a static check), it
+// also resolves and BINDS any free Type::Var it finds along the way --
+// exactly like unify() does, via the same delegation to unify() itself
+// for every case that isn't specifically Fun or Record (which is also
+// where unify()'s own occurs-check and infer.subst.insert actually
+// live -- unify_fits doesn't duplicate that logic, it reaches it
+// through the catch-all below).
+fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
+    let required = infer.resolve(required);
+    let actual = infer.resolve(actual);
+    match (&required, &actual) {
+        (Type::Fun(req_param, req_row, req_ret), Type::Fun(act_param, act_row, act_ret)) => {
+            unify_fits(act_param, req_param, infer, span)?;
+            unify_fits(req_ret, act_ret, infer, span)?;
+            if !row_consistent(req_row, act_row) {
+                return Err(TypeError(format!("type mismatch: expected {required}, found {actual}"), span));
+            }
+            Ok(())
+        }
+        (Type::Record(req_fields), Type::Record(act_fields)) => {
+            for (name, req_ty) in req_fields.iter() {
+                match find_field(act_fields, name) {
+                    Some(act_ty) => unify_fits(req_ty, act_ty, infer, span)?,
+                    None => return Err(TypeError(format!("type mismatch: expected {required}, found {actual}"), span)),
+                }
+            }
+            Ok(())
+        }
+        (Type::Union(_), _) | (_, Type::Union(_)) => {
+            if consistent(&required, &actual) {
+                Ok(())
+            } else {
+                Err(TypeError(format!("type mismatch: expected {required}, found {actual}"), span))
+            }
+        }
+        _ => unify(&required, &actual, infer, span),
     }
 }
 
@@ -1579,33 +1619,6 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // (the width/union-subtyping cases below) -- only
                     // changes what coerce sees when something upstream
                     // has ALREADY resolved it.
-                    //
-                    // ponytail: known ceiling, PRE-EXISTING and not
-                    // caused by this line -- exposing a real, resolved
-                    // Fun shape to coerce also exposes it to
-                    // consistent()'s own Fun arm, which checks BOTH
-                    // sides' param types with plain, symmetric
-                    // consistent() (no contravariance). A higher-order
-                    // parameter inferred to require a WIDER record (e.g.
-                    // from a literal constructed inside the callee's own
-                    // body) rejects being satisfied by a callback
-                    // accepting only a NARROWER one, even though that's
-                    // exactly what contravariant function subtyping
-                    // would allow. Confirmed via direct comparison this
-                    // is NOT new: the identical rejection, byte-for-byte,
-                    // already happens today for an EXPLICITLY annotated
-                    // parameter of the same shape, on the untouched
-                    // pre-this-plan baseline -- this line just gives
-                    // inferred positions the SAME behavior explicit ones
-                    // always had, which is this whole plan's own theme.
-                    // See inferred_higher_order_param_inherits_the_same_
-                    // width_subtyping_ceiling_annotated_ones_already_have
-                    // (Step 1) for the documented, confirmed-pre-existing
-                    // case. Upgrade path if ever needed: give
-                    // consistent()'s own Fun arm real contravariant
-                    // parameter subtyping -- a substantially larger,
-                    // separate feature, well outside this plan's own
-                    // scope.
                     let param_ty_resolved = infer.resolve_deep(param_ty);
                     let a3 = coerce(arena, a2, &a_ty, &param_ty_resolved, spans[a])?;
                     let mut row_subst = HashMap::new();
@@ -1622,47 +1635,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // behavior difference.
                     bind_row_vars(param_ty, &a_ty, &mut row_subst);
                     let call_row2 = resolve_row(call_row, &row_subst);
-                    // Best-effort only -- NOT `?`. `coerce`, just above,
-                    // is ALREADY the sole authority on whether this call
-                    // is valid: it's subtyping-aware (record width via
-                    // record_satisfies, Union alternatives), matching
-                    // consistent()'s own established semantics. unify()
-                    // is NOT subtyping-aware (its Record/Tuple arms
-                    // require exact structural equality, the same
-                    // symmetric relation consistent() uses for those
-                    // shapes) -- deliberately not generalized to width/
-                    // Union tolerance here, since unify() is also used at
-                    // several OTHER call sites (Cons, bind_pattern_vars,
-                    // and a later task's If/Match/ListLit combination)
-                    // where an asymmetric "required vs actual" direction
-                    // doesn't apply and exact matching is exactly what's
-                    // wanted. unify()'s only job at THIS specific call
-                    // site is opportunistic: bind any free Type::Var
-                    // param_ty still has (e.g. an instantiated
-                    // generalized scheme's own fresh param -- the
-                    // passthrough-made-real case) so the return type
-                    // below can resolve precisely. Its failure here means
-                    // "nothing new to bind, or this pair needs coerce's
-                    // own richer width/Union tolerance instead" -- never
-                    // a fresh rejection of a call coerce already
-                    // approved one line above.
-                    //
-                    // ponytail: known ceiling -- a genuinely POLYMORPHIC
-                    // param combined with a width-subtyped/Union argument
-                    // in the SAME call (e.g. a generalized `{x: 'a} -> 'a`
-                    // called with `{x: 5, y: 10}`) won't get `'a` bound
-                    // here, since unify()'s Record arm rejects on arity
-                    // before ever reaching the shared field. Falls back to
-                    // reading as Dyn via the still-unresolved Var, same
-                    // permissive behavior this whole feature started
-                    // from -- not a regression, just not sharpened by
-                    // this task. Upgrade path if ever needed: give
-                    // unify()'s own Record/Tuple/Union arms the same
-                    // one-directional width/alternative tolerance
-                    // record_satisfies/consistent() already establish,
-                    // choosing a direction (required vs actual) per call
-                    // site rather than baking one into unify() globally.
-                    let _ = unify(param_ty, &a_ty, infer, spans[a]);
+                    unify_fits(param_ty, &a_ty, infer, spans[a])?;
                     // resolve_deep alone only ever consults infer.subst
                     // (ordinary Type::Var bindings) -- it knows nothing
                     // about row_subst, built separately just above.

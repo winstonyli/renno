@@ -2879,6 +2879,28 @@ mod tests {
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 1);
     }
 
+    #[test]
+    fn unify_fits_still_rejects_a_callback_requiring_a_field_that_does_not_exist() {
+        // Regression guard: unify_fits must not become MORE permissive
+        // than fits() itself -- a callback requiring a field the
+        // required record doesn't have AT ALL must still be a hard
+        // rejection, not silently accepted (or silently discarded, the
+        // way the OLD best-effort unify() call in this arm used to
+        // swallow ANY failure regardless of cause). Careful with the
+        // exact shape: {y: Int} would NOT work for this test -- it's a
+        // genuinely valid narrower requirement of {x: Int, y: Int} (see
+        // fits_rejects_a_callback_requiring_a_field_that_does_not_
+        // exist_in_what_is_required's own comment, Task 1) -- this uses
+        // {z: Int}, a field {x: Int, y: Int} doesn't have at all.
+        let src = r#"
+            let use_it = fun f -> f({x: 1, y: 2}) in
+            use_it(fun r: {z: Int} -> r.z)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("type mismatch"), "unexpected message: {}", err.0);
+    }
+
     // --- Final whole-branch review regressions (found after all 7 tasks
     // landed -- each is a valid program that worked before this whole
     // feature and broke after, invisible to any single task's own
