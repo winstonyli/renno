@@ -2606,4 +2606,30 @@ mod tests {
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 5);
     }
+
+    #[test]
+    fn calling_an_unannotated_parameter_learns_its_function_shape() {
+        // Regression for the SECOND correlation my_map-shaped code
+        // needs: f is an unannotated parameter (Type::Var, not Fun-
+        // shaped yet) -- calling it as f(x) must learn f's own param/
+        // return types from how it's actually used, not just fall back
+        // to Dyn the way today's Type::Dyn-callee branch does.
+        let src = "let twice = fun f -> fun x -> f(f(x)) in twice(fun n: Int -> n + 1)(5)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 7);
+    }
+
+    #[test]
+    fn calling_something_that_resolves_to_a_non_function_is_still_a_hard_error() {
+        // Regression guard: the new Type::Var-callee case must still
+        // reject calling something that turns out concretely
+        // non-callable, same as today's existing "cannot call" rejection
+        // -- it must not silently succeed just because unify() is now
+        // involved.
+        let src = "let apply = fun f -> fun x -> f(x) in apply(5)(1)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("cannot call") || err.0.contains("type mismatch"), "unexpected message: {}", err.0);
+    }
 }

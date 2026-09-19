@@ -549,6 +549,12 @@ fn bind_row_vars(param: &Type, arg: &Type, subst: &mut HashMap<String, EffectRow
 // argument's own type is known, not just Type::Var (which would render
 // exactly like Dyn -- see Type::Var's own doc comment). This is what
 // turns `id(5)`'s call-site type from Dyn into Int.
+//
+// #[allow(dead_code)]: its only caller (Expr::App's Fun-callee arm) now
+// uses unify()+resolve_deep instead, which supersede it -- the function
+// itself is deleted in Task 7, alongside the rest of the passthrough-era
+// machinery it belongs to.
+#[allow(dead_code)]
 fn bind_type_vars(param: &Type, arg: &Type, subst: &mut HashMap<String, Type>) {
     match (param, arg) {
         (Type::Var(name), _) => {
@@ -1666,36 +1672,104 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let (a_ty, a_row, a2) = elaborate(arena, a, ctx, spans, infer)?;
             let (call_row, ret_ty, app2) = match &f_ty {
                 Type::Fun(param_ty, call_row, ret_ty) => {
-                    let a3 = coerce(arena, a2, &a_ty, param_ty, spans[a])?;
-                    // If param_ty names a row variable (from an explicit
-                    // `->{e}` annotation on the callee) and the argument's
-                    // own inferred type reveals a concrete row in the
-                    // matching position, bind it -- and carry that binding
-                    // into the return type and this call's own row, so a
-                    // row-polymorphic function's result is precisely typed
-                    // once its callback is known, not just Dyn. Same idea,
-                    // same call site, for ordinary Type::Var (see
-                    // bind_type_vars's own doc comment) -- one combined
-                    // subst_type call resolves both kinds together.
+                    // Resolve BEFORE handing to coerce, not just before/
+                    // after unify below: coerce has no InferCtx of its
+                    // own, and its OWN Type::Var-as-target handling is
+                    // blanket-permissive -- ZERO check inserted -- exactly
+                    // like Dyn (see coerce's own `matches!(to,
+                    // Type::Var(_))` early-return). If param_ty is a bare
+                    // Type::Var that unify() has ALREADY bound to
+                    // something concrete elsewhere (e.g. `apply = fun f ->
+                    // fun x -> f(x)`, where f's own parameter position
+                    // gets bound to a concrete Fun shape while apply's
+                    // OWN body is elaborated), coerce needs to see that
+                    // REAL, resolved shape -- not the stale Var reference
+                    // -- or a genuinely invalid call (`apply(5)`, 5 where
+                    // a function is required) silently passes with no
+                    // check at all. A no-op when param_ty is still
+                    // genuinely unconstrained (the ordinary id/const
+                    // passthrough-made-real case) or already concrete
+                    // (the width/union-subtyping cases below) -- only
+                    // changes what coerce sees when something upstream
+                    // has ALREADY resolved it.
+                    let param_ty_resolved = infer.resolve_deep(param_ty);
+                    let a3 = coerce(arena, a2, &a_ty, &param_ty_resolved, spans[a])?;
                     let mut row_subst = HashMap::new();
                     bind_row_vars(param_ty, &a_ty, &mut row_subst);
-                    let mut type_subst = HashMap::new();
-                    bind_type_vars(param_ty, &a_ty, &mut type_subst);
-                    let ret_ty2 = subst_type(ret_ty, &row_subst, &type_subst);
                     let call_row2 = resolve_row(call_row, &row_subst);
+                    // Best-effort only -- NOT `?`. `coerce`, just above,
+                    // is ALREADY the sole authority on whether this call
+                    // is valid: it's subtyping-aware (record width via
+                    // record_satisfies, Union alternatives), matching
+                    // consistent()'s own established semantics. unify()
+                    // is NOT subtyping-aware (its Record/Tuple arms
+                    // require exact structural equality, the same
+                    // symmetric relation consistent() uses for those
+                    // shapes) -- deliberately not generalized to width/
+                    // Union tolerance here, since unify() is also used at
+                    // several OTHER call sites (Cons, bind_pattern_vars,
+                    // and a later task's If/Match/ListLit combination)
+                    // where an asymmetric "required vs actual" direction
+                    // doesn't apply and exact matching is exactly what's
+                    // wanted. unify()'s only job at THIS specific call
+                    // site is opportunistic: bind any free Type::Var
+                    // param_ty still has (e.g. an instantiated
+                    // generalized scheme's own fresh param -- the
+                    // passthrough-made-real case) so the return type
+                    // below can resolve precisely. Its failure here means
+                    // "nothing new to bind, or this pair needs coerce's
+                    // own richer width/Union tolerance instead" -- never
+                    // a fresh rejection of a call coerce already
+                    // approved one line above.
+                    //
+                    // ponytail: known ceiling -- a genuinely POLYMORPHIC
+                    // param combined with a width-subtyped/Union argument
+                    // in the SAME call (e.g. a generalized `{x: 'a} -> 'a`
+                    // called with `{x: 5, y: 10}`) won't get `'a` bound
+                    // here, since unify()'s Record arm rejects on arity
+                    // before ever reaching the shared field. Falls back to
+                    // reading as Dyn via the still-unresolved Var, same
+                    // permissive behavior this whole feature started
+                    // from -- not a regression, just not sharpened by
+                    // this task. Upgrade path if ever needed: give
+                    // unify()'s own Record/Tuple/Union arms the same
+                    // one-directional width/alternative tolerance
+                    // record_satisfies/consistent() already establish,
+                    // choosing a direction (required vs actual) per call
+                    // site rather than baking one into unify() globally.
+                    let _ = unify(param_ty, &a_ty, infer, spans[a]);
+                    // resolve_deep alone only ever consults infer.subst
+                    // (ordinary Type::Var bindings) -- it knows nothing
+                    // about row_subst, built separately just above.
+                    // Apply row_subst first (subst_type with an empty
+                    // type_subst leaves every Type::Var untouched, only
+                    // touching EffectRow::Var positions), then
+                    // resolve_deep to layer in whatever unify() just
+                    // bound -- the two substitutions act on disjoint
+                    // parts of the type (EffectRow positions vs Type::Var
+                    // positions), so composing them in either order gives
+                    // the same result.
+                    let ret_ty2 = infer.resolve_deep(&subst_type(ret_ty, &row_subst, &HashMap::new()));
                     (call_row2, ret_ty2, arena.push(Expr::App(f2, a3)))
                 }
-                Type::Dyn => {
-                    // Unknown callee: still route "is this even callable"
-                    // through the same is_fun/fail desugaring
-                    // build_shallow_check uses everywhere else, rather
-                    // than leaving it to a differently-worded panic in
-                    // machine.rs. Can't know what it might perform, so the
-                    // call contributes an unknown (Dyn) row.
-                    let f3 = build_shallow_check(arena, f2, &any_fun(), "is_fun");
-                    (EffectRow::Dyn, Type::Dyn, arena.push(Expr::App(f3, a2)))
-                }
+                // NEW: the callee itself isn't known to be a function
+                // YET -- an unannotated parameter (Task 2) starts life as
+                // a bare Type::Var. Mint a fresh Fun shape and unify the
+                // callee against it: this is what actually lets an
+                // unannotated callback's parameter type become known
+                // from how it's called, the crux of my_map's own
+                // correlation (see the design spec's own Motivation and
+                // "Where unify is called", site 2).
                 Type::Var(_) => {
+                    let param_ty = infer.fresh_var("param");
+                    let ret_ty = infer.fresh_var("ret");
+                    let fun_shape = Type::Fun(Rc::new(param_ty.clone()), EffectRow::Dyn, Rc::new(ret_ty.clone()));
+                    unify(&f_ty, &fun_shape, infer, spans[f])?;
+                    unify(&param_ty, &a_ty, infer, spans[a])?;
+                    let ret_ty2 = infer.resolve_deep(&ret_ty);
+                    (EffectRow::Dyn, ret_ty2, arena.push(Expr::App(f2, a2)))
+                }
+                Type::Dyn => {
                     // Unknown callee: still route "is this even callable"
                     // through the same is_fun/fail desugaring
                     // build_shallow_check uses everywhere else, rather
