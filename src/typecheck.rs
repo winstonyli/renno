@@ -241,6 +241,13 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
             }
             Ok(())
         }
+        // ponytail: no Type::Var binding via consistent() -- mirrors fits()'s own
+        // Union handling but consistent() performs no unification. If a Type::Var
+        // is only resolvable via one specific Union alternative, it stays unbound
+        // (reads as Dyn via the unresolved Var) -- same permissive-fallback ceiling
+        // this feature area already documents elsewhere (e.g. If/Match/ListLit
+        // branch combination), not a regression, just not newly closed by this fix.
+        // Upgrade if real programs need tighter Union constraint binding.
         (Type::Union(_), _) | (_, Type::Union(_)) => {
             if consistent(&required, &actual) {
                 Ok(())
