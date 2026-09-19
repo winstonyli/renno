@@ -3165,13 +3165,12 @@ mod tests {
         // with anything other than another Named type sharing its
         // exact id, even a hand-built value that happens to look
         // exactly like what it (hypothetically) unfolds to.
-        use types::{consistent, EffectRow, Type};
+        use types::{consistent, Type};
         let named = Type::Named("List#3".to_string());
         let concrete = Type::Union(std::rc::Rc::new(vec![
             Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Dyn])),
             Type::Int,
         ]));
-        let _ = EffectRow::Dyn; // silence unused-import if EffectRow isn't otherwise needed here
         assert!(!consistent(&named, &concrete));
     }
 
@@ -3395,7 +3394,7 @@ mod tests {
                 | (h, _) -> h
                 | _ -> 0
             in
-            f((7, opaque))
+            f((7, true))
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
         let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
@@ -3461,5 +3460,101 @@ mod tests {
         "#;
         let err = run_source(src).unwrap_err();
         assert!(err.contains("type mismatch"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn plain_parse_and_check_do_not_panic_on_a_self_referential_type_alias() {
+        // Regression test for the final fix wave's Defect 1:
+        // parser::parse (the ORIGINAL, unchanged signature) builds its
+        // own named_types registry internally (Parser's own field) but
+        // discards it rather than returning it, so pairing plain parse()
+        // with plain typecheck::check() (also unchanged, defaults to an
+        // EMPTY registry) used to reach one of Type::Named's several
+        // consumers' own `.expect("Type::Named with no registry entry --
+        // internal bug")` and PANIC, aborting the whole process --
+        // reachable by any caller (in this repo or a library consumer of
+        // this crate) who uses the preserved parse()/check() pair
+        // instead of the _with_named_types pair on a program using a
+        // self-referential type alias, not an internal-bug-only
+        // condition as the old comments claimed. Every such call site
+        // now degrades gracefully instead of panicking (matching each
+        // function's own existing Dyn/Var-permissive fallback), so
+        // check() below is expected to return a plain Result either way
+        // -- proven here via catch_unwind, mirroring this file's own
+        // existing "prove no panic occurs" style (see
+        // dyn_to_fun_boundary_rejects_closure_with_wrong_return_type and
+        // dyn_sourced_call_falls_back_permissively above). Exercises
+        // pattern_could_match (the `match xs` arms), build_boundary_check/
+        // build_shape_predicate (the Dyn-to-List crossing at `f(v)`), and
+        // coerce (the literal tuple argument to `f`) all in one program,
+        // to cover as many of the (five, not four) `expect` sites as one
+        // source string reasonably can.
+        let src = r#"
+            type List = (Int, List) | Bool in
+            let f = fun xs: List ->
+                match xs
+                | (h, _) -> h
+                | _ -> 0
+            in
+            let g = fun v: Dyn -> f(v) in
+            g((1, true))
+        "#;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (mut arena, spans, root) = parser::parse(src).unwrap();
+            typecheck::check(&mut arena, root, &spans)
+        }));
+        assert!(
+            outcome.is_ok(),
+            "plain parse()+check() must never panic on a self-referential type alias, just possibly error"
+        );
+    }
+
+    #[test]
+    fn coerce_rescue_rejects_a_bare_union_self_reference_given_the_wrong_type() {
+        // Regression test for the final fix wave's Defect 2:
+        // replace_named_with_dyn's own Union arm used to map a bare
+        // Type::Named(id) alternative to Type::Dyn (e.g. Union([Int,
+        // Named(id)]) -> Union([Int, Dyn])) instead of dropping it --
+        // and Dyn is consistent with EVERYTHING, so the whole Union
+        // became trivially satisfied by any value at all, making an
+        // `A`-typed annotation completely inert. With the fix, the
+        // self-referential alternative is dropped instead (Union([Int,
+        // Dyn]) -> Union([Int])), agreeing with the runtime path
+        // (build_shape_predicate's own ancestor-guard correctly reduces
+        // `A` to just `Int` for a re-encountered self-reference). A `Str`
+        // argument must be statically rejected -- this is coerce()'s own
+        // STATIC rescue specifically (both `xs`/the argument are fully
+        // concrete, no Dyn boundary involved at all, unlike Task 3's own
+        // a_bare_union_self_reference_does_not_infinite_loop_at_a_dyn_boundary
+        // test above, or pattern_could_match's own bare-Union coverage in
+        // pattern_could_match_does_not_infinite_loop_on_a_bare_union_self_reference).
+        let src = r#"
+            type A = Int | A in
+            let f = fun xs: A -> xs in
+            f("wrong")
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let err = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap_err();
+        assert!(err.0.contains("type mismatch"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn coerce_rescue_accepts_a_bare_union_self_reference_given_the_reachable_alternative() {
+        // The accept-side counterpart to the rejection test just above --
+        // an Int literal is exactly the one alternative `type A = Int |
+        // A` can ever actually reduce to (its own self-reference
+        // contributes nothing new), so coerce()'s static rescue must
+        // still accept it after the replace_named_with_dyn fix, the same
+        // way it did before (this direction was never broken -- the bug
+        // was only ever "accepts too much," never "accepts too little").
+        let src = r#"
+            type A = Int | A in
+            let f = fun xs: A -> xs in
+            f(5)
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
+        assert_eq!(result.as_int(), 5);
     }
 }

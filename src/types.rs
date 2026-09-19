@@ -53,7 +53,7 @@ pub enum Type {
     // separate name-registry/brand-comparison mechanism needed.
     Token(u64),
     // A reference to a genuinely self-referential `type` alias's own
-    // definition -- `type List = (Int, List) | Unit in ...` -- rather
+    // definition -- `type List = (Int, List) | Bool in ...` -- rather
     // than the ordinary, fully-expanded structural value every OTHER
     // (non-recursive) alias resolves to directly. The string is always
     // a gensym'd unique id in the shape "Base#N" (see parser::atom's
@@ -73,10 +73,10 @@ pub enum Type {
     // needed anywhere in this file's own structural recursion, even
     // though a registry entry for a genuinely recursive alias
     // structurally contains this SAME leaf pointing at itself.
-    // build_shape_predicate/build_boundary_check/pattern_could_match
-    // (typecheck.rs) are the only consumers that ever look up what a
-    // Named id stands for, and only one level at a time -- see their
-    // own doc comments (Task 3/4 of this plan).
+    // build_shape_predicate/build_boundary_check/pattern_could_match/
+    // coerce/unify_fits (typecheck.rs) are the consumers that ever look
+    // up what a Named id stands for, and only one level at a time -- see
+    // their own doc comments.
     Named(String),
     // Fixed-arity, per-position-typed product -- `(a, b, c)` syntax.
     // Anonymous (no declared name, no registry lookup): consistent_inner

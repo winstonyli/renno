@@ -7,24 +7,19 @@ use crate::span::Span;
 use crate::types::{EffectRow, Type};
 use crate::util::find_field;
 
+// Delegates to parse_with_named_types and drops the registry -- kept as
+// a separate signature (rather than making every caller take a 4th
+// tuple element) so the 115+ existing callers in this codebase's own
+// test suite that never use self-referential type aliases are
+// unaffected. Note this means `parse`'s own caller has no way to reach
+// the registry parse_with_named_types builds internally -- pairing this
+// `parse` with plain `typecheck::check` (which defaults to an empty
+// registry) on a program using a self-referential type alias is exactly
+// the condition every Type::Named consumer's own missing-registry-entry
+// fallback exists to handle gracefully; see coerce()'s own doc comment.
 pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
-    let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
-    let mut p = Parser {
-        tokens,
-        tok_spans,
-        pos: 0,
-        arena: Arena::new(),
-        expr_spans: SpanMap::new(),
-        src,
-        type_aliases: HashMap::new(),
-        named_types: HashMap::new(),
-    };
-    let root = p.expr()?;
-    if p.pos != p.tokens.len() {
-        let span = p.span_at();
-        return Err(p.err_at(span, format!("trailing tokens after expression: {:?}", &p.tokens[p.pos..])));
-    }
-    Ok((p.arena, p.expr_spans, root))
+    let (arena, spans, root, _named_types) = parse_with_named_types(src)?;
+    Ok((arena, spans, root))
 }
 
 // Same as `parse`, but ALSO returns the registry of genuinely

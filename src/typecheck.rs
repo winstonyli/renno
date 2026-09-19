@@ -281,13 +281,24 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
                     // right after coerce() on this exact same (required,
                     // actual) pair (Expr::App's own param_ty/a_ty), so it
                     // must accept anything coerce() itself just accepted,
-                    // not re-reject it here a second time.
-                    let raw = infer.named_types.get(id).expect("Type::Named with no registry entry -- internal bug").clone();
-                    let unfolded = replace_named_with_dyn(&raw, id);
-                    if consistent(&actual, &unfolded) || fits(&unfolded, &actual) {
-                        Ok(())
-                    } else {
-                        Err(e)
+                    // not re-reject it here a second time. A missing
+                    // registry entry IS reachable (not an internal-bug-
+                    // only case): a caller pairing plain parse() with
+                    // plain check() gets an empty registry -- see coerce()'s
+                    // own doc comment on this exact same condition. When
+                    // that happens, skip this rescue (coerce() itself will
+                    // already have skipped it too, for the same reason) and
+                    // fall through to the ordinary Err(e) below.
+                    match infer.named_types.get(id) {
+                        Some(raw) => {
+                            let unfolded = replace_named_with_dyn(&raw.clone(), id);
+                            if consistent(&actual, &unfolded) || fits(&unfolded, &actual) {
+                                Ok(())
+                            } else {
+                                Err(e)
+                            }
+                        }
+                        None => Err(e),
                     }
                 } else {
                     Err(e)
@@ -639,6 +650,23 @@ fn any_fun() -> Type {
 // recursion occurred, and comparing a concrete literal's own
 // substructure against that leaf via the ordinary nominal
 // consistent()/fits() could never succeed.
+//
+// The Union arm is special: a BARE Union alternative that is exactly
+// Type::Named(id) (e.g. `type A = Int | A`) is DROPPED rather than
+// mapped to Dyn, because Dyn is consistent with EVERYTHING -- mapping it
+// to Dyn would make the whole Union trivially satisfied by any value at
+// all (Union([Int, Dyn]) accepts a Str), silently defeating the
+// annotation. Dropping it instead reduces Union([Int, Named(id)]) to
+// just Union([Int]), agreeing with the runtime path's own
+// build_shape_predicate, whose matching Named arm correctly answers
+// `false` for a re-encountered self-reference (see its doc comment) --
+// so the self-referential alternative correctly contributes nothing
+// beyond what's already reachable through the other alternatives, on
+// both the static and runtime path alike. A degenerate fully-self-
+// referential alias with no non-recursive alternative at all (`type A =
+// A`) reduces to an empty Union, which consistent()/fits() both
+// correctly treat as satisfiable by nothing (see their own Union arms) --
+// i.e. "always false," not a crash or silent accept.
 fn replace_named_with_dyn(ty: &Type, id: &str) -> Type {
     match ty {
         Type::Named(n) if n == id => Type::Dyn,
@@ -649,7 +677,13 @@ fn replace_named_with_dyn(ty: &Type, id: &str) -> Type {
             Rc::new(replace_named_with_dyn(ret, id)),
         ),
         Type::Tuple(items) => Type::Tuple(Rc::new(items.iter().map(|t| replace_named_with_dyn(t, id)).collect())),
-        Type::Union(items) => Type::Union(Rc::new(items.iter().map(|t| replace_named_with_dyn(t, id)).collect())),
+        Type::Union(items) => Type::Union(Rc::new(
+            items
+                .iter()
+                .filter(|t| !matches!(t, Type::Named(n) if n == id))
+                .map(|t| replace_named_with_dyn(t, id))
+                .collect(),
+        )),
         Type::Record(fields) => Type::Record(Rc::new(
             fields.iter().map(|(n, t)| (n.clone(), replace_named_with_dyn(t, id))).collect(),
         )),
@@ -702,8 +736,26 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, nam
         // succeeds, so `e` returns UNCHANGED -- zero overhead, the
         // same "fully-annotated code pays nothing" property every
         // other branch of this function already has.
-        if let Type::Named(id) = to {
-            let raw = named_types.get(id).expect("Type::Named with no registry entry -- internal bug");
+        // A missing registry entry IS reachable here (not an internal-bug-
+        // only case): a caller pairing plain parse() with plain check()
+        // gets an empty registry even though parse() itself built one
+        // internally (parse()'s own unchanged signature just discards
+        // it) -- see build_boundary_check's own doc comment. When that
+        // happens, skip this rescue entirely (treat `to` as if it weren't
+        // Type::Named for the purposes of this one check) and fall
+        // through to the ordinary mismatch error below, rather than
+        // panicking.
+        // `to`'s registry entry, only when `to` actually is Type::Named --
+        // folded into one Option (rather than nesting `if let Type::Named`
+        // around `if let Some(raw) = ...`) so there's a single if-let
+        // below instead of two, avoiding a clippy::collapsible_if without
+        // reaching for a let-chain (this codebase's own established style
+        // elsewhere: see bind_row_vars's own nested if, left as-is).
+        let named_raw = match to {
+            Type::Named(id) => named_types.get(id).map(|raw| (id, raw)),
+            _ => None,
+        };
+        if let Some((id, raw)) = named_raw {
             // A self-referential alias's own one-level definition, by
             // construction, contains this SAME Type::Named leaf again
             // wherever the recursion occurred (parser::Parser's own
@@ -813,11 +865,14 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &
         // as that unfolded shape. Any Type::Named NESTED inside that
         // unfolded shape stays unresolved -- checked later, lazily,
         // only if something else separately touches that position.
-        // `expect` rather than a graceful fallback: every Type::Named
-        // this codebase can construct comes from parser::atom's own
-        // Token::TypeKw handling, which always registers a definition
-        // in the SAME registry this looks up -- a missing entry means
-        // an internal bug, not a user-reachable condition.
+        // A missing registry entry IS reachable (not an internal-bug-only
+        // case): parser::parse (the original, unchanged signature) builds
+        // its own named_types registry but discards it rather than
+        // returning it, so a caller pairing plain parse() with plain
+        // check() (also unchanged, defaults to an empty registry) hits
+        // this with nothing registered. Degrade the same way this
+        // function's own Type::Var(_) arm above does for "no information
+        // here" -- return `e` unchecked -- rather than panicking.
         //
         // If `id` is already an ancestor in THIS unfold chain, stop
         // instead of unfolding again: build_shape_predicate's own
@@ -831,9 +886,10 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &
             if visiting.contains(id) {
                 return build_fail_call(arena, to, e);
             }
+            let Some(raw) = named_types.get(id) else { return e };
             let mut visiting = visiting.clone();
             visiting.insert(id.clone());
-            let unfolded = named_types.get(id).expect("Type::Named with no registry entry -- internal bug").clone();
+            let unfolded = raw.clone();
             build_boundary_check(arena, e, &unfolded, named_types, &visiting)
         }
     }
@@ -923,8 +979,14 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, named
             fold_predicate(arena, alts, FoldOp::Or, |arena, alt| build_shape_predicate(arena, value_ref, alt, named_types, visiting))
         }
         // Same one-level-only unfold as build_boundary_check's own new
-        // arm just above -- see its doc comment for why `expect` is
-        // correct here rather than a graceful fallback.
+        // arm just above. A missing registry entry IS reachable (not an
+        // internal-bug-only case): a caller pairing plain parse() with
+        // plain check() gets an empty registry even though parse() itself
+        // built one internally (parse()'s own unchanged signature just
+        // discards it) -- see build_boundary_check's own doc comment.
+        // Degrade the same way this function's own Type::Dyn/Var(_) arms
+        // above do for "no information here" -- answer `true` -- rather
+        // than panicking.
         //
         // Same ancestor-tracking cycle break as build_boundary_check's
         // own Named arm (see its doc comment for the bare-Union-
@@ -939,9 +1001,10 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, named
             if visiting.contains(id) {
                 return arena.push(Expr::Bool(false));
             }
+            let Some(raw) = named_types.get(id) else { return arena.push(Expr::Bool(true)) };
             let mut visiting = visiting.clone();
             visiting.insert(id.clone());
-            let unfolded = named_types.get(id).expect("Type::Named with no registry entry -- internal bug").clone();
+            let unfolded = raw.clone();
             build_shape_predicate(arena, value_ref, &unfolded, named_types, &visiting)
         }
     }
@@ -1242,9 +1305,14 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
         (Pattern::List(_), Type::Dyn | Type::Var(_)) => true,
         // One level only, matching every other consumer of Type::Named
         // in this file: unfold what this id stands for and ask the SAME
-        // question about that shape instead. See build_boundary_check's
-        // own doc comment (Task 3) for why `expect` is correct here
-        // rather than a graceful fallback.
+        // question about that shape instead. A missing registry entry IS
+        // reachable (not an internal-bug-only case): a caller pairing
+        // plain parse() with plain check() gets an empty registry even
+        // though parse() itself built one internally (parse()'s own
+        // unchanged signature just discards it) -- see
+        // build_boundary_check's own doc comment. Degrade the same way
+        // this function's own Type::Dyn/Var(_) arms above do for "no
+        // information here" -- answer `true` -- rather than panicking.
         //
         // Ancestor-tracking cycle break, same as build_shape_predicate's
         // own Named arm: if `id` is already being unfolded somewhere
@@ -1259,9 +1327,9 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
             if visiting.contains(id) {
                 return false;
             }
+            let Some(unfolded) = named_types.get(id) else { return true };
             let mut visiting = visiting.clone();
             visiting.insert(id.clone());
-            let unfolded = named_types.get(id).expect("Type::Named with no registry entry -- internal bug");
             pattern_could_match(pat, unfolded, named_types, &visiting)
         }
         _ => consistent(ty, &pattern_type(pat)),
@@ -2175,23 +2243,16 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     }
 }
 
+// Delegates to check_with_named_types with an empty registry -- kept as
+// a separate signature (rather than adding a 4th parameter to every
+// caller) so the many existing callers that never use self-referential
+// type aliases are unaffected. Note this means pairing `check` with
+// plain `parser::parse` on a program using a self-referential type
+// alias hits every Type::Named consumer with nothing registered -- see
+// coerce()'s own doc comment on why that's a real, reachable condition
+// each consumer now degrades gracefully for, rather than an internal bug.
 pub fn check(arena: &mut Arena, root: ExprRef, spans: &SpanMap) -> Result<ExprRef, TypeError> {
-    let mut infer = InferCtx::new(HashMap::new());
-    let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), spans, &mut infer)?;
-    match row {
-        EffectRow::Closed(unhandled) if !unhandled.is_empty() => {
-            let names: Vec<_> = unhandled.into_iter().collect();
-            Err(TypeError(
-                format!(
-                    "unhandled effect{}: {}",
-                    if names.len() > 1 { "s" } else { "" },
-                    names.join(", ")
-                ),
-                spans[root],
-            ))
-        }
-        _ => Ok(elaborated),
-    }
+    check_with_named_types(arena, root, spans, HashMap::new())
 }
 
 // Same as `check`, but resolves a Type::Named reference against
