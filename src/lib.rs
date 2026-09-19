@@ -111,7 +111,10 @@ mod tests {
             Expr::Handle { body, handler } => contains_check(arena, *body) || contains_check(arena, *handler),
             Expr::MakeHandler { body, .. } => contains_check(arena, *body),
             Expr::Match(scrutinee, arms) => {
-                contains_check(arena, *scrutinee) || arms.iter().any(|(_, body)| contains_check(arena, *body))
+                contains_check(arena, *scrutinee)
+                    || arms.iter().any(|(_, guard, body)| {
+                        guard.is_some_and(|g| contains_check(arena, g)) || contains_check(arena, *body)
+                    })
             }
             // Stale as of records getting a real runtime kind: Expr::Record
             // DOES survive elaboration now (see its own doc comment), so
@@ -845,6 +848,83 @@ mod tests {
         let (mut arena, spans, root) = parser::parse("match 5 | true -> 1 | _ -> 2").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("can never match"), "unexpected message: {}", err.0);
+    }
+
+    // --- match guards ---
+
+    #[test]
+    fn match_guard_true_takes_the_guarded_arm() {
+        assert_eq!(run_untyped(r#"match 4 | n if n > 0 -> "pos" | _ -> "other""#).as_str(), "pos");
+    }
+
+    #[test]
+    fn match_guard_false_falls_through_to_next_arm() {
+        assert_eq!(run_untyped(r#"match -4 | n if n > 0 -> "pos" | _ -> "other""#).as_str(), "other");
+    }
+
+    #[test]
+    fn match_guard_sees_the_patterns_own_bindings() {
+        assert_eq!(run_untyped(r#"match [1, 2] | [a, b] if a < b -> "asc" | _ -> "other""#).as_str(), "asc");
+    }
+
+    #[test]
+    fn match_guard_falls_through_to_a_differently_shaped_later_arm() {
+        // Regression shape for the fallthrough machinery itself: the failed
+        // guard's arm and the arm it falls through to don't even share a
+        // pattern shape (List vs Var) -- confirms retry re-matches from
+        // scratch against the ORIGINAL scrutinee, not just re-checks a
+        // guard on the same binding.
+        assert_eq!(run_untyped(r#"match [1, 2] | [a, b] if a > b -> "desc" | xs -> "fallback""#).as_str(), "fallback");
+    }
+
+    #[test]
+    fn match_guard_may_not_perform() {
+        let err = parser::parse("match 1 | n if perform foo(n) -> 1 | _ -> 2").unwrap_err();
+        assert!(err.contains("match guard may not perform"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn match_guard_must_be_bool() {
+        // The guard itself (a plain Int literal, not the Dyn-bound `n`) is
+        // concretely, statically non-Bool -- rejected the same way as any
+        // other concrete-type mismatch, same as If's own cond.
+        let (mut arena, spans, root) = parser::parse("match 1 | n if 5 -> 1 | _ -> 0").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected Bool, found Int"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn guarded_earlier_arm_does_not_mask_a_later_arm_as_unreachable() {
+        // A bare Var pattern normally dominates everything after it (see
+        // width_dominated_record_arm_reported_unreachable and friends) --
+        // but a GUARDED Var might reject, so the second arm must still be
+        // reachable, both statically (typechecks) and at runtime (the
+        // guard rejects 5, falling through to it).
+        let src = "match 5 | n if n > 100 -> 1 | n -> n + 1";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).expect("guarded arm must not mask the fallback as dead code");
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 6);
+    }
+
+    #[test]
+    fn unguarded_earlier_arm_still_masks_a_later_guarded_arm() {
+        // The mirror case: an earlier arm with NO guard fully covers
+        // everything, so a later arm is genuinely dead regardless of
+        // whether that later arm itself carries a guard.
+        let (mut arena, spans, root) = parser::parse("match 5 | n -> 1 | n if n > 100 -> 2").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("unreachable match arm"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn all_arms_guarded_is_non_exhaustive() {
+        // Every arm's pattern is a bare Var (normally exhaustive by
+        // itself), but every one is guarded -- a guard can reject, so
+        // none of them can be relied on to cover the remaining case.
+        let src = "match true | b if b -> 1 | b if !b -> 0";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("non-exhaustive"), "unexpected message: {}", err.0);
     }
 
     // --- hand-rolled tagged tuples (a `data` declaration's replacement --

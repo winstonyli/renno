@@ -31,7 +31,14 @@ pub enum Frame {
     // `done` mirror ListElems's own left-to-right accumulation shape.
     LetRecBody { names: Rc<Vec<String>>, remaining: Vec<ExprRef>, done: Vec<Value>, body: ExprRef, env: Env },
     // Scrutinee has just been evaluated to `value` -- try `arms` in order.
-    MatchArms { arms: Rc<Vec<(Pattern, ExprRef)>>, env: Env },
+    MatchArms { arms: Rc<Vec<(Pattern, Option<ExprRef>, ExprRef)>>, env: Env },
+    // A pattern matched (binding `guard_env`) but its arm has a guard,
+    // which has just been evaluated -- true takes `arms[idx]`'s body under
+    // `guard_env`, false resumes the search from `idx + 1` against the
+    // ORIGINAL scrutinee `value` and pre-match `outer_env` (guard_env's
+    // pattern bindings must NOT leak into a sibling arm's own match
+    // attempt).
+    MatchGuard { arms: Rc<Vec<(Pattern, Option<ExprRef>, ExprRef)>>, idx: usize, outer_env: Env, guard_env: Env, value: Value },
     // `l_span`/`r_span` are the two operands' own spans, carried from
     // BinOpL into BinOpR and into apply_binop, which picks whichever one
     // actually explains a given panic (see apply_binop's own doc comment):

@@ -176,10 +176,18 @@ pub enum Expr {
         resume_var: String,
         body: ExprRef,
     },
-    // `match scrutinee | p1 -> e1 | p2 -> e2 ...`, tried top to bottom,
-    // first match wins. Arms in Rc (not a plain Vec, unlike ListLit) since
-    // a captured continuation can carry a MatchArms frame (see cont.rs) --
-    // resuming it more than once (multi-shot) would otherwise reclone the
-    // whole arm list on every resume.
-    Match(ExprRef, Rc<Vec<(Pattern, ExprRef)>>),
+    // `match scrutinee | p1 -> e1 | p2 if g -> e2 ...`, tried top to
+    // bottom, first match wins. Arms in Rc (not a plain Vec, unlike
+    // ListLit) since a captured continuation can carry a MatchArms frame
+    // (see cont.rs) -- resuming it more than once (multi-shot) would
+    // otherwise reclone the whole arm list on every resume. The middle
+    // `Option<ExprRef>` is an optional `if` guard: when present, the arm
+    // is only taken if the pattern matches AND the guard evaluates to
+    // true, otherwise matching falls through to the next arm as if this
+    // one's pattern hadn't matched at all (see machine.rs's Frame::
+    // MatchGuard). A guard may never `perform` -- enforced statically by
+    // parser::contains_perform, not by this type -- see [[renno_future_
+    // pattern_guards]] for why (multi-shot resume replaying match-arm
+    // selection itself).
+    Match(ExprRef, Rc<Vec<(Pattern, Option<ExprRef>, ExprRef)>>),
 }

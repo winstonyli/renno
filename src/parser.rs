@@ -184,6 +184,44 @@ impl<'a> Parser<'a> {
         span.format_error(self.src, &msg)
     }
 
+    // Walks `e`'s whole expression tree looking for an Expr::Perform node
+    // -- the static half of "guards may never perform" (see match's own
+    // Token::Match arm, and [[renno_future_pattern_guards]]). Conservative
+    // on purpose, not exhaustively precise: this flags a `perform` even
+    // inside an uncalled Lambda literal the guard would never actually
+    // invoke, since telling "present in the text" from "actually reached
+    // when the guard runs" needs real reachability analysis, not a plain
+    // tree walk. ponytail: syntactic over-approximation, not reachability
+    // analysis -- upgrade only if a real guard is rejected by this in
+    // practice.
+    fn contains_perform(arena: &Arena, e: ExprRef) -> bool {
+        match &arena[e] {
+            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
+            Expr::Perform(_, _) => true,
+            Expr::Tuple(items) | Expr::ListLit(items) => items.iter().any(|i| Self::contains_perform(arena, *i)),
+            Expr::Record(fields) => fields.iter().any(|(_, v)| Self::contains_perform(arena, *v)),
+            Expr::FieldAccess(target, _) => Self::contains_perform(arena, *target),
+            Expr::Lambda(_, _, body) => Self::contains_perform(arena, *body),
+            Expr::App(f, a) => Self::contains_perform(arena, *f) || Self::contains_perform(arena, *a),
+            Expr::Let(_, _, val, body) => Self::contains_perform(arena, *val) || Self::contains_perform(arena, *body),
+            Expr::LetRec(bindings, body) => {
+                bindings.iter().any(|(_, _, v)| Self::contains_perform(arena, *v)) || Self::contains_perform(arena, *body)
+            }
+            Expr::BinOp(_, l, r) => Self::contains_perform(arena, *l) || Self::contains_perform(arena, *r),
+            Expr::If(c, t, e) => {
+                Self::contains_perform(arena, *c) || Self::contains_perform(arena, *t) || Self::contains_perform(arena, *e)
+            }
+            Expr::Handle { body, handler } => Self::contains_perform(arena, *body) || Self::contains_perform(arena, *handler),
+            Expr::MakeHandler { body, .. } => Self::contains_perform(arena, *body),
+            Expr::Match(scrutinee, arms) => {
+                Self::contains_perform(arena, *scrutinee)
+                    || arms.iter().any(|(_, guard, body)| {
+                        guard.is_some_and(|g| Self::contains_perform(arena, g)) || Self::contains_perform(arena, *body)
+                    })
+            }
+        }
+    }
+
     // The only way an Expr node should ever be added to the arena --
     // keeps expr_spans in lockstep with it (same ExprRef, pushed in the
     // same call), which is what lets typecheck later look up any
@@ -1194,9 +1232,37 @@ impl<'a> Parser<'a> {
                 let mut arms = Vec::new();
                 loop {
                     let pat = self.pattern()?;
+                    // Optional `if cond` guard -- reuses the existing `if`
+                    // token rather than a new keyword (Rust/Scala/Python's
+                    // choice, not OCaml/Erlang/Swift's `when`/`where`; see
+                    // [[renno_future_pattern_guards]]), so this costs zero
+                    // new lexer tokens. No ambiguity: pattern grammar never
+                    // otherwise produces `if` right before `Arrow`.
+                    let guard = if matches!(self.peek(), Some(Token::If)) {
+                        self.bump();
+                        let g = self.expr()?;
+                        // A guard may never `perform` -- decided against on
+                        // purpose (not an oversight): match fallthrough
+                        // means a guard's effects would fire once per
+                        // ATTEMPTED arm, not once per taken one, and
+                        // renno's `resume` is genuinely multi-shot, so a
+                        // guard's handler resuming more than once would
+                        // replay arm selection (and the arm body) itself
+                        // from one `match`. See [[renno_future_pattern_
+                        // guards]] for the full reasoning.
+                        if Self::contains_perform(&self.arena, g) {
+                            return Err(self.err_at(
+                                self.span_before(),
+                                "match guard may not perform an effect".to_string(),
+                            ));
+                        }
+                        Some(g)
+                    } else {
+                        None
+                    };
                     self.expect(&Token::Arrow)?;
                     let body = self.expr()?;
-                    arms.push((pat, body));
+                    arms.push((pat, guard, body));
                     if matches!(self.peek(), Some(Token::Pipe)) {
                         self.bump();
                     } else {

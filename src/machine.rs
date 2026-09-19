@@ -371,10 +371,23 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                         }
                         Frame::MatchArms { arms, env } => {
                             let (arms, env) = (arms.clone(), env.clone());
-                            cont = rest;
-                            match first_match(&arms, &value, &env) {
-                                Some((body, matched_env)) => control = Control::Eval(body, matched_env),
-                                None => panic!("match failed: no pattern matched the value"),
+                            let outcome = first_match(&arms, 0, &value, &env);
+                            let (new_cont, new_control) = dispatch_arm_outcome(outcome, arms, env, value, rest);
+                            cont = new_cont;
+                            control = new_control;
+                        }
+                        Frame::MatchGuard { arms, idx, outer_env, guard_env, value: scrutinee } => {
+                            let (arms, idx, outer_env, guard_env, scrutinee) =
+                                (arms.clone(), *idx, outer_env.clone(), guard_env.clone(), scrutinee.clone());
+                            if value.as_bool() {
+                                let (_, _, body) = &arms[idx];
+                                cont = rest;
+                                control = Control::Eval(*body, guard_env);
+                            } else {
+                                let outcome = first_match(&arms, idx + 1, &scrutinee, &outer_env);
+                                let (new_cont, new_control) = dispatch_arm_outcome(outcome, arms, outer_env, scrutinee, rest);
+                                cont = new_cont;
+                                control = new_control;
                             }
                         }
                         Frame::BinOpL { op, rhs, env, l_span, r_span } => {
@@ -703,10 +716,47 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
     }
 }
 
-// Tries `arms` in order, returning the first one whose pattern matches
-// `value`, together with `env` extended by whatever that pattern bound.
-fn first_match(arms: &[(Pattern, ExprRef)], value: &Value, env: &Env) -> Option<(ExprRef, Env)> {
-    arms.iter().find_map(|(pat, body)| match_pattern(pat, value, env.clone()).map(|env2| (*body, env2)))
+// What trying an arm's pattern (from some starting index) turned up.
+enum ArmOutcome {
+    // Pattern matched, arm has no guard -- take it, under the pattern's bindings.
+    Body(ExprRef, Env),
+    // Pattern matched, but `arms[idx]`'s guard still needs evaluating
+    // (under `guard_env`, the pattern's bindings) before it's known
+    // whether this arm is actually taken.
+    Guard { idx: usize, guard: ExprRef, guard_env: Env },
+}
+
+// Tries `arms[start..]` in order, returning the first one whose pattern
+// matches `value` -- either ready to run (no guard) or needing its guard
+// evaluated first. `env` is the match expression's OWN env (unaffected by
+// any arm's pattern bindings), extended per-candidate by match_pattern.
+fn first_match(arms: &[(Pattern, Option<ExprRef>, ExprRef)], start: usize, value: &Value, env: &Env) -> Option<ArmOutcome> {
+    arms[start..].iter().enumerate().find_map(|(i, (pat, guard, body))| {
+        match_pattern(pat, value, env.clone()).map(|env2| match guard {
+            None => ArmOutcome::Body(*body, env2),
+            Some(g) => ArmOutcome::Guard { idx: start + i, guard: *g, guard_env: env2 },
+        })
+    })
+}
+
+// Shared by Frame::MatchArms and Frame::MatchGuard's own retry-on-failed-
+// guard branch -- both need to turn a `first_match` result into the next
+// (Cont, Control) step, or panic the same way on total failure.
+fn dispatch_arm_outcome(
+    outcome: Option<ArmOutcome>,
+    arms: Rc<Vec<(Pattern, Option<ExprRef>, ExprRef)>>,
+    outer_env: Env,
+    value: Value,
+    rest: Cont,
+) -> (Cont, Control) {
+    match outcome {
+        Some(ArmOutcome::Body(body, matched_env)) => (rest, Control::Eval(body, matched_env)),
+        Some(ArmOutcome::Guard { idx, guard, guard_env }) => (
+            Cont::cons(Frame::MatchGuard { arms, idx, outer_env, guard_env: guard_env.clone(), value }, rest),
+            Control::Eval(guard, guard_env),
+        ),
+        None => panic!("match failed: no pattern matched the value"),
+    }
 }
 
 // Native recursion here is bounded by the PATTERN's own size (as written

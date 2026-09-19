@@ -662,9 +662,14 @@ fn dominates(earlier: &Pattern, later: &Pattern) -> bool {
 }
 
 // The index of the first arm some EARLIER arm already fully dominates, if
-// any -- reported as unreachable (dead code).
-fn first_unreachable(patterns: &[&Pattern]) -> Option<usize> {
-    (0..patterns.len()).find(|&i| (0..i).any(|j| dominates(patterns[j], patterns[i])))
+// any -- reported as unreachable (dead code). `has_guard[j]` gates whether
+// arm j can dominate anything: a GUARDED earlier arm might not fire (its
+// guard could reject), so it covering arm i's pattern doesn't guarantee
+// arm i never runs -- only an unguarded earlier arm's coverage is a
+// guarantee. An earlier arm's own guard therefore makes it transparent to
+// this check, never a later arm's.
+fn first_unreachable(patterns: &[&Pattern], has_guard: &[bool]) -> Option<usize> {
+    (0..patterns.len()).find(|&i| (0..i).any(|j| !has_guard[j] && dominates(patterns[j], patterns[i])))
 }
 
 // Does `pat` cover every possible value at a position statically known to
@@ -1214,11 +1219,12 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
         // silently never runs, so this is the only chance to catch it, and
         // there's no point elaborating a body that can't run anyway.
         Expr::Match(scrutinee, arms) => {
-            let pats: Vec<&Pattern> = arms.iter().map(|(p, _)| p).collect();
-            if let Some(i) = first_unreachable(&pats) {
+            let pats: Vec<&Pattern> = arms.iter().map(|(p, _, _)| p).collect();
+            let has_guard: Vec<bool> = arms.iter().map(|(_, g, _)| g.is_some()).collect();
+            if let Some(i) = first_unreachable(&pats, &has_guard) {
                 return Err(TypeError(
                     "unreachable match arm: an earlier arm already covers everything it matches".to_string(),
-                    spans[arms[i].1],
+                    spans[arms[i].2],
                 ));
             }
 
@@ -1226,7 +1232,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
             let mut row = scrut_row;
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
-            for (pat, (_, body)) in pats.iter().copied().zip(arms.iter()) {
+            for (pat, (_, guard, body)) in pats.iter().copied().zip(arms.iter()) {
                 if !pattern_could_match(pat, &scrut_ty) {
                     return Err(TypeError(
                         format!(
@@ -1237,6 +1243,18 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
                     ));
                 }
                 let arm_ctx = bind_pattern_vars(ctx, pat);
+                // Same Bool coercion as If's own cond -- a Dyn-typed guard
+                // gets a runtime is_bool check inserted, same as
+                // everywhere else Dyn meets an expected concrete type.
+                let guard2 = match guard {
+                    Some(g) => {
+                        let (guard_ty, guard_row, g2) = elaborate(arena, *g, &arm_ctx, spans)?;
+                        let g3 = coerce(arena, g2, &guard_ty, &Type::Bool, spans[*g])?;
+                        row = EffectRow::union(&row, &guard_row);
+                        Some(g3)
+                    }
+                    None => None,
+                };
                 let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, spans)?;
                 row = EffectRow::union(&row, &arm_row);
                 // Same widen-to-Dyn-on-disagreement rule as If's branches
@@ -1246,9 +1264,20 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
                     Some(t) if t == arm_ty => t,
                     Some(_) => Type::Dyn,
                 });
-                new_arms.push((pat.clone(), body2));
+                new_arms.push((pat.clone(), guard2, body2));
             }
-            if let Some(missing) = missing_case(&pats, &scrut_ty) {
+            // A guarded arm's pattern can't be relied on to cover
+            // anything for exhaustiveness -- its guard might reject --
+            // so only unguarded arms' patterns count here (mirrors
+            // first_unreachable's own has_guard gating above).
+            let unguarded_pats: Vec<&Pattern> = pats
+                .iter()
+                .copied()
+                .zip(has_guard.iter())
+                .filter(|(_, g)| !**g)
+                .map(|(p, _)| p)
+                .collect();
+            if let Some(missing) = missing_case(&unguarded_pats, &scrut_ty) {
                 return Err(TypeError(format!("non-exhaustive match: {missing}"), spans[expr]));
             }
             Ok((result_ty.unwrap_or(Type::Dyn), row, arena.push(Expr::Match(scrutinee2, Rc::new(new_arms)))))
