@@ -875,16 +875,26 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &
         // here" -- return `e` unchecked -- rather than panicking.
         //
         // If `id` is already an ancestor in THIS unfold chain, stop
-        // instead of unfolding again: build_shape_predicate's own
-        // matching arm hard-codes `false` for this exact alternative
-        // (see its doc comment), so build_union_check's own
-        // `If(pred, checked, ...)` can never actually select this
-        // branch at runtime -- reuse build_fail_call, this file's own
-        // existing "impossible case" construct, rather than inventing a
-        // new one.
+        // instead of unfolding again -- but return `e` unchecked
+        // (matching this function's own Type::Var(_) arm above) rather
+        // than an unconditional fail(). Two different callers reach this
+        // branch, and only ONE of them makes fail() safe: build_union_check's
+        // own use is always gated behind build_shape_predicate's matching
+        // arm, which hard-codes `false` for this exact alternative (see
+        // its doc comment) -- so build_union_check's own `If(pred, checked,
+        // ...)` can never actually select this branch at runtime, and a
+        // fail() there was always dead code no matter what sat in it.
+        // wrap_fun_contract's own call (a self-reference in a Fun's
+        // RETURN position, e.g. `type F = Dyn -> F`) is NOT gated by any
+        // predicate -- it's spliced directly into a contract-wrapped
+        // closure's own body, so a fail() there ran unconditionally on
+        // EVERY call through that closure, even when the real return
+        // value never needed checking at all. `e` unchecked is correct
+        // for both: harmless where it's dead code anyway, and the right
+        // "checked later, lazily" answer where it actually runs.
         Type::Named(id) => {
             if visiting.contains(id) {
-                return build_fail_call(arena, to, e);
+                return e;
             }
             let Some(raw) = named_types.get(id) else { return e };
             let mut visiting = visiting.clone();

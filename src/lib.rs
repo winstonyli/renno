@@ -3463,6 +3463,30 @@ mod tests {
     }
 
     #[test]
+    fn wrap_fun_contract_return_position_self_reference_does_not_always_fail() {
+        // F's own return type is F again -- wrap_fun_contract's contract
+        // closure, checking its own call's return value against F, hits
+        // build_boundary_check's "already visiting F" branch on every
+        // single call, since there's no predicate gating it here (unlike
+        // build_union_check's own use of the same branch, which is always
+        // dead code behind a hard-coded-false predicate). Before the fix,
+        // this branch unconditionally failed -- every call through such a
+        // contract-wrapped closure panicked, even when the real return
+        // value (42 here) never needed checking at all.
+        let src = r#"
+            type F = (Dyn -> F) in
+            let make: (Dyn -> Dyn) = fun v -> (fun y -> 42) in
+            let x: F = make(opaque) in
+            let y: Dyn = x in
+            y(opaque)
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
+        assert_eq!(result.as_int(), 42);
+    }
+
+    #[test]
     fn plain_parse_and_check_do_not_panic_on_a_self_referential_type_alias() {
         // Regression test for the final fix wave's Defect 1:
         // parser::parse (the ORIGINAL, unchanged signature) builds its
