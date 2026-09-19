@@ -2632,4 +2632,38 @@ mod tests {
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("cannot call") || err.0.contains("type mismatch"), "unexpected message: {}", err.0);
     }
+
+    #[test]
+    fn inferred_higher_order_param_inherits_the_same_width_subtyping_ceiling_annotated_ones_already_have() {
+        // Documents a KNOWN, PRE-EXISTING limitation this task's own
+        // precision improvements make newly visible for an INFERRED
+        // higher-order parameter, rather than a new defect: renno's
+        // consistent() has never supported contravariant Fun-parameter
+        // subtyping (its own Fun arm checks both sides' param types with
+        // plain, symmetric consistent(), not a directional relation) --
+        // confirmed by running this exact shape with f's OWN type
+        // EXPLICITLY annotated instead of inferred, on the untouched
+        // pre-this-plan baseline: identical rejection, byte-for-byte same
+        // message. Before this task, f's own inferred parameter type
+        // stayed a bare Type::Var (blanket-permissive, matching Dyn) at
+        // every use, so this ceiling was invisible for INFERRED positions
+        // specifically -- after Step 3's param_ty_resolved fix, an
+        // inferred higher-order parameter's own real, resolved type
+        // reaches `coerce` the same way an explicitly-annotated one
+        // always has, and inherits the identical, already-existing
+        // ceiling. This is exactly the theme of this whole plan (giving
+        // inferred positions the SAME precision explicit annotations
+        // already have) applied to a case where "the same precision"
+        // includes a pre-existing limitation, not just new capability --
+        // fixing the limitation itself (real contravariant Fun-parameter
+        // subtyping) is a substantially larger, separate feature, well
+        // outside "wire real unification into a few call sites."
+        let src = r#"
+            let use_it = fun f -> f({x: 1, y: 2}) in
+            use_it(fun r: {x: Int} -> r.x)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("type mismatch"), "unexpected message: {}", err.0);
+    }
 }

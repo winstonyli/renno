@@ -1692,9 +1692,47 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // (the width/union-subtyping cases below) -- only
                     // changes what coerce sees when something upstream
                     // has ALREADY resolved it.
+                    //
+                    // ponytail: known ceiling, PRE-EXISTING and not
+                    // caused by this line -- exposing a real, resolved
+                    // Fun shape to coerce also exposes it to
+                    // consistent()'s own Fun arm, which checks BOTH
+                    // sides' param types with plain, symmetric
+                    // consistent() (no contravariance). A higher-order
+                    // parameter inferred to require a WIDER record (e.g.
+                    // from a literal constructed inside the callee's own
+                    // body) rejects being satisfied by a callback
+                    // accepting only a NARROWER one, even though that's
+                    // exactly what contravariant function subtyping
+                    // would allow. Confirmed via direct comparison this
+                    // is NOT new: the identical rejection, byte-for-byte,
+                    // already happens today for an EXPLICITLY annotated
+                    // parameter of the same shape, on the untouched
+                    // pre-this-plan baseline -- this line just gives
+                    // inferred positions the SAME behavior explicit ones
+                    // always had, which is this whole plan's own theme.
+                    // See inferred_higher_order_param_inherits_the_same_
+                    // width_subtyping_ceiling_annotated_ones_already_have
+                    // (Step 1) for the documented, confirmed-pre-existing
+                    // case. Upgrade path if ever needed: give
+                    // consistent()'s own Fun arm real contravariant
+                    // parameter subtyping -- a substantially larger,
+                    // separate feature, well outside this plan's own
+                    // scope.
                     let param_ty_resolved = infer.resolve_deep(param_ty);
                     let a3 = coerce(arena, a2, &a_ty, &param_ty_resolved, spans[a])?;
                     let mut row_subst = HashMap::new();
+                    // Deliberately the RAW param_ty here, not
+                    // param_ty_resolved -- row variables only ever
+                    // originate from an explicit `->{e}` annotation
+                    // (bind_row_vars's own doc comment), and an
+                    // explicitly-annotated param_ty is never a bare
+                    // Type::Var in the first place, so resolving it here
+                    // would always be a no-op. Keeping this call on the
+                    // same raw reference unify() and the row/type
+                    // substitution below already use, rather than
+                    // introducing a third variant, is simpler with no
+                    // behavior difference.
                     bind_row_vars(param_ty, &a_ty, &mut row_subst);
                     let call_row2 = resolve_row(call_row, &row_subst);
                     // Best-effort only -- NOT `?`. `coerce`, just above,
