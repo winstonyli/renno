@@ -547,24 +547,22 @@ fn any_fun() -> Type {
 // Type::Var, treated identically -- see its own doc comment) and `to` is
 // concrete. If both sides are concrete
 // and disagree, that's a real static error -- reject before running at
-// all, UNLESS `to` is a Record that `from` (also a concrete Record)
-// width-satisfies (see types::record_satisfies' own doc comment) -- the
-// one place `from`/`to`'s naming is more than accidental, since that
-// relation is genuinely directional, unlike consistent()'s own symmetric
-// one. Accepted with NO wrapping at all: a wider record needs no runtime
-// projection to be used where a narrower type is expected (see
-// Pattern::Record's own doc comment for why). If `from` is already
-// exactly consistent and concrete, no check needed either: zero overhead
-// for fully-annotated code. The error, if any, points at `span` -- the
-// CALLER's job to have already looked up via the ORIGINAL
-// (pre-elaboration) ExprRef for the value in question, e.g. `spans[val]`
-// where `val` is a field straight off the un-elaborated node, NOT the
-// elaborated `e` this function receives to potentially wrap:
-// elaborate_node re-pushes almost every compound node it touches (App,
-// BinOp, If, ...) regardless of whether anything actually changed, so
-// `e` itself is often already a brand new ExprRef past the end of the
-// parser-built SpanMap by the time it reaches here -- indexing spans BY
-// IT, not by the original, was a latent bug (worked by coincidence
+// all, UNLESS `fits(to, from)` succeeds: a directional subtyping check that
+// accepts wider-field Records (see Pattern::Record's own doc comment for why
+// a wider record needs no runtime projection to be used where a narrower
+// type is expected) and narrower-parameter Functions (contravariant
+// parameters, covariant return type). The `from`/`to` parameter order
+// reflects this directionality, unlike consistent()'s own symmetric relation.
+// Both cases incur NO wrapping at all: zero overhead for fully-annotated code.
+// The error, if any, points at `span` -- the CALLER's job to have already
+// looked up via the ORIGINAL (pre-elaboration) ExprRef for the value in
+// question, e.g. `spans[val]` where `val` is a field straight off the
+// un-elaborated node, NOT the elaborated `e` this function receives to
+// potentially wrap: elaborate_node re-pushes almost every compound node it
+// touches (App, BinOp, If, ...) regardless of whether anything actually
+// changed, so `e` itself is often already a brand new ExprRef past the end
+// of the parser-built SpanMap by the time it reaches here -- indexing spans
+// BY IT, not by the original, was a latent bug (worked by coincidence
 // whenever the mismatched value happened to be a leaf that elaborate_node
 // returns unchanged).
 fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span) -> Result<ExprRef, TypeError> {
