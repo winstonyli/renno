@@ -2560,7 +2560,7 @@ mod tests {
         // Type::Var counterpart, so a Record/List pattern against an
         // unannotated (now Type::Var) parameter would be wrongly,
         // statically rejected as "can never match".
-        let src = r#"let get_x = fun r -> match r | {x: v} -> v in get_x({x: 5})"#;
+        let src = r#"let get_x = fun r -> match r | {x: v} -> v | _ -> 0 in get_x({x: 5})"#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 5);

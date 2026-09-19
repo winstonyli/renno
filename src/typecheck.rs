@@ -1162,14 +1162,6 @@ fn missing_case(patterns: &[&Pattern], scrut_ty: &Type) -> Option<String> {
         return None;
     }
 
-    // Type::Var is an unconstrained type variable -- we can't know what
-    // values it might take, so we can't prove exhaustiveness is violated.
-    // Return None (exhaustive) to allow pattern matching on Type::Var
-    // without requiring a wildcard arm.
-    if matches!(scrut_ty, Type::Var(_)) {
-        return None;
-    }
-
     // A Tuple's arity is fixed and known (unlike a general List, which
     // could be any length) -- a fixed-length pattern of exactly that
     // arity, whose every position either binds a Var (matches anything
@@ -1591,7 +1583,17 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     let call_row2 = resolve_row(call_row, &row_subst);
                     (call_row2, ret_ty2, arena.push(Expr::App(f2, a3)))
                 }
-                Type::Dyn | Type::Var(_) => {
+                Type::Dyn => {
+                    // Unknown callee: still route "is this even callable"
+                    // through the same is_fun/fail desugaring
+                    // build_shallow_check uses everywhere else, rather
+                    // than leaving it to a differently-worded panic in
+                    // machine.rs. Can't know what it might perform, so the
+                    // call contributes an unknown (Dyn) row.
+                    let f3 = build_shallow_check(arena, f2, &any_fun(), "is_fun");
+                    (EffectRow::Dyn, Type::Dyn, arena.push(Expr::App(f3, a2)))
+                }
+                Type::Var(_) => {
                     // Unknown callee: still route "is this even callable"
                     // through the same is_fun/fail desugaring
                     // build_shallow_check uses everywhere else, rather
