@@ -1207,12 +1207,25 @@ fn record_field_type(ty: &Type, name: &str) -> Option<Type> {
 // exist in the scrutinee type (recursing into a Union's alternatives,
 // any one of which might supply it), everything else falls back to the
 // ordinary consistent()-based question.
-fn pattern_could_match(pat: &Pattern, ty: &Type) -> bool {
+// `visiting` is the same ancestor-tracking device build_boundary_check/
+// build_shape_predicate use (see build_boundary_check's own doc comment):
+// the set of Type::Named ids currently being unfolded somewhere ABOVE
+// this call in the SAME unfold chain, empty at the one genuine entry
+// point (the Expr::Match call site below) and extended by exactly one id
+// each time the Type::Named arm actually descends into an unfold. Needed
+// for the same reason it's needed there: a self-referential alias whose
+// recursive occurrence is a BARE Union alternative (`type A = Int | A`)
+// unfolds to the exact same Union([Int, Named(id)]) every time, and a
+// Record/List pattern's own Union arm just below fans out into EVERY
+// alternative (including that same Named(id) again) -- without this,
+// that's genuine infinite recursion in this function's own call stack,
+// not just a runtime concern.
+fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, Type>, visiting: &HashSet<String>) -> bool {
     match (pat, ty) {
         (Pattern::Record(fields), Type::Record(type_fields)) => {
             fields.iter().all(|(name, _)| find_field(type_fields, name).is_some())
         }
-        (Pattern::Record(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt)),
+        (Pattern::Record(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt, named_types, visiting)),
         (Pattern::Record(_), Type::Dyn | Type::Var(_)) => true,
         (Pattern::Record(_), _) => false,
         // Same story as Record just above, for the same reason: a fixed-
@@ -1225,8 +1238,32 @@ fn pattern_could_match(pat: &Pattern, ty: &Type) -> bool {
         // consistent()-based catch-all below, correctly: an actual List
         // type has no fixed arity to check a pattern's length against.
         (Pattern::List(subpats), Type::Tuple(items)) => subpats.len() == items.len(),
-        (Pattern::List(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt)),
+        (Pattern::List(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt, named_types, visiting)),
         (Pattern::List(_), Type::Dyn | Type::Var(_)) => true,
+        // One level only, matching every other consumer of Type::Named
+        // in this file: unfold what this id stands for and ask the SAME
+        // question about that shape instead. See build_boundary_check's
+        // own doc comment (Task 3) for why `expect` is correct here
+        // rather than a graceful fallback.
+        //
+        // Ancestor-tracking cycle break, same as build_shape_predicate's
+        // own Named arm: if `id` is already being unfolded somewhere
+        // above this call, stop and answer `false` instead of unfolding
+        // again -- re-trying the same id against the same pattern gives
+        // no new information beyond what the non-recursive alternatives
+        // already cover (the `any()` fan-out above already tried them),
+        // so this correctly makes e.g. `type A = Int | A` behave
+        // equivalently to plain `Int` for reachability purposes instead
+        // of recursing forever.
+        (_, Type::Named(id)) => {
+            if visiting.contains(id) {
+                return false;
+            }
+            let mut visiting = visiting.clone();
+            visiting.insert(id.clone());
+            let unfolded = named_types.get(id).expect("Type::Named with no registry entry -- internal bug");
+            pattern_could_match(pat, unfolded, named_types, &visiting)
+        }
         _ => consistent(ty, &pattern_type(pat)),
     }
 }
@@ -2073,7 +2110,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
             for (pat, (_, guard, body)) in pats.iter().copied().zip(arms.iter()) {
-                if !pattern_could_match(pat, &scrut_ty) {
+                if !pattern_could_match(pat, &scrut_ty, &infer.named_types, &HashSet::new()) {
                     return Err(TypeError(
                         format!(
                             "match: pattern of type {} can never match scrutinee of type {scrut_ty}",

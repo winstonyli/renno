@@ -3380,4 +3380,60 @@ mod tests {
         let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
         assert_eq!(result.as_int(), 1);
     }
+
+    #[test]
+    fn matching_on_a_named_typed_value_is_not_incorrectly_flagged_as_impossible() {
+        // Without this task's own fix, pattern_could_match would reject
+        // BOTH arms below as statically impossible (consistent()'s new
+        // nominal-only Type::Named arm rejects it against any
+        // structural pattern type), making this a static error instead
+        // of running to completion.
+        let src = r#"
+            type List = (Int, List) | Bool in
+            let f = fun xs: List ->
+                match xs
+                | (h, _) -> h
+                | _ -> 0
+            in
+            f((7, opaque))
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
+        assert_eq!(result.as_int(), 7);
+    }
+
+    #[test]
+    fn pattern_could_match_does_not_infinite_loop_on_a_bare_union_self_reference() {
+        // A's own recursive occurrence is a BARE Union alternative (not
+        // wrapped in a Tuple the way List = (Int, List) | Bool is
+        // above), same shape as build_shape_predicate's own regression
+        // at a_bare_union_self_reference_does_not_infinite_loop_at_a_dyn_boundary.
+        // A List pattern against a Named(A) scrutinee unfolds to
+        // Union([Int, Named(A)]), and Pattern::List's own Union arm fans
+        // out into EVERY alternative -- including Named(A) again -- which
+        // without pattern_could_match's own ancestor-tracking cycle
+        // break would send it into genuine infinite recursion (a real
+        // stack overflow) in THIS PROCESS's own call stack during
+        // elaboration, rather than a graceful type error. With the fix,
+        // `A`'s own self-reference contributes nothing new (revisiting
+        // it answers `false` immediately), so the List pattern is
+        // correctly and STATICALLY rejected as impossible against an
+        // Int-or-A scrutinee -- the fact that this test returns an
+        // error at all (rather than crashing the test process) is the
+        // primary evidence a stack-overflow bug can't be caught by a
+        // plain pass/fail assertion.
+        let src = r#"
+            type A = Int | A in
+            let f = fun xs: A ->
+                match xs
+                | (h, t) -> h
+                | _ -> 0
+            in
+            f(1)
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let result = typecheck::check_with_named_types(&mut arena, root, &spans, named_types);
+        assert!(result.is_err(), "a List pattern can never match an Int-or-A scrutinee");
+    }
 }
