@@ -1036,17 +1036,119 @@ fn pattern_could_match(pat: &Pattern, ty: &Type) -> bool {
     }
 }
 
-// Extends `ctx` with every Var this pattern binds, each as Dyn (renno has
-// no pattern-driven type refinement -- e.g. a List pattern's element
-// bindings don't learn the list's element type). "_" is just an ordinary
-// Var name here, bound like any other.
-fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern) -> Ctx {
+// Extends `ctx` with every Var this pattern binds, correlated with
+// `scrutinee_ty` where that's informative: a Cons/List pattern's element
+// bindings unify against the scrutinee's own (possibly still-open, via a
+// fresh Type::Var) element type, instead of always Dyn -- this is the
+// FIRST of the two problems full parametric polymorphism exists to
+// solve (see the design spec's own Motivation). Fallible now (it wasn't
+// before): a genuinely impossible correlation (e.g. unifying two
+// concretely-different, incompatible shapes) is a real static error, the
+// same class of mistake `pattern_could_match`'s own existing rejection
+// already catches for the cases IT can see -- this rewrite doesn't
+// replace that check, it adds a second, complementary one that can see
+// INTO a pattern's own sub-bindings, not just its top-level shape.
+fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut InferCtx, span: Span) -> Result<Ctx, TypeError> {
     match pat {
-        Pattern::Var(name) => extend(ctx, name, Type::Dyn),
-        Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => ctx.clone(),
-        Pattern::List(pats) => pats.iter().fold(ctx.clone(), |c, p| bind_pattern_vars(&c, p)),
-        Pattern::Cons(head, tail) => bind_pattern_vars(&bind_pattern_vars(ctx, head), tail),
-        Pattern::Record(fields) => fields.iter().fold(ctx.clone(), |c, (_, p)| bind_pattern_vars(&c, p)),
+        // Resolve before storing, not just clone: by the time a Pattern::Var
+        // binds, an enclosing Cons/List/Record arm may have ALREADY unified
+        // scrutinee_ty's own Type::Var against something concrete (e.g.
+        // Cons's own unify(scrutinee_ty, List(elem_ty)) runs before it
+        // recurses into `head`) -- storing the raw, unresolved Type::Var
+        // reference would hide that from every later consumer that reads
+        // straight from ctx without a chance to resolve it first
+        // (coerce_numeric and Expr::FieldAccess, per Task 2's own parity
+        // fixes, both treat ANY Type::Var as permissively as Type::Dyn,
+        // with no InferCtx of their own to tell an already-resolved one
+        // apart from a still-open one). resolve_deep is a safe no-op when
+        // scrutinee_ty is still genuinely unconstrained (e.g. my_map's own
+        // unannotated xs -- nothing to resolve yet) and only ever changes
+        // the stored type when something upstream has ALREADY pinned it
+        // down.
+        Pattern::Var(name) => Ok(extend(ctx, name, infer.resolve_deep(scrutinee_ty))),
+        Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => Ok(ctx.clone()),
+        // A fixed-length List pattern is really a Tuple-shaped correlation
+        // (each position its own type), not a single shared element type
+        // -- so, like Record just below, figure out each position's REAL
+        // type from scrutinee_ty FIRST, then recurse using that type
+        // directly. Order matters here: an earlier draft minted an
+        // independent fresh var per position, recursed into it
+        // immediately, and only unified against the real scrutinee shape
+        // AFTER the loop -- for a NESTED List/Tuple sub-pattern, that
+        // recursive call would see its own scrutinee_ty as a totally
+        // unconstrained Type::Var and eagerly bind it to a generic
+        // List(fresh) shape (via this same function's own Type::Var arm
+        // below) before the outer call ever got a chance to instead
+        // correlate that position with, say, a concrete nested Tuple --
+        // producing a spurious List-vs-Tuple unification failure for
+        // exactly the "num-position, no bare Var" nested-tuple pattern
+        // this design is supposed to handle. Determining the real
+        // per-position type before recursing avoids the fresh var ever
+        // being eagerly bound to the wrong shape.
+        Pattern::List(pats) => match scrutinee_ty {
+            Type::Tuple(items) if items.len() == pats.len() => {
+                let mut c = ctx.clone();
+                for (p, item_ty) in pats.iter().zip(items.iter()) {
+                    c = bind_pattern_vars(&c, p, item_ty, infer, span)?;
+                }
+                Ok(c)
+            }
+            Type::List(shared_elem) => {
+                let mut c = ctx.clone();
+                for p in pats {
+                    c = bind_pattern_vars(&c, p, shared_elem, infer, span)?;
+                }
+                Ok(c)
+            }
+            Type::Var(_) => {
+                // Still fully unconstrained: force scrutinee_ty into a
+                // List(fresh shared element) shape via unify -- same
+                // choice Cons makes just below, at the cost of not being
+                // able to give each position its own distinct type the
+                // way an already-known Tuple scrutinee can (there's
+                // nothing here yet to tell List and Tuple apart).
+                let elem_ty = infer.fresh_var("elem");
+                let list_shape = Type::List(Rc::new(elem_ty.clone()));
+                unify(scrutinee_ty, &list_shape, infer, span)?;
+                let mut c = ctx.clone();
+                for p in pats {
+                    c = bind_pattern_vars(&c, p, &elem_ty, infer, span)?;
+                }
+                Ok(c)
+            }
+            // A concrete, non-Tuple, non-List scrutinee against a List
+            // pattern: pattern_could_match's own existing check (called
+            // by Expr::Match before this function ever runs) already
+            // rejects this case statically -- bind each position to its
+            // own independent fresh var (nothing real to correlate
+            // against) so nested sub-bindings still work.
+            _ => {
+                let mut c = ctx.clone();
+                for p in pats {
+                    let elem_ty = infer.fresh_var("elem");
+                    c = bind_pattern_vars(&c, p, &elem_ty, infer, span)?;
+                }
+                Ok(c)
+            }
+        },
+        Pattern::Cons(head, tail) => {
+            let elem_ty = infer.fresh_var("elem");
+            let list_shape = Type::List(Rc::new(elem_ty.clone()));
+            unify(scrutinee_ty, &list_shape, infer, span)?;
+            let c = bind_pattern_vars(ctx, head, &elem_ty, infer, span)?;
+            bind_pattern_vars(&c, tail, &list_shape, infer, span)
+        }
+        Pattern::Record(fields) => {
+            let mut c = ctx.clone();
+            for (name, p) in fields {
+                let field_ty = match scrutinee_ty {
+                    Type::Record(type_fields) => find_field(type_fields, name).cloned().unwrap_or_else(|| infer.fresh_var(name)),
+                    _ => infer.fresh_var(name),
+                };
+                c = bind_pattern_vars(&c, p, &field_ty, infer, span)?;
+            }
+            Ok(c)
+        }
     }
 }
 
@@ -1811,7 +1913,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         spans[expr],
                     ));
                 }
-                let arm_ctx = bind_pattern_vars(ctx, pat);
+                let arm_ctx = bind_pattern_vars(ctx, pat, &scrut_ty, infer, spans[expr])?;
                 // Same Bool coercion as If's own cond -- a Dyn-typed guard
                 // gets a runtime is_bool check inserted, same as
                 // everywhere else Dyn meets an expected concrete type.

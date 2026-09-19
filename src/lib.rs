@@ -1294,6 +1294,33 @@ mod tests {
     }
 
     #[test]
+    fn cons_pattern_binds_head_to_the_scrutinee_own_element_type() {
+        // Regression for the FIRST of the two problems the design spec's
+        // Motivation names: h used to always be Dyn regardless of the
+        // scrutinee's own (here, explicitly annotated) element type --
+        // h + 1 needed a runtime is_int check even though the annotation
+        // already proves h is Int. After this task, h is precisely Int,
+        // no check needed.
+        let src = "let f = fun xs: [Int] -> match xs | [] -> 0 | h :: t -> h + 1 in f([1, 2, 3])";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(!contains_check(&arena, elaborated), "h should already be Int from xs's own annotation -- no runtime check needed");
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 2);
+    }
+
+    #[test]
+    fn record_pattern_still_rejects_a_genuinely_impossible_scrutinee() {
+        // Regression guard: bind_pattern_vars's rewrite must not weaken
+        // pattern_could_match's OWN existing static rejection -- a
+        // Record pattern against a concretely-known-Int scrutinee is
+        // still a compile-time error, unchanged.
+        let src = "let f = fun x: Int -> match x | {y: v} -> v in f(5)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("can never match"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
     fn tuple_pattern_with_wrong_arity_rejected_statically() {
         // Regression: pattern_type gives every fixed-length Pattern::List
         // the same blind List(Dyn), discarding its actual length -- and
@@ -1381,7 +1408,20 @@ mod tests {
     }
 
     #[test]
-    fn two_opaque_tuple_values_from_different_functions_carry_different_tokens() {
+    fn two_opaque_tuple_values_from_different_functions_are_rejected_statically() {
+        // Renamed and re-asserted as part of full parametric polymorphism's
+        // own Task 3: tuple-pattern destructuring now correlates each
+        // position with its REAL type (see Pattern::List's own rewrite
+        // above), so `at`/`bt` are now precisely Token(id1)/Token(id2)
+        // instead of both collapsing to Dyn. This brings tuple-destructured
+        // bindings in line with directly-bound ones, which have ALWAYS
+        // statically rejected comparing two provably-different opaque
+        // tokens (confirmed on the pre-this-task baseline: `let a = opaque
+        // in let b = opaque in a == b` already produces the identical
+        // "cannot compare Token with Token" error) -- this was never a
+        // deliberate runtime-permissive design choice specific to tuples,
+        // just a side effect of the old bind_pattern_vars always widening
+        // tuple-destructured bindings to Dyn.
         let src = r#"
             let Meters = fun n -> (n, opaque) in
             let Seconds = fun n -> (n, opaque) in
@@ -1389,8 +1429,9 @@ mod tests {
             | (an, at) -> match Seconds(5)
               | (bn, bt) -> at == bt
         "#;
-        let outcome = run_source(src).unwrap();
-        assert!(!outcome.as_bool());
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("cannot compare"), "unexpected message: {}", err.0);
     }
 
     #[test]
