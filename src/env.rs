@@ -33,6 +33,7 @@ impl PList<Value> {
             // same "ordinary prelude builtin, not hidden" treatment.
             .bind("get_field", Value::Builtin(Builtin::GetField))
             .bind("type_name", Value::Builtin(Builtin::TypeName))
+            .bind("print", Value::Builtin(Builtin::Print))
     }
 
     pub fn lookup(&self, name: &str) -> Value {

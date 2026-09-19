@@ -1461,6 +1461,18 @@ mod tests {
     }
 
     #[test]
+    fn print_echoes_its_argument_unchanged() {
+        // The printed side effect itself isn't asserted on here (would
+        // need stdout capture) -- this locks in the other half of print's
+        // contract, that it's transparent to the surrounding expression
+        // regardless of the argument's shape, which is what makes
+        // `print(x)` usable inline instead of needing its own statement.
+        assert_eq!(run_untyped("print(41) + 1").as_int(), 42);
+        assert_eq!(run_untyped(r#"print("hi")"#).as_str(), "hi");
+        assert_eq!(run_untyped("print([1, 2, 3])").to_string(), "[1, 2, 3]");
+    }
+
+    #[test]
     fn dyn_boundary_to_record_reports_a_clean_error_for_a_non_record_value() {
         // Regression: build_shape_predicate's Record arm used to check
         // has_field BEFORE is_record, so a non-Record Dyn value hit

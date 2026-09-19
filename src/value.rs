@@ -95,6 +95,16 @@ pub enum Builtin {
     // message at runtime (the actual runtime value's type isn't known
     // until then).
     TypeName,
+    // Dyn -> Dyn: writes the argument's own Display impl to stdout (same
+    // rendering the REPL/CLI already gives a program's final result --
+    // see main.rs's run_and_print) followed by a newline, then returns
+    // the argument UNCHANGED -- so `print(x)` reads as a transparent
+    // side-effecting echo, usable inline (`print(x) + 1`) rather than
+    // needing a separate binding just to observe a value. A raw Rust-
+    // level side effect, not routed through renno's own `perform`/
+    // `handle` -- same precedent Fail already sets (its panic! is
+    // likewise invisible to the effect-row tracker), not a new pattern.
+    Print,
 }
 
 impl Builtin {
@@ -110,7 +120,8 @@ impl Builtin {
             | Builtin::IsList
             | Builtin::IsFun
             | Builtin::IsRecord
-            | Builtin::TypeName => 1,
+            | Builtin::TypeName
+            | Builtin::Print => 1,
             Builtin::Map | Builtin::Get | Builtin::HasField | Builtin::GetField => 2,
             Builtin::Fold => 3,
         }

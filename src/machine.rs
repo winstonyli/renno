@@ -686,6 +686,15 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             Some(v) => Value::Str(Rc::from(v.type_name())),
             None => panic!("type_name expects one argument"),
         },
+        // Echoes its argument back unchanged after printing it -- see
+        // Builtin::Print's own doc comment.
+        Builtin::Print => match args.pop() {
+            Some(v) => {
+                println!("{v}");
+                v
+            }
+            None => panic!("print expects one argument"),
+        },
         Builtin::Map => {
             let (list, f) = (args.pop(), args.pop());
             match (f, list) {
