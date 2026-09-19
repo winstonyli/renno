@@ -541,10 +541,60 @@ mod tests {
     }
 
     #[test]
+    fn cons_unifies_an_unconstrained_head_with_an_unconstrained_tail() {
+        // Regression: today's Cons typing widens to List(Dyn) the
+        // moment the two sides aren't LITERALLY equal types -- an
+        // unconstrained head (Type::Var) and an unconstrained tail
+        // element type (also Type::Var, likely a DIFFERENT one) are
+        // never equal, so this always widened to Dyn before this task,
+        // discarding precision my_map's own body depends on. Routed
+        // through a match arm (not an annotated list parameter) so the
+        // observable signal is coerce_numeric's own check on h2 + 1,
+        // not coerce's own boundary-check insertion -- coerce only ever
+        // inspects a type's TOP-LEVEL shape (Dyn/Var vs. concrete), so
+        // an annotated `xs: [Int]` parameter would never notice an
+        // imprecise NESTED element type either way, old widening or new
+        // precision, and silently pass both (confirmed by hand: the
+        // earlier version of this test, `let g = fun xs: [Int] -> xs in
+        // g(build(1)([2, 3]))`, is GREEN even against the OLD Cons arm
+        // -- not a real regression guard at all). Matching through
+        // bind_pattern_vars's own already-fixed correlation (Task 3)
+        // makes the type flow all the way to an arithmetic operator,
+        // which DOES distinguish the two: confirmed this version is RED
+        // against the old arm and GREEN against the new one.
+        let src = "let build = fun h -> fun t -> h :: t in match build(1)([2, 3]) | [] -> 0 | h2 :: t2 -> h2 + 1";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(!contains_check(&arena, elaborated), "h2 should already be Int -- build(1)([2, 3])'s own Cons-typed element, no runtime check needed");
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 2);
+    }
+
+    #[test]
+    fn unifying_a_variable_with_a_shape_containing_itself_is_an_infinite_type_error() {
+        // The occurs-check, exercised for real for the first time now
+        // that Cons's own unify() call (this task) makes it reachable
+        // via an ordinary program: x can't simultaneously be a List and
+        // its own element type (x = List(x) = List(List(x)) = ...) --
+        // this must be a clean static rejection, not a hang, a stack
+        // overflow, or a panic somewhere unrelated.
+        let src = "fun x -> x :: x";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("infinite type"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
     fn cons_onto_non_list_rejected_statically() {
+        // Message wording changed with the move to real unification
+        // (Cons's own hand-written "expected a list, found {r_ty}" is
+        // now unify()'s own generic "type mismatch: expected {t2}, found
+        // {t1}", with t2 rendering as "[Dyn]" since a fresh, still-
+        // unconstrained Type::Var displays identically to Dyn by design)
+        // -- the rejection itself is unchanged, still a clean static
+        // error, just no longer pinned to the old exact phrasing.
         let (mut arena, spans, root) = parser::parse("1 :: 2").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("expected a list, found Int"), "unexpected message: {}", err.0);
+        assert!(err.0.contains("type mismatch") && err.0.contains("Int"), "unexpected message: {}", err.0);
     }
 
     #[test]

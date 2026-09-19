@@ -1931,17 +1931,23 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // other runtime panic). Result type widens to List(Dyn)
                 // unless `h`'s type and `t`'s element type actually agree.
                 BinOp::Cons => {
-                    let list_of_dyn = Type::List(Rc::new(Type::Dyn));
-                    if !consistent(&r_ty, &list_of_dyn) {
-                        return Err(TypeError(
-                            format!("type mismatch: expected a list, found {r_ty}"),
-                            spans[r],
-                        ));
-                    }
-                    let result_ty = match &r_ty {
-                        Type::List(elem) if **elem == l_ty => Type::List(Rc::new(l_ty.clone())),
-                        _ => Type::List(Rc::new(Type::Dyn)),
-                    };
+                    // Try real unification first: if the tail side is
+                    // (or resolves to) some List(elem) shape -- known
+                    // concretely, or still-open via a fresh Type::Var --
+                    // unify the head's type into that same element type,
+                    // recovering precision unify() alone provides.
+                    // Falls back to today's exact "consistent + widen"
+                    // check only when the tail side is neither, matching
+                    // the SAME hard-error behavior `::` already had --
+                    // this is an App/pattern-binding-class site (a
+                    // genuine shape requirement), not an If/Match/ListLit
+                    // one, so a failure here stays a real error, not a
+                    // fallback-to-Dyn.
+                    let elem_ty = infer.fresh_var("elem");
+                    let list_shape = Type::List(Rc::new(elem_ty.clone()));
+                    unify(&r_ty, &list_shape, infer, spans[r])?;
+                    unify(&l_ty, &elem_ty, infer, spans[l])?;
+                    let result_ty = Type::List(Rc::new(infer.resolve_deep(&elem_ty)));
                     Ok((result_ty, row, arena.push(Expr::BinOp(op, l2, r2))))
                 }
             }
