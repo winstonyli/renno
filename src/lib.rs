@@ -1041,6 +1041,41 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_does_not_generalize_a_parameter_used_in_arithmetic() {
+        // x is used in a type-fixing operation (+), so it must stay Dyn --
+        // calling it at a non-numeric type is still a runtime failure
+        // (via the ordinary Dyn boundary check), not a static rejection,
+        // confirming this is exactly today's pre-existing behavior,
+        // untouched.
+        let src = "let f = fun x -> x + 1 in f(true)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).expect("still Dyn-typed, statically accepted same as before this feature");
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            machine::run(&arena, elaborated, Env::prelude(), &spans)
+        }));
+        assert!(panic_result.is_err(), "f(true) should still panic at runtime (Bool isn't Int), same as before this feature");
+    }
+
+    #[test]
+    fn passthrough_does_not_break_my_map_shaped_structural_recursion() {
+        // Explicit non-goal regression (see the design spec's own
+        // "Non-goals" and this plan's "Before you start"): a hand-rolled
+        // map-shaped function must keep typechecking exactly as it does
+        // today (falls back to Dyn throughout), not newly error out just
+        // because this feature now exists.
+        let src = r#"
+            let rec my_map = fun f -> fun xs ->
+                match xs
+                | [] -> []
+                | h :: t -> f(h) :: my_map(f)(t)
+            in my_map(fun x -> x + 1)([1, 2, 3])
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[2, 3, 4]");
+    }
+
+    #[test]
     fn match_rejects_impossible_pattern_statically() {
         let (mut arena, spans, root) = parser::parse("match 5 | true -> 1 | _ -> 2").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
