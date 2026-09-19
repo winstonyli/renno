@@ -695,6 +695,10 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             }
             None => panic!("print expects one argument"),
         },
+        Builtin::ToStr => match args.pop() {
+            Some(v) => Value::Str(Rc::from(v.to_string())),
+            None => panic!("to_str expects one argument"),
+        },
         Builtin::Map => {
             let (list, f) = (args.pop(), args.pop());
             match (f, list) {

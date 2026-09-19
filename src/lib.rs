@@ -1461,6 +1461,16 @@ mod tests {
     }
 
     #[test]
+    fn to_str_renders_the_same_text_print_would() {
+        // "x = " ++ to_str(x) is renno's string interpolation -- no
+        // "${...}" syntax, just this plus ordinary ++ -- so it needs to
+        // agree with Display (what print/the CLI already show) exactly.
+        assert_eq!(run_untyped("to_str(42)").as_str(), "42");
+        assert_eq!(run_untyped(r#""n = " ++ to_str(1 + 2)"#).as_str(), "n = 3");
+        assert_eq!(run_untyped("to_str([1, 2])").as_str(), "[1, 2]");
+    }
+
+    #[test]
     fn print_echoes_its_argument_unchanged() {
         // The printed side effect itself isn't asserted on here (would
         // need stdout capture) -- this locks in the other half of print's

@@ -105,6 +105,12 @@ pub enum Builtin {
     // `handle` -- same precedent Fail already sets (its panic! is
     // likewise invisible to the effect-row tracker), not a new pattern.
     Print,
+    // Dyn -> Str: the same rendering Print writes to stdout, captured as
+    // a Str instead -- `"x = " ++ to_str(x)` is renno's answer to string
+    // interpolation (no `"...${e}..."` syntax; see [[renno_future_string_
+    // interpolation]]), so this is the one piece those needed, not a
+    // separate feature of its own.
+    ToStr,
 }
 
 impl Builtin {
@@ -121,7 +127,8 @@ impl Builtin {
             | Builtin::IsFun
             | Builtin::IsRecord
             | Builtin::TypeName
-            | Builtin::Print => 1,
+            | Builtin::Print
+            | Builtin::ToStr => 1,
             Builtin::Map | Builtin::Get | Builtin::HasField | Builtin::GetField => 2,
             Builtin::Fold => 3,
         }

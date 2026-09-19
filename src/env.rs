@@ -34,6 +34,7 @@ impl PList<Value> {
             .bind("get_field", Value::Builtin(Builtin::GetField))
             .bind("type_name", Value::Builtin(Builtin::TypeName))
             .bind("print", Value::Builtin(Builtin::Print))
+            .bind("to_str", Value::Builtin(Builtin::ToStr))
     }
 
     pub fn lookup(&self, name: &str) -> Value {
