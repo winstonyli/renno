@@ -3292,7 +3292,7 @@ mod tests {
         let src = r#"
             type List = (Int, List) | Bool in
             let f = fun xs: List -> xs in
-            f((1, (2, opaque)))
+            f((1, (2, true)))
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
         let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
@@ -3317,7 +3317,7 @@ mod tests {
             type List = (Int, List) | Bool in
             let f = fun xs: List -> xs in
             let g = fun v: Dyn -> f(v) in
-            g((1, (2, opaque)))
+            g((1, (2, true)))
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
         let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
@@ -3345,5 +3345,39 @@ mod tests {
             machine::run(&arena, elaborated, Env::prelude(), &spans)
         }));
         assert!(outcome.is_err(), "expected the runtime boundary check to reject a Str where List is required");
+    }
+
+    #[test]
+    fn a_bare_union_self_reference_does_not_infinite_loop_at_a_dyn_boundary() {
+        // A's own recursive occurrence is a BARE Union alternative -- not
+        // wrapped in a Tuple/Record the way List = (Int, List) | Bool is
+        // above, whose Tuple shape check never inspects element types and
+        // so never revisits the Named leaf. Unfolding Type::Named(id) here
+        // reproduces the exact same Union([Int, Named(id)]) again, which
+        // used to send build_union_check/build_shape_predicate/
+        // build_boundary_check into genuine infinite recursion in THIS
+        // PROCESS's own call stack during elaboration (a real stack
+        // overflow, not a graceful type error). g's own parameter is
+        // explicitly Dyn, so it stays Dyn all the way to f(v) -- forcing a
+        // real runtime boundary check against A, not coerce's own static
+        // rescue (mirrors a_genuinely_dyn_sourced_value_is_checked_at_runtime_against_a_named_type_one_level_deep
+        // above). With the ancestor-tracking fix, `A`'s own self-reference
+        // contributes nothing new to the check -- `type A = Int | A`
+        // behaves exactly like plain `Int`, the only alternative that can
+        // ever actually match -- so this is expected to type-check and RUN
+        // TO COMPLETION (not hang or crash) for a genuine Int value. The
+        // fact that `cargo test` returns at all with this test included is
+        // itself the primary evidence a stack-overflow bug can't be caught
+        // by a plain pass/fail assertion.
+        let src = r#"
+            type A = Int | A in
+            let f = fun xs: A -> xs in
+            let g = fun v: Dyn -> f(v) in
+            g(1)
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
+        assert_eq!(result.as_int(), 1);
     }
 }

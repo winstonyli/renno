@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -721,6 +721,15 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, nam
             // consistent with anything, so only the outer shape actually
             // gets checked here.
             let unfolded = replace_named_with_dyn(raw, id);
+            // ponytail: this whole rescue is a purely static, zero-overhead
+            // decision -- so for a literal value, nothing is EVER checked at
+            // the recursive position past this first level, not deferred to
+            // a later shallow check the way a genuine Dyn-boundary crossing
+            // works, just never checked, period (e.g. `f((1, (2, 3)))`
+            // against `List = (Int, List) | Bool` never confirms `3` is
+            // secretly wrapped Bool-shaped anything at that inner position).
+            // Upgrade if a real program needs a malformed literal caught at
+            // this specific position instead of by whatever consumes it later.
             if consistent(from, &unfolded) || fits(&unfolded, from) {
                 return Ok(e);
             }
@@ -730,7 +739,7 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, nam
     if !matches!(from, Type::Dyn | Type::Var(_)) || *to == Type::Dyn || matches!(to, Type::Var(_)) {
         return Ok(e);
     }
-    Ok(build_boundary_check(arena, e, to, named_types))
+    Ok(build_boundary_check(arena, e, to, named_types, &HashSet::new()))
 }
 
 // Like `coerce`, but the target is "Int or Float" rather than one fixed
@@ -748,7 +757,7 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, nam
 fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, named_types: &HashMap<String, Type>) -> Result<ExprRef, TypeError> {
     match ty {
         Type::Int | Type::Float => Ok(e),
-        Type::Dyn | Type::Var(_) => Ok(build_boundary_check(arena, e, &Type::Union(Rc::new(vec![Type::Int, Type::Float])), named_types)),
+        Type::Dyn | Type::Var(_) => Ok(build_boundary_check(arena, e, &Type::Union(Rc::new(vec![Type::Int, Type::Float])), named_types, &HashSet::new())),
         other => Err(TypeError(format!("type mismatch: expected Int or Float, found {other}"), span)),
     }
 }
@@ -772,18 +781,30 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, named_ty
 // same "type error: expected X, found Y" text, built at RUNTIME via the
 // type_name builtin since the actual mismatched value's type isn't known
 // until then.
-fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &HashMap<String, Type>) -> ExprRef {
+// `visiting` is the set of Named ids currently being unfolded somewhere
+// ABOVE this call in the SAME unfold chain (an ancestor set, not a global
+// history) -- empty at every genuinely fresh entry point (coerce's own
+// Dyn-boundary crossing, coerce_numeric, the FieldAccess call site), and
+// extended by exactly one id each time the Type::Named arm below actually
+// descends into an unfold. Needed because a self-referential alias whose
+// recursive occurrence is a BARE Union alternative (e.g. `type A = Int |
+// A`, contrast with `List = (Int, List) | Bool`, where the Tuple's own
+// shape check never inspects element types at all and so never revisits
+// the Named leaf) would otherwise unfold to the exact same Union([Int,
+// Named(id)]) forever -- genuine infinite recursion in THIS function's own
+// call stack during elaboration, not a runtime concern.
+fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &HashMap<String, Type>, visiting: &HashSet<String>) -> ExprRef {
     match to {
         Type::Int => build_shallow_check(arena, e, to, "is_int"),
         Type::Float => build_shallow_check(arena, e, to, "is_float"),
         Type::Bool => build_shallow_check(arena, e, to, "is_bool"),
         Type::Str => build_shallow_check(arena, e, to, "is_str"),
         Type::List(_) => build_shallow_check(arena, e, to, "is_list"),
-        Type::Fun(param_ty, _row, ret_ty) => wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone(), named_types),
+        Type::Fun(param_ty, _row, ret_ty) => wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone(), named_types, visiting),
         Type::Token(id) => build_token_check(arena, e, to, *id),
-        Type::Tuple(_) => build_shape_check(arena, e, to, named_types),
-        Type::Record(_) => build_shape_check(arena, e, to, named_types),
-        Type::Union(_) => build_union_check(arena, e, to, named_types),
+        Type::Tuple(_) => build_shape_check(arena, e, to, named_types, visiting),
+        Type::Record(_) => build_shape_check(arena, e, to, named_types, visiting),
+        Type::Union(_) => build_union_check(arena, e, to, named_types, visiting),
         Type::Dyn => unreachable!("coerce only calls this once *to != Type::Dyn is already established"),
         Type::Var(_) => e,
         // One level only, matching every other shape check in this
@@ -797,9 +818,23 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &
         // Token::TypeKw handling, which always registers a definition
         // in the SAME registry this looks up -- a missing entry means
         // an internal bug, not a user-reachable condition.
+        //
+        // If `id` is already an ancestor in THIS unfold chain, stop
+        // instead of unfolding again: build_shape_predicate's own
+        // matching arm hard-codes `false` for this exact alternative
+        // (see its doc comment), so build_union_check's own
+        // `If(pred, checked, ...)` can never actually select this
+        // branch at runtime -- reuse build_fail_call, this file's own
+        // existing "impossible case" construct, rather than inventing a
+        // new one.
         Type::Named(id) => {
+            if visiting.contains(id) {
+                return build_fail_call(arena, to, e);
+            }
+            let mut visiting = visiting.clone();
+            visiting.insert(id.clone());
             let unfolded = named_types.get(id).expect("Type::Named with no registry entry -- internal bug").clone();
-            build_boundary_check(arena, e, &unfolded, named_types)
+            build_boundary_check(arena, e, &unfolded, named_types, &visiting)
         }
     }
 }
@@ -818,7 +853,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &
 // one -- so the shape predicate decides WHICH alternative's full check to
 // run, and that full check (redundantly, but harmlessly) re-confirms the
 // same shape on its way to the real work.
-fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &HashMap<String, Type>) -> ExprRef {
+fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &HashMap<String, Type>, visiting: &HashSet<String>) -> ExprRef {
     let alts: Rc<Vec<Type>> = match to {
         Type::Union(alts) => alts.clone(),
         _ => unreachable!("build_union_check is only ever called with a Union target"),
@@ -827,8 +862,8 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &Has
     let tmp_ref = arena.push(Expr::Var(tmp.clone()));
     let mut result = build_fail_call(arena, to, tmp_ref);
     for alt in alts.iter().rev() {
-        let pred = build_shape_predicate(arena, tmp_ref, alt, named_types);
-        let checked = build_boundary_check(arena, tmp_ref, alt, named_types);
+        let pred = build_shape_predicate(arena, tmp_ref, alt, named_types, visiting);
+        let checked = build_boundary_check(arena, tmp_ref, alt, named_types, visiting);
         result = arena.push(Expr::If(pred, checked, result));
     }
     arena.push(Expr::Let(tmp, None, e, result))
@@ -840,7 +875,7 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &Has
 // together before deciding anything. Mirrors build_boundary_check's own
 // arms exactly (same shallow-check precedent each one sets), just
 // stopping short of wrapping the result in Let/If/fail.
-fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, named_types: &HashMap<String, Type>) -> ExprRef {
+fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, named_types: &HashMap<String, Type>, visiting: &HashSet<String>) -> ExprRef {
     match ty {
         Type::Dyn => arena.push(Expr::Bool(true)),
         Type::Var(_) => arena.push(Expr::Bool(true)),
@@ -885,14 +920,29 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, named
             arena.push(Expr::If(is_record, has_all, false_lit))
         }
         Type::Union(alts) => {
-            fold_predicate(arena, alts, FoldOp::Or, |arena, alt| build_shape_predicate(arena, value_ref, alt, named_types))
+            fold_predicate(arena, alts, FoldOp::Or, |arena, alt| build_shape_predicate(arena, value_ref, alt, named_types, visiting))
         }
         // Same one-level-only unfold as build_boundary_check's own new
         // arm just above -- see its doc comment for why `expect` is
         // correct here rather than a graceful fallback.
+        //
+        // Same ancestor-tracking cycle break as build_boundary_check's
+        // own Named arm (see its doc comment for the bare-Union-
+        // alternative infinite-recursion case this prevents), but
+        // stopping at `false` here instead of build_fail_call: re-trying
+        // the same id against the same value gives no new information
+        // beyond what the non-recursive alternatives already cover, so
+        // this correctly makes e.g. `type A = Int | A` behave equivalently
+        // to plain `Int` (the only alternative that can ever actually
+        // match) instead of recursing forever.
         Type::Named(id) => {
+            if visiting.contains(id) {
+                return arena.push(Expr::Bool(false));
+            }
+            let mut visiting = visiting.clone();
+            visiting.insert(id.clone());
             let unfolded = named_types.get(id).expect("Type::Named with no registry entry -- internal bug").clone();
-            build_shape_predicate(arena, value_ref, &unfolded, named_types)
+            build_shape_predicate(arena, value_ref, &unfolded, named_types, &visiting)
         }
     }
 }
@@ -987,8 +1037,8 @@ fn build_token_check(arena: &mut Arena, e: ExprRef, to: &Type, id: u64) -> ExprR
 // own job, not re-derived here, so this one function serves both
 // Type::Tuple and Type::Record with nothing Tuple/Record-specific of its
 // own.
-fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &HashMap<String, Type>) -> ExprRef {
-    build_checked(arena, e, to, |arena, v| build_shape_predicate(arena, v, to, named_types))
+fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &HashMap<String, Type>, visiting: &HashSet<String>) -> ExprRef {
+    build_checked(arena, e, to, |arena, v| build_shape_predicate(arena, v, to, named_types, visiting))
 }
 
 // `predicate` is looked up by name through the ordinary prelude Env
@@ -1026,14 +1076,14 @@ fn build_fail_call(arena: &mut Arena, to: &Type, value_ref: ExprRef) -> ExprRef 
 // span bookkeeping here: these nodes are synthesized, not sourced from
 // the program text, and typecheck never looks up a span for them (see
 // TypeError's doc comment).
-fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: Rc<Type>, named_types: &HashMap<String, Type>) -> ExprRef {
+fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: Rc<Type>, named_types: &HashMap<String, Type>, visiting: &HashSet<String>) -> ExprRef {
     let fn_var = "__contract_fn".to_string();
     let arg_var = "__contract_arg".to_string();
     let fn_var_ref = arena.push(Expr::Var(fn_var.clone()));
     let arg_var_ref = arena.push(Expr::Var(arg_var.clone()));
     let checked_fn = build_shallow_check(arena, fn_var_ref, &any_fun(), "is_fun");
     let call = arena.push(Expr::App(checked_fn, arg_var_ref));
-    let checked_call = build_boundary_check(arena, call, &ret_ty, named_types);
+    let checked_call = build_boundary_check(arena, call, &ret_ty, named_types, visiting);
     let lambda = arena.push(Expr::Lambda(arg_var, Some((*param_ty).clone()), checked_call));
     arena.push(Expr::Let(fn_var, None, e, lambda))
 }
@@ -1680,7 +1730,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             };
             let checked_target = if matches!(target_ty, Type::Dyn | Type::Var(_)) {
                 let required = Type::Record(Rc::new(vec![(name.clone(), Type::Dyn)]));
-                build_shape_check(arena, target2, &required, &infer.named_types)
+                build_shape_check(arena, target2, &required, &infer.named_types, &HashSet::new())
             } else {
                 target2
             };
