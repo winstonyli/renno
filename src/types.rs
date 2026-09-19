@@ -29,6 +29,13 @@ pub enum Type {
     // precision: at a call site, an instantiated Type::Var naming the
     // callee's parameter gets bound to the caller's own concrete argument
     // type, and that binding is substituted into the return type.
+    // IS surfaced to a user: an unresolved Type::Var can appear in a
+    // static type-mismatch message (e.g. `id(id) + 1`). Its Display impl
+    // renders it identically to Type::Dyn ("Dyn") rather than some
+    // internal name like "<generic>" -- renno has no generics syntax a
+    // user would recognize such a name as referring to, and since a
+    // Type::Var behaves exactly like Dyn everywhere it's observable,
+    // showing "Dyn" is the more honest, actionable thing to tell them.
     Var(String),
     Bool,
     Str,
@@ -278,11 +285,10 @@ impl fmt::Display for Type {
             Type::Int => write!(f, "Int"),
             Type::Float => write!(f, "Float"),
             // The name is internal bookkeeping (see Type::Var's own doc
-            // comment) -- never shown to a user, since nothing surfaces
-            // it: there's no annotation syntax that could produce one,
-            // and every error message a Type::Var could appear in would
-            // only ever fire from typecheck's own bugs, not user code.
-            Type::Var(_) => write!(f, "<generic>"),
+            // comment) that a user has no way to interpret -- render
+            // identically to Type::Dyn, which is what a Type::Var
+            // actually behaves like everywhere it's observable.
+            Type::Var(_) => write!(f, "Dyn"),
             Type::Bool => write!(f, "Bool"),
             Type::Str => write!(f, "Str"),
             Type::List(elem) => write!(f, "[{elem}]"),

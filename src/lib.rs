@@ -1076,6 +1076,65 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_annotated_alias_still_gets_a_real_boundary_check() {
+        // Regression for a critical bug: an ANNOTATED alias (`let y: Int
+        // = x in y`) was wrongly treated as a safe passthrough, and the
+        // resulting Type::Var flowing into the Int annotation skipped
+        // coerce's boundary-check-building entirely -- f("oops") used to
+        // silently return the string "oops" with zero error, despite y
+        // being statically declared Int. Either a static rejection or a
+        // clean runtime boundary panic is an acceptable, sound fix; what
+        // must NOT happen is silent success.
+        let src = r#"let f = fun x -> let y: Int = x in y in f("oops")"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        match typecheck::check(&mut arena, root, &spans) {
+            Err(e) => assert!(e.0.contains("Int") && e.0.contains("Str"), "unexpected static error message: {}", e.0),
+            Ok(elaborated) => {
+                let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    machine::run(&arena, elaborated, Env::prelude(), &spans)
+                }));
+                assert!(panic_result.is_err(), "f(\"oops\") must fail (statically or at runtime), not silently return a Str where Int was declared");
+            }
+        }
+    }
+
+    #[test]
+    fn passthrough_fun_typed_alias_still_gets_a_real_contract() {
+        // Same root cause, a second symptom: an annotated Fun-typed
+        // alias used to skip wrap_fun_contract entirely (the Type::Var
+        // from-side bypassed coerce's check-building for ANY concrete
+        // to-side, not just primitives), silently losing the per-call
+        // contract a (Int -> Int)-annotated value is supposed to get.
+        let src = "let f = fun x -> let y: (Int -> Int) = x in y in f(fun n -> n)(5)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 5);
+    }
+
+    #[test]
+    fn passthrough_generalizes_through_let_rec_too() {
+        let src = "let rec id = fun x -> x in let f = fun n: Int -> n + 1 in f(id(1))";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(!contains_check(&arena, elaborated), "id(1) via let rec should already be Int -- no runtime check needed");
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 2);
+    }
+
+    #[test]
+    fn passthrough_two_calls_in_one_program_are_independently_precise() {
+        let src = r#"
+            let id = fun x -> x in
+            let use_int = fun n: Int -> n + 1 in
+            let use_str = fun s: Str -> s ++ "!" in
+            (use_int(id(1)), use_str(id("hi")))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(!contains_check(&arena, elaborated), "both id(1) and id(\"hi\") should already be precisely typed -- no runtime checks needed for either");
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[2, hi!]");
+    }
+
+    #[test]
     fn match_rejects_impossible_pattern_statically() {
         let (mut arena, spans, root) = parser::parse("match 5 | true -> 1 | _ -> 2").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();

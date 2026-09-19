@@ -149,8 +149,8 @@ fn free_row_vars(ty: &Type) -> BTreeSet<String> {
 fn is_passthrough_safe(arena: &Arena, e: ExprRef, tracked: &BTreeSet<String>, is_tail: bool) -> bool {
     match &arena[e] {
         Expr::Var(name) => !tracked.contains(name) || is_tail,
-        Expr::Let(var, _ann, val, body) => {
-            let val_is_bare_alias = matches!(&arena[*val], Expr::Var(n) if tracked.contains(n));
+        Expr::Let(var, ann, val, body) => {
+            let val_is_bare_alias = ann.is_none() && matches!(&arena[*val], Expr::Var(n) if tracked.contains(n));
             if val_is_bare_alias {
                 let mut widened = tracked.clone();
                 widened.insert(var.clone());
@@ -333,8 +333,9 @@ fn any_fun() -> Type {
     Type::Fun(Rc::new(Type::Dyn), EffectRow::Dyn, Rc::new(Type::Dyn))
 }
 
-// The only place a runtime boundary check gets built: `from` is Dyn
-// (unknown statically) and `to` is concrete. If both sides are concrete
+// The only place a runtime boundary check gets built: `from` is Dyn (or
+// Type::Var, treated identically -- see its own doc comment) and `to` is
+// concrete. If both sides are concrete
 // and disagree, that's a real static error -- reject before running at
 // all, UNLESS `to` is a Record that `from` (also a concrete Record)
 // width-satisfies (see types::record_satisfies' own doc comment) -- the
@@ -365,7 +366,7 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span) -> 
         }
         return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span));
     }
-    if *from != Type::Dyn || *to == Type::Dyn || matches!(to, Type::Var(_)) {
+    if !matches!(from, Type::Dyn | Type::Var(_)) || *to == Type::Dyn || matches!(to, Type::Var(_)) {
         return Ok(e);
     }
     Ok(build_boundary_check(arena, e, to))
