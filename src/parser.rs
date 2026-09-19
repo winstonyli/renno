@@ -17,6 +17,7 @@ pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
         expr_spans: SpanMap::new(),
         src,
         type_aliases: HashMap::new(),
+        named_types: HashMap::new(),
     };
     let root = p.expr()?;
     if p.pos != p.tokens.len() {
@@ -24,6 +25,36 @@ pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
         return Err(p.err_at(span, format!("trailing tokens after expression: {:?}", &p.tokens[p.pos..])));
     }
     Ok((p.arena, p.expr_spans, root))
+}
+
+// Same as `parse`, but ALSO returns the registry of genuinely
+// self-referential type aliases this parse registered (Parser's own
+// `named_types` field) -- needed by typecheck::check_with_named_types
+// to resolve a Type::Named reference's own shape. Every ordinary
+// caller that never uses self-referential type aliases keeps calling
+// plain `parse` above, completely unaffected; this exists so the one
+// real production entry point (lib.rs's own run_source_on_this_thread)
+// can support the feature end to end without changing `parse`'s own
+// signature and forcing every one of its 115+ existing callers in this
+// codebase's own test suite to update for a capability they don't use.
+pub fn parse_with_named_types(src: &str) -> Result<(Arena, SpanMap, ExprRef, HashMap<String, Type>), String> {
+    let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
+    let mut p = Parser {
+        tokens,
+        tok_spans,
+        pos: 0,
+        arena: Arena::new(),
+        expr_spans: SpanMap::new(),
+        src,
+        type_aliases: HashMap::new(),
+        named_types: HashMap::new(),
+    };
+    let root = p.expr()?;
+    if p.pos != p.tokens.len() {
+        let span = p.span_at();
+        return Err(p.err_at(span, format!("trailing tokens after expression: {:?}", &p.tokens[p.pos..])));
+    }
+    Ok((p.arena, p.expr_spans, root, p.named_types))
 }
 
 struct Parser<'a> {
@@ -42,6 +73,46 @@ struct Parser<'a> {
     // restored (LIFO) once its own `in <body>` ends -- see atom's own
     // `type_alias_restore`.
     type_aliases: HashMap<String, Type>,
+    // Every genuinely self-referential `type` alias registered so far
+    // (Parser::atom's own `Token::TypeKw` arm) -- keyed by the SAME
+    // gensym'd id its own Type::Named leaf carries, so it survives
+    // past this parser's own scoped/LIFO-restored `type_aliases`
+    // (which only remembers a NAME's CURRENT alias while parsing is
+    // still inside that name's own scope). Unlike `type_aliases`, this
+    // is never restored/popped -- once an alias is registered here, it
+    // stays for the rest of parsing and is handed to whichever of
+    // `parse`/`parse_with_named_types` the caller invoked.
+    named_types: HashMap<String, Type>,
+}
+
+// Mints a globally-unique id for a `type` alias binder occurrence --
+// same freshening idiom typecheck.rs's own fresh_row_name/
+// fresh_type_name already use (a monotonic counter appended to a base
+// name), just its own separate counter and its own separate namespace:
+// this mechanism exists purely at parse time, before InferCtx (which
+// owns the OTHER two) is even constructed.
+fn fresh_named_type_id(base: &str) -> String {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{base}#{n}")
+}
+
+// Does `ty` structurally contain a Type::Named leaf carrying exactly
+// `id` anywhere inside it? Used right after parsing a `type` alias's
+// own RHS to decide whether it actually referenced itself (mirrors the
+// shape of typecheck.rs's own free_row_vars/free_type_vars_resolved --
+// a plain structural walk, terminating because `ty` here is always a
+// FRESH parse result, never something already containing a completed
+// recursive reference of its own).
+fn contains_named(ty: &Type, id: &str) -> bool {
+    match ty {
+        Type::Named(n) => n == id,
+        Type::List(elem) => contains_named(elem, id),
+        Type::Fun(param, _row, ret) => contains_named(param, id) || contains_named(ret, id),
+        Type::Tuple(items) | Type::Union(items) => items.iter().any(|t| contains_named(t, id)),
+        Type::Record(fields) => fields.iter().any(|(_, t)| contains_named(t, id)),
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Var(_) => false,
+    }
 }
 
 // A `let`/`fun` prefix collected while flattening a chain of them (see
@@ -922,10 +993,40 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     self.expect(&Token::Equals)?;
+                    // Insert a placeholder BEFORE parsing the RHS, keyed
+                    // to a fresh id -- any self-reference inside the RHS
+                    // resolves through the SAME, already-existing
+                    // alias-lookup path (parse_type's own
+                    // `self.type_aliases.get(&name)` arm) with no new
+                    // grammar needed. Captured here (before the insert),
+                    // not after parsing the RHS, so an OUTER scope's own
+                    // same-named alias (if any) is what gets restored,
+                    // exactly as the pre-existing scoping logic already
+                    // requires.
+                    let previous = self.type_aliases.get(&name).cloned();
+                    let fresh_id = fresh_named_type_id(&name);
+                    self.type_aliases.insert(name.clone(), Type::Named(fresh_id.clone()));
                     let ty = self.parse_union_type()?;
                     self.expect(&Token::In)?;
-                    type_alias_restore.push((name.clone(), self.type_aliases.get(&name).cloned()));
-                    self.type_aliases.insert(name, ty);
+                    // Did the RHS actually reference itself? If not,
+                    // this is an ordinary, non-recursive alias --
+                    // discard the placeholder, store the real parsed
+                    // type exactly as this alias mechanism already did
+                    // before this whole feature existed. If so,
+                    // register the definition (which may itself
+                    // structurally contain this SAME Type::Named leaf,
+                    // nested wherever the self-reference occurred) and
+                    // make every future use of `name` resolve to the
+                    // lightweight reference instead of the (impossible
+                    // to fully construct) expansion.
+                    let final_ty = if contains_named(&ty, &fresh_id) {
+                        self.named_types.insert(fresh_id.clone(), ty);
+                        Type::Named(fresh_id)
+                    } else {
+                        ty
+                    };
+                    type_alias_restore.push((name.clone(), previous));
+                    self.type_aliases.insert(name, final_ty);
                 }
                 Some(Token::Let) => {
                     let start = self.span_at().start;

@@ -3181,4 +3181,100 @@ mod tests {
         let ty = Type::Named("List#3".to_string());
         assert_eq!(format!("{ty}"), "List");
     }
+
+    #[test]
+    fn a_self_referential_type_alias_parses_successfully() {
+        // This used to be a parse error ("unknown type: List") --
+        // List wasn't in scope yet while its own RHS was being parsed.
+        // (Bool stands in for a Unit-style base case here -- this
+        // grammar has no builtin Unit type; any non-recursive
+        // alternative demonstrates the same self-reference detection.)
+        let src = r#"
+            type List = (Int, List) | Bool in
+            5
+        "#;
+        assert!(parser::parse(src).is_ok());
+    }
+
+    #[test]
+    fn a_non_recursive_alias_is_completely_unaffected() {
+        // Same alias mechanism, but this one never references itself
+        // -- must behave EXACTLY as before this whole feature: fully
+        // expanded, no Type::Named anywhere, no registry entry.
+        let src = r#"
+            type Pair = (Int, Int) in
+            let p: Pair = (1, 2) in
+            p
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
+        match result {
+            Value::List(items) => assert_eq!(items[0].as_int(), 1),
+            other => panic!("expected a tuple, got {other}"),
+        }
+    }
+
+    #[test]
+    fn parse_with_named_types_registers_a_self_referential_alias() {
+        use types::Type;
+        let src = r#"
+            type List = (Int, List) | Bool in
+            5
+        "#;
+        let (_, _, _, named_types) = parser::parse_with_named_types(src).unwrap();
+        assert_eq!(named_types.len(), 1);
+        let def = named_types.values().next().unwrap();
+        // The registered definition is List's own one-level structure
+        // -- a Union of a Tuple (whose second element is the SAME
+        // Named id, pointing back at this very entry) and a plain
+        // Bool base case. Confirm it's a Union containing a Tuple
+        // whose second element is a Type::Named.
+        match def {
+            Type::Union(alts) => {
+                let has_self_ref_tuple = alts.iter().any(|alt| {
+                    matches!(alt, Type::Tuple(items) if items.len() == 2 && matches!(items[1], Type::Named(_)))
+                });
+                assert!(has_self_ref_tuple, "expected a Tuple alternative whose 2nd element is Type::Named, got {def:?}");
+            }
+            other => panic!("expected a Union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_recursive_aliases_sharing_a_surface_name_in_different_scopes_do_not_collide() {
+        use types::Type;
+        // Parenthesized grouping + sequential `let _ = ... in ...`,
+        // not a tuple literal -- both are definitely-valid constructs
+        // in this grammar, avoiding any risk that a tuple element
+        // doesn't accept a full `type ... in ...` prefix chain (this
+        // plan never verified that either way, and there's no reason
+        // to depend on it here).
+        let src = r#"
+            let _ = (type List = (Int, List) | Bool in 1) in
+            let _ = (type List = (Str, List) | Bool in 2) in
+            3
+        "#;
+        let (_, _, _, named_types) = parser::parse_with_named_types(src).unwrap();
+        // Two SEPARATE registrations, each with its own gensym'd id --
+        // not one clobbering the other.
+        assert_eq!(named_types.len(), 2);
+        let mut sees_int_tuple = false;
+        let mut sees_str_tuple = false;
+        for def in named_types.values() {
+            if let Type::Union(alts) = def {
+                for alt in alts.iter() {
+                    if let Type::Tuple(items) = alt {
+                        if items[0] == Type::Int {
+                            sees_int_tuple = true;
+                        }
+                        if items[0] == Type::Str {
+                            sees_str_tuple = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(sees_int_tuple && sees_str_tuple, "expected both scopes' own definitions preserved independently");
+    }
 }
