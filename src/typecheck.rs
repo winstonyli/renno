@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
 use crate::plist::PList;
 use crate::span::Span;
-use crate::types::{consistent, record_satisfies, EffectRow, Type};
+use crate::types::{consistent, fits, EffectRow, Type};
 use crate::util::find_field;
 
 // The Span is always an ORIGINAL (pre-elaboration) node's -- the one whose
@@ -569,9 +569,7 @@ fn any_fun() -> Type {
 // returns unchanged).
 fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span) -> Result<ExprRef, TypeError> {
     if !consistent(from, to) {
-        if let (Type::Record(actual), Type::Record(required)) = (from, to)
-            && record_satisfies(required, actual)
-        {
+        if fits(to, from) {
             return Ok(e);
         }
         return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span));
