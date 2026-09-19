@@ -212,6 +212,28 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
     }
 }
 
+// unify() mutates infer.subst as it recurses and has no rollback -- a
+// structural mismatch found partway through (e.g. unifying
+// Tuple([Var(x), Int]) against Tuple([Str, Bool]) binds x := Str at
+// position 0, THEN fails at position 1) leaves x permanently bound even
+// though the unify() call, as a WHOLE, failed. At a hard-error call site
+// (bind_pattern_vars/App/Cons) that's harmless -- Err there aborts the
+// entire elaboration, so a half-applied binding is never observed. But
+// at a fallback-to-Dyn site (If/Match/ListLit's own branch combination),
+// the Global Constraint requires a failed unify() to behave EXACTLY like
+// today's widen-to-Dyn -- not silently leave a partial binding that
+// relocates the rejection to some LATER, unrelated use of that same
+// variable. This wrapper snapshots infer.subst before trying, and
+// restores it on failure, so a failed trial genuinely leaves no trace.
+fn unify_trial(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
+    let snapshot = infer.subst.clone();
+    let result = unify(t1, t2, infer, span);
+    if result.is_err() {
+        infer.subst = snapshot;
+    }
+    result
+}
+
 fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
     // Unbound at typecheck time: don't error here, machine::run's own
     // `unbound variable` panic at runtime is the right place for that.
@@ -239,20 +261,30 @@ fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
     ctx.bind(name, Scheme::mono(ty))
 }
 
-// `let`-binding: if `ty` mentions any row-variable names (from an explicit
-// `->{e}` annotation somewhere in it), generalize over them so each
-// reference gets its own fresh instantiation -- otherwise two calls to the
-// same row-polymorphic function with different concrete callbacks would
-// wrongly be forced to agree on one row. row_vars auto-derives from
-// free_row_vars(&ty), but only picks up a name if generalizable_row_vars
-// confirms it ISN'T also free somewhere still open in `ctx` -- see that
-// function's own doc comment for why an EffectRow::Var needs this
-// (confirmed reachable: `let f = fun cb: (Dyn ->{e} Dyn) -> let g = cb in g
-// in f(fun y -> perform choose(y))(0)` used to typecheck clean and only
-// panic at runtime -- "e" leaking from cb's still-open annotation into g's
-// generalized scheme, then getting freshly (and wrongly) renamed on every
-// `g` reference, exactly like the Type::Var bug generalizable_type_vars
-// guards against below).
+// `let`-binding: generalizes over both row variables (via the existing
+// generalizable_row_vars, unchanged) and type variables (via
+// generalizable_type_vars) symmetrically -- there is no longer a
+// separate caller-supplied-list variant to keep in sync with this one
+// (that mechanism, extend_generalized_with_type_vars, only worked when
+// Type::Var had exactly one manufacturing call site; real unification
+// mints it at many, so it no longer applies -- see the design spec's own
+// "Data model" section).
+//
+// Row variables: if `ty` mentions any row-variable names (from an
+// explicit `->{e}` annotation somewhere in it), generalize over them so
+// each reference gets its own fresh instantiation -- otherwise two calls
+// to the same row-polymorphic function with different concrete callbacks
+// would wrongly be forced to agree on one row. row_vars auto-derives
+// from free_row_vars(&ty), but only picks up a name if
+// generalizable_row_vars confirms it ISN'T also free somewhere still
+// open in `ctx` -- see that function's own doc comment for why an
+// EffectRow::Var needs this (confirmed reachable: `let f = fun cb: (Dyn
+// ->{e} Dyn) -> let g = cb in g in f(fun y -> perform choose(y))(0)`
+// used to typecheck clean and only panic at runtime -- "e" leaking from
+// cb's still-open annotation into g's generalized scheme, then getting
+// freshly (and wrongly) renamed on every `g` reference, exactly like the
+// Type::Var bug generalizable_type_vars guards against for the type-var
+// side).
 //
 // Resolve deeply before storing, not just for the free-variable scan:
 // unify() can bind one Type::Var to ANOTHER Type::Var (e.g. Cons's own
@@ -265,21 +297,17 @@ fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // resolving to the ORIGINAL (never freshened) variable forever,
 // producing an incoherent instantiated type. Resolving once here
 // ensures every position that means the same variable also LITERALLY
-// names it. Safe to snapshot: this runs after the value's own
-// elaboration is fully complete, and the stored type is never itself
-// unified against anything again -- only its freshly-instantiated
-// copies (built at each use) are. resolve_deep leaves EffectRow
+// names it. Safe to snapshot: infer.subst is write-once per name --
+// unify() only ever binds a name that infer.resolve() just showed is
+// still unbound (never rebinds one that already has a target), so a
+// name resolved here to something concrete can never later resolve to
+// something ELSE. A name left as a bare Type::Var here either gets
+// generalized (and lookup freshens it before any later use can unify
+// against it) or stays free in `ctx` (and downstream consumers that
+// read it back out re-resolve it themselves -- see Expr::App's own
+// `let f_ty = infer.resolve(&f_ty);`). resolve_deep leaves EffectRow
 // untouched (it only walks Type positions), so this doesn't affect
 // row-variable generalization at all.
-//
-// `let`-binding: generalizes over both row variables (via the existing
-// generalizable_row_vars, unchanged) and type variables (via
-// generalizable_type_vars, new) symmetrically -- there is no longer a
-// separate caller-supplied-list variant to keep in sync with this one
-// (that mechanism, extend_generalized_with_type_vars, only worked when
-// Type::Var had exactly one manufacturing call site; real unification
-// mints it at many, so it no longer applies -- see the design spec's own
-// "Data model" section).
 fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &InferCtx) -> Ctx {
     let ty = infer.resolve_deep(&ty);
     let row_vars = generalizable_row_vars(ctx, &ty);
@@ -393,6 +421,17 @@ fn free_type_vars_resolved(ty: &Type, infer: &InferCtx) -> BTreeSet<String> {
 // scheme's own (sealed) type_vars -- see free_row_vars_in_ctx's own doc
 // comment for why the exclusion matters (a name a scheme already
 // generalized over is dead, not still open).
+//
+// ponytail: same O(ctx depth) walk, same O(N^2)-on-a-long-chain ceiling
+// free_row_vars_in_ctx already carries a note for -- but paid far more
+// often here: unannotated bindings default to a fresh Type::Var broadly
+// (Task 2), so most `let`s in an ordinary program have a type variable
+// to scan for, unlike a row variable (which only ever comes from an
+// explicit `->{e}` annotation). generalizable_type_vars's own
+// short-circuit below still keeps a variable-free binding at O(1), but
+// that's now the LESS common case. Same upgrade path as
+// free_row_vars_in_ctx: thread a cumulative "still open type vars" set
+// incrementally through Ctx itself instead of re-walking the chain here.
 fn free_type_vars_in_ctx(ctx: &Ctx, infer: &InferCtx) -> BTreeSet<String> {
     let mut vars = BTreeSet::new();
     ctx.for_each(|scheme: &Scheme| {
@@ -595,7 +634,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type) -> ExprRef {
         Type::Record(_) => build_shape_check(arena, e, to),
         Type::Union(_) => build_union_check(arena, e, to),
         Type::Dyn => unreachable!("coerce only calls this once *to != Type::Dyn is already established"),
-        Type::Var(_) => unreachable!("coerce only calls this once *to != Type::Var is already established"),
+        Type::Var(_) => e,
     }
 }
 
@@ -1033,18 +1072,24 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut 
                 }
                 Ok(c)
             }
+            // A still-fully-unconstrained scrutinee (Type::Var) is
+            // handled the SAME way as a concrete, non-Tuple, non-List
+            // scrutinee just below: bind each position to its own
+            // independent fresh var, no unify against a forced List
+            // shape. Pattern::List is ALSO renno's tuple pattern
+            // (`(a, b)` desugars to this same variant) -- the two are
+            // indistinguishable at this point, so forcing scrutinee_ty
+            // into a List shape here is a guess that's WRONG whenever
+            // the pattern is actually destructuring a Tuple, and
+            // unrecoverable once made (infer.subst never shrinks). An
+            // actual List-shaped scrutinee still gets its real
+            // correlation via Cons's own arm, which is where my_map's
+            // own precision genuinely comes from -- this arm never
+            // forcing List costs nothing there.
             Type::Var(_) => {
-                // Still fully unconstrained: force scrutinee_ty into a
-                // List(fresh shared element) shape via unify -- same
-                // choice Cons makes just below, at the cost of not being
-                // able to give each position its own distinct type the
-                // way an already-known Tuple scrutinee can (there's
-                // nothing here yet to tell List and Tuple apart).
-                let elem_ty = infer.fresh_var("elem");
-                let list_shape = Type::List(Rc::new(elem_ty.clone()));
-                unify(scrutinee_ty, &list_shape, infer, span)?;
                 let mut c = ctx.clone();
                 for p in pats {
+                    let elem_ty = infer.fresh_var("elem");
                     c = bind_pattern_vars(&c, p, &elem_ty, infer, span)?;
                 }
                 Ok(c)
@@ -1142,12 +1187,12 @@ fn first_unreachable(patterns: &[&Pattern], has_guard: &[bool]) -> Option<usize>
 // recurses into NESTED tuple/record positions too: `((p, q), x)` covers
 // all of `((Int, Int), Int)` even though NEITHER top-level sub-pattern is
 // a bare Var, because the first one is itself a fully-covering pattern
-// for ITS OWN (also Tuple) position. Does NOT help a scrutinee bound by
-// an outer match/lambda pattern first (renno has no pattern-driven type
-// refinement -- see bind_pattern_vars's own doc comment -- so that
-// binding's own type is just Dyn, not the precise Tuple/Record type this
-// needs): a fully-nested pattern in ONE match sidesteps that, a match on
-// a separately-destructured intermediate variable does not.
+// for ITS OWN (also Tuple) position. A scrutinee bound by an outer
+// match/lambda pattern first now ALSO benefits: bind_pattern_vars's own
+// Pattern::Var arm resolves and stores the real scrutinee type (Task 3's
+// own correlation, not always Dyn any more), so `match (1, 2) | p ->
+// match p | (a, b) -> a + b` is correctly recognized exhaustive too, not
+// just a fully-nested pattern written in one match.
 //
 // Record's own arm is genuinely simpler than Tuple's, not just a variant
 // of it: since Pattern::Record matching is width-tolerant (extra fields
@@ -1480,7 +1525,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 refs.push(item2);
                 elem_ty = Some(match elem_ty {
                     None => item_ty,
-                    Some(t) => match unify(&t, &item_ty, infer, spans[item]) {
+                    Some(t) => match unify_trial(&t, &item_ty, infer, spans[item]) {
                         Ok(()) => infer.resolve_deep(&t),
                         Err(_) => Type::Dyn,
                     },
@@ -1502,6 +1547,20 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         Expr::App(f, a) => {
             let (f_ty, f_row, f2) = elaborate(arena, f, ctx, spans, infer)?;
             let (a_ty, a_row, a2) = elaborate(arena, a, ctx, spans, infer)?;
+            // Resolve before dispatching: f_ty is read straight out of
+            // Ctx (via lookup), which -- since Task 7's ctx-wide
+            // generalization -- can hand back a raw Type::Var that
+            // unify() has ALREADY bound to something concrete elsewhere
+            // (e.g. a variable reused across two calls in the same
+            // scope). Matching on the unresolved form would route a
+            // callee that's actually a concrete Fun through the
+            // Type::Var(_) arm below -- which has no coerce() at all --
+            // instead of the Type::Fun arm's own subtyping-aware
+            // handling, or would silently skip the Type::Dyn arm's own
+            // is_fun check when the callee resolves to Dyn. Same
+            // principle as Task 3's resolve_deep in Pattern::Var and
+            // Task 4's param_ty_resolved just below.
+            let f_ty = infer.resolve(&f_ty);
             let (call_row, ret_ty, app2) = match &f_ty {
                 Type::Fun(param_ty, call_row, ret_ty) => {
                     // Resolve BEFORE handing to coerce, not just before/
@@ -1760,8 +1819,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // tells everywhere else; a wrong-shaped Dyn value still
                 // fails at apply_binop, just without a location any more
                 // precise than machine::current_span already gives every
-                // other runtime panic). Result type widens to List(Dyn)
-                // unless `h`'s type and `t`'s element type actually agree.
+                // other runtime panic).
                 BinOp::Cons => {
                     // Try real unification first: if the tail side is
                     // (or resolves to) some List(elem) shape -- known
@@ -1794,7 +1852,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // possible); fall back to today's exact widen-to-Dyn
             // behavior on genuine failure, never a new rejection -- see
             // this plan's own Global Constraints.
-            let result_ty = match unify(&t_ty, &e_ty, infer, spans[expr]) {
+            let result_ty = match unify_trial(&t_ty, &e_ty, infer, spans[expr]) {
                 Ok(()) => infer.resolve_deep(&t_ty),
                 Err(_) => Type::Dyn,
             };
@@ -1885,7 +1943,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 row = EffectRow::union(&row, &arm_row);
                 result_ty = Some(match result_ty {
                     None => arm_ty,
-                    Some(t) => match unify(&t, &arm_ty, infer, spans[expr]) {
+                    Some(t) => match unify_trial(&t, &arm_ty, infer, spans[expr]) {
                         Ok(()) => infer.resolve_deep(&t),
                         Err(_) => Type::Dyn,
                     },

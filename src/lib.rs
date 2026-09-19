@@ -2874,4 +2874,121 @@ mod tests {
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("type mismatch"), "unexpected message: {}", err.0);
     }
+
+    // --- Final whole-branch review regressions (found after all 7 tasks
+    // landed -- each is a valid program that worked before this whole
+    // feature and broke after, invisible to any single task's own
+    // scoped review because each needs a LATER task's own change to
+    // become reachable) ---
+
+    #[test]
+    fn coercing_a_dyn_sourced_higher_order_value_does_not_panic() {
+        // Regression: Task 4's own param_ty_resolved fix (Expr::App's
+        // Type::Fun arm) hands coerce a REAL, resolved Fun(Var, _, Var)
+        // shape once a callee's own parameter position has been learned
+        // via unification -- coerce's own Type::Fun branch of
+        // build_boundary_check recurses into wrap_fun_contract, which
+        // recurses again for the return type, landing on a bare
+        // Type::Var. build_boundary_check's own Type::Var arm was still
+        // `unreachable!()` (a leftover from when Type::Var could never
+        // reach this deep, before real unification existed) -- so this
+        // program made the typechecker itself PANIC, not just reject.
+        let src = r#"
+            let apply = fun f -> fun x -> f(x) in
+            let d: Dyn = fun n: Int -> n + 1 in
+            apply(d)(5)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 6);
+    }
+
+    #[test]
+    fn tuple_destructuring_through_an_unannotated_parameter_still_works() {
+        // Regression: Pattern::List is ALSO renno's tuple pattern
+        // (`(a, b)` desugars to it) -- bind_pattern_vars's own
+        // Type::Var(_) arm used to force an unconstrained scrutinee into
+        // a List shape (indistinguishable from "this IS a list
+        // pattern"), which is simply the wrong guess whenever the
+        // pattern is actually destructuring a tuple, and unrecoverable
+        // once made (infer.subst never shrinks). An actual List-shaped
+        // scrutinee still gets its real correlation via Cons's own arm.
+        let src = r#"let fst = fun p -> match p | (a, b) -> a | _ -> 0 in fst((1, 2))"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 1);
+    }
+
+    #[test]
+    fn a_failed_tolerant_unify_does_not_leak_partial_bindings_if() {
+        // Regression: unify() mutates infer.subst as it recurses with no
+        // rollback -- unifying Tuple([Var(x), Int]) against
+        // Tuple([Str, Bool]) binds x := Str at position 0, THEN fails at
+        // position 1. Expr::If's own fallback-to-Dyn correctly catches
+        // the overall Err and widens the IF's own result to Dyn, exactly
+        // as the Global Constraint requires -- but x itself was already,
+        // permanently bound to Str by the failed attempt, so the
+        // rejection just relocates to x's own later use. A compound
+        // (non-scalar) mismatch is essential here: a scalar mismatch
+        // (e.g. `if _ then 1 else true`) fails on unify's very FIRST
+        // comparison, making zero bindings, and can never exercise this.
+        let src = r#"let g = fun x -> if 1 < 2 then (x, 1) else ("s", true) in g(5)"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[5, 1]");
+    }
+
+    #[test]
+    fn a_failed_tolerant_unify_does_not_leak_partial_bindings_match() {
+        // Same bug as the If-shaped test above, Match's own cross-arm
+        // combination specifically -- a separate code edit from If's, in
+        // this same task (Task 6), must not be accidentally missed.
+        let src = r#"let g = fun x -> match 1 | 1 -> (x, 1) | _ -> ("s", true) in g(5)"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[5, 1]");
+    }
+
+    #[test]
+    fn a_failed_tolerant_unify_does_not_leak_partial_bindings_listlit() {
+        // Same bug, ListLit's own element combination.
+        let src = r#"let x = 5 in [(x, 1), ("s", true)]"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[[5, 1], [s, true]]");
+    }
+
+    #[test]
+    fn calling_the_same_inferred_callback_twice_at_a_wider_type_still_widens() {
+        // Regression: Expr::App dispatched on the UNRESOLVED f_ty read
+        // straight out of Ctx -- if an earlier call already bound f's
+        // own type variable to a concrete Fun, a later call still saw
+        // the raw, syntactically-unresolved Type::Var and took the
+        // Type::Var(_) arm (no coerce() at all, so no width-subtyping
+        // tolerance) instead of the Type::Fun arm's own subtyping-aware
+        // handling.
+        let src = r#"
+            let g = fun f ->
+                let a = f({x: 1}) in
+                f({x: 1, y: 2})
+            in g(fun r: {x: Int} -> r.x)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 1);
+    }
+
+    #[test]
+    fn calling_an_inferred_parameter_learned_to_be_non_int_is_a_static_rejection() {
+        // Companion to the resolve-before-dispatch fix above: once a
+        // callee's own type variable is bound (here, to Int, via the
+        // App's own Type::Var(_) arm learning it from f(1)), a LATER,
+        // clearly-incompatible call site is now correctly caught
+        // STATICALLY (via the Type::Fun arm's own coerce/consistent
+        // check) instead of reaching a raw, un-typed runtime panic.
+        let src = r#"let g = fun f -> f(1) in g(5)"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("type mismatch"), "unexpected message: {}", err.0);
+    }
 }
