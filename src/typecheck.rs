@@ -87,7 +87,7 @@ fn free_row_vars(ty: &Type) -> BTreeSet<String> {
         Type::List(elem) => free_row_vars(elem),
         Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(free_row_vars).collect(),
         Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_row_vars(t)).collect(),
-        Type::Dyn | Type::Int | Type::Bool | Type::Str | Type::Token(_) => BTreeSet::new(),
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) => BTreeSet::new(),
     }
 }
 
@@ -205,6 +205,26 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span) -> 
     Ok(build_boundary_check(arena, e, to))
 }
 
+// Like `coerce`, but the target is "Int or Float" rather than one fixed
+// type -- Add/Sub/Mul/Div/Mod/Lt's own operand check. Kept separate from
+// the general coerce()/consistent() machinery ON PURPOSE: Int and Float
+// stay mutually INCONSISTENT everywhere else in the type system (a
+// [Float]-annotated parameter still statically rejects a [Int] argument,
+// a Fun's declared Int parameter still rejects a Float argument, etc.) --
+// only these specific operators treat the two as interchangeable, so this
+// local helper is where that interchangeability lives. Building the
+// actual Dyn-boundary runtime check by reaching into build_boundary_check
+// with an ad-hoc Union([Int, Float]) is safe reuse despite that: it only
+// asks "does this runtime value look like one of these shapes," which
+// carries no implication for consistent() or any other static check.
+fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span) -> Result<ExprRef, TypeError> {
+    match ty {
+        Type::Int | Type::Float => Ok(e),
+        Type::Dyn => Ok(build_boundary_check(arena, e, &Type::Union(Rc::new(vec![Type::Int, Type::Float])))),
+        other => Err(TypeError(format!("type mismatch: expected Int or Float, found {other}"), span)),
+    }
+}
+
 // Builds the actual runtime check for a definitely-Dyn-origin value
 // against concrete target type `to` -- shared between coerce's own
 // Dyn-to-concrete crossings and wrap_fun_contract's return-type check (a
@@ -227,6 +247,7 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span) -> 
 fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type) -> ExprRef {
     match to {
         Type::Int => build_shallow_check(arena, e, to, "is_int"),
+        Type::Float => build_shallow_check(arena, e, to, "is_float"),
         Type::Bool => build_shallow_check(arena, e, to, "is_bool"),
         Type::Str => build_shallow_check(arena, e, to, "is_str"),
         Type::List(_) => build_shallow_check(arena, e, to, "is_list"),
@@ -279,6 +300,7 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type) -> Ex
     match ty {
         Type::Dyn => arena.push(Expr::Bool(true)),
         Type::Int => build_predicate_call(arena, "is_int", value_ref),
+        Type::Float => build_predicate_call(arena, "is_float", value_ref),
         Type::Bool => build_predicate_call(arena, "is_bool", value_ref),
         Type::Str => build_predicate_call(arena, "is_str", value_ref),
         Type::List(_) => build_predicate_call(arena, "is_list", value_ref),
@@ -926,6 +948,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
     let node = arena[expr].clone();
     match node {
         Expr::Int(_) => Ok((Type::Int, EffectRow::pure(), expr)),
+        Expr::Float(_) => Ok((Type::Float, EffectRow::pure(), expr)),
         Expr::Bool(_) => Ok((Type::Bool, EffectRow::pure(), expr)),
         Expr::Str(_) => Ok((Type::Str, EffectRow::pure(), expr)),
         // A singleton per source position -- see Expr::Token's own doc
@@ -1069,21 +1092,45 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap) 
             let (r_ty, r_row, r2) = elaborate(arena, r, ctx, spans)?;
             let row = EffectRow::union(&l_row, &r_row);
             match op {
-                // Arithmetic and ordering: both operands must be Int.
+                // Arithmetic and ordering: both operands must be Int or
+                // Float (mixing promotes to Float) -- see coerce_numeric's
+                // own doc comment for why this stays a local special case
+                // rather than a general Int<->Float consistent() rule.
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Lt => {
-                    let l3 = coerce(arena, l2, &l_ty, &Type::Int, spans[l])?;
-                    let r3 = coerce(arena, r2, &r_ty, &Type::Int, spans[r])?;
-                    let result_ty = if op == BinOp::Lt { Type::Bool } else { Type::Int };
+                    let l3 = coerce_numeric(arena, l2, &l_ty, spans[l])?;
+                    let r3 = coerce_numeric(arena, r2, &r_ty, spans[r])?;
+                    // Both concretely Int: stays Int, exactly like before
+                    // Float existed (Div/Mod's truncating semantics are
+                    // untouched). Either side concretely Float: the OTHER
+                    // side promotes to Float at runtime no matter what it
+                    // turns out to be (even a Dyn side that's actually an
+                    // Int), so Float is knowable here regardless. Anything
+                    // else (some Dyn side, no concrete Float forcing
+                    // promotion) can't be known until runtime.
+                    let numeric_result = match (&l_ty, &r_ty) {
+                        (Type::Float, _) | (_, Type::Float) => Type::Float,
+                        (Type::Int, Type::Int) => Type::Int,
+                        _ => Type::Dyn,
+                    };
+                    let result_ty = if op == BinOp::Lt { Type::Bool } else { numeric_result };
                     Ok((result_ty, row, arena.push(Expr::BinOp(op, l3, r3))))
                 }
                 // Equality: operands just need to be consistent with EACH
                 // OTHER, not both forced to Int -- `true == false` is a
-                // real comparison. If one side is Dyn and the other
-                // concrete, coerce the Dyn side to the concrete side's
-                // type so the runtime value at least has a known tag;
-                // apply_binop compares by matching Value variants.
+                // real comparison. Int/Float is the one extra pairing
+                // allowed here beyond plain consistent() (numeric_pair) --
+                // deliberately narrow to this direct concrete-vs-concrete
+                // comparison, NOT extended to a Dyn side: a Dyn value
+                // still has to match the OTHER side's actual concrete
+                // shape exactly to compare at all (unchanged from before
+                // Float existed), same as it already required for Int.
+                // If one side is Dyn and the other concrete, coerce the
+                // Dyn side to the concrete side's type so the runtime
+                // value at least has a known tag; apply_binop compares by
+                // matching Value variants.
                 BinOp::Eq => {
-                    if !consistent(&l_ty, &r_ty) {
+                    let numeric_pair = matches!(l_ty, Type::Int | Type::Float) && matches!(r_ty, Type::Int | Type::Float);
+                    if !numeric_pair && !consistent(&l_ty, &r_ty) {
                         return Err(TypeError(
                             format!("type mismatch: cannot compare {l_ty} with {r_ty}"),
                             spans[expr],

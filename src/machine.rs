@@ -98,6 +98,7 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                 }
                 match &arena[expr] {
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
+                Expr::Float(x) => control = Control::Apply(Value::Float(*x)),
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
                 Expr::Str(s) => control = Control::Apply(Value::Str(Rc::from(s.as_str()))),
                 Expr::Token(id) => control = Control::Apply(Value::Token(*id)),
@@ -492,29 +493,59 @@ fn combine_spans(a: Option<Span>, b: Option<Span>) -> Option<Span> {
     }
 }
 
-// Only touches CURRENT_SPAN on the FAILING path (never on a successful
-// as_int()) -- setting it unconditionally would clobber whatever the last
-// real Eval left behind with this operand's own span even when this
-// operand is perfectly fine, which is wrong the moment `span` itself is
-// None (an elaborated, Check-wrapped Dyn operand has no span of its own
-// in `spans` -- see combine_spans's doc comment -- so the CORRECT blame
-// for a later failure is exactly "whatever Eval ran last", which this
-// must not overwrite on the way there). So e.g. `true + 1` blames `true`
-// specifically, not `1` (the last thing Eval'd before this call, and not
-// at fault here) -- and `10 / y` with `y` a Dyn-sourced 0 blames `y` via
-// that same untouched last-Eval fallback, not `10`. Delegates the actual
-// Int extraction (and its panic message) entirely to Value::as_int() --
-// only the shape check ahead of it is duplicated, so there's exactly one
-// place that knows how to pull an i64 out of a Value.
-fn as_int_at(v: &Value, span: Option<Span>) -> i64 {
-    if !matches!(v, Value::Int(_)) {
-        set_current_span(span);
-    }
-    v.as_int()
+// Int or Float, for Add/Sub/Mul/Div/Mod/Lt's own runtime promotion --
+// typecheck::coerce_numeric only ever lets an Int/Float/checked-Dyn
+// operand reach here (see its own doc comment), so the two variants here
+// are the only shapes apply_binop's arithmetic arms ever actually see;
+// anything else is a genuinely Dyn-sourced value whose runtime shape
+// disagreed with what the boundary check demanded, and as_num_at's own
+// fallback arm panics for it.
+//
+// as_num_at only touches CURRENT_SPAN on the FAILING path (never on a
+// successful match) -- setting it unconditionally would clobber whatever
+// the last real Eval left behind with this operand's own span even when
+// this operand is perfectly fine, which is wrong the moment `span` itself
+// is None (an elaborated, Check-wrapped Dyn operand has no span of its
+// own in `spans` -- see combine_spans's doc comment -- so the CORRECT
+// blame for a later failure is exactly "whatever Eval ran last", which
+// this must not overwrite on the way there). So e.g. `true + 1` blames
+// `true` specifically, not `1` (the last thing Eval'd before this call,
+// and not at fault here) -- and `10 / y` with `y` a Dyn-sourced 0 blames
+// `y` via that same untouched last-Eval fallback, not `10`.
+enum Num {
+    Int(i64),
+    Float(f64),
 }
 
-// Add/Sub/Mul/Div/Mod/Lt are Int-only -- wrong operand type panics via
-// as_int_at(), which blames whichever operand's own span was passed in
+impl Num {
+    fn as_f64(&self) -> f64 {
+        match self {
+            Num::Int(n) => *n as f64,
+            Num::Float(x) => *x,
+        }
+    }
+}
+
+fn as_num_at(v: &Value, span: Option<Span>) -> Num {
+    match v {
+        Value::Int(n) => Num::Int(*n),
+        Value::Float(x) => Num::Float(*x),
+        _ => {
+            set_current_span(span);
+            panic!("expected a number")
+        }
+    }
+}
+
+// Add/Sub/Mul/Div/Mod/Lt are Int-or-Float (see typecheck::coerce_numeric)
+// -- both Int stays Int, exactly the same as before Float existed
+// (including Div/Mod's truncating semantics and their own division/
+// modulo-by-zero panics); either operand Float promotes the other to f64
+// and produces a Float result, with zero-divisor still an explicit panic
+// rather than IEEE754's own inf/NaN, so renno's "0 divisor is always a
+// hard error" story stays uniform across both numeric types instead of
+// quietly diverging for Float. A wrong operand type panics via
+// as_num_at(), which blames whichever operand's own span was passed in
 // (left evaluated, thus blamed, before right, matching apply_binop's
 // call sites below). Div/Mod-by-zero pass `r_span` -- it's always the
 // right operand that's zero, never a type question about either side --
@@ -526,7 +557,7 @@ fn as_int_at(v: &Value, span: Option<Span>) -> i64 {
 // divisor, just not the divisor's own span as a whole. Eq is structural: it compares whatever tags
 // the two values actually carry (typecheck.rs only requires the two
 // operand types to be consistent with each other, not both Int), so it
-// dispatches on Value directly instead of projecting through as_int_at(),
+// dispatches on Value directly instead of projecting through as_num_at(),
 // and never panics. Concat (++) and Cons (::) typecheck.rs statically
 // rejects when it can tell; a runtime panic here only fires for a
 // Dyn-sourced operand of the wrong tag, in which case the fallback arm
@@ -536,26 +567,56 @@ fn as_int_at(v: &Value, span: Option<Span>) -> i64 {
 // on Cons's `t` being the only operand `::` can ever blame).
 fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: Option<Span>) -> Value {
     match op {
-        BinOp::Add => Value::Int(as_int_at(&lhs, l_span) + as_int_at(&rhs, r_span)),
-        BinOp::Sub => Value::Int(as_int_at(&lhs, l_span) - as_int_at(&rhs, r_span)),
-        BinOp::Mul => Value::Int(as_int_at(&lhs, l_span) * as_int_at(&rhs, r_span)),
-        BinOp::Div => {
-            let (l, r) = (as_int_at(&lhs, l_span), as_int_at(&rhs, r_span));
-            if r == 0 {
-                set_current_span(r_span);
-                panic!("division by zero");
+        BinOp::Add => match (as_num_at(&lhs, l_span), as_num_at(&rhs, r_span)) {
+            (Num::Int(a), Num::Int(b)) => Value::Int(a + b),
+            (a, b) => Value::Float(a.as_f64() + b.as_f64()),
+        },
+        BinOp::Sub => match (as_num_at(&lhs, l_span), as_num_at(&rhs, r_span)) {
+            (Num::Int(a), Num::Int(b)) => Value::Int(a - b),
+            (a, b) => Value::Float(a.as_f64() - b.as_f64()),
+        },
+        BinOp::Mul => match (as_num_at(&lhs, l_span), as_num_at(&rhs, r_span)) {
+            (Num::Int(a), Num::Int(b)) => Value::Int(a * b),
+            (a, b) => Value::Float(a.as_f64() * b.as_f64()),
+        },
+        BinOp::Div => match (as_num_at(&lhs, l_span), as_num_at(&rhs, r_span)) {
+            (Num::Int(a), Num::Int(b)) => {
+                if b == 0 {
+                    set_current_span(r_span);
+                    panic!("division by zero");
+                }
+                Value::Int(a / b)
             }
-            Value::Int(l / r)
-        }
-        BinOp::Mod => {
-            let (l, r) = (as_int_at(&lhs, l_span), as_int_at(&rhs, r_span));
-            if r == 0 {
-                set_current_span(r_span);
-                panic!("modulo by zero");
+            (a, b) => {
+                let b = b.as_f64();
+                if b == 0.0 {
+                    set_current_span(r_span);
+                    panic!("division by zero");
+                }
+                Value::Float(a.as_f64() / b)
             }
-            Value::Int(l % r)
-        }
-        BinOp::Lt => Value::Bool(as_int_at(&lhs, l_span) < as_int_at(&rhs, r_span)),
+        },
+        BinOp::Mod => match (as_num_at(&lhs, l_span), as_num_at(&rhs, r_span)) {
+            (Num::Int(a), Num::Int(b)) => {
+                if b == 0 {
+                    set_current_span(r_span);
+                    panic!("modulo by zero");
+                }
+                Value::Int(a % b)
+            }
+            (a, b) => {
+                let b = b.as_f64();
+                if b == 0.0 {
+                    set_current_span(r_span);
+                    panic!("modulo by zero");
+                }
+                Value::Float(a.as_f64() % b)
+            }
+        },
+        BinOp::Lt => match (as_num_at(&lhs, l_span), as_num_at(&rhs, r_span)) {
+            (Num::Int(a), Num::Int(b)) => Value::Bool(a < b),
+            (a, b) => Value::Bool(a.as_f64() < b.as_f64()),
+        },
         BinOp::Eq => Value::Bool(value_eq(&lhs, &rhs)),
         BinOp::Concat => match (&lhs, &rhs) {
             (Value::Str(a), Value::Str(b)) => Value::Str(Rc::from(format!("{a}{b}"))),
@@ -639,6 +700,7 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             }
         }
         Builtin::IsInt => Value::Bool(matches!(args.pop(), Some(Value::Int(_)))),
+        Builtin::IsFloat => Value::Bool(matches!(args.pop(), Some(Value::Float(_)))),
         Builtin::IsBool => Value::Bool(matches!(args.pop(), Some(Value::Bool(_)))),
         Builtin::IsStr => Value::Bool(matches!(args.pop(), Some(Value::Str(_)))),
         Builtin::IsList => Value::Bool(matches!(args.pop(), Some(Value::List(_)))),
@@ -914,6 +976,13 @@ fn match_pattern(pat: &Pattern, value: &Value, env: Env) -> Option<Env> {
 fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        // Cross-type: `1 == 1.0` -- typecheck.rs's own Eq arm allows this
+        // ONE extra pairing beyond its usual same-type-or-Dyn rule (see
+        // its own numeric_pair comment), so this has to actually agree
+        // with a real comparison, not just "false, different tags" the
+        // way e.g. Int vs Str would be if it ever reached here.
+        (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => *x as f64 == *y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Token(x), Value::Token(y)) => x == y,

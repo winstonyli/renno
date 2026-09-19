@@ -68,19 +68,29 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
-    // Integer division, truncating toward zero (Rust's own `/` on i64) --
-    // dividing by zero panics at runtime (apply_binop), same as any other
-    // Dyn-sourced-value mismatch this interpreter can't rule out statically.
+    // Int/Int truncates toward zero (Rust's own `/` on i64); Float/Float
+    // (or a mix, promoting the Int side) is real division -- see types::
+    // Type::Float's own doc comment. Dividing by zero panics at runtime
+    // (apply_binop) for BOTH numeric types, not just Int -- deliberately
+    // not IEEE754 inf/NaN for the Float case, so "0 divisor is a hard
+    // error" stays one uniform story instead of quietly diverging by type.
     Div,
     // Remainder, truncating toward zero same as Div (Rust's own `%` on
-    // i64) -- so `-7 % 2` is `-1`, not `1`. Same zero-divisor panic as Div.
+    // both i64 and f64) -- so `-7 % 2` is `-1`, not `1`. Same zero-divisor
+    // panic as Div, same Int/Float promotion story.
     Mod,
     Eq,
     Lt,
     // `++`: Str++Str or List++List. Kept separate from Add rather than
-    // overloading `+` (Python/JS-style) -- simpler and lower-risk than
-    // generalizing Add's existing Int-only typecheck arm; revisit if `+`
-    // overloading turns out to read better in practice.
+    // overloading `+` (Python/JS-style) across Str/List -- Add/Sub/Mul/
+    // Div/Mod/Lt DID end up overloaded across Int/Float (see types::
+    // Type::Float's own doc comment, and typecheck::coerce_numeric), so
+    // this comment's own "revisit if + overloading turns out to read
+    // better in practice" already got revisited once, for numerics
+    // specifically -- Concat stays its own operator regardless: Str/List
+    // concatenation and Int/Float arithmetic aren't the same question,
+    // and generalizing Add across Str/List would still mean the exact
+    // ambiguity-with-numeric-`+` this operator exists to avoid.
     Concat,
     // `h :: t`: prepend h onto list t, producing a new list. The mirror
     // image of Pattern::Cons, which only DEstructures -- until now there
@@ -94,6 +104,10 @@ pub enum BinOp {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64),
+    // A second numeric literal kind, distinct from Int -- see types::
+    // Type::Float's own doc comment for how far the Int/Float interop
+    // goes (arithmetic operators only, not general type consistency).
+    Float(f64),
     Bool(bool),
     Str(String),
     // A literal Value::Token(u64), unique per SOURCE POSITION (this u64

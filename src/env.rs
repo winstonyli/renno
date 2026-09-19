@@ -22,6 +22,7 @@ impl PList<Value> {
             // desugaring (see its own doc comment) -- ordinary prelude
             // builtins, not hidden, the same way `fail` already isn't.
             .bind("is_int", Value::Builtin(Builtin::IsInt))
+            .bind("is_float", Value::Builtin(Builtin::IsFloat))
             .bind("is_bool", Value::Builtin(Builtin::IsBool))
             .bind("is_str", Value::Builtin(Builtin::IsStr))
             .bind("is_list", Value::Builtin(Builtin::IsList))

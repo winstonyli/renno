@@ -81,6 +81,11 @@ pub enum Builtin {
     // PartialBuiltin), the same shallow "is it callable at all" question
     // Value::matches_type's own Fun arm used to answer.
     IsInt,
+    // Dyn -> Bool. Float's own tag test, same story as IsInt -- used both
+    // directly (a `Float`-annotated Dyn boundary) and as one half of the
+    // numeric Union check typecheck::coerce_numeric builds for Add/Sub/
+    // Mul/Div/Mod/Lt's own Dyn operands.
+    IsFloat,
     IsBool,
     IsStr,
     IsList,
@@ -160,6 +165,7 @@ impl Builtin {
             | Builtin::Len
             | Builtin::Fail
             | Builtin::IsInt
+            | Builtin::IsFloat
             | Builtin::IsBool
             | Builtin::IsStr
             | Builtin::IsList
@@ -188,6 +194,12 @@ impl Builtin {
 #[derive(Clone)]
 pub enum Value {
     Int(i64),
+    // See types::Type::Float's own doc comment -- a distinct numeric kind
+    // from Int, not silently unified with it at this representation
+    // level either; apply_binop is the one place that reaches across the
+    // two (promoting an Int operand to f64 whenever the other operand is
+    // Float).
+    Float(f64),
     Bool(bool),
     Str(Rc<str>),
     // What an `opaque` expression evaluates to -- a DISTINCT kind from
@@ -245,6 +257,13 @@ impl Value {
         }
     }
 
+    pub fn as_float(&self) -> f64 {
+        match self {
+            Value::Float(x) => *x,
+            _ => panic!("expected float"),
+        }
+    }
+
     pub fn as_bool(&self) -> bool {
         match self {
             Value::Bool(b) => *b,
@@ -262,6 +281,7 @@ impl Value {
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Int(_) => "Int",
+            Value::Float(_) => "Float",
             Value::Bool(_) => "Bool",
             Value::Str(_) => "Str",
             Value::Token(_) => "Token",
@@ -277,6 +297,13 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Value::Int(n) => write!(f, "{n}"),
+            // Always at least one decimal digit -- Rust's own f64 Display
+            // prints a whole number like 4.0 as bare "4", which would be
+            // indistinguishable from Value::Int(4)'s own output. Only
+            // forced for the whole-number case; 3.14 still prints as
+            // "3.14" via the ordinary `{n}` path, not truncated to "3.1".
+            Value::Float(n) if n.fract() == 0.0 && n.is_finite() => write!(f, "{n:.1}"),
+            Value::Float(n) => write!(f, "{n}"),
             Value::Bool(b) => write!(f, "{b}"),
             Value::Str(s) => write!(f, "{s}"),
             // Never the numeric id -- that would leak a meaningless
@@ -328,6 +355,7 @@ impl fmt::Display for Value {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     Int(i64),
+    Float(f64),
     Bool(bool),
     Str(String),
     // Mirrors Value::Token -- see its own doc comment.
@@ -359,6 +387,7 @@ impl From<&Value> for Outcome {
     fn from(v: &Value) -> Outcome {
         match v {
             Value::Int(n) => Outcome::Int(*n),
+            Value::Float(n) => Outcome::Float(*n),
             Value::Bool(b) => Outcome::Bool(*b),
             Value::Str(s) => Outcome::Str(s.to_string()),
             Value::Token(_) => Outcome::Token,
@@ -388,6 +417,9 @@ impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Outcome::Int(n) => write!(f, "{n}"),
+            // Same whole-number formatting as Value::Float's own Display arm.
+            Outcome::Float(n) if n.fract() == 0.0 && n.is_finite() => write!(f, "{n:.1}"),
+            Outcome::Float(n) => write!(f, "{n}"),
             Outcome::Bool(b) => write!(f, "{b}"),
             Outcome::Str(s) => write!(f, "{s}"),
             Outcome::Token => write!(f, "<brand>"),

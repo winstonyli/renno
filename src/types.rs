@@ -8,6 +8,16 @@ use crate::util::find_field;
 pub enum Type {
     Dyn,
     Int,
+    // A second, DISTINCT numeric type from Int -- not generally consistent
+    // with it (types::consistent has no Int<->Float arm; a [Float]-
+    // annotated parameter still statically rejects a [Int] argument, same
+    // as any other two concrete types). Int/Float interop lives ONLY in
+    // typecheck::elaborate's own arithmetic BinOp arm (Add/Sub/Mul/Div/
+    // Mod/Lt/Eq), via a local coerce_numeric helper that never touches
+    // this general relation -- deliberately narrow, so this new type
+    // can't quietly widen unrelated Tuple/Record/List/Fun consistency
+    // checks elsewhere in the checker.
+    Float,
     Bool,
     Str,
     // Element type. renno's List is a native primitive (Value::List,
@@ -161,6 +171,10 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
     match (a, b) {
         (Type::Dyn, _) | (_, Type::Dyn) => true,
         (Type::Int, Type::Int) => true,
+        // Deliberately NOT (Type::Int, Type::Float) => true -- see
+        // Type::Float's own doc comment on why that interop stays local
+        // to the arithmetic operators, not this general relation.
+        (Type::Float, Type::Float) => true,
         (Type::Bool, Type::Bool) => true,
         (Type::Str, Type::Str) => true,
         (Type::List(a), Type::List(b)) => consistent(a, b),
@@ -245,6 +259,7 @@ impl fmt::Display for Type {
         match self {
             Type::Dyn => write!(f, "Dyn"),
             Type::Int => write!(f, "Int"),
+            Type::Float => write!(f, "Float"),
             Type::Bool => write!(f, "Bool"),
             Type::Str => write!(f, "Str"),
             Type::List(elem) => write!(f, "[{elem}]"),

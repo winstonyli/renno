@@ -120,6 +120,16 @@ pub enum Token {
     #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
     Int(i64),
 
+    // Digits required on BOTH sides of the dot -- no `3.`/`.5` -- so this
+    // never collides with Dot (`.field` access): `3.field` has no digit
+    // after the dot, so this regex simply doesn't match there and the
+    // lexer falls through to Int("3") + Dot + Ident("field") exactly as
+    // before Float existed. Where a number IS followed by digits after a
+    // dot, this regex is strictly longer than Int's own bare-digits match
+    // at the same position, so logos's longest-match rule prefers this.
+    #[regex(r"[0-9]+\.[0-9]+", |lex| lex.slice().parse::<f64>().ok())]
+    Float(f64),
+
     // `"..."` with a small set of escapes (\" \\ \n \t). Slice includes
     // the surrounding quotes; unescape() strips them and processes escapes.
     #[regex(r#""([^"\\]|\\.)*""#, |lex| unescape(lex.slice()))]

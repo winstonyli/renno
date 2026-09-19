@@ -95,7 +95,7 @@ mod tests {
     fn contains_check(arena: &expr::Arena, root: expr::ExprRef) -> bool {
         use expr::Expr;
         match &arena[root] {
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
             Expr::ListLit(items) | Expr::Tuple(items) => items.iter().any(|i| contains_check(arena, *i)),
             Expr::Lambda(_, _, body) => contains_check(arena, *body),
             Expr::App(f, a) => contains_check(arena, *f) || contains_check(arena, *a),
@@ -220,7 +220,7 @@ mod tests {
     fn minus_rejects_non_int_operand_statically() {
         let (mut arena, spans, root) = parser::parse("true - 1").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("expected Int, found Bool"), "unexpected message: {}", err.0);
+        assert!(err.0.contains("expected Int or Float, found Bool"), "unexpected message: {}", err.0);
     }
 
     #[test]
@@ -246,7 +246,7 @@ mod tests {
     fn mul_rejects_non_int_operand_statically() {
         let (mut arena, spans, root) = parser::parse("true * 1").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("expected Int, found Bool"), "unexpected message: {}", err.0);
+        assert!(err.0.contains("expected Int or Float, found Bool"), "unexpected message: {}", err.0);
     }
 
     #[test]
@@ -265,6 +265,107 @@ mod tests {
     #[should_panic(expected = "modulo by zero")]
     fn modulo_by_zero_panics() {
         run_untyped("5 % 0");
+    }
+
+    // --- floats ---
+
+    #[test]
+    fn int_int_arithmetic_stays_int() {
+        // Regression guard for the overload: two concrete Ints must still
+        // produce an Int result (and Div/Mod must still truncate, and
+        // Display must still print bare "2" not "2.0"), not silently
+        // drift to Float now that the operators are shared.
+        assert_eq!(run_untyped("7 / 2").as_int(), 3);
+        assert_eq!(run_untyped("1 + 1").to_string(), "2");
+    }
+
+    #[test]
+    fn float_arithmetic_and_mixed_promotion() {
+        assert_eq!(run_untyped("1.5 + 2.5").as_float(), 4.0);
+        assert_eq!(run_untyped("3 + 1.5").as_float(), 4.5);
+        assert_eq!(run_untyped("1.5 + 3").as_float(), 4.5);
+        assert_eq!(run_untyped("7.0 / 2.0").as_float(), 3.5);
+    }
+
+    #[test]
+    fn float_display_always_shows_a_decimal_point() {
+        // 4.0 must print as "4.0", not bare "4" -- otherwise it'd be
+        // indistinguishable from Value::Int(4)'s own Display output.
+        assert_eq!(run_untyped("1.5 + 2.5").to_string(), "4.0");
+        assert_eq!(run_untyped("3.14").to_string(), "3.14");
+    }
+
+    #[test]
+    fn unary_minus_works_on_floats() {
+        assert_eq!(run_untyped("-3.5 + 1.0").as_float(), -2.5);
+    }
+
+    #[test]
+    fn lt_and_eq_compare_across_int_and_float() {
+        assert!(run_untyped("1.5 < 2").as_bool());
+        assert!(run_untyped("1 == 1.0").as_bool());
+        assert!(!run_untyped("1 == 1.5").as_bool());
+    }
+
+    #[test]
+    fn is_int_and_is_float_are_mutually_exclusive() {
+        assert_eq!(run_untyped("(is_int(1.5), is_float(1.5), is_int(1), is_float(1))").to_string(), "[false, true, true, false]");
+    }
+
+    #[test]
+    #[should_panic(expected = "division by zero")]
+    fn float_division_by_zero_panics_same_as_int() {
+        // Deliberately NOT IEEE754 inf/NaN -- renno's "0 divisor is
+        // always a hard error" story stays uniform across both numeric
+        // types instead of quietly diverging for Float.
+        run_untyped("1.0 / 0.0");
+    }
+
+    #[test]
+    fn add_still_rejects_non_numeric_operand_statically() {
+        let (mut arena, spans, root) = parser::parse("true + 1.5").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected Int or Float, found Bool"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn int_and_float_stay_mutually_rejecting_outside_arithmetic() {
+        // The overload is scoped to the arithmetic/comparison operators
+        // only (typecheck::coerce_numeric) -- general type consistency
+        // must NOT have been broadened alongside it, so an Int-vs-Float
+        // mismatch at an ordinary annotation boundary still statically
+        // rejects in both directions, same as any other two concrete
+        // types would.
+        let (mut arena, spans, root) = parser::parse("let f = fun x: Float -> x in f(2)").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected Float, found Int"), "unexpected message: {}", err.0);
+
+        let (mut arena, spans, root) = parser::parse("let f = fun x: Int -> x in f(2.5)").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected Int, found Float"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn dyn_sourced_value_can_cross_into_an_arithmetic_position() {
+        let src = r#"
+            handle
+              let y = perform choose(0) in
+              y + 1.5
+            with handler choose(p, resume) -> resume(1)
+        "#;
+        assert_eq!(run_source(src).unwrap().to_string(), "2.5");
+    }
+
+    #[test]
+    fn dyn_sourced_non_numeric_value_is_rejected_at_the_arithmetic_boundary() {
+        let src = r#"
+            handle
+              let y = perform choose(0) in
+              y + 1.5
+            with handler choose(p, resume) -> resume(true)
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected Int | Float, found Bool"), "unexpected message: {err}");
     }
 
     #[test]

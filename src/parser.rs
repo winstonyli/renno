@@ -196,7 +196,7 @@ impl<'a> Parser<'a> {
     // practice.
     fn contains_perform(arena: &Arena, e: ExprRef) -> bool {
         match &arena[e] {
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
             Expr::Perform(_, _) => true,
             Expr::Tuple(items) | Expr::ListLit(items) => items.iter().any(|i| Self::contains_perform(arena, *i)),
             Expr::Record(fields) => fields.iter().any(|(_, v)| Self::contains_perform(arena, *v)),
@@ -456,7 +456,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // The four builtin type names. Not reserved lexer keywords (unlike
+    // The five builtin type names. Not reserved lexer keywords (unlike
     // If/Let/Fun/...) since they're only ever meaningful inside a type
     // position -- resolved contextually right here instead, which is what
     // keeps them available as ordinary identifiers (`let Int = 5 in ...`)
@@ -466,6 +466,7 @@ impl<'a> Parser<'a> {
     fn builtin_type(name: &str) -> Option<Type> {
         match name {
             "Int" => Some(Type::Int),
+            "Float" => Some(Type::Float),
             "Bool" => Some(Type::Bool),
             "Str" => Some(Type::Str),
             "Dyn" => Some(Type::Dyn),
@@ -853,6 +854,7 @@ impl<'a> Parser<'a> {
         matches!(
             tok,
             Token::Int(_)
+                | Token::Float(_)
                 | Token::True
                 | Token::False
                 | Token::Str(_)
@@ -1079,6 +1081,7 @@ impl<'a> Parser<'a> {
         let start = self.span_at().start;
         match self.bump() {
             Some(Token::Int(n)) => Ok(self.push_spanned(Expr::Int(n), Span { start, end: self.span_before().end })),
+            Some(Token::Float(x)) => Ok(self.push_spanned(Expr::Float(x), Span { start, end: self.span_before().end })),
             Some(Token::True) => {
                 Ok(self.push_spanned(Expr::Bool(true), Span { start, end: self.span_before().end }))
             }
