@@ -3436,4 +3436,30 @@ mod tests {
         let result = typecheck::check_with_named_types(&mut arena, root, &spans, named_types);
         assert!(result.is_err(), "a List pattern can never match an Int-or-A scrutinee");
     }
+
+    #[test]
+    fn a_non_recursive_alias_still_produces_no_registry_entries() {
+        let src = r#"
+            type Pair = (Int, Int) in
+            type Triple = (Int, Int, Int) in
+            5
+        "#;
+        let (_, _, _, named_types) = parser::parse_with_named_types(src).unwrap();
+        assert!(named_types.is_empty(), "non-recursive aliases must never populate the registry, got {named_types:?}");
+    }
+
+    #[test]
+    fn two_different_named_types_are_never_interchangeable_even_if_isomorphic() {
+        // Two SEPARATE recursive aliases with IDENTICAL structure --
+        // nominal comparison means they're still not interchangeable.
+        let src = r#"
+            type IntList = (Int, IntList) | Bool in
+            type OtherIntList = (Int, OtherIntList) | Bool in
+            let f = fun xs: IntList -> xs in
+            let make_other: (Dyn -> OtherIntList) = fun _ -> (1, (2, opaque)) in
+            f(make_other(opaque))
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("type mismatch"), "unexpected message: {err}");
+    }
 }
