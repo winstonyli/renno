@@ -2532,4 +2532,37 @@ mod tests {
         }
         drop(chain);
     }
+
+    #[test]
+    fn unannotated_lambda_param_still_works_arithmetically() {
+        // Regression: x is now Type::Var by default (not Type::Dyn) --
+        // coerce_numeric needs its own Type::Var arm or this newly,
+        // wrongly rejects statically the moment the default changes.
+        let src = "let f = fun x -> x + 1 in f(5)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 6);
+    }
+
+    #[test]
+    fn unannotated_lambda_param_still_supports_field_access() {
+        // Same root cause, FieldAccess's own target-type match.
+        let src = "let f = fun r -> r.x in f({x: 5})";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 5);
+    }
+
+    #[test]
+    fn pattern_could_match_accepts_record_and_list_patterns_against_an_unconstrained_var() {
+        // Regression for a confirmed existing gap: pattern_could_match's
+        // explicit Type::Dyn arms for Record/List patterns had no
+        // Type::Var counterpart, so a Record/List pattern against an
+        // unannotated (now Type::Var) parameter would be wrongly,
+        // statically rejected as "can never match".
+        let src = r#"let get_x = fun r -> match r | {x: v} -> v in get_x({x: 5})"#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 5);
+    }
 }

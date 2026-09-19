@@ -625,7 +625,7 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span) -> 
 fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span) -> Result<ExprRef, TypeError> {
     match ty {
         Type::Int | Type::Float => Ok(e),
-        Type::Dyn => Ok(build_boundary_check(arena, e, &Type::Union(Rc::new(vec![Type::Int, Type::Float])))),
+        Type::Dyn | Type::Var(_) => Ok(build_boundary_check(arena, e, &Type::Union(Rc::new(vec![Type::Int, Type::Float])))),
         other => Err(TypeError(format!("type mismatch: expected Int or Float, found {other}"), span)),
     }
 }
@@ -1018,7 +1018,7 @@ fn pattern_could_match(pat: &Pattern, ty: &Type) -> bool {
             fields.iter().all(|(name, _)| find_field(type_fields, name).is_some())
         }
         (Pattern::Record(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt)),
-        (Pattern::Record(_), Type::Dyn) => true,
+        (Pattern::Record(_), Type::Dyn | Type::Var(_)) => true,
         (Pattern::Record(_), _) => false,
         // Same story as Record just above, for the same reason: a fixed-
         // length list pattern's own arity is real, provable information
@@ -1031,7 +1031,7 @@ fn pattern_could_match(pat: &Pattern, ty: &Type) -> bool {
         // type has no fixed arity to check a pattern's length against.
         (Pattern::List(subpats), Type::Tuple(items)) => subpats.len() == items.len(),
         (Pattern::List(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt)),
-        (Pattern::List(_), Type::Dyn) => true,
+        (Pattern::List(_), Type::Dyn | Type::Var(_)) => true,
         _ => consistent(ty, &pattern_type(pat)),
     }
 }
@@ -1159,6 +1159,14 @@ fn covers_tuple_position(pat: &Pattern, ty: &Type) -> bool {
 // with no catch-all, or a List match using only fixed-length patterns.
 fn missing_case(patterns: &[&Pattern], scrut_ty: &Type) -> Option<String> {
     if patterns.iter().copied().any(|p| matches!(p, Pattern::Var(_))) {
+        return None;
+    }
+
+    // Type::Var is an unconstrained type variable -- we can't know what
+    // values it might take, so we can't prove exhaustiveness is violated.
+    // Return None (exhaustive) to allow pattern matching on Type::Var
+    // without requiring a wildcard arm.
+    if matches!(scrut_ty, Type::Var(_)) {
         return None;
     }
 
@@ -1370,7 +1378,7 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
             Expr::LetRec(bindings, body) => {
                 let mut val_ctx = cur_ctx.clone();
                 for (name, ann, _) in bindings.iter() {
-                    val_ctx = extend(&val_ctx, name, ann.clone().unwrap_or(Type::Dyn));
+                    val_ctx = extend(&val_ctx, name, ann.clone().unwrap_or_else(|| infer.fresh_var(name)));
                 }
                 let mut elaborated = Vec::with_capacity(bindings.len());
                 let mut extra_type_vars_per_binding = Vec::with_capacity(bindings.len());
@@ -1400,7 +1408,7 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
                 cur_expr = body;
             }
             Expr::Lambda(param, ann, body) => {
-                let param_ty = ann.unwrap_or(Type::Dyn);
+                let param_ty = ann.unwrap_or_else(|| infer.fresh_var(&param));
                 cur_ctx = extend(&cur_ctx, &param, param_ty.clone());
                 pending.push(PendingElab::Fun { param, param_ty });
                 cur_expr = body;
@@ -1520,12 +1528,12 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         Expr::FieldAccess(target, name) => {
             let (target_ty, target_row, target2) = elaborate(arena, target, ctx, spans, infer)?;
             let field_ty = match &target_ty {
-                Type::Dyn => Type::Dyn,
+                Type::Dyn | Type::Var(_) => Type::Dyn,
                 ty if record_shaped(ty) => record_field_type(ty, &name)
                     .ok_or_else(|| TypeError(format!("no field named `{name}`"), spans[expr]))?,
                 other => return Err(TypeError(format!("expected a record, found {other}"), spans[target])),
             };
-            let checked_target = if target_ty == Type::Dyn {
+            let checked_target = if matches!(target_ty, Type::Dyn | Type::Var(_)) {
                 let required = Type::Record(Rc::new(vec![(name.clone(), Type::Dyn)]));
                 build_shape_check(arena, target2, &required)
             } else {
@@ -1583,7 +1591,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     let call_row2 = resolve_row(call_row, &row_subst);
                     (call_row2, ret_ty2, arena.push(Expr::App(f2, a3)))
                 }
-                Type::Dyn => {
+                Type::Dyn | Type::Var(_) => {
                     // Unknown callee: still route "is this even callable"
                     // through the same is_fun/fail desugaring
                     // build_shallow_check uses everywhere else, rather
