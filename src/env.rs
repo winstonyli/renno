@@ -35,6 +35,14 @@ impl PList<Value> {
             .bind("type_name", Value::Builtin(Builtin::TypeName))
             .bind("print", Value::Builtin(Builtin::Print))
             .bind("to_str", Value::Builtin(Builtin::ToStr))
+            .bind("filter", Value::Builtin(Builtin::Filter))
+            .bind("reverse", Value::Builtin(Builtin::Reverse))
+            .bind("zip", Value::Builtin(Builtin::Zip))
+            .bind("sort", Value::Builtin(Builtin::Sort))
+            .bind("range", Value::Builtin(Builtin::Range))
+            .bind("split", Value::Builtin(Builtin::Split))
+            .bind("join", Value::Builtin(Builtin::Join))
+            .bind("trim", Value::Builtin(Builtin::Trim))
     }
 
     pub fn lookup(&self, name: &str) -> Value {

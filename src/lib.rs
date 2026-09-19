@@ -1460,6 +1460,44 @@ mod tests {
         assert_eq!(run_untyped(src).to_string(), "[true, true, false, false]");
     }
 
+    // --- stdlib ---
+
+    #[test]
+    fn filter_keeps_elements_the_predicate_accepts() {
+        assert_eq!(run_untyped("filter(fun x -> x > 2)([1, 2, 3, 4])").to_string(), "[3, 4]");
+    }
+
+    #[test]
+    fn reverse_reverses_a_list() {
+        assert_eq!(run_untyped("reverse([1, 2, 3])").to_string(), "[3, 2, 1]");
+    }
+
+    #[test]
+    fn zip_pairs_elements_and_stops_at_the_shorter_list() {
+        assert_eq!(run_untyped(r#"zip([1, 2, 3])(["a", "b"])"#).to_string(), "[[1, a], [2, b]]");
+    }
+
+    #[test]
+    fn sort_orders_by_the_given_comparator() {
+        assert_eq!(run_untyped("sort(fun a -> fun b -> a <= b)([3, 1, 2])").to_string(), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn range_is_exclusive_of_its_end() {
+        assert_eq!(run_untyped("range(0)(5)").to_string(), "[0, 1, 2, 3, 4]");
+    }
+
+    #[test]
+    fn split_and_join_round_trip() {
+        assert_eq!(run_untyped(r#"split("a,b,c")(",")"#).to_string(), "[a, b, c]");
+        assert_eq!(run_untyped(r#"join(["a", "b", "c"])("-")"#).as_str(), "a-b-c");
+    }
+
+    #[test]
+    fn trim_strips_leading_and_trailing_whitespace() {
+        assert_eq!(run_untyped(r#"trim("  hi  ")"#).as_str(), "hi");
+    }
+
     #[test]
     fn to_str_renders_the_same_text_print_would() {
         // "x = " ++ to_str(x) is renno's string interpolation -- no

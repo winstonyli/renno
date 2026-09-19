@@ -111,6 +111,45 @@ pub enum Builtin {
     // interpolation]]), so this is the one piece those needed, not a
     // separate feature of its own.
     ToStr,
+    // (a -> Bool, [a]) -> [a]. Map's own structural sibling -- same
+    // callback-driven shape, same effect-handling caveat (see Map's own
+    // doc comment).
+    Filter,
+    // [a] -> [a]. Single-arg, unlike Filter/Map -- nothing to call back
+    // into, just an ordinary structural rebuild.
+    Reverse,
+    // ([a], [b]) -> [(a, b)]. Stops at the shorter list -- there's no
+    // renno-level Option/Result to pad the longer one out with, the same
+    // "no partial value to invent" story Get's out-of-range panic and
+    // GetField's missing-field panic already tell, just resolved by
+    // truncating instead of panicking since running out of pairs isn't a
+    // shape error the way indexing past the end is.
+    Zip,
+    // ((a, a) -> Bool, [a]) -> [a]. `cmp(x, y)` means "x belongs at or
+    // before y". Bool, not a three-way Ordering -- renno has no Ordering
+    // type, and Bool is the same contract every other renno-level
+    // predicate (Filter's own, map's callback) already uses. ponytail:
+    // dispatch_builtin's own Sort arm calls `cmp` up to twice per
+    // comparison (translating this Bool predicate into Rust's own
+    // Ordering for sort_by) -- upgrade to a single 3-way callback only if
+    // sort ever shows up in a profile; not worth an Ordering type for one
+    // builtin otherwise.
+    Sort,
+    // (Int, Int) -> [Int], exclusive of the end (`range(0, 3)` is
+    // `[0, 1, 2]`) -- same convention as Rust's own `0..3`, not `..=`.
+    Range,
+    // (Str, Str) -> [Str]: `split(s, sep)` -- subject first, same
+    // argument order as Get/HasField/GetField's own (subject, ...)
+    // convention. Splitting on "" is left to Rust's own str::split
+    // behavior (an empty-string separator, which yields the string cut
+    // between every char) rather than special-cased.
+    Split,
+    // ([Str], Str) -> Str: `join(parts, sep)` -- the inverse of Split,
+    // same subject-first argument order.
+    Join,
+    // Str -> Str: strips leading/trailing whitespace, same definition
+    // Rust's own str::trim uses (Unicode `White_Space`, not just ASCII).
+    Trim,
 }
 
 impl Builtin {
@@ -128,8 +167,19 @@ impl Builtin {
             | Builtin::IsRecord
             | Builtin::TypeName
             | Builtin::Print
-            | Builtin::ToStr => 1,
-            Builtin::Map | Builtin::Get | Builtin::HasField | Builtin::GetField => 2,
+            | Builtin::ToStr
+            | Builtin::Reverse
+            | Builtin::Trim => 1,
+            Builtin::Map
+            | Builtin::Get
+            | Builtin::HasField
+            | Builtin::GetField
+            | Builtin::Filter
+            | Builtin::Zip
+            | Builtin::Sort
+            | Builtin::Range
+            | Builtin::Split
+            | Builtin::Join => 2,
             Builtin::Fold => 3,
         }
     }

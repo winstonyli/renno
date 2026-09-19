@@ -726,6 +726,99 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 _ => panic!("fold expects a function, an initial value, and a list"),
             }
         }
+        Builtin::Filter => {
+            let (list, pred) = (args.pop(), args.pop());
+            match (pred, list) {
+                (Some(pred), Some(Value::List(items))) => {
+                    let filtered: Vec<Value> = items
+                        .iter()
+                        .filter(|v| apply(arena, pred.clone(), (*v).clone(), spans).as_bool())
+                        .cloned()
+                        .collect();
+                    Value::List(Rc::new(filtered))
+                }
+                _ => panic!("filter expects a function and a list"),
+            }
+        }
+        Builtin::Reverse => match args.pop() {
+            Some(Value::List(items)) => {
+                let mut items = (*items).clone();
+                items.reverse();
+                Value::List(Rc::new(items))
+            }
+            _ => panic!("reverse expects a list"),
+        },
+        Builtin::Zip => {
+            let (ys, xs) = (args.pop(), args.pop());
+            match (xs, ys) {
+                (Some(Value::List(xs)), Some(Value::List(ys))) => {
+                    let zipped: Vec<Value> = xs
+                        .iter()
+                        .zip(ys.iter())
+                        .map(|(a, b)| Value::List(Rc::new(vec![a.clone(), b.clone()])))
+                        .collect();
+                    Value::List(Rc::new(zipped))
+                }
+                _ => panic!("zip expects two lists"),
+            }
+        }
+        Builtin::Sort => {
+            let (list, cmp) = (args.pop(), args.pop());
+            match (cmp, list) {
+                (Some(cmp), Some(Value::List(items))) => {
+                    let mut items = (*items).clone();
+                    items.sort_by(|a, b| {
+                        let a_first = apply(arena, apply(arena, cmp.clone(), a.clone(), spans), b.clone(), spans).as_bool();
+                        if a_first {
+                            std::cmp::Ordering::Less
+                        } else if apply(arena, apply(arena, cmp.clone(), b.clone(), spans), a.clone(), spans).as_bool() {
+                            std::cmp::Ordering::Greater
+                        } else {
+                            std::cmp::Ordering::Equal
+                        }
+                    });
+                    Value::List(Rc::new(items))
+                }
+                _ => panic!("sort expects a comparator and a list"),
+            }
+        }
+        Builtin::Range => {
+            let (end, start) = (args.pop(), args.pop());
+            match (start, end) {
+                (Some(Value::Int(start)), Some(Value::Int(end))) => Value::List(Rc::new((start..end).map(Value::Int).collect())),
+                _ => panic!("range expects two ints"),
+            }
+        }
+        Builtin::Split => {
+            let (sep, s) = (args.pop(), args.pop());
+            match (s, sep) {
+                (Some(Value::Str(s)), Some(Value::Str(sep))) => {
+                    let parts: Vec<Value> = s.split(&*sep).map(|p| Value::Str(Rc::from(p))).collect();
+                    Value::List(Rc::new(parts))
+                }
+                _ => panic!("split expects two strings"),
+            }
+        }
+        Builtin::Join => {
+            let (sep, parts) = (args.pop(), args.pop());
+            match (parts, sep) {
+                (Some(Value::List(items)), Some(Value::Str(sep))) => {
+                    let strs: Vec<&str> = items
+                        .iter()
+                        .map(|v| match v {
+                            Value::Str(s) => &**s,
+                            _ => panic!("join expects a list of strings"),
+                        })
+                        .collect();
+                    Value::Str(Rc::from(strs.join(&*sep)))
+                }
+                _ => panic!("join expects a list and a string"),
+            }
+        }
+        Builtin::Trim => match args.pop() {
+            Some(Value::Str(s)) => Value::Str(Rc::from(s.trim())),
+            _ => panic!("trim expects a string"),
+        },
     }
 }
 
