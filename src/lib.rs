@@ -1028,6 +1028,19 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_generalizes_through_a_chain_of_simple_let_aliases() {
+        let src = r#"
+            let f = fun x -> let y = x in let z = y in z in
+            let g = fun n: Int -> n + 1 in
+            g(f(1))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(!contains_check(&arena, elaborated), "f(1) should already be Int through the alias chain -- no runtime check needed");
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 2);
+    }
+
+    #[test]
     fn match_rejects_impossible_pattern_statically() {
         let (mut arena, spans, root) = parser::parse("match 5 | true -> 1 | _ -> 2").unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
