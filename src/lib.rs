@@ -2241,6 +2241,54 @@ mod tests {
     }
 
     #[test]
+    fn row_var_not_regeneralized_through_nested_let_alias() {
+        // Regression test: a row variable from a still-open enclosing
+        // annotation (`cb`'s own `{e}`) used to get wrongly re-generalized
+        // by a plain alias-only `let` nested inside that same function's
+        // body -- the exact class of bug fixed for Type::Var (see
+        // extend_generalized's doc comment), just reachable through an
+        // ordinary user-written row annotation instead of only through
+        // passthrough inference. Before the fix, this typechecked clean
+        // and only panicked at runtime, unlike the alias-free control
+        // (next test) which always caught it statically -- see
+        // typecheck::generalizable_row_vars, which now excludes any row
+        // var still free in the enclosing ctx, so both shapes behave
+        // identically.
+        let src = "let f = fun cb: (Dyn ->{e} Dyn) -> let g = cb in g in \
+                    f(fun y -> perform choose(y))(0)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("unhandled effect") && err.0.contains("choose"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn row_var_not_regeneralized_through_nested_let_alias_control() {
+        // Same callback, no intervening let-alias -- confirms the previous
+        // test's static rejection is really row polymorphism doing its
+        // job, not a coincidence of this particular program shape.
+        let src = "let f = fun cb: (Dyn ->{e} Dyn) -> cb in \
+                    f(fun y -> perform choose(y))(0)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("unhandled effect") && err.0.contains("choose"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
+    fn row_var_not_regeneralized_through_nested_let_record_embedding() {
+        // Same bug, different carrier: generalizable_row_vars's own doc
+        // comment claims a row var reached through ANY structural
+        // embedding (not just a bare alias) is excluded the same way --
+        // this exercises that via a Record field instead of a plain alias,
+        // so a future change to free_row_vars's Record-recursion arm that
+        // regresses this doesn't slip through unnoticed.
+        let src = "let f = fun cb: (Dyn ->{e} Dyn) -> let g = {cb: cb} in g.cb in \
+                    f(fun y -> perform choose(y))(0)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("unhandled effect") && err.0.contains("choose"), "unexpected message: {}", err.0);
+    }
+
+    #[test]
     fn str_type_annotation() {
         let src = r#"let f = fun x: Str -> x ++ "!" in f("hi")"#;
         assert_eq!(run_untyped(src).as_str(), "hi!");

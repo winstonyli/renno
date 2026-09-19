@@ -36,6 +36,31 @@ impl<T: Clone> PList<T> {
             }
         }
     }
+
+    // Visits every value currently bound, innermost (most recent) first --
+    // same iterative Rc-clone walk as `get`, just without stopping at a
+    // name match. Used by typecheck::free_row_vars_in_ctx to scan the
+    // WHOLE visible scope chain; kept iterative for the same reason `get`
+    // and the custom Drop impl below are: a chain built from a long
+    // sequential program must not cost native stack proportional to its
+    // depth. Unlike `get`, there's no early exit -- `f` runs for every
+    // node, unconditionally. Harmless for today's only caller (Ctx, and
+    // even that's short-circuited one level up by
+    // typecheck::generalizable_row_vars before it ever reaches here), but
+    // worth knowing before reusing this against a much deeper PList<Value>
+    // Env in a hot path: add a variant that lets `f` signal "stop" first.
+    pub fn for_each(&self, mut f: impl FnMut(&T)) {
+        let mut node = self.clone();
+        loop {
+            match &*node.0 {
+                PNode::Empty => return,
+                PNode::Bind(_, v, parent) => {
+                    f(v);
+                    node = parent.clone();
+                }
+            }
+        }
+    }
 }
 
 // Rust's default Drop for a struct wrapping Rc<PNode<T>> recurses through

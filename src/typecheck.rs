@@ -29,6 +29,25 @@ pub struct TypeError(pub String, pub Span);
 // this stays simple name substitution (extend_generalized computes both
 // sets once at the `let`, lookup renames them to fresh names at each
 // reference), not a general unification engine.
+//
+// A row variable being user-written rather than manufactured does NOT
+// make it safe to generalize wherever free_row_vars finds it -- see
+// generalizable_row_vars's own doc comment for why it still needs a
+// ctx-wide "is this still open in an enclosing scope" check, the same
+// class of hazard Type::Var has (just reachable through ordinary
+// annotations instead of only through passthrough inference).
+//
+// The general rule behind BOTH exclusions, stated once here so a future
+// THIRD kind of variable needing this treatment has one place to read it
+// instead of re-deriving it: generalize(ctx, ty) = freevars(ty) MINUS
+// freevars(ctx) -- never quantify over a name that's still free somewhere
+// still open in the enclosing scope. `extend_generalized_with_type_vars`'s
+// caller-supplied list is just an optimization of that same rule, valid
+// only when there's exactly one call site that manufactures the variable
+// and so can hand back precisely which names are its own (Type::Var's
+// case); with no such single manufacturer (EffectRow::Var's case, born
+// from any annotation anywhere), the rule has to be applied directly via a
+// ctx-wide scan (generalizable_row_vars/free_row_vars_in_ctx below).
 #[derive(Clone)]
 struct Scheme {
     row_vars: Vec<String>,
@@ -77,40 +96,105 @@ fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // same row-polymorphic function with different concrete callbacks would
 // wrongly be forced to agree on one row.
 //
-// Deliberately does NOT auto-derive type_vars from free_type_vars(&ty), even
-// though it auto-derives row_vars that way. Row variables are safe to
-// harvest wherever they're found because an EffectRow::Var only ever comes
-// from a closed, already-fully-written user annotation -- never from a
-// still-open, in-scope binding. Type::Var is different: it's manufactured by
-// elaborate_generalizing_passthrough for a lambda parameter WHILE that
-// parameter's own function body is still being elaborated, so a plain
-// alias-only `let` nested inside that body (e.g. `let y = x in y`) would, if
-// this function auto-harvested free Type::Vars the way it auto-harvests row
-// vars, wrongly re-generalize over the still-open outer parameter's own
-// fresh name -- disconnecting `y`'s uses from `x`'s (each `lookup` of `y`
-// would mint yet another fresh name instead of sharing the parameter's).
-// See extend_generalized_with_type_vars for the one call site that's allowed
-// to introduce type_vars, via an explicit caller-supplied list instead of
-// this kind of auto-derivation. Ordinary extend_generalized must never gain
-// this behavior back.
+// Deliberately does NOT auto-derive type_vars from free_type_vars(&ty) --
+// see extend_generalized_with_type_vars for why, and why type_vars needs a
+// narrower fix (a caller-supplied list) instead of what row_vars gets below
+// (a ctx-wide exclusion check). row_vars still auto-derives from
+// free_row_vars(&ty), but only picks up a name if generalizable_row_vars
+// confirms it ISN'T also free somewhere still open in `ctx` -- see that
+// function's own doc comment for why an EffectRow::Var needs this
+// (confirmed reachable: `let f = fun cb: (Dyn ->{e} Dyn) -> let g = cb in g
+// in f(fun y -> perform choose(y))(0)` used to typecheck clean and only
+// panic at runtime -- "e" leaking from cb's still-open annotation into g's
+// generalized scheme, then getting freshly (and wrongly) renamed on every
+// `g` reference, exactly like the Type::Var bug this mirrors). Delegates to
+// extend_generalized_with_type_vars (with an empty type_vars) rather than
+// repeating its body: the two are identical apart from that one field, and
+// a hand-copied second implementation is exactly the kind of thing that
+// silently drifts out of sync with the first the next time either changes.
 fn extend_generalized(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
-    let row_vars: Vec<String> = free_row_vars(&ty).into_iter().collect();
-    ctx.bind(name, Scheme { row_vars, type_vars: Vec::new(), ty })
+    extend_generalized_with_type_vars(ctx, name, ty, Vec::new())
 }
 
 // Identical to extend_generalized except type_vars is supplied by the
-// caller instead of auto-derived -- see extend_generalized's own doc
-// comment for why auto-derivation is unsafe for Type::Var in general. The
-// only caller that may use this is the `Expr::Let`/`Expr::LetRec` wiring for
-// a binding whose value came back from elaborate_generalizing_passthrough
-// (and only when there's no explicit annotation on the binding): that
-// function can hand back exactly the fresh Type::Var names IT just
-// introduced for this value's own generalizable parameters, which are safe
-// to generalize by construction (they don't leak from some other, still-open
-// enclosing scope the way an incidentally-encountered Type::Var might).
+// caller instead of auto-derived -- Type::Var is only ever manufactured by
+// ONE place (elaborate_generalizing_passthrough, for a lambda parameter
+// WHILE that parameter's own function body is still being elaborated), so a
+// plain alias-only `let` nested inside that body (e.g. `let y = x in y`)
+// auto-harvesting free Type::Vars the way row_vars harvests row vars would
+// wrongly re-generalize over the still-open outer parameter's own fresh
+// name -- disconnecting `y`'s uses from `x`'s (each `lookup` of `y` would
+// mint yet another fresh name instead of sharing the parameter's). Because
+// there's exactly one source, the caller can hand back the EXACT fresh
+// names it just introduced, which are safe to generalize by construction.
+// row_vars has no single source like that (any annotation currently in
+// scope can introduce one), so it uses generalizable_row_vars's ctx-wide
+// check instead -- see that function's own doc comment. The only caller
+// that may supply `type_vars` here is the `Expr::Let`/`Expr::LetRec` wiring
+// for a binding whose value came back from elaborate_generalizing_passthrough
+// (and only when there's no explicit annotation on the binding).
 fn extend_generalized_with_type_vars(ctx: &Ctx, name: &str, ty: Type, type_vars: Vec<String>) -> Ctx {
-    let row_vars: Vec<String> = free_row_vars(&ty).into_iter().collect();
+    let row_vars = generalizable_row_vars(ctx, &ty);
     ctx.bind(name, Scheme { row_vars, type_vars, ty })
+}
+
+// Row-variable names free in `ty` that are actually safe to generalize
+// over: free_row_vars(ty) MINUS whatever's ALSO free somewhere still open
+// in `ctx`. Unlike Type::Var (see extend_generalized_with_type_vars's doc
+// comment), an EffectRow::Var has no single manufacturing call site whose
+// caller could hand back a safe list -- it comes from ANY `->{e}`
+// annotation anywhere currently in scope (a lambda parameter's own
+// annotation, bound via plain `extend`, stays open for that parameter's
+// entire body). A nested `let` that merely happens to mention that same
+// row-var name (most often through a bare alias like `let g = cb in g`,
+// but any value whose type structurally embeds it -- a tuple, a record --
+// works the same way) must not re-generalize over it, for exactly the
+// reason Type::Var's own fix document gives: the name isn't THIS let's own
+// to quantify, it belongs to the enclosing, not-yet-closed binding, and
+// generalizing it anyway disconnects every future reference from that
+// binding's real identity.
+//
+// Skips the ctx walk entirely when `ty` has no row vars at all -- the
+// overwhelmingly common case (most bindings never mention a row-polymorphic
+// annotation), so an ordinary long `let` chain (see
+// deeply_nested_let_chain_does_not_overflow_the_stack) stays O(1) per let
+// instead of paying an O(ctx depth) scan on every single one; only a let
+// whose value's type actually mentions a row variable pays that cost.
+fn generalizable_row_vars(ctx: &Ctx, ty: &Type) -> Vec<String> {
+    let candidates = free_row_vars(ty);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let still_open = free_row_vars_in_ctx(ctx);
+    candidates.difference(&still_open).cloned().collect()
+}
+
+// Every row-variable name free in any type currently bound in `ctx` --
+// generalizable_row_vars's own "still open" set. Walks the whole visible
+// scope chain (PList::for_each, iterative -- see its own doc comment), not
+// just the immediately-enclosing binding: a row var can be several scopes
+// out from the `let` that's about to (maybe) re-capture it. Excludes each
+// visited scheme's OWN `row_vars`: a name that scheme already generalized
+// over is SEALED, not still open -- `lookup` always renames it to a fresh
+// name before it's ever read again (see `lookup`'s own fresh_row_name
+// call), so the literal name surviving inside that scheme's stored `ty` is
+// dead and must not be treated as blocking some unrelated, later `let`
+// that happens to reuse the same letter in its own annotation.
+//
+// ponytail: this is an O(ctx depth) walk, paid once per row-var-carrying
+// `let` (generalizable_row_vars's own short-circuit keeps every OTHER let
+// at O(1)) -- fine at this codebase's scale, but a chain of N sequential
+// row-polymorphic `let`s costs O(N^2) instead of O(N) to typecheck.
+// Upgrade path if that ever matters: thread a cumulative "still open row
+// vars" set incrementally through Ctx itself (unioned in once per `bind`,
+// O(1) amortized) instead of re-walking the whole chain from scratch here.
+fn free_row_vars_in_ctx(ctx: &Ctx) -> BTreeSet<String> {
+    let mut vars = BTreeSet::new();
+    ctx.for_each(|scheme: &Scheme| {
+        let sealed: BTreeSet<String> = scheme.row_vars.iter().cloned().collect();
+        vars.extend(free_row_vars(&scheme.ty).difference(&sealed).cloned());
+    });
+    vars
 }
 
 fn free_row_vars(ty: &Type) -> BTreeSet<String> {
