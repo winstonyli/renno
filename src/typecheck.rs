@@ -1622,6 +1622,7 @@ fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: 
 // coerce-then-unify_fits fallback (mirroring Expr::App's existing
 // argument-check pattern) is what makes Check mode sound for those shapes
 // too, without each of them needing its own Check-mode arm.
+#[derive(Clone, Copy)]
 pub(crate) enum Mode<'a> {
     Synth,
     Check(&'a Type),
@@ -2265,27 +2266,17 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         }
     }
 
-    let (mut result_ty, mut result_row, mut result_expr) = match cur_mode {
-        Mode::Synth => elaborate_node(arena, cur_expr, &cur_ctx, spans, infer, Mode::Synth)?,
-        Mode::Check(expected) => {
-            // If/Match (Tasks 3-4) check their own branches/arms against
-            // `expected` internally and return `expected.clone()` faithfully
-            // -- re-wrapping their result in another coerce/unify_fits would
-            // be redundant, so only apply the generic fallback to every
-            // OTHER expression shape, the same way Expr::App's own argument
-            // check and Let/LetRec's own annotated-binding check already do
-            // by hand today.
-            let self_checking = matches!(arena[cur_expr], Expr::If(..) | Expr::Match(..));
-            let (ty, row, e2) = elaborate_node(arena, cur_expr, &cur_ctx, spans, infer, Mode::Check(expected))?;
-            if self_checking {
-                (ty, row, e2)
-            } else {
-                let e3 = coerce(arena, e2, &ty, expected, spans[cur_expr], &infer.named_types)?;
-                unify_fits(expected, &ty, infer, spans[cur_expr])?;
-                (expected.clone(), row, e3)
-            }
-        }
-    };
+    // Dispatch the chain's tail under whatever `cur_mode` is in force at
+    // this point -- which may have been legitimately downgraded to Synth
+    // by a Lambda peel above whose own Fun-shape check didn't fire. No
+    // per-shape self-checking special case is needed here any more: the
+    // single enforcement point below (after the `pending` unwind, against
+    // the function's ORIGINAL `mode` parameter, not `cur_mode`) is what
+    // actually holds the caller's obligation, so this call is free to just
+    // elaborate the tail under `cur_mode` and let that later check do the
+    // one real validation.
+    let (mut result_ty, mut result_row, mut result_expr) =
+        elaborate_node(arena, cur_expr, &cur_ctx, spans, infer, cur_mode)?;
 
     for frame in pending.into_iter().rev() {
         match frame {
@@ -2315,6 +2306,23 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 result_expr = arena.push(Expr::Lambda(param, Some(param_ty), result_expr));
             }
         }
+    }
+
+    // The one place the caller's ORIGINAL obligation is actually enforced:
+    // after Lambda/Let/LetRec unwinding has reconstructed the TRUE overall
+    // type of `expr` (not just the innermost tail's), require it to fit
+    // `mode`'s own expected type -- using `mode`, never `cur_mode` (which
+    // may have been downgraded to Synth by a Lambda peel whose own
+    // Fun-shape check didn't fire; that downgrade only ever meant "freely
+    // elaborate the inner tail," never "skip validating the outer,
+    // reconstructed value against what the caller actually asked for" --
+    // see this file's own regression history for why skipping this step
+    // silently accepted `let f: Int = fun x -> x in ...`).
+    if let Mode::Check(expected) = mode {
+        let checked = coerce(arena, result_expr, &result_ty, expected, spans[expr], &infer.named_types)?;
+        unify_fits(expected, &result_ty, infer, spans[expr])?;
+        result_ty = expected.clone();
+        result_expr = checked;
     }
 
     Ok((result_ty, result_row, result_expr))

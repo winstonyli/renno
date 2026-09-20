@@ -365,6 +365,29 @@ mod tests {
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 1);
     }
 
+    // Regression test for a fix-round-1 finding on this same task: the
+    // chain-flattening loop's Lambda arm can downgrade `cur_mode` to
+    // `Synth` (when the expected type isn't a `Fun`), which is fine for
+    // elaborating the Lambda's own inner tail -- but the RECONSTRUCTED
+    // value, after `pending`'s Fun-wrapping unwinds back on, must still be
+    // validated against the caller's ORIGINAL expected type. Before the
+    // fix, nothing re-checked the reconstructed `Fun` type against a
+    // non-Fun (or shape-mismatched) annotation, so both of these silently
+    // type-checked instead of erroring.
+    #[test]
+    fn annotated_let_rejects_a_lambda_whose_shape_does_not_match_the_annotation() {
+        // Non-Fun annotation, Fun value: `Int` can never fit `Dyn -> Dyn`.
+        let (mut arena, spans, root) = parser::parse("let f: Int = fun x -> x in 1").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected Int") && err.0.contains("found"), "unexpected message: {}", err.0);
+
+        // Arity mismatch: annotation is a 1-argument Fun, value is a
+        // 2-argument curried Fun.
+        let (mut arena, spans, root) = parser::parse("let f: (Int -> Int) = fun x -> fun y -> y in 1").unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("expected (Int -> Int)") && err.0.contains("found"), "unexpected message: {}", err.0);
+    }
+
     #[test]
     fn dyn_sourced_value_can_cross_into_an_arithmetic_position() {
         let src = r#"
