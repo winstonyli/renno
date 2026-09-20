@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
+use crate::index_expr::IndexExpr;
 use crate::lexer::{tokenize, Token};
 use crate::span::Span;
 use crate::types::{EffectRow, Type};
@@ -50,6 +51,26 @@ pub fn parse_with_named_types(src: &str) -> Result<(Arena, SpanMap, ExprRef, Has
         return Err(p.err_at(span, format!("trailing tokens after expression: {:?}", &p.tokens[p.pos..])));
     }
     Ok((p.arena, p.expr_spans, root, p.named_types))
+}
+
+// Test-only entry point: parses a single, standalone type expression
+// (not a full program) -- used by this plan's own Vec(...) syntax
+// tests, which need to inspect a Type in isolation rather than run a
+// whole program. Not part of the language's own real parsing path.
+#[cfg(test)]
+pub fn parse_type_string(src: &str) -> Result<Type, String> {
+    let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
+    let mut p = Parser {
+        tokens,
+        tok_spans,
+        pos: 0,
+        arena: Arena::new(),
+        expr_spans: SpanMap::new(),
+        src,
+        type_aliases: HashMap::new(),
+        named_types: HashMap::new(),
+    };
+    p.parse_fun_type()
 }
 
 struct Parser<'a> {
@@ -514,6 +535,12 @@ impl<'a> Parser<'a> {
             // resolves later" story left once every type must be a
             // builtin, a Token/Tuple/Union, or a named alias.
             Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => {
+                if name == "Vec" && matches!(self.peek(), Some(Token::LParen)) {
+                    self.bump(); // consume '('
+                    let index = self.parse_index_expr()?;
+                    self.expect(&Token::RParen)?;
+                    return Ok(Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index)));
+                }
                 match Self::builtin_type(&name) {
                     Some(ty) => Ok(ty),
                     None => match self.type_aliases.get(&name) {
@@ -523,6 +550,57 @@ impl<'a> Parser<'a> {
                 }
             }
             other => Err(self.err_at(self.span_before(), format!("expected a type, found {other:?}"))),
+        }
+    }
+
+    // Index-expression grammar only: Var | Lit | + | - | * -- see the
+    // spec's own §1 for why this deliberately doesn't reuse the full
+    // expression parser (embedding arbitrary expressions in type
+    // position would reopen the divergent-typechecker risk the design
+    // explicitly rejected). Standard two-level precedence: `+`/`-` loosest,
+    // left-associative; `*` tighter, left-associative; parenthesized
+    // sub-expressions and atoms (a variable name or an integer literal)
+    // at the bottom.
+    fn parse_index_expr(&mut self) -> Result<IndexExpr, String> {
+        let mut lhs = self.parse_index_term()?;
+        loop {
+            match self.peek() {
+                Some(Token::Plus) => {
+                    self.bump();
+                    let rhs = self.parse_index_term()?;
+                    lhs = IndexExpr::Add(Rc::new(lhs), Rc::new(rhs));
+                }
+                Some(Token::Minus) => {
+                    self.bump();
+                    let rhs = self.parse_index_term()?;
+                    lhs = IndexExpr::Sub(Rc::new(lhs), Rc::new(rhs));
+                }
+                _ => break,
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_index_term(&mut self) -> Result<IndexExpr, String> {
+        let mut lhs = self.parse_index_atom()?;
+        while matches!(self.peek(), Some(Token::Star)) {
+            self.bump();
+            let rhs = self.parse_index_atom()?;
+            lhs = IndexExpr::Mul(Rc::new(lhs), Rc::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_index_atom(&mut self) -> Result<IndexExpr, String> {
+        match self.bump() {
+            Some(Token::Int(n)) => Ok(IndexExpr::Lit(n)),
+            Some(Token::Ident(name)) => Ok(IndexExpr::Var(name)),
+            Some(Token::LParen) => {
+                let inner = self.parse_index_expr()?;
+                self.expect(&Token::RParen)?;
+                Ok(inner)
+            }
+            other => Err(self.err_at(self.span_before(), format!("expected an index expression, found {other:?}"))),
         }
     }
 

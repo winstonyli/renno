@@ -3651,4 +3651,34 @@ mod tests {
         let c = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(4)));
         assert!(!types::fits(&a, &c));
     }
+
+    #[test]
+    fn vec_with_a_literal_index_parses_and_displays() {
+        let ty = parser::parse_type_string("Vec(3)").unwrap();
+        assert_eq!(ty.to_string(), "[Dyn](3)");
+    }
+
+    #[test]
+    fn vec_with_a_variable_index_parses_and_displays() {
+        let ty = parser::parse_type_string("Vec(n)").unwrap();
+        assert_eq!(ty.to_string(), "[Dyn](n)");
+    }
+
+    #[test]
+    fn vec_with_an_arithmetic_index_parses() {
+        let ty = parser::parse_type_string("Vec(n + m)").unwrap();
+        assert_eq!(ty.to_string(), "[Dyn](n + m)");
+    }
+
+    #[test]
+    fn vec_index_supports_multiplication_and_subtraction() {
+        let ty = parser::parse_type_string("Vec(n * 2 - 1)").unwrap();
+        assert_eq!(ty.to_string(), "[Dyn](n * 2 - 1)");
+    }
+
+    #[test]
+    fn vec_without_an_index_argument_is_a_parse_error() {
+        assert!(parser::parse_type_string("Vec").is_err());
+        assert!(parser::parse_type_string("Vec()").is_err());
+    }
 }
