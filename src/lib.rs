@@ -3887,4 +3887,52 @@ mod tests {
         assert!(err.contains("type error: expected"), "unexpected message: {err}");
         assert!(!err.contains("len expects"), "leaked a bare len() panic instead of a clean type error: {err}");
     }
+
+    #[test]
+    fn resolve_index_follows_a_bound_index_variable() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::InferCtx;
+        use std::collections::HashMap;
+        let mut infer = InferCtx::new(HashMap::new());
+        infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
+        let resolved = infer.resolve_index(&IndexExpr::Var("n".to_string()));
+        assert_eq!(resolved, IndexExpr::Lit(3));
+    }
+
+    #[test]
+    fn resolve_index_leaves_an_unbound_variable_alone() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::InferCtx;
+        use std::collections::HashMap;
+        let infer = InferCtx::new(HashMap::new());
+        let resolved = infer.resolve_index(&IndexExpr::Var("n".to_string()));
+        assert_eq!(resolved, IndexExpr::Var("n".to_string()));
+    }
+
+    #[test]
+    fn resolve_index_deep_substitutes_inside_a_compound_expression() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::InferCtx;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+        let mut infer = InferCtx::new(HashMap::new());
+        infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
+        let expr = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)));
+        let resolved = infer.resolve_index_deep(&expr);
+        assert_eq!(resolved, IndexExpr::Add(Rc::new(IndexExpr::Lit(3)), Rc::new(IndexExpr::Lit(1))));
+    }
+
+    #[test]
+    fn resolve_deep_on_a_type_substitutes_inside_an_indexed_wrapper() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::InferCtx;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+        use types::Type;
+        let mut infer = InferCtx::new(HashMap::new());
+        infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
+        let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
+        let resolved = infer.resolve_deep(&ty);
+        assert_eq!(resolved, Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Lit(3))));
+    }
 }

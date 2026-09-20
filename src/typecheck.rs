@@ -73,11 +73,19 @@ type Ctx = PList<Scheme>;
 // `unify` is now called unconditionally from Expr::App/BinOp::Cons/If/
 // Match/ListLit (Tasks 4-6), so `subst` and every method below are live
 // on every elaboration, not just exercised by this file's own tests.
-struct InferCtx {
+pub(crate) struct InferCtx {
     // Grows monotonically as unify() binds variables; never shrinks --
     // no backtracking, matching this checker's existing single-pass
     // character everywhere else.
     subst: HashMap<String, Type>,
+    // Grows monotonically exactly like `subst`, for the same reason --
+    // no backtracking anywhere in this checker. A SEPARATE map from
+    // `subst`: an index variable (IndexExpr::Var) and a type variable
+    // (Type::Var) are different namespaces that happen to both be
+    // plain Strings -- conflating them would let an ordinary generic
+    // function's own type-var name collide with an unrelated Vec's
+    // own index-var name.
+    pub(crate) index_subst: HashMap<String, IndexExpr>,
     // Every genuinely self-referential type alias this program's own
     // parse registered (parser::Parser's own `named_types`, handed in
     // once at construction) -- consulted on demand by
@@ -90,8 +98,8 @@ struct InferCtx {
 }
 
 impl InferCtx {
-    fn new(named_types: HashMap<String, Type>) -> InferCtx {
-        InferCtx { subst: HashMap::new(), named_types }
+    pub(crate) fn new(named_types: HashMap<String, Type>) -> InferCtx {
+        InferCtx { subst: HashMap::new(), index_subst: HashMap::new(), named_types }
     }
 
     // Mints a fresh Type::Var -- every unannotated binding site (Lambda
@@ -135,7 +143,7 @@ impl InferCtx {
     // result types BinOp::Cons/If/Match/ListLit hand back after their
     // own unify() calls succeed (Tasks 5-6), and generalization's own
     // free-variable collection (Task 7).
-    fn resolve_deep(&self, ty: &Type) -> Type {
+    pub(crate) fn resolve_deep(&self, ty: &Type) -> Type {
         match self.resolve(ty) {
             Type::Fun(param, row, ret) => {
                 Type::Fun(Rc::new(self.resolve_deep(&param)), row, Rc::new(self.resolve_deep(&ret)))
@@ -146,6 +154,35 @@ impl InferCtx {
             Type::Record(fields) => {
                 Type::Record(Rc::new(fields.iter().map(|(n, t)| (n.clone(), self.resolve_deep(t))).collect()))
             }
+            Type::Indexed(wrapped, index) => {
+                Type::Indexed(Rc::new(self.resolve_deep(&wrapped)), Rc::new(self.resolve_index_deep(&index)))
+            }
+            other => other,
+        }
+    }
+
+    // IndexExpr's own analog of resolve() -- follows a bound index
+    // variable to whatever it's currently bound to, one level (not
+    // recursively substituting INSIDE a compound result -- that's
+    // resolve_index_deep's job, same split as resolve/resolve_deep).
+    pub(crate) fn resolve_index(&self, e: &IndexExpr) -> IndexExpr {
+        match e {
+            IndexExpr::Var(name) => match self.index_subst.get(name) {
+                Some(bound) => self.resolve_index(bound),
+                None => e.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    // Like resolve_index, but rebuilds a fully-substituted IndexExpr,
+    // walking every nested position -- same split as resolve_deep vs.
+    // resolve for ordinary Types.
+    pub(crate) fn resolve_index_deep(&self, e: &IndexExpr) -> IndexExpr {
+        match self.resolve_index(e) {
+            IndexExpr::Add(a, b) => IndexExpr::Add(Rc::new(self.resolve_index_deep(&a)), Rc::new(self.resolve_index_deep(&b))),
+            IndexExpr::Sub(a, b) => IndexExpr::Sub(Rc::new(self.resolve_index_deep(&a)), Rc::new(self.resolve_index_deep(&b))),
+            IndexExpr::Mul(a, b) => IndexExpr::Mul(Rc::new(self.resolve_index_deep(&a)), Rc::new(self.resolve_index_deep(&b))),
             other => other,
         }
     }
