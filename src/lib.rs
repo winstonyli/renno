@@ -4373,4 +4373,77 @@ mod tests {
         let err = run_source(src).unwrap_err();
         assert!(err.contains("index 3 does not unify with index 2"), "unexpected message: {err}");
     }
+
+    // Task 6 review finding: the fix above only excludes an Indexed-vs-
+    // Indexed pair from unify_fits's consistent()/fits() rescue at the TOP
+    // level of the match -- unify_fits has explicit recursive arms for
+    // Fun/Record (both correctly re-run unify_fits itself on their
+    // sub-parts, so the exclusion re-fires one level down), but had NONE
+    // for Tuple/List, so a Vec(n) conflict nested inside a Tuple/List
+    // annotation fell straight to the generic catch-all seeing only the
+    // OUTER Tuple/List shape -- never the nested Indexed pair -- and was
+    // silently rescued by consistent()'s own permissiveness. Same bound-
+    // index-conflict shape as the test just above (n bound to 3, then
+    // reused incompatibly as Vec(2)), just one level deeper inside a
+    // Tuple annotation instead of directly.
+    //
+    // Routed through intermediate concrete `wa: Vec(3)`/`wb: Vec(2)`
+    // bindings rather than splicing the raw `Dyn`-typed `ca`/`cb` directly
+    // into the tuple literal (the review's own literal example) -- adapted
+    // for the SAME reason as this file's own pre-existing
+    // `a_let_bound_vec_annotation_still_rejects_a_genuinely_mismatched_
+    // reuse` test (see its comment above): confirmed empirically that the
+    // literal all-Dyn version never even reaches the Tuple/List-arm bug at
+    // all, let alone exercises this fix. `coerce()`'s top-level Dyn-
+    // boundary check only fires when the WHOLE annotated type is Dyn (`if
+    // !matches!(from, Type::Dyn | ...)`) -- here `from` is
+    // `Tuple([Dyn, Int])`, not itself Dyn, so no check is inserted, and
+    // unify_fits's own new Tuple arm then recurses into comparing
+    // `Indexed(n)` against a genuinely-Dyn element, which trivially
+    // succeeds via unify()'s own unconditional Dyn permissiveness (no
+    // `Type::Var`/index binding happens at all against Dyn) -- so `n`
+    // never gets bound in the first place and there is nothing for a
+    // second annotation to conflict with, regardless of this fix. That is
+    // the SAME already-known, already-deferred raw-Dyn-into-bare-Vec(n)
+    // gap Task 6's own report documents as "Deviation 3" for the
+    // non-nested case, not a new one -- the concrete `Vec(k)` intermediate
+    // sidesteps it exactly as those existing tests already do, keeping
+    // this test a pure exercise of the Tuple/List-arm fix. Confirmed via
+    // `git stash` (isolating just the new Tuple/List arms in
+    // typecheck.rs, keeping this test as-is): pre-fix this ran to
+    // completion returning 1 instead of being statically rejected;
+    // post-fix it correctly fails with the same index-conflict message.
+    #[test]
+    fn a_vec_conflict_nested_inside_a_tuple_annotation_is_still_rejected() {
+        let src = r#"
+            let ca: Dyn = [1, 2, 3] in
+            let cb: Dyn = [1, 2] in
+            let wa: Vec(3) = ca in
+            let wb: Vec(2) = cb in
+            let pa: (Vec(n), Int) = (wa, 1) in
+            let pb: (Vec(n), Int) = (wb, 2) in
+            1
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("index 3 does not unify with index 2"), "unexpected message: {err}");
+    }
+
+    // Same gap, List-nested rather than Tuple-nested -- unify_fits had no
+    // Type::List arm either, so `[Vec(n)]` has the identical false-
+    // negative failure mode as `(Vec(n), Int)` above. Same concrete-
+    // intermediate adaptation and reasoning as the Tuple test just above.
+    #[test]
+    fn a_vec_conflict_nested_inside_a_list_annotation_is_still_rejected() {
+        let src = r#"
+            let ca: Dyn = [1, 2, 3] in
+            let cb: Dyn = [1, 2] in
+            let wa: Vec(3) = ca in
+            let wb: Vec(2) = cb in
+            let la: [Vec(n)] = [wa] in
+            let lb: [Vec(n)] = [wb] in
+            1
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("index 3 does not unify with index 2"), "unexpected message: {err}");
+    }
 }

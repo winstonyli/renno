@@ -416,9 +416,29 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
             }
             Ok(())
         }
+        // Added alongside Fun/Record above: a Tuple or List annotation can
+        // wrap a Vec(n) element (e.g. `(Vec(n), Int)`, `[Vec(n)]`) just
+        // like a Record field can, and without an explicit recursive arm
+        // here, that pair falls straight to the generic catch-all below --
+        // which sees only the OUTER Tuple/List shape, never the nested
+        // Indexed pair, so the Type::Indexed-vs-Type::Indexed rescue
+        // exclusion just below never fires and a genuine bound-index
+        // conflict (n already bound to 3, freshly compared against an
+        // incompatible Vec(2)) is wrongly rescued by consistent()'s own
+        // permissiveness one level down. Recursing through unify_fits
+        // itself (not unify_trial/the bare rescue) re-fires that exclusion
+        // at the nesting depth where the Indexed pair actually appears --
+        // same fix shape the Record arm above already gets right for
+        // `{v: Vec(n)}`. Tuple's length check mirrors unify()'s own Tuple
+        // arm just below in this file: a length mismatch is a plain type
+        // mismatch, not something to recurse into element-wise.
+        (Type::Tuple(req_items), Type::Tuple(act_items)) if req_items.len() == act_items.len() => {
+            req_items.iter().zip(act_items.iter()).try_for_each(|(req_ty, act_ty)| unify_fits(req_ty, act_ty, infer, span))
+        }
+        (Type::List(req_elem), Type::List(act_elem)) => unify_fits(req_elem, act_elem, infer, span),
         // Type::Indexed gets no explicit arm here, deliberately -- this
-        // match already has none for List/Tuple/Union either, so anything
-        // that isn't Fun or Record falls through to the generic catch-all
+        // match already has none for Union either, so anything that isn't
+        // Fun/Record/Tuple/List falls through to the generic catch-all
         // below: unify_trial tries unify() first (which DOES have its own
         // Indexed arm), with a consistent()/fits() rescue on failure. That
         // path gives Indexed the right answer on match, index mismatch,
