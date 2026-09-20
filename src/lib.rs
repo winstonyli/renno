@@ -5012,16 +5012,17 @@ mod tests {
 
     #[test]
     fn synth_mode_match_on_an_indexed_scrutinee_gets_no_refinement() {
-        // The Global Constraint this whole task exists to protect: with NO
-        // expected type flowing in (an unannotated `let`, so the match is
-        // elaborated in Synth mode), no hypothesis is injected -- `t`
-        // stays plainly List(Dyn) (bind_pattern_vars's own untouched
-        // Cons arm), exactly as before this task. `f` itself still needs
-        // an explicit Dyn round-trip to be called with a concrete Vec(3)
-        // (see this test module's own established idiom, e.g.
-        // `identity_vec_dyn_boundary_gets_a_real_runtime_check` above) --
-        // that part is unrelated to Case A, just how every other
-        // Vec(n)-parameterized call in this file already works.
+        // NOTE: this scrutinee's own index (`Vec(3)`) is a LITERAL, so
+        // `case_a_refinement_target`'s own eligibility check already
+        // returns None for it independent of `mode` -- this test would
+        // pass identically even if the `Mode::Synth => None` gate were
+        // deleted outright. It's kept as basic Synth-mode-Match
+        // regression coverage (the match still elaborates fine with no
+        // refinement machinery touching it), but the gate itself -- the
+        // thing this task most needs protected -- is isolated by
+        // `synth_mode_match_on_a_bare_index_var_scrutinee_gets_no_refinement`
+        // just below, whose scrutinee IS eligible (a bare index Var) and
+        // so actually exercises the `Mode::Synth => None` branch.
         let src = r#"
             let f = fun v: Vec(3) ->
                 let r = match v | [] -> [] | h :: t -> t in
@@ -5034,6 +5035,50 @@ mod tests {
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans);
         assert!(elaborated.is_ok(), "an unannotated let's own Match must still type-check with no refinement, exactly as before this task");
+    }
+
+    #[test]
+    fn synth_mode_match_on_a_bare_index_var_scrutinee_gets_no_refinement() {
+        // Isolates the `Mode::Synth => None` gate itself. Unlike the test
+        // just above (whose `Vec(3)` scrutinee is a literal index that
+        // `case_a_refinement_target` already excludes regardless of
+        // mode), `v` here is annotated `Vec(n)` -- a BARE index Var --
+        // so `case_a_refinement_target`'s OWN eligibility check would
+        // return `Some(("n", elem_ty))` for it if `mode` allowed it.
+        //
+        // `f`'s own definition is the un-annotated `let f = ...`'s value,
+        // so per Expr::Lambda's own peel logic in typecheck.rs (the
+        // `_ => (ann.unwrap_or_else(...), Mode::Synth)` fallback --  no
+        // enclosing Check(Fun(..)) is in force since nothing annotates
+        // `f`), the Lambda's body -- this Match -- is elaborated in
+        // Mode::Synth, with no expected type flowing in.
+        //
+        // With the gate intact, `t` in the step arm keeps its plain,
+        // unindexed List type from `bind_pattern_vars`'s untouched Cons
+        // arm (no hypothesis is injected, no re-`extend` override), so
+        // `let proof: Vec(n - 1) = t in 1` requires coercing a plain List
+        // into a required Indexed type -- rejected. If the
+        // `Mode::Synth => None` line were ever deleted,
+        // `case_a_refinement_target` WOULD fire here (its own eligibility
+        // check alone can't stop it, unlike the literal-index test
+        // above): the step arm would re-bind `t` to `Vec(m)` with
+        // hypothesis `n = m + 1`, and `proof`'s binding would type-check
+        // instead (`n - 1` SOP-normalizes to exactly `m`) -- proving the
+        // gate itself, not just the eligibility filter, is load-bearing.
+        let src = r#"
+            let f = fun v: Vec(n) ->
+                match v
+                | [] -> 0
+                | h :: t ->
+                    let proof: Vec(n - 1) = t in 1
+            in f
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans);
+        assert!(
+            elaborated.is_err(),
+            "Synth mode must not refine `t`'s type from the scrutinee's own bare index var, so `t : Vec(n - 1)` must be rejected"
+        );
     }
 
     #[test]
