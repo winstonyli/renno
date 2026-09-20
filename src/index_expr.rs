@@ -10,6 +10,18 @@ pub enum IndexExpr {
     Mul(Rc<IndexExpr>, Rc<IndexExpr>),
 }
 
+impl std::fmt::Display for IndexExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            IndexExpr::Var(name) => write!(f, "{name}"),
+            IndexExpr::Lit(n) => write!(f, "{n}"),
+            IndexExpr::Add(a, b) => write!(f, "{a} + {b}"),
+            IndexExpr::Sub(a, b) => write!(f, "{a} - {b}"),
+            IndexExpr::Mul(a, b) => write!(f, "{a} * {b}"),
+        }
+    }
+}
+
 // A monomial is a multiset of variable names (repetition = exponent),
 // represented as a sorted Vec<String> for a canonical, comparable key.
 // The polynomial is a map from that canonical monomial key to its

@@ -107,6 +107,10 @@ fn contains_named(ty: &Type, id: &str) -> bool {
         Type::Tuple(items) | Type::Union(items) => items.iter().any(|t| contains_named(t, id)),
         Type::Record(fields) => fields.iter().any(|(_, t)| contains_named(t, id)),
         Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Var(_) => false,
+        // Wraps one nested Type (the index is never itself a Type, so
+        // has nothing to check here) -- same recurse-into-the-wrapped-
+        // type precedent as List's own arm just above.
+        Type::Indexed(wrapped, _) => contains_named(wrapped, id),
     }
 }
 

@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
 
+use crate::index_expr::{index_exprs_equal, IndexExpr};
 use crate::util::find_field;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +112,12 @@ pub enum Type {
     // has no runtime representation of its own, only whatever VALUE
     // actually flows through ends up being one alternative's own shape.
     Union(Rc<Vec<Type>>),
+    // `Vec(n)` sugars over this -- NOT its own bespoke primitive. Wraps
+    // either Type::List directly (the primary, worked case) or a
+    // qualifying Type::Named+Type::Union (derived index-refinement, a
+    // later phase) with one IndexExpr tracking its own length/size.
+    // See the design spec's own section 2 for the full rationale.
+    Indexed(Rc<Type>, Rc<IndexExpr>),
 }
 
 // Closed effect row: an exact known set (Closed), "unknown, could be
@@ -240,6 +247,11 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         // what it (or any other Named type) unfolds to. Never unfolds
         // the registry -- see Type::Named's own doc comment.
         (Type::Named(a), Type::Named(b)) => a == b,
+        // Two Indexed types are consistent when their wrapped types are
+        // consistent AND their index expressions are equal (§3's SOP
+        // normalization) -- both halves required, mirroring how List's
+        // own arm requires its element type to match.
+        (Type::Indexed(wa, ia), Type::Indexed(wb, ib)) => consistent(wa, wb) && index_exprs_equal(ia, ib),
         // Positional, structural, no name/registry involved -- same idea
         // as List's own element comparison, just per-position instead of
         // one shared element type.
@@ -393,6 +405,7 @@ impl fmt::Display for Type {
                 }
                 Ok(())
             }
+            Type::Indexed(wrapped, index) => write!(f, "{wrapped}({index})"),
         }
     }
 }

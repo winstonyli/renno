@@ -3183,6 +3183,45 @@ mod tests {
     }
 
     #[test]
+    fn indexed_type_displays_as_a_wrapped_type_with_its_index() {
+        use crate::index_expr::IndexExpr;
+        use std::rc::Rc;
+        use types::Type;
+        let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
+        assert_eq!(ty.to_string(), "[Dyn](n)");
+    }
+
+    #[test]
+    fn two_indexed_types_with_equal_wrapped_types_and_equal_indices_are_consistent() {
+        use crate::index_expr::IndexExpr;
+        use std::rc::Rc;
+        use types::Type;
+        let a = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
+        let b = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
+        assert!(types::consistent(&a, &b));
+    }
+
+    #[test]
+    fn two_indexed_types_with_different_indices_are_not_consistent() {
+        use crate::index_expr::IndexExpr;
+        use std::rc::Rc;
+        use types::Type;
+        let a = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(3)));
+        let b = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(4)));
+        assert!(!types::consistent(&a, &b));
+    }
+
+    #[test]
+    fn indexed_type_is_consistent_with_dyn() {
+        use crate::index_expr::IndexExpr;
+        use std::rc::Rc;
+        use types::Type;
+        let a = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(3)));
+        assert!(types::consistent(&a, &Type::Dyn));
+        assert!(types::consistent(&Type::Dyn, &a));
+    }
+
+    #[test]
     fn a_self_referential_type_alias_parses_successfully() {
         // This used to be a parse error ("unknown type: List") --
         // List wasn't in scope yet while its own RHS was being parsed.

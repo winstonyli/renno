@@ -171,6 +171,10 @@ fn occurs_in(name: &str, ty: &Type, infer: &InferCtx) -> bool {
         // it can never contain `name` as a free Type::Var either, same
         // as Type::Token right next to it here.
         Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) => false,
+        // Wraps one nested Type (the index expression is never itself a
+        // Type::Var) -- same recurse-into-the-wrapped-type precedent as
+        // List's own arm just above.
+        Type::Indexed(wrapped, _) => occurs_in(name, &wrapped, infer),
     }
 }
 
@@ -484,6 +488,9 @@ fn free_row_vars(ty: &Type) -> BTreeSet<String> {
         Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(free_row_vars).collect(),
         Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_row_vars(t)).collect(),
         Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) | Type::Var(_) => BTreeSet::new(),
+        // Wraps one nested Type -- same recurse-into-the-wrapped-type
+        // precedent as List's own arm just above.
+        Type::Indexed(wrapped, _) => free_row_vars(wrapped),
     }
 }
 
@@ -509,6 +516,9 @@ fn free_type_vars_resolved(ty: &Type, infer: &InferCtx) -> BTreeSet<String> {
         Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(|t| free_type_vars_resolved(t, infer)).collect(),
         Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_type_vars_resolved(t, infer)).collect(),
         Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) => BTreeSet::new(),
+        // Wraps one nested Type -- same recurse-into-the-wrapped-type
+        // precedent as List's own arm just above.
+        Type::Indexed(wrapped, _) => free_type_vars_resolved(&wrapped, infer),
     }
 }
 
@@ -859,6 +869,12 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &
         Type::Union(_) => build_union_check(arena, e, to, named_types, visiting),
         Type::Dyn => unreachable!("coerce only calls this once *to != Type::Dyn is already established"),
         Type::Var(_) => e,
+        // Placeholder only, to keep this match exhaustive -- real
+        // Indexed-aware boundary-check logic is Task 5's own job (see
+        // this plan's task list). Mirrors this function's own
+        // Type::Var(_) arm just above: "no real check built yet for
+        // this shape," return `e` unchecked rather than reject it.
+        Type::Indexed(..) => e,
         // One level only, matching every other shape check in this
         // file: look up what this id unfolds to and build ITS OWN
         // boundary check, exactly as if `to` had been written directly
@@ -1017,6 +1033,13 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, named
             let unfolded = raw.clone();
             build_shape_predicate(arena, value_ref, &unfolded, named_types, &visiting)
         }
+        // An Indexed value IS, at runtime, just its wrapped type's own
+        // value (Vec(n) sugars over this -- see Type::Indexed's own doc
+        // comment); the index itself isn't a runtime shape trait this
+        // shallow check can observe, so delegate straight to the
+        // wrapped type's own predicate, same as Named's one-level
+        // unfold just above delegates to what it unfolds to.
+        Type::Indexed(wrapped, _) => build_shape_predicate(arena, value_ref, wrapped, named_types, visiting),
     }
 }
 
