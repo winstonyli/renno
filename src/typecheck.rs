@@ -216,6 +216,60 @@ fn occurs_in(name: &str, ty: &Type, infer: &InferCtx) -> bool {
     }
 }
 
+// IndexExpr's own analog of occurs_in -- does `name` appear free
+// anywhere inside `e`, resolving through infer's index substitution as
+// it recurses? Same rationale as occurs_in's own doc comment: without
+// this, unifying `n` against `n + 1` would silently build an infinite
+// index expression instead of a clean type error.
+fn occurs_in_index(name: &str, e: &IndexExpr, infer: &InferCtx) -> bool {
+    match infer.resolve_index(e) {
+        IndexExpr::Var(n) => n == name,
+        IndexExpr::Lit(_) => false,
+        IndexExpr::Add(a, b) | IndexExpr::Sub(a, b) | IndexExpr::Mul(a, b) => {
+            occurs_in_index(name, &a, infer) || occurs_in_index(name, &b, infer)
+        }
+    }
+}
+
+// A real, but DELIBERATELY NARROW unifier for IndexExpr -- see the
+// design spec's own §4 and this plan's Global Constraints for why:
+// this binds a BARE unbound variable to whatever it's compared
+// against (mirroring unify()'s own Type::Var arm exactly), and
+// recurses when both sides already share the same top-level shape.
+// It does NOT solve equations -- unifying `n+1` against `4` does NOT
+// infer `n=3` (that would need a real constraint solver, out of scope
+// per the spec's own Non-goals). Anything that doesn't hit one of
+// those two cases falls back to Phase 1's own index_exprs_equal
+// (SOP normalization), which still decides plenty on its own (e.g.
+// `m*n` against `n*m` with no unbound variable anywhere).
+//
+// pub(crate), not private, only because this project's own test
+// convention (see occurs_in's neighbors) keeps tests in src/lib.rs --
+// a different module -- rather than because anything outside
+// typecheck.rs is meant to call this directly.
+pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
+    let a = infer.resolve_index(a);
+    let b = infer.resolve_index(b);
+    match (&a, &b) {
+        (IndexExpr::Var(n1), IndexExpr::Var(n2)) if n1 == n2 => Ok(()),
+        (IndexExpr::Var(name), other) | (other, IndexExpr::Var(name)) => {
+            if occurs_in_index(name, other, infer) {
+                return Err(TypeError(format!("infinite index expression: {name} occurs in {other}"), span));
+            }
+            infer.index_subst.insert(name.clone(), other.clone());
+            Ok(())
+        }
+        (IndexExpr::Add(a1, a2), IndexExpr::Add(b1, b2))
+        | (IndexExpr::Sub(a1, a2), IndexExpr::Sub(b1, b2))
+        | (IndexExpr::Mul(a1, a2), IndexExpr::Mul(b1, b2)) => {
+            unify_index_expr(a1, b1, infer, span)?;
+            unify_index_expr(a2, b2, infer, span)
+        }
+        _ if crate::index_expr::index_exprs_equal(&a, &b) => Ok(()),
+        _ => Err(TypeError(format!("type mismatch: index {a} does not unify with index {b}"), span)),
+    }
+}
+
 // The real unifier. Resolves both sides through infer.subst first, then:
 // an unbound Type::Var on either side gets BOUND (after an occurs-check)
 // to the other, already-resolved side; Type::Dyn on either side succeeds
