@@ -5529,6 +5529,24 @@ mod tests {
         // must terminate and type-check successfully (the match body
         // just returns an Int literal from each arm; nothing further
         // constrains t's own type).
+        //
+        // Task 4's own verification found this test as originally
+        // committed used `parser::parse` + `typecheck::check` -- which
+        // per `parse`'s own doc comment ("pairing this `parse` with plain
+        // `typecheck::check`... is exactly the condition every
+        // Type::Named consumer's own missing-registry-entry fallback
+        // exists to handle gracefully") means `infer.named_types` is
+        // ALWAYS EMPTY here, so `Type::Named("List")` never actually
+        // unfolds at all -- it hits the graceful "unknown id" fallback
+        // immediately, every time, regardless of whether the cycle-guard
+        // fix above is present. Confirmed empirically: this test as
+        // originally written keeps passing even with the fix fully
+        // reverted (the pre-fix code, and even a version with NO cycle
+        // guard at all), because the buggy code path is never reached.
+        // Switched to `parse_with_named_types` + `check_with_named_types`
+        // (the same pairing Task 3's own Case B tests already use)
+        // to make this test genuinely exercise the fix -- re-verified
+        // below.
         let src = r#"
             type List = List | (Int, List) in
             let f: (List -> Int) = fun v ->
@@ -5537,12 +5555,83 @@ mod tests {
                 | x -> 1
             in 0
         "#;
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans);
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types);
         assert!(
             elaborated.is_ok(),
             "expected the exact repro program to type-check successfully once the Union arm's own visiting set \
              is correctly threaded (no cycle, t correlates against the genuine Tuple alternative), got: {:?}",
+            elaborated.err()
+        );
+        let result = machine::run(&arena, elaborated.unwrap(), Env::prelude(), &spans);
+        assert_eq!(result.as_int(), 0);
+    }
+
+    // --- Task 4: coverage gap (finding 6) ---
+
+    #[test]
+    fn bind_pattern_vars_falls_back_to_fresh_vars_at_a_cycle_detected_nested_position() {
+        // Finding 6 (Task 4 brief): the cycle-detected fallback branch in
+        // bind_pattern_vars's own Type::Named arm (`if visiting.contains(id)
+        // { return bind_fresh_positions(...) }`, added by Task 3's own
+        // fix-round-1) is correct by inspection and was re-verified there,
+        // but wasn't exercised by any existing test -- every existing
+        // Case B test puts a bare Var at the self-referential position
+        // (`t` in `(h, t)`), which binds via Pattern::Var's own arm
+        // directly and never re-enters bind_pattern_vars's Type::Named
+        // match at all. Triggering the cycle-detected branch specifically
+        // needs a NESTED structural pattern (not a bare Var) at that
+        // position, so bind_pattern_vars recurses back into a
+        // Pattern::List/Type::Named combination with "List" already in
+        // `visiting` from the outer unfold -- no third level of recursive
+        // type nesting needed, just one more level of pattern nesting on
+        // top of the existing two-alternative `List | (Int, List)` type.
+        //
+        // `(h2, t2)` at the self-ref position: bind_pattern_vars unfolds
+        // "List" once for the outer `(h, ..)` (visiting: {} -> {List}),
+        // lands on the Tuple alternative, then recurses into position 1
+        // with pat=(h2, t2) (a nested Pattern::List) against
+        // ty=Named("List") -- this time "List" is ALREADY in visiting, so
+        // the cycle guard fires and h2/t2 both get fresh, uncorrelated
+        // types via bind_fresh_positions, rather than h2:Int/t2:Named(id)
+        // the way a genuinely one-more-level unfold would give them. This
+        // is a real, deliberate conservative approximation (mirroring
+        // pattern_could_match's own identical stance) -- it fires here
+        // even though this specific two-level pattern would have
+        // terminated fine with one more unfold, sacrificing precision for
+        // a termination guarantee that doesn't inspect how deep the
+        // pattern itself goes.
+        //
+        // Observed via h2: if h2 got the fresh, unconstrained type the
+        // cycle guard produces, checking it against a required `Bool`
+        // trivially succeeds (permissive, like Type::Dyn). If h2 had
+        // instead been correlated to its real position-0 type (`Int`,
+        // from `(Int, List)`), the same check would be a genuine,
+        // provable mismatch.
+        //
+        // Uses `parse_with_named_types` + `check_with_named_types` (not
+        // plain `parse`/`check`) -- Task 4's own verification found that
+        // pairing plain `parse` with plain `check` leaves
+        // `infer.named_types` empty (see `parse`'s own doc comment), so
+        // `Type::Named("List")` would never actually unfold at all here,
+        // making the test vacuous regardless of the cycle guard. See the
+        // fix applied just above, to the pre-existing
+        // `bind_pattern_vars_union_arm_does_not_infinite_loop_on_a_bare_self_referential_alternative`
+        // test, for the same finding.
+        let src = r#"
+            type List = List | (Int, List) in
+            let f: (List -> Int) = fun v ->
+                match v
+                | (h, (h2, t2)) -> let proof: Bool = h2 in 0
+                | x -> 1
+            in 0
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types);
+        assert!(
+            elaborated.is_ok(),
+            "expected the cycle-detected fallback to give h2 a fresh, unconstrained type (permissive with \
+             Bool), got: {:?}",
             elaborated.err()
         );
         let result = machine::run(&arena, elaborated.unwrap(), Env::prelude(), &spans);
