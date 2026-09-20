@@ -4446,4 +4446,35 @@ mod tests {
         let err = run_source(src).unwrap_err();
         assert!(err.contains("index 3 does not unify with index 2"), "unexpected message: {err}");
     }
+
+    #[test]
+    fn check_against_accepts_a_matching_literal() {
+        use crate::typecheck::{check_against, Ctx, InferCtx};
+        use crate::span::Span;
+        use crate::expr::{Arena, Expr, SpanMap};
+        use crate::types::{Type, EffectRow};
+        use std::collections::HashMap;
+        let mut arena = Arena::new();
+        let mut spans = SpanMap::new();
+        let e = arena.push(Expr::Int(5));
+        spans.push(Span { start: 0, end: 0 });
+        let mut infer = InferCtx::new(HashMap::new());
+        let (row, _) = check_against(&mut arena, e, &Type::Int, &Ctx::empty(), &spans, &mut infer).unwrap();
+        assert_eq!(row, EffectRow::pure());
+    }
+
+    #[test]
+    fn check_against_rejects_a_mismatched_literal() {
+        use crate::typecheck::{check_against, Ctx, InferCtx};
+        use crate::span::Span;
+        use crate::expr::{Arena, Expr, SpanMap};
+        use crate::types::Type;
+        use std::collections::HashMap;
+        let mut arena = Arena::new();
+        let mut spans = SpanMap::new();
+        let e = arena.push(Expr::Int(5));
+        spans.push(Span { start: 0, end: 0 });
+        let mut infer = InferCtx::new(HashMap::new());
+        assert!(check_against(&mut arena, e, &Type::Bool, &Ctx::empty(), &spans, &mut infer).is_err());
+    }
 }

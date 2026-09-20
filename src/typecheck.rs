@@ -1610,6 +1610,23 @@ fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: 
     arena.push(Expr::Let(fn_var, None, e, lambda))
 }
 
+// The bidirectional-checking mode a call to `elaborate_mode`/`elaborate_node`
+// runs under. `Synth` is today's only mode (infer a type bottom-up, no
+// expected type available). `Check(expected)` is new: the caller already
+// knows what type this expression must have (typically a declared
+// annotation flowing down through a Let/Lambda chain) -- `If` and `Match`
+// use this to check each branch/arm against `expected` directly instead of
+// inferring each one and reconciling them against EACH OTHER afterward
+// (today's only option, via unify_trial). Every other expression shape
+// still just synthesizes regardless of mode; `check_against`'s own
+// coerce-then-unify_fits fallback (mirroring Expr::App's existing
+// argument-check pattern) is what makes Check mode sound for those shapes
+// too, without each of them needing its own Check-mode arm.
+pub(crate) enum Mode<'a> {
+    Synth,
+    Check(&'a Type),
+}
+
 // A `let`/`fun` prefix collected while flattening a chain of them (see
 // `elaborate`) -- deferred until the terminal body is elaborated, then
 // folded back into nested Let/Lambda nodes (and their types/rows) in
@@ -2114,7 +2131,7 @@ fn missing_case(patterns: &[&Pattern], scrut_ty: &Type) -> Option<String> {
 // sound: check() below rejects a program only when it can prove an effect
 // is never discharged, and stays silent (deferring to today's runtime
 // panic) whenever it can't prove either way.
-fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<(Type, EffectRow, ExprRef), TypeError> {
+fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx, mode: Mode) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     // Peels off a run of leading `let`/`fun` prefixes iteratively -- a
     // match per iteration, not a recursive call -- so a long chain of
     // either (sequential `let`s, or a deeply curried `fun a -> fun b ->
@@ -2207,7 +2224,27 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
         }
     }
 
-    let (mut result_ty, mut result_row, mut result_expr) = elaborate_node(arena, cur_expr, &cur_ctx, spans, infer)?;
+    let (mut result_ty, mut result_row, mut result_expr) = match mode {
+        Mode::Synth => elaborate_node(arena, cur_expr, &cur_ctx, spans, infer, Mode::Synth)?,
+        Mode::Check(expected) => {
+            // If/Match (Tasks 3-4) check their own branches/arms against
+            // `expected` internally and return `expected.clone()` faithfully
+            // -- re-wrapping their result in another coerce/unify_fits would
+            // be redundant, so only apply the generic fallback to every
+            // OTHER expression shape, the same way Expr::App's own argument
+            // check and Let/LetRec's own annotated-binding check already do
+            // by hand today.
+            let self_checking = matches!(arena[cur_expr], Expr::If(..) | Expr::Match(..));
+            let (ty, row, e2) = elaborate_node(arena, cur_expr, &cur_ctx, spans, infer, Mode::Check(expected))?;
+            if self_checking {
+                (ty, row, e2)
+            } else {
+                let e3 = coerce(arena, e2, &ty, expected, spans[cur_expr], &infer.named_types)?;
+                unify_fits(expected, &ty, infer, spans[cur_expr])?;
+                (expected.clone(), row, e3)
+            }
+        }
+    };
 
     for frame in pending.into_iter().rev() {
         match frame {
@@ -2242,6 +2279,26 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
     Ok((result_ty, result_row, result_expr))
 }
 
+// Today's only mode until Phase 3: infer `expr`'s type bottom-up with no
+// expected type available. Unchanged signature and behavior from before
+// this file had a Mode enum -- every existing call site is untouched.
+fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<(Type, EffectRow, ExprRef), TypeError> {
+    elaborate_mode(arena, expr, ctx, spans, infer, Mode::Synth)
+}
+
+// The bidirectional-checking entry point (spec section 6): verify `expr`
+// against an already-known `expected` type. Callers that already know the
+// type discard the redundant `Type` `elaborate_mode` would otherwise
+// return (by contract, `Mode::Check(expected)` always returns
+// `expected.clone()` on success) and get back only the effect row and the
+// elaborated expression, the same shape `coerce` alone used to hand back
+// to callers like Expr::Let's own annotated-binding case before this
+// function existed.
+pub(crate) fn check_against(arena: &mut Arena, expr: ExprRef, expected: &Type, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<(EffectRow, ExprRef), TypeError> {
+    let (_, row, expr2) = elaborate_mode(arena, expr, ctx, spans, infer, Mode::Check(expected))?;
+    Ok((row, expr2))
+}
+
 // Every Expr variant except Let/Lambda, which `elaborate` peels off
 // iteratively above -- reached only once no more chain prefix remains.
 // `expr` (this function's own parameter) is always the ORIGINAL,
@@ -2249,7 +2306,7 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
 // `spans[expr]` is a valid, always-available "point at this whole
 // construct" location for any error an arm below doesn't have a more
 // specific sub-expression to blame instead.
-fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<(Type, EffectRow, ExprRef), TypeError> {
+fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx, _mode: Mode) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     let node = arena[expr].clone();
     match node {
         Expr::Int(_) => Ok((Type::Int, EffectRow::pure(), expr)),
