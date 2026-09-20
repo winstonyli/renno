@@ -1830,18 +1830,6 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
     }
 }
 
-// Extends `ctx` with every Var this pattern binds, correlated with
-// `scrutinee_ty` where that's informative: a Cons/List pattern's element
-// bindings unify against the scrutinee's own (possibly still-open, via a
-// fresh Type::Var) element type, instead of always Dyn -- this is the
-// FIRST of the two problems full parametric polymorphism exists to
-// solve (see the design spec's own Motivation). Fallible now (it wasn't
-// before): a genuinely impossible correlation (e.g. unifying two
-// concretely-different, incompatible shapes) is a real static error, the
-// same class of mistake `pattern_could_match`'s own existing rejection
-// already catches for the cases IT can see -- this rewrite doesn't
-// replace that check, it adds a second, complementary one that can see
-// INTO a pattern's own sub-bindings, not just its top-level shape.
 // Eligibility (spec section 5): is `scrut_ty` (already resolved via
 // infer.resolve_deep) a Type::Indexed wrapping a shape Match's own arm
 // loop knows how to derive a base/step hypothesis from, whose own index
@@ -1961,6 +1949,42 @@ fn bind_fresh_positions(
     Ok(c)
 }
 
+// `bind_fresh_positions`'s own Record analog: bind each of a
+// Pattern::Record's own named fields to its own independent fresh var,
+// keyed by that field's own name (matching this function's own existing
+// per-field fallback). Same "nothing real to correlate against"
+// fallback, factored out for the same reason -- Finding 6's new
+// Type::Indexed/Named/Union delegation arms below need this same
+// fallback for their own "no matching alternative found" cases, not
+// just the catch-all.
+fn bind_fresh_record_fields(
+    ctx: &Ctx,
+    fields: &[(String, Pattern)],
+    infer: &mut InferCtx,
+    span: Span,
+    visiting: &HashSet<String>,
+) -> Result<Ctx, TypeError> {
+    let mut c = ctx.clone();
+    for (name, p) in fields {
+        let field_ty = infer.fresh_var(name);
+        c = bind_pattern_vars(&c, p, &field_ty, infer, span, visiting)?;
+    }
+    Ok(c)
+}
+
+// Extends `ctx` with every Var this pattern binds, correlated with
+// `scrutinee_ty` where that's informative: a Cons/List pattern's element
+// bindings unify against the scrutinee's own (possibly still-open, via a
+// fresh Type::Var) element type, instead of always Dyn -- this is the
+// FIRST of the two problems full parametric polymorphism exists to
+// solve (see the design spec's own Motivation). Fallible now (it wasn't
+// before): a genuinely impossible correlation (e.g. unifying two
+// concretely-different, incompatible shapes) is a real static error, the
+// same class of mistake `pattern_could_match`'s own existing rejection
+// already catches for the cases IT can see -- this rewrite doesn't
+// replace that check, it adds a second, complementary one that can see
+// INTO a pattern's own sub-bindings, not just its top-level shape.
+//
 // Fix round 1 (critical review finding): `visiting` mirrors
 // pattern_could_match's own parameter of the same name/position exactly
 // -- an accumulated set of Type::Named ids already being unfolded on
@@ -2157,17 +2181,43 @@ fn bind_pattern_vars(
             let c = bind_pattern_vars(ctx, head, &elem_ty, infer, span, visiting)?;
             bind_pattern_vars(&c, tail, &list_shape, infer, span, visiting)
         }
-        Pattern::Record(fields) => {
-            let mut c = ctx.clone();
-            for (name, p) in fields {
-                let field_ty = match scrutinee_ty {
-                    Type::Record(type_fields) => find_field(type_fields, name).cloned().unwrap_or_else(|| infer.fresh_var(name)),
-                    _ => infer.fresh_var(name),
-                };
-                c = bind_pattern_vars(&c, p, &field_ty, infer, span, visiting)?;
+        Pattern::Record(fields) => match scrutinee_ty {
+            Type::Record(type_fields) => {
+                let mut c = ctx.clone();
+                for (name, p) in fields {
+                    let field_ty = find_field(type_fields, name).cloned().unwrap_or_else(|| infer.fresh_var(name));
+                    c = bind_pattern_vars(&c, p, &field_ty, infer, span, visiting)?;
+                }
+                Ok(c)
             }
-            Ok(c)
-        }
+            // Finding 6 (final review): the same Type::Indexed/Named/Union
+            // delegation Pattern::List already got from Task 3's own Case B
+            // prerequisite fix, mirrored here for Record so a Record
+            // pattern matched against a Vec(n)-of-records or a Case-B-
+            // eligible Named/Union scrutinee gets real per-field
+            // correlation too, instead of always falling back to
+            // `infer.fresh_var` per field (the same "zero correlation" gap
+            // Task 3 closed for List).
+            Type::Indexed(wrapped, _) => bind_pattern_vars(ctx, pat, wrapped, infer, span, visiting),
+            Type::Named(id) => {
+                if visiting.contains(id) {
+                    return bind_fresh_record_fields(ctx, fields, infer, span, visiting);
+                }
+                match infer.named_types.get(id).cloned() {
+                    Some(unfolded) => {
+                        let mut visiting = visiting.clone();
+                        visiting.insert(id.clone());
+                        bind_pattern_vars(ctx, pat, &unfolded, infer, span, &visiting)
+                    }
+                    None => bind_fresh_record_fields(ctx, fields, infer, span, visiting),
+                }
+            }
+            Type::Union(alts) => match alts.iter().find(|alt| pattern_could_match(pat, alt, &infer.named_types, visiting)) {
+                Some(matching_alt) => bind_pattern_vars(ctx, pat, matching_alt, infer, span, visiting),
+                None => bind_fresh_record_fields(ctx, fields, infer, span, visiting),
+            },
+            _ => bind_fresh_record_fields(ctx, fields, infer, span, visiting),
+        },
     }
 }
 
@@ -3077,7 +3127,42 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 Mode::Check(_) => indexed_refinement_target(&resolved_scrut_ty, resolved_index.as_ref(), &infer.named_types),
                 Mode::Synth => None,
             };
-            let index_snapshot = refinement_target.as_ref().map(|_| infer.index_subst.clone());
+            // Scope the eventual restore to the ONE key this mechanism is
+            // entitled to touch -- the hypothesis's own index variable --
+            // not the whole index_subst map. A whole-map snapshot/restore
+            // (this file's own unify_trial idiom, meant for a genuinely
+            // SPECULATIVE unification that either fully commits or fully
+            // rolls back) is the wrong shape here: an arm's own body-check
+            // is not speculative, and can legitimately prove unrelated
+            // index facts (an ambient Vec(k) binding's own real length,
+            // say) that must survive the match, not be silently erased
+            // alongside the hypothesis when it's reverted (critical review
+            // finding, Phase 4 final review -- confirmed reproducible via
+            // ordinary source: an in-arm `let p: Vec(2) = w in ..` proof
+            // used to get wiped by the very next restore).
+            let index_key: Option<String> = refinement_target.as_ref().map(|t| match t {
+                IndexedRefinementTarget::List { index_var, .. } | IndexedRefinementTarget::Named { index_var, .. } => index_var.clone(),
+            });
+            let prior_index_value: Option<Option<IndexExpr>> = index_key.as_ref().map(|k| infer.index_subst.get(k).cloned());
+            // Restores `infer.index_subst`'s hypothesis key to its value
+            // from BEFORE this match ever ran -- re-inserting the prior
+            // binding if there was one, or removing the key entirely if it
+            // was unbound. Shared by the per-arm restore (start of every
+            // iteration) and the final restore (after the whole loop) so
+            // both do the IDENTICAL key-scoped logic, never the old
+            // whole-map assignment.
+            fn restore_index_key(infer: &mut InferCtx, index_key: &Option<String>, prior_index_value: &Option<Option<IndexExpr>>) {
+                if let (Some(k), Some(prior)) = (index_key, prior_index_value) {
+                    match prior {
+                        Some(v) => {
+                            infer.index_subst.insert(k.clone(), v.clone());
+                        }
+                        None => {
+                            infer.index_subst.remove(k);
+                        }
+                    }
+                }
+            }
             let mut row = scrut_row;
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
@@ -3091,12 +3176,12 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         spans[expr],
                     ));
                 }
-                // Task 3 Fix 1: restore infer.index_subst to its
-                // pre-match snapshot BEFORE deciding THIS arm's own
-                // hypothesis (if any) -- not just once, after the whole
-                // loop. index_subst is one shared map, mutated in place
-                // by each eligible arm's own `insert` call below; without
-                // this per-arm restore, an arm that injects no
+                // Task 3 Fix 1: restore infer.index_subst's hypothesis
+                // key to its pre-match value BEFORE deciding THIS arm's
+                // own hypothesis (if any) -- not just once, after the
+                // whole loop. index_subst is one shared map, mutated in
+                // place by each eligible arm's own `insert` call below;
+                // without this per-arm restore, an arm that injects no
                 // hypothesis of its own (the `_ => {}`/no-override
                 // fallthroughs just below) would silently INHERIT
                 // whatever a PRECEDING sibling arm left behind in that
@@ -3113,10 +3198,15 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // task's own report): reverting to a single restore
                 // after the whole loop flips
                 // `stale_hypothesis_does_not_leak_into_a_later_ineligible_sibling_arm`
-                // from passing to failing.
-                if let Some(snapshot) = &index_snapshot {
-                    infer.index_subst = snapshot.clone();
-                }
+                // from passing to failing. Critical review finding (Phase
+                // 4 final review): this restore used to reassign the
+                // WHOLE index_subst map back to a pre-match clone, which
+                // also erased any UNRELATED index fact a preceding arm's
+                // own body legitimately proved (e.g. an ambient Vec(k)
+                // binding's real length) -- restore_index_key touches
+                // only the hypothesis's own key, leaving everything else
+                // an arm proves intact.
+                restore_index_key(infer, &index_key, &prior_index_value);
                 let mut arm_ctx = bind_pattern_vars(ctx, pat, &scrut_ty, infer, spans[expr], &HashSet::new())?;
                 // Hypothesis injection (spec section 5): base case implies
                 // the scrutinee's own index is 0; step case mints a fresh
@@ -3161,8 +3251,24 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                             _ => {}
                         },
                         IndexedRefinementTarget::Named { index_var: n_name, id, base_alt, step_alt } => {
-                            let matches_base = pattern_could_match(pat, base_alt, &infer.named_types, &HashSet::new());
-                            let matches_step = pattern_could_match(pat, step_alt, &infer.named_types, &HashSet::new());
+                            // `base_alt`/`step_alt` are themselves already-
+                            // unfolded alternatives of `id` (see
+                            // `qualifying_named_alternatives`), so this
+                            // probe is conceptually already mid-unfold of
+                            // `id` -- pass `{id}`, not an empty set, for
+                            // consistency with the `visiting`-threading
+                            // discipline the rest of this phase established
+                            // (the exact shape whose absence caused
+                            // bind_pattern_vars's own fix-round-1 bug).
+                            // Doesn't change behavior today (verified by
+                            // trace: neither alternative can itself unfold
+                            // back to `id` without violating
+                            // `qualifying_named_alternatives`'s own
+                            // occurrence-count check), just defense in
+                            // depth.
+                            let visiting_id = HashSet::from([id.clone()]);
+                            let matches_base = pattern_could_match(pat, base_alt, &infer.named_types, &visiting_id);
+                            let matches_step = pattern_could_match(pat, step_alt, &infer.named_types, &visiting_id);
                             if matches_base && !matches_step {
                                 infer.index_subst.insert(n_name.clone(), IndexExpr::Lit(0));
                             } else if matches_step && !matches_base {
@@ -3235,14 +3341,14 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // hypothesis into a later, unrelated one). This last restore
             // is what makes a per-arm hypothesis fully undone once the
             // LAST arm's own body-check finishes too, and is what keeps
-            // infer.index_subst's otherwise strictly monotonic, never-
-            // shrinks character (see InferCtx.index_subst's own doc
-            // comment and unify_trial's identical snapshot/restore idiom,
-            // which this mirrors) from leaking a hypothesis into code
-            // after the match entirely.
-            if let Some(snapshot) = index_snapshot {
-                infer.index_subst = snapshot;
-            }
+            // the hypothesis's own key from leaking into code after the
+            // match entirely -- same key-scoped `restore_index_key`
+            // helper as the per-arm restore above (critical review
+            // finding: a whole-map restore here erased unrelated index
+            // facts an arm's own body legitimately proved, same bug as
+            // the per-arm restore's, just triggered once at the end
+            // instead of every iteration).
+            restore_index_key(infer, &index_key, &prior_index_value);
             // A guarded arm's pattern can't be relied on to cover
             // anything for exhaustiveness -- its guard might reject --
             // so only unguarded arms' patterns count here (mirrors

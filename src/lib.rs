@@ -5344,6 +5344,127 @@ mod tests {
         assert_eq!(result.as_int(), 1);
     }
 
+    // --- Final review fix wave: key-scoped index_subst restore
+    // (critical finding) ---
+    //
+    // The whole-branch final review found the snapshot/restore above
+    // (Task 3 Fix 1) was scoped too broadly: it clones and restores the
+    // ENTIRE index_subst map, not just the one key the match's own
+    // hypothesis mechanism is entitled to touch (the scrutinee's own
+    // index variable). An arm's own body-check can legitimately prove a
+    // genuinely UNRELATED index fact about some other ambient binding
+    // (e.g. a second Vec-typed parameter's own real length) -- a whole-
+    // map restore silently erases that fact too, the moment the very
+    // next restore fires (per-arm, or the final one), even though it has
+    // nothing to do with the injected hypothesis. The two tests below
+    // prove the fix (key-scoped restore, touching only the hypothesis's
+    // own variable) both let a real fact survive the match AND still
+    // catches an actual contradiction -- not just that something stopped
+    // vanishing.
+
+    #[test]
+    fn unrelated_ambient_index_fact_proven_inside_an_arm_survives_the_match_and_a_real_conflict_is_still_caught() {
+        // `v: Vec(n)` is the match's own eligible scrutinee; `w: Vec(k)`
+        // is a completely separate ambient parameter, sharing NO index
+        // variable with `v`'s own hypothesis (`k` != `n`). Inside the
+        // `[]` arm, `let p1: Vec(2) = w in 0` proves a real fact --
+        // k := 2 -- that has nothing to do with the match on `v` at all.
+        // AFTER the match returns (same function body, same elaboration
+        // pass, no let-generalization boundary crossed), `let p2: Vec(1)
+        // = w in inner` re-checks `w` against a CONTRADICTING length.
+        //
+        // With the fix (key-scoped restore, only ever touching `n`): `k`
+        // is untouched by either the per-arm or the final restore, so it
+        // stays resolved to 2 past the match -- comparing it against the
+        // literal 1 is a real, provable "2 != 1" conflict, correctly
+        // REJECTED.
+        //
+        // With the bug (whole-map restore): the final restore reassigns
+        // the ENTIRE index_subst back to its pre-match snapshot, wiping
+        // `k`'s own k := 2 binding right alongside `n`'s. `k` is then
+        // genuinely free again when `p2` is checked, so it freely binds
+        // to 1 with no conflict at all -- the whole program WRONGLY
+        // type-checks, exactly the false-accept the final review's own
+        // critical finding describes (confirmed via the reviewer's own
+        // repro shape).
+        //
+        // Verified empirically (comment-out-and-rerun): temporarily
+        // reverting both restores to whole-map assignment (`infer.index_subst
+        // = snapshot[.clone()]`) flips this test from passing (is_err())
+        // to failing (the program wrongly type-checks instead).
+        let src = r#"
+            let f: (Vec(n) -> Vec(k) -> Int) = fun v -> fun w ->
+                let inner: Int =
+                    match v
+                    | [] -> let p1: Vec(2) = w in 0
+                    | h :: t -> 0
+                in
+                let p2: Vec(1) = w in
+                inner
+            in
+            let x1: Dyn = [] in
+            let vx: Vec(0) = x1 in
+            let x2: Dyn = [9] in
+            let vw: Vec(1) = x2 in
+            f(vx)(vw)
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(
+            err.contains("does not unify") || err.contains("mismatch"),
+            "w's own k=2 fact, proven inside the [] arm, must survive past the match -- comparing it against \
+             the real Vec(1) afterward should be a genuine, rejected conflict, got: {err}"
+        );
+    }
+
+    #[test]
+    fn contradictory_ambient_index_facts_across_sibling_arms_are_caught_not_both_silently_accepted() {
+        // Same ambient `w: Vec(k)` shape as the test above, but now BOTH
+        // sibling arms of the SAME match each prove their own fact about
+        // `w` -- the `[]` arm proves k := 2, the `h :: t` arm proves
+        // k := 3. These are mutually contradictory (k can't be both),
+        // and the fix's own key-scoped restore deliberately does NOT
+        // reset `k` between arms (only `n`, the match's own hypothesis
+        // key, gets reset) -- so entering the second arm, `k` is already
+        // resolved to 2 from the first, and its own `Vec(3)` proof is a
+        // real, provable "2 != 3" conflict. The whole match -- and so
+        // the whole program -- must be REJECTED.
+        //
+        // With the bug (whole-map restore between arms): the per-arm
+        // restore at the top of the SECOND arm's own iteration wipes `k`
+        // back to fully unbound (the pre-match snapshot), so the second
+        // arm's own `Vec(3)` proof freely succeeds with no conflict at
+        // all -- BOTH arms silently succeed independently, each having
+        // "proven" a different, mutually-incompatible fact about the
+        // exact same ambient binding, with nothing ever catching the
+        // inconsistency. The call site below (`vw: Vec(2)`) then also
+        // succeeds against a freshly-instantiated `k`, so the whole
+        // program WRONGLY type-checks under the bug.
+        //
+        // Verified empirically (comment-out-and-rerun): temporarily
+        // reverting both restores to whole-map assignment flips this
+        // test from passing (is_err()) to failing (the program wrongly
+        // type-checks instead).
+        let src = r#"
+            let f: (Vec(n) -> Vec(k) -> Int) = fun v -> fun w ->
+                match v
+                | [] -> let p1: Vec(2) = w in 0
+                | h :: t -> let p2: Vec(3) = w in 0
+            in
+            let x1: Dyn = [] in
+            let vx: Vec(0) = x1 in
+            let x2: Dyn = [9, 9] in
+            let vw: Vec(2) = x2 in
+            f(vx)(vw)
+        "#;
+        let elaborated_err = run_source(src);
+        assert!(
+            elaborated_err.is_err(),
+            "the [] arm's own k=2 and the h::t arm's own k=3 are mutually contradictory facts about the SAME \
+             ambient binding w -- this must be caught as a real conflict, not silently accepted from both arms \
+             independently, got: {elaborated_err:?}"
+        );
+    }
+
     // --- Task 3, Step 1: bind_pattern_vars's own Union-correlation gap ---
 
     #[test]
@@ -5442,7 +5563,12 @@ mod tests {
             | false -> v
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let id = named_types.keys().next().unwrap().clone();
+        // Look up the specific "List" alias's own minted id directly,
+        // rather than relying on `HashMap` iteration order (fragile the
+        // moment a second `type` declaration exists in the same source)
+        // -- `fresh_named_type_id` (parser.rs) mints ids as `"{name}#{n}"`,
+        // so the surface name is always the part before the first `#`.
+        let id = named_types.keys().find(|k| k.split('#').next() == Some("List")).unwrap().clone();
         let mut infer = InferCtx::new(named_types);
         let scrut_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend(&Ctx::empty(), "v", scrut_ty);
@@ -5483,7 +5609,10 @@ mod tests {
             | false -> let x: Dyn = 0 in x
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let id = named_types.keys().next().unwrap().clone();
+        // Same fragility fix as the base-case test just above: look up
+        // "List"'s own minted id directly instead of relying on
+        // `HashMap` iteration order.
+        let id = named_types.keys().find(|k| k.split('#').next() == Some("List")).unwrap().clone();
         let mut infer = InferCtx::new(named_types);
         let scrut_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend(&Ctx::empty(), "v", scrut_ty);

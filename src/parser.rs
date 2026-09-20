@@ -121,14 +121,7 @@ fn fresh_named_type_id(base: &str) -> String {
 // a plain structural walk, terminating because `ty` here is always a
 // FRESH parse result, never something already containing a completed
 // recursive reference of its own).
-//
-// `pub(crate)`, not private: Phase 4 Task 3's own Case B eligibility
-// check (typecheck.rs's `qualifying_named_alternatives`) needs to ask
-// this SAME question about an already-registered alias's own
-// alternatives (spec section 5, Case B point 1) -- same progressive,
-// only-as-far-as-needed visibility widening this project already uses
-// repeatedly for `InferCtx`/`Scheme`/`Ctx`/etc.
-pub(crate) fn contains_named(ty: &Type, id: &str) -> bool {
+fn contains_named(ty: &Type, id: &str) -> bool {
     match ty {
         Type::Named(n) => n == id,
         Type::List(elem) => contains_named(elem, id),
@@ -149,7 +142,24 @@ pub(crate) fn contains_named(ty: &Type, id: &str) -> bool {
 // apart from "zero" or "two or more" (spec section 5, Case B point 2:
 // a step alternative referencing the recursive id twice or more, e.g. a
 // binary tree's `Node(Tree, Tree)` shape, deliberately doesn't qualify),
-// which a plain bool can't distinguish.
+// which a plain bool can't distinguish. Terminates for the same
+// structural reason `contains_named` does, though NOT because `ty` is
+// always a fresh parse result here: Case B's own real caller
+// (`qualifying_named_alternatives`, typecheck.rs) runs this on an
+// ALREADY-REGISTERED alias's own RHS, which can (and typically does)
+// contain completed `Type::Named(id)` leaves. It still terminates
+// because neither `contains_named` nor `count_named` ever UNFOLDS a
+// `Type::Named` reference -- both only count/check its occurrences as
+// an opaque leaf in an already-fully-parsed type structure, so there's
+// no recursion to follow through it at all.
+//
+// `pub(crate)`, not private: Phase 4 Task 3's own Case B eligibility
+// check (typecheck.rs's `qualifying_named_alternatives`) needs to ask
+// this question about an already-registered alias's own alternatives
+// (spec section 5, Case B point 1) -- same progressive, only-as-far-
+// as-needed visibility widening this project already uses repeatedly
+// for `InferCtx`/`Scheme`/`Ctx`/etc. `contains_named` just above has no
+// caller outside this file and stays private.
 pub(crate) fn count_named(ty: &Type, id: &str) -> usize {
     match ty {
         Type::Named(n) => usize::from(n == id),
