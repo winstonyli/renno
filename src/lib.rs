@@ -4027,6 +4027,88 @@ mod tests {
         assert!(unify_index_expr(&IndexExpr::Var("n".to_string()), &rhs, &mut infer, span).is_err());
     }
 
+    // Final review Finding 1: unify_trial only snapshotted/restored
+    // infer.subst, not infer.index_subst -- so a failed trial that had
+    // ALREADY bound an index variable partway through (e.g. position 0
+    // of a Tuple, before a later position fails) left that binding
+    // permanently in place, even though the trial as a WHOLE failed and
+    // unify_trial's own doc comment promises "genuinely leaves no
+    // trace." Tuple([Indexed(n), Int]) against Tuple([Indexed(3), Bool])
+    // binds n := 3 at position 0 (via unify_index_expr), then fails at
+    // position 1 (Int vs Bool) -- confirmed to fail WITHOUT the fix
+    // (infer.index_subst still contains n -> 3 after unify_trial
+    // returns Err) and pass WITH it, by temporarily reverting
+    // unify_trial's own index_subst snapshot/restore and rerunning.
+    #[test]
+    fn unify_trial_rolls_back_index_subst_on_a_failed_trial() {
+        use crate::index_expr::IndexExpr;
+        use crate::span::Span;
+        use crate::typecheck::{unify_trial, InferCtx};
+        use std::collections::HashMap;
+        use std::rc::Rc;
+        use types::Type;
+        let mut infer = InferCtx::new(HashMap::new());
+        let span = Span { start: 0, end: 0 };
+        let t1 = Type::Tuple(Rc::new(vec![
+            Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string()))),
+            Type::Int,
+        ]));
+        let t2 = Type::Tuple(Rc::new(vec![
+            Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Lit(3))),
+            Type::Bool,
+        ]));
+        assert!(unify_trial(&t1, &t2, &mut infer, span).is_err());
+        assert!(
+            infer.index_subst.is_empty(),
+            "unify_trial must leave no trace on failure, but index_subst still has: {:?}",
+            infer.index_subst
+        );
+    }
+
+    // Final review Finding 2: unify_index_expr resolved both sides via
+    // resolve_index -- a ONE-LEVEL resolution that only unwraps a bare
+    // Var, never substituting inside a compound expression. With `n`
+    // already bound to 3, unifying Add(n, 1) against Lit(4) incorrectly
+    // failed: resolve_index left Add(n, 1) untouched (n is buried inside
+    // the Add, not itself a bare Var), so neither the bind-arm nor the
+    // SOP-equality arm ever saw the already-true fact that n+1 == 4.
+    // Confirmed to fail without the resolve_index_deep fix and pass with
+    // it (temporarily reverted and restored).
+    #[test]
+    fn unify_index_expr_resolves_deeply_so_an_already_bound_variable_inside_a_compound_expression_is_recognized() {
+        use crate::index_expr::IndexExpr;
+        use crate::span::Span;
+        use crate::typecheck::{unify_index_expr, InferCtx};
+        use std::collections::HashMap;
+        use std::rc::Rc;
+        let mut infer = InferCtx::new(HashMap::new());
+        infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
+        let span = Span { start: 0, end: 0 };
+        let lhs = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)));
+        unify_index_expr(&lhs, &IndexExpr::Lit(4), &mut infer, span).unwrap();
+    }
+
+    // The related Minor issue Finding 2 also predicted: with deep
+    // resolution, unifying a bare `n` against `n + 0` now hits the
+    // SOP-equality arm (n == n+0 under SOP normalization) BEFORE the
+    // occurs-check-guarded bind arm ever runs, so it no longer
+    // incorrectly rejects this as an "infinite index expression." No
+    // index_subst binding is left behind either, since the pair was
+    // already equal and needed none.
+    #[test]
+    fn unify_index_expr_does_not_false_positive_occurs_check_when_sop_equal() {
+        use crate::index_expr::IndexExpr;
+        use crate::span::Span;
+        use crate::typecheck::{unify_index_expr, InferCtx};
+        use std::collections::HashMap;
+        use std::rc::Rc;
+        let mut infer = InferCtx::new(HashMap::new());
+        let span = Span { start: 0, end: 0 };
+        let rhs = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(0)));
+        unify_index_expr(&IndexExpr::Var("n".to_string()), &rhs, &mut infer, span).unwrap();
+        assert!(infer.index_subst.is_empty());
+    }
+
     // The brief's own literal Step-1 test -- `identity_vec(3)(v)`, `v:
     // Vec(3)` -- was written and run against this task's own change
     // (both with and without it) before landing this test. It turns out
@@ -4122,7 +4204,7 @@ mod tests {
     #[test]
     fn free_index_vars_resolved_finds_nothing_in_an_ordinary_type() {
         use crate::typecheck::{free_index_vars_resolved, InferCtx};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
         use types::Type;
         let infer = InferCtx::new(HashMap::new());
         let vars = free_index_vars_resolved(&Type::Int, &infer);

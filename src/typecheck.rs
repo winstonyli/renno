@@ -19,30 +19,37 @@ use crate::util::find_field;
 #[derive(Debug)]
 pub struct TypeError(pub String, pub Span);
 
-// A binding's type, plus the row-variable AND value-type-variable names
-// generalized over it -- quantified fresh at every use, the way ML/
-// Haskell generalize a `let`-bound type. Row variables only ever come
-// from what the user wrote (an explicit `->{e}` annotation); type
-// variables (`type_vars`) are manufactured by real unification (`unify`,
-// via `InferCtx::fresh_var`) at many sites, never written by a user --
-// see Type::Var's own doc comment. Either way, this stays simple name
-// substitution (extend_generalized computes both sets once at the `let`,
-// lookup renames them to fresh names at each reference), not a
-// second unification engine of its own.
+// A binding's type, plus the row-variable, value-type-variable, AND
+// index-variable names generalized over it -- quantified fresh at every
+// use, the way ML/Haskell generalize a `let`-bound type. Row variables
+// only ever come from what the user wrote (an explicit `->{e}`
+// annotation); type variables (`type_vars`) are manufactured by real
+// unification (`unify`, via `InferCtx::fresh_var`) at many sites, never
+// written by a user -- see Type::Var's own doc comment; index variables
+// (`index_vars`) are the same idea one level down, for a name appearing
+// inside a `Type::Indexed`'s own `IndexExpr` rather than as a `Type`
+// itself (manufactured by `unify_index_expr`, via `index_subst`, not
+// `fresh_var` -- a separate namespace, see `InferCtx::index_subst`'s own
+// doc comment). All three stay simple name substitution
+// (extend_generalized computes every set once at the `let`, lookup
+// renames them to fresh names at each reference), not a second
+// unification engine of its own.
 //
-// Neither kind of variable is safe to generalize wherever its own
-// free-variable collector finds it -- see generalizable_row_vars's and
-// generalizable_type_vars's own doc comments for why each needs a
-// ctx-wide "is this still open in an enclosing scope" check.
+// None of the three kinds of variable is safe to generalize wherever its
+// own free-variable collector finds it -- see generalizable_row_vars's,
+// generalizable_type_vars's, and generalizable_index_vars's own doc
+// comments for why each needs a ctx-wide "is this still open in an
+// enclosing scope" check.
 //
-// The general rule behind BOTH exclusions, stated once here so a future
-// THIRD kind of variable needing this treatment has one place to read it
-// instead of re-deriving it: generalize(ctx, ty) = freevars(ty) MINUS
-// freevars(ctx) -- never quantify over a name that's still free somewhere
-// still open in the enclosing scope. Applied directly via a ctx-wide scan
-// for both kinds (generalizable_row_vars/free_row_vars_in_ctx and
-// generalizable_type_vars/free_type_vars_in_ctx below) -- there is no
-// longer a caller-supplied-list shortcut for either (Type::Var's own used
+// The general rule behind ALL THREE exclusions, stated once here so a
+// future FOURTH kind of variable needing this treatment has one place to
+// read it instead of re-deriving it: generalize(ctx, ty) = freevars(ty)
+// MINUS freevars(ctx) -- never quantify over a name that's still free
+// somewhere still open in the enclosing scope. Applied directly via a
+// ctx-wide scan for each kind (generalizable_row_vars/
+// free_row_vars_in_ctx, generalizable_type_vars/free_type_vars_in_ctx,
+// and generalizable_index_vars/free_index_vars_in_ctx below) -- there is
+// no caller-supplied-list shortcut for any of them (Type::Var's own used
 // to have one, extend_generalized_with_type_vars, back when it had
 // exactly one manufacturing call site; real unification mints it at many,
 // so that shortcut no longer applies -- see the design spec's own "Data
@@ -51,6 +58,12 @@ pub struct TypeError(pub String, pub Span);
 pub(crate) struct Scheme {
     row_vars: Vec<String>,
     type_vars: Vec<String>,
+    // Index-variable names generalized over this binding -- Phase 2's
+    // own addition, alongside row_vars/type_vars above. Same
+    // generalize-then-instantiate treatment: generalizable_index_vars
+    // computes this set at the `let` (a ctx-wide "still open elsewhere"
+    // exclusion, exactly like the other two), lookup mints a fresh
+    // IndexExpr::Var name per reference via fresh_index_name.
     index_vars: Vec<String>,
     ty: Type,
 }
@@ -253,13 +266,32 @@ fn occurs_in_index(name: &str, e: &IndexExpr, infer: &InferCtx) -> bool {
 // a different module -- rather than because anything outside
 // typecheck.rs is meant to call this directly.
 pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
-    let a = infer.resolve_index(a);
-    let b = infer.resolve_index(b);
+    // resolve_index_deep, not resolve_index -- a shallow resolve only
+    // unwraps a bare Var, so a bound variable buried inside a compound
+    // expression (e.g. `n` in `Add(n, 1)`) stayed unsubstituted and
+    // could make an already-true equality (n=3 => n+1 == 4) look like a
+    // mismatch, or make the SOP-equality arm below miss cases it should
+    // catch (see final review Finding 2).
+    let a = infer.resolve_index_deep(a);
+    let b = infer.resolve_index_deep(b);
     match (&a, &b) {
         (IndexExpr::Var(n1), IndexExpr::Var(n2)) if n1 == n2 => Ok(()),
         (IndexExpr::Var(name), other) | (other, IndexExpr::Var(name)) => {
             if occurs_in_index(name, other, infer) {
-                return Err(TypeError(format!("infinite index expression: {name} occurs in {other}"), span));
+                // A structural occurrence isn't always a genuine
+                // infinite-expression violation: `n` against `n + 0` (or
+                // any other SOP-equal shape) LOOKS self-referential
+                // positionally, but SOP normalization already proves the
+                // two sides equal, needing no binding at all -- the same
+                // rescue the arm below gives non-Var compound pairs,
+                // extended to cover this arm too (final review Finding
+                // 2's related Minor issue). Only a GENUINE occurs
+                // violation (not SOP-equal either) still errors.
+                return if crate::index_expr::index_exprs_equal(&a, &b) {
+                    Ok(())
+                } else {
+                    Err(TypeError(format!("infinite index expression: {name} occurs in {other}"), span))
+                };
             }
             infer.index_subst.insert(name.clone(), other.clone());
             Ok(())
@@ -462,13 +494,29 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
 // the Global Constraint requires a failed unify() to behave EXACTLY like
 // today's widen-to-Dyn -- not silently leave a partial binding that
 // relocates the rejection to some LATER, unrelated use of that same
-// variable. This wrapper snapshots infer.subst before trying, and
-// restores it on failure, so a failed trial genuinely leaves no trace.
-fn unify_trial(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
+// variable. This wrapper snapshots infer.subst AND infer.index_subst
+// before trying, and restores both on failure, so a failed trial
+// genuinely leaves no trace (see final review Finding 1 -- index_subst
+// didn't exist yet when this wrapper's own doc comment was first
+// written, and unify() only started writing to it once Task 3 wired
+// unify_index_expr in).
+//
+// pub(crate), not private, only because this project's own test
+// convention (see unify_index_expr's neighbors) keeps tests in
+// src/lib.rs -- a different module -- rather than because anything
+// outside typecheck.rs is meant to call this directly.
+pub(crate) fn unify_trial(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
     let snapshot = infer.subst.clone();
+    // unify() (Task 3) now writes to index_subst too, via
+    // unify_index_expr's own bare-variable-bind arm -- a failed trial
+    // must roll that back as well, or a later, unrelated index
+    // comparison would silently see a binding this trial never actually
+    // committed to.
+    let index_snapshot = infer.index_subst.clone();
     let result = unify(t1, t2, infer, span);
     if result.is_err() {
         infer.subst = snapshot;
+        infer.index_subst = index_snapshot;
     }
     result
 }
