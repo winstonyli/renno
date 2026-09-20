@@ -2147,6 +2147,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     let mut pending = Vec::new();
     let mut cur_expr = expr;
     let mut cur_ctx: Ctx = ctx.clone();
+    let mut cur_mode = mode;
     loop {
         // Expr is Clone and, now that its fields are ExprRef (Copy)
         // instead of Rc<Expr>, cheap to clone -- this ends the borrow on
@@ -2154,22 +2155,29 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         let node = arena[cur_expr].clone();
         match node {
             Expr::Let(var, ann, val, body) => {
-                let (val_ty, val_row, val2) = elaborate(arena, val, &cur_ctx, spans, infer)?;
-                let (bound_ty, val3) = match ann {
+                // `cur_mode` is deliberately NOT read or written here: a
+                // `let` binding's own annotation (if any) is a fully
+                // self-contained expected type for `val` -- it doesn't
+                // come from, or change, whatever mode the ENCLOSING
+                // chain is running under, and the body/tail after this
+                // binding stays under that same enclosing mode.
+                let (bound_ty, val_row, val3) = match ann {
+                    // `check_against` folds today's coerce-then-unify_fits
+                    // pair into one call, AND -- since val may itself be a
+                    // Lambda/If/Match -- lets the declared annotation `t`
+                    // actually flow into val's own tail position instead of
+                    // only being checked against val's independently
+                    // inferred type after the fact. This is Phase 3's real
+                    // entry point: `let f: A -> Vec(n) = fn(x) = <body>`
+                    // now checks <body> against Vec(n) directly.
                     Some(t) => {
-                        let val4 = coerce(arena, val2, &val_ty, &t, spans[val], &infer.named_types)?;
-                        // Mirrors Expr::App's own coerce-then-unify_fits
-                        // pattern: coerce still runs first and stays the
-                        // error-message authority (unchanged from before),
-                        // this just ADDS a follow-up unify_fits so a bare
-                        // index variable that consistent()'s new
-                        // permissiveness let coerce() no-op on (see
-                        // types::consistent's Type::Indexed arm) actually
-                        // gets bound instead of silently left unconstrained.
-                        unify_fits(&t, &val_ty, infer, spans[val])?;
-                        (t.clone(), val4)
+                        let (val_row, val4) = check_against(arena, val, &t, &cur_ctx, spans, infer)?;
+                        (t.clone(), val_row, val4)
                     }
-                    None => (val_ty, val2),
+                    None => {
+                        let (val_ty, val_row, val2) = elaborate(arena, val, &cur_ctx, spans, infer)?;
+                        (val_ty, val_row, val2)
+                    }
                 };
                 cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone(), infer);
                 pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3 });
@@ -2195,16 +2203,19 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 }
                 let mut elaborated = Vec::with_capacity(bindings.len());
                 for (name, ann, val) in bindings.iter() {
-                    let (val_ty, val_row, val2) = elaborate(arena, *val, &val_ctx, spans, infer)?;
-                    let (bound_ty, val3) = match ann {
+                    // Same check_against restructuring as Expr::Let just
+                    // above -- see its own comment. `cur_mode` is likewise
+                    // untouched: each binding's annotation is its own
+                    // self-contained expected type.
+                    let (bound_ty, val_row, val3) = match ann {
                         Some(t) => {
-                            let val4 = coerce(arena, val2, &val_ty, t, spans[*val], &infer.named_types)?;
-                            // Identical fix as Expr::Let just above -- see
-                            // its own comment.
-                            unify_fits(t, &val_ty, infer, spans[*val])?;
-                            (t.clone(), val4)
+                            let (val_row, val4) = check_against(arena, *val, t, &val_ctx, spans, infer)?;
+                            (t.clone(), val_row, val4)
                         }
-                        None => (val_ty, val2),
+                        None => {
+                            let (val_ty, val_row, val2) = elaborate(arena, *val, &val_ctx, spans, infer)?;
+                            (val_ty, val_row, val2)
+                        }
                     };
                     elaborated.push((name.clone(), bound_ty, val_row, val3));
                 }
@@ -2215,16 +2226,46 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 cur_expr = body;
             }
             Expr::Lambda(param, ann, body) => {
-                let param_ty = ann.unwrap_or_else(|| infer.fresh_var(&param));
+                // The one place `cur_mode` actually changes: if the
+                // caller already knows this Lambda must have type
+                // Fun(param_ty, _, ret_ty) -- e.g. it's the value of a
+                // `let f: X -> Y = fn(p) = ...` binding, or a nested
+                // Lambda inside a curried one -- adopt that expected
+                // param type (or this Lambda's own local annotation,
+                // unify_fits-checked against it so a mismatched explicit
+                // annotation is still a real error, not silently
+                // overridden) and switch `cur_mode` to Check(ret_ty) for
+                // the rest of the chain, so THIS Lambda's own body (and
+                // anything nested inside it: more Lets, another curried
+                // Lambda layer, or a tail Match/If) gets checked against
+                // ret_ty instead of inferred blind. Any other expected
+                // type (Check with a non-Fun type, or Synth) means this
+                // position isn't known to be a function -- fall back to
+                // today's exact Synth behavior for this Lambda's own
+                // param/body.
+                let (param_ty, next_mode): (Type, Mode) = match cur_mode {
+                    Mode::Check(Type::Fun(expected_param, _eff, expected_ret)) => {
+                        let param_ty = match ann {
+                            Some(local) => {
+                                unify_fits(expected_param, &local, infer, spans[cur_expr])?;
+                                local
+                            }
+                            None => (**expected_param).clone(),
+                        };
+                        (param_ty, Mode::Check(expected_ret))
+                    }
+                    _ => (ann.unwrap_or_else(|| infer.fresh_var(&param)), Mode::Synth),
+                };
                 cur_ctx = extend(&cur_ctx, &param, param_ty.clone());
                 pending.push(PendingElab::Fun { param, param_ty });
+                cur_mode = next_mode;
                 cur_expr = body;
             }
             _ => break,
         }
     }
 
-    let (mut result_ty, mut result_row, mut result_expr) = match mode {
+    let (mut result_ty, mut result_row, mut result_expr) = match cur_mode {
         Mode::Synth => elaborate_node(arena, cur_expr, &cur_ctx, spans, infer, Mode::Synth)?,
         Mode::Check(expected) => {
             // If/Match (Tasks 3-4) check their own branches/arms against

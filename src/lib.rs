@@ -346,6 +346,25 @@ mod tests {
         assert!(err.0.contains("expected Int, found Float"), "unexpected message: {}", err.0);
     }
 
+    // Phase 3, Task 2: `elaborate_mode`'s chain-flattening loop now threads
+    // a running `cur_mode` through curried Lambda layers, peeling one
+    // Fun(param, _, ret) off the annotation per Lambda and Check-ing the
+    // next layer against `ret` instead of only Synth-ing it. Both Lambda
+    // layers here should adopt their param types from the annotation's own
+    // Fun layers, and the innermost body (`x`, a bare Var) gets checked
+    // against the innermost Int via check_against's generic fallback --
+    // this doesn't observably differ from today's Synth-then-reconcile
+    // result for a plain Int, but confirms the loop's own cur_mode
+    // threading doesn't panic or misroute across two Lambda layers before
+    // Tasks 3/4 add anything Match/If-specific.
+    #[test]
+    fn check_against_threads_expected_return_type_through_a_curried_lambda() {
+        let src = "let f: (Int -> Int -> Int) = fun x -> fun y -> x in f(1)(2)";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 1);
+    }
+
     #[test]
     fn dyn_sourced_value_can_cross_into_an_arithmetic_position() {
         let src = r#"
