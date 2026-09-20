@@ -48,19 +48,24 @@ pub struct TypeError(pub String, pub Span);
 // so that shortcut no longer applies -- see the design spec's own "Data
 // model" section).
 #[derive(Clone)]
-struct Scheme {
+pub(crate) struct Scheme {
     row_vars: Vec<String>,
     type_vars: Vec<String>,
+    index_vars: Vec<String>,
     ty: Type,
 }
 
 impl Scheme {
     fn mono(ty: Type) -> Scheme {
-        Scheme { row_vars: Vec::new(), type_vars: Vec::new(), ty }
+        Scheme { row_vars: Vec::new(), type_vars: Vec::new(), index_vars: Vec::new(), ty }
     }
 }
 
-type Ctx = PList<Scheme>;
+// pub(crate), not private, only because this project's own test
+// convention (see unify_index_expr's neighbors) keeps tests in
+// src/lib.rs -- a different module -- rather than because anything
+// outside typecheck.rs is meant to name this directly.
+pub(crate) type Ctx = PList<Scheme>;
 
 // The real, threaded state a Hindley-Milner-style unifier needs, carried
 // through every elaborate()/elaborate_node() call as `&mut InferCtx` --
@@ -483,12 +488,12 @@ fn forget_index(ty: &Type) -> Type {
     }
 }
 
-fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
+pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
     // Unbound at typecheck time: don't error here, machine::run's own
     // `unbound variable` panic at runtime is the right place for that.
     match ctx.get(name) {
         None => Type::Dyn,
-        Some(scheme) if scheme.row_vars.is_empty() && scheme.type_vars.is_empty() => scheme.ty,
+        Some(scheme) if scheme.row_vars.is_empty() && scheme.type_vars.is_empty() && scheme.index_vars.is_empty() => scheme.ty,
         Some(scheme) => {
             let row_subst: HashMap<String, EffectRow> = scheme
                 .row_vars
@@ -497,7 +502,9 @@ fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
                 .collect();
             let type_subst: HashMap<String, Type> =
                 scheme.type_vars.iter().map(|v| (v.clone(), infer.fresh_var(v))).collect();
-            subst_type(&scheme.ty, &row_subst, &type_subst)
+            let index_subst: HashMap<String, IndexExpr> =
+                scheme.index_vars.iter().map(|v| (v.clone(), IndexExpr::Var(fresh_index_name(v)))).collect();
+            subst_type(&scheme.ty, &row_subst, &type_subst, &index_subst)
         }
     }
 }
@@ -557,11 +564,16 @@ fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // `let f_ty = infer.resolve(&f_ty);`). resolve_deep leaves EffectRow
 // untouched (it only walks Type positions), so this doesn't affect
 // row-variable generalization at all.
-fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &InferCtx) -> Ctx {
+// pub(crate) for the same test-access reason as Ctx/unify_index_expr
+// above -- extend_generalized/lookup together are what this task's
+// own unit test exercises directly, bypassing the separate Expr::App
+// coerce() gap a source-level `identity_vec(3)(va)` call would hit.
+pub(crate) fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &InferCtx) -> Ctx {
     let ty = infer.resolve_deep(&ty);
     let row_vars = generalizable_row_vars(ctx, &ty);
     let type_vars = generalizable_type_vars(ctx, &ty, infer);
-    ctx.bind(name, Scheme { row_vars, type_vars, ty })
+    let index_vars = generalizable_index_vars(ctx, &ty, infer);
+    ctx.bind(name, Scheme { row_vars, type_vars, index_vars, ty })
 }
 
 // Row-variable names free in `ty` that are actually safe to generalize
@@ -755,6 +767,28 @@ fn generalizable_type_vars(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<String
     candidates.difference(&still_open).cloned().collect()
 }
 
+// Type::Indexed's own analog of free_type_vars_in_ctx/generalizable_type_vars
+// -- same ctx-wide "still open somewhere enclosing" exclusion, just over
+// index-variable names via free_index_vars_resolved (Task 4) and
+// Scheme.index_vars instead of free_type_vars_resolved/Scheme.type_vars.
+fn free_index_vars_in_ctx(ctx: &Ctx, infer: &InferCtx) -> BTreeSet<String> {
+    let mut vars = BTreeSet::new();
+    ctx.for_each(|scheme: &Scheme| {
+        let sealed: BTreeSet<String> = scheme.index_vars.iter().cloned().collect();
+        vars.extend(free_index_vars_resolved(&scheme.ty, infer).difference(&sealed).cloned());
+    });
+    vars
+}
+
+fn generalizable_index_vars(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<String> {
+    let candidates = free_index_vars_resolved(ty, infer);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let still_open = free_index_vars_in_ctx(ctx, infer);
+    candidates.difference(&still_open).cloned().collect()
+}
+
 fn fresh_row_name(base: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -766,6 +800,15 @@ fn fresh_row_name(base: &str) -> String {
 // share one (and every reason not to, in case they're ever compared or
 // logged together during debugging).
 fn fresh_type_name(base: &str) -> String {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{base}#{n}")
+}
+
+// Same idea as fresh_type_name, its own separate counter/namespace --
+// an index variable's identity is unrelated to a Type::Var's or an
+// EffectRow::Var's, for the same reason index_subst is its own map.
+fn fresh_index_name(base: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{base}#{n}")
@@ -797,19 +840,38 @@ fn resolve_row(row: &EffectRow, subst: &HashMap<String, EffectRow>) -> EffectRow
 // anyway, on the same "recurse everywhere free_row_vars does" principle
 // the Fun/List/Tuple arms already establish -- correct by construction,
 // not by a failing case this fixed.
-fn subst_type(ty: &Type, row_subst: &HashMap<String, EffectRow>, type_subst: &HashMap<String, Type>) -> Type {
+// Index-expression analog of subst_type's own Type::Var arm -- renames a
+// bare IndexExpr::Var per index_subst (built fresh per lookup() call, one
+// entry per generalized index variable), leaving Lit and any variable not
+// in the map untouched, and recursing into Add/Sub/Mul the same way
+// subst_type recurses into Fun/List/Tuple/Union/Record.
+fn subst_index_expr(e: &IndexExpr, index_subst: &HashMap<String, IndexExpr>) -> IndexExpr {
+    match e {
+        IndexExpr::Var(name) => index_subst.get(name).cloned().unwrap_or_else(|| e.clone()),
+        IndexExpr::Lit(_) => e.clone(),
+        IndexExpr::Add(a, b) => IndexExpr::Add(Rc::new(subst_index_expr(a, index_subst)), Rc::new(subst_index_expr(b, index_subst))),
+        IndexExpr::Sub(a, b) => IndexExpr::Sub(Rc::new(subst_index_expr(a, index_subst)), Rc::new(subst_index_expr(b, index_subst))),
+        IndexExpr::Mul(a, b) => IndexExpr::Mul(Rc::new(subst_index_expr(a, index_subst)), Rc::new(subst_index_expr(b, index_subst))),
+    }
+}
+
+fn subst_type(ty: &Type, row_subst: &HashMap<String, EffectRow>, type_subst: &HashMap<String, Type>, index_subst: &HashMap<String, IndexExpr>) -> Type {
     match ty {
         Type::Var(name) => type_subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Fun(param, row, ret) => Type::Fun(
-            Rc::new(subst_type(param, row_subst, type_subst)),
-            resolve_row(row, row_subst),
-            Rc::new(subst_type(ret, row_subst, type_subst)),
+        Type::Indexed(wrapped, index) => Type::Indexed(
+            Rc::new(subst_type(wrapped, row_subst, type_subst, index_subst)),
+            Rc::new(subst_index_expr(index, index_subst)),
         ),
-        Type::List(elem) => Type::List(Rc::new(subst_type(elem, row_subst, type_subst))),
-        Type::Tuple(items) => Type::Tuple(Rc::new(items.iter().map(|t| subst_type(t, row_subst, type_subst)).collect())),
-        Type::Union(alts) => Type::Union(Rc::new(alts.iter().map(|t| subst_type(t, row_subst, type_subst)).collect())),
+        Type::Fun(param, row, ret) => Type::Fun(
+            Rc::new(subst_type(param, row_subst, type_subst, index_subst)),
+            resolve_row(row, row_subst),
+            Rc::new(subst_type(ret, row_subst, type_subst, index_subst)),
+        ),
+        Type::List(elem) => Type::List(Rc::new(subst_type(elem, row_subst, type_subst, index_subst))),
+        Type::Tuple(items) => Type::Tuple(Rc::new(items.iter().map(|t| subst_type(t, row_subst, type_subst, index_subst)).collect())),
+        Type::Union(alts) => Type::Union(Rc::new(alts.iter().map(|t| subst_type(t, row_subst, type_subst, index_subst)).collect())),
         Type::Record(fields) => {
-            Type::Record(Rc::new(fields.iter().map(|(n, t)| (n.clone(), subst_type(t, row_subst, type_subst))).collect()))
+            Type::Record(Rc::new(fields.iter().map(|(n, t)| (n.clone(), subst_type(t, row_subst, type_subst, index_subst))).collect()))
         }
         other => other.clone(),
     }
@@ -2257,7 +2319,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // parts of the type (EffectRow positions vs Type::Var
                     // positions), so composing them in either order gives
                     // the same result.
-                    let ret_ty2 = infer.resolve_deep(&subst_type(ret_ty, &row_subst, &HashMap::new()));
+                    let ret_ty2 = infer.resolve_deep(&subst_type(ret_ty, &row_subst, &HashMap::new(), &HashMap::new()));
                     (call_row2, ret_ty2, arena.push(Expr::App(f2, a3)))
                 }
                 // NEW: the callee itself isn't known to be a function

@@ -4128,4 +4128,89 @@ mod tests {
         let vars = free_index_vars_resolved(&Type::Int, &infer);
         assert!(vars.is_empty());
     }
+
+    #[test]
+    #[ignore = "uninformative for this task: fails on the separate, already-flagged \
+        Expr::App/coerce gap (Task 3's own finding) -- coerce() checks call \
+        arguments structurally, not via unify()/unify_fits(), so it rejects \
+        Vec(n) against Vec(3) even when n WOULD unify. Not this task's job to \
+        fix; see the direct extend_generalized/lookup unit test below for the \
+        real proof that index-variable generalization works."]
+    fn a_let_bound_vec_producing_function_generalizes_over_its_own_index_variable() {
+        // identity_vec's own `n` must be generalized so it can be called
+        // at two DIFFERENT lengths from the same let-binding, the same way
+        // an ordinary polymorphic identity function already generalizes
+        // over its own type variable.
+        let src = r#"
+            let identity_vec = fun n: Int -> fun v: Vec(n) -> v in
+            let a: Dyn = [1, 2, 3] in
+            let b: Dyn = [1, 2] in
+            let va: Vec(3) = a in
+            let vb: Vec(2) = b in
+            len(identity_vec(3)(va)) + len(identity_vec(2)(vb))
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 5);
+    }
+
+    // Direct unit test on extend_generalized/lookup themselves (per the
+    // task's own Step 2 fallback), bypassing the Expr::App/coerce gap
+    // above entirely: builds identity_vec's OWN type by hand --
+    // `Fun(Int, Fun(Vec(n), Vec(n)))` -- generalizes it into a fresh Ctx
+    // via extend_generalized, then calls lookup TWICE. Without real
+    // generalization (index_vars left empty), both lookups would return
+    // the exact same stored Type::Indexed(_, IndexExpr::Var("n")) --
+    // literally the same `n`, unable to independently unify against two
+    // different lengths later. With generalization working, each lookup
+    // mints its OWN fresh index-variable name (fresh_index_name's
+    // `n#<counter>` shape), so the two instantiations disagree on that
+    // name -- the same signal generalizable_type_vars's own fresh
+    // Type::Var per lookup gives for ordinary polymorphism.
+    #[test]
+    fn extend_generalized_and_lookup_mint_a_fresh_index_variable_per_use() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{extend_generalized, lookup, Ctx, InferCtx};
+        use std::rc::Rc;
+        use types::{EffectRow, Type};
+
+        fn vec_of(index: IndexExpr) -> Type {
+            Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index))
+        }
+
+        // fun n: Int -> fun v: Vec(n) -> v
+        let n = IndexExpr::Var("n".to_string());
+        let identity_vec_ty = Type::Fun(
+            Rc::new(Type::Int),
+            EffectRow::Dyn,
+            Rc::new(Type::Fun(Rc::new(vec_of(n.clone())), EffectRow::Dyn, Rc::new(vec_of(n)))),
+        );
+
+        let mut infer = InferCtx::new(std::collections::HashMap::new());
+        let ctx = extend_generalized(&Ctx::empty(), "identity_vec", identity_vec_ty, &infer);
+
+        // Extracts the index-variable name inside `Fun(Int, Fun(Vec(idx), Vec(idx)))`.
+        fn index_var_name(ty: &Type) -> String {
+            match ty {
+                Type::Fun(_, _, ret) => match ret.as_ref() {
+                    Type::Fun(param, _, _) => match param.as_ref() {
+                        Type::Indexed(_, index) => match index.as_ref() {
+                            IndexExpr::Var(name) => name.clone(),
+                            other => panic!("expected a bare index variable, got {other:?}"),
+                        },
+                        other => panic!("expected Vec(_) as the inner param, got {other:?}"),
+                    },
+                    other => panic!("expected a nested Fun as identity_vec's return type, got {other:?}"),
+                },
+                other => panic!("expected identity_vec's own type to be a Fun, got {other:?}"),
+            }
+        }
+
+        let use_a = lookup(&ctx, "identity_vec", &mut infer);
+        let use_b = lookup(&ctx, "identity_vec", &mut infer);
+        let name_a = index_var_name(&use_a);
+        let name_b = index_var_name(&use_b);
+
+        assert_ne!(name_a, "n", "lookup should instantiate a FRESH name, not return the generalized `n` verbatim");
+        assert_ne!(name_b, "n", "lookup should instantiate a FRESH name, not return the generalized `n` verbatim");
+        assert_ne!(name_a, name_b, "two separate lookups of a generalized index variable must get INDEPENDENT fresh names");
+    }
 }
