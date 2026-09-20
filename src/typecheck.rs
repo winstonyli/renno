@@ -278,18 +278,18 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
         // match already has none for List/Tuple/Union either, so anything
         // that isn't Fun or Record falls through to the generic catch-all
         // below: unify_trial tries unify() first (which DOES have its own
-        // Indexed arm, added alongside this comment), with a consistent()
-        // rescue on failure. That path was verified directly (temporary
-        // probe test against this exact function, then removed) to give
-        // Indexed the right answer on match, index mismatch, AND binding a
-        // Type::Var reachable only through the wrapped type -- so adding a
-        // redundant explicit arm here would only duplicate what already
-        // works; see this task's own report for the probe results.
-        // ponytail: no Type::Var binding via the consistent() rescue path below --
-        // unify_trial is tried first and binds Vars on success, but a Var
-        // reachable ONLY through consistent() accepting the pair (e.g. only
+        // Indexed arm), with a consistent()/fits() rescue on failure. That
+        // path gives Indexed the right answer on match, index mismatch,
+        // AND binding a Type::Var reachable only through the wrapped
+        // type -- see the design spec's own §3 for the rationale -- so
+        // adding a redundant explicit arm here would only duplicate what
+        // already works.
+        // ponytail: no Type::Var binding via the consistent()/fits() rescue path
+        // below -- unify_trial is tried first and binds Vars on success, but a Var
+        // reachable ONLY through consistent()/fits() accepting the pair (e.g. only
         // resolvable through one alternative of a Union, or only through the
-        // List(Dyn)/Tuple bridge) stays unbound (reads as Dyn via the unresolved
+        // List(Dyn)/Tuple bridge, or only through an Indexed value's own
+        // forget-the-index widening) stays unbound (reads as Dyn via the unresolved
         // Var) -- same permissive-fallback ceiling this feature area already
         // documents elsewhere (e.g. If/Match/ListLit branch combination), not a
         // regression, just not newly closed by this fix. Upgrade if real programs
@@ -297,7 +297,16 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
         _ => match unify_trial(&required, &actual, infer, span) {
             Ok(()) => Ok(()),
             Err(e) => {
-                if consistent(&required, &actual) {
+                // fits(), not just consistent(): an Indexed-typed `actual`
+                // satisfying a plain-typed `required` position (types::fits's
+                // own new Indexed arm, "forgetting" the index) is a real
+                // fits()/consistent() divergence outside the Fun/Record cases
+                // already special-cased above, and unify_fits's own doc
+                // comment promises it's never stricter than coerce()/fits()
+                // itself -- coerce() already accepts this exact pair via
+                // fits() before unify_fits ever runs on it (Expr::App), so
+                // this must too.
+                if consistent(&required, &actual) || fits(&required, &actual) {
                     Ok(())
                 } else if let Type::Named(id) = &required {
                     // Same one-level-unfold rescue as coerce()'s own new
@@ -352,6 +361,21 @@ fn unify_trial(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result
         infer.subst = snapshot;
     }
     result
+}
+
+// `Type::Indexed`'s own "forget the index" widening (see types::fits's
+// own new Indexed arm), applied locally wherever an operator cares only
+// about an operand's wrapped shape, not its statically-tracked length
+// (BinOp::Cons/Concat) -- reusing types::fits itself isn't an option at
+// these two call sites since they run through unify()/consistent()
+// directly, not fits(). One level only: an Indexed value's wrapped type
+// is never itself Indexed in this phase (see Type::Indexed's own doc
+// comment).
+fn forget_index(ty: &Type) -> Type {
+    match ty {
+        Type::Indexed(wrapped, _) => (**wrapped).clone(),
+        _ => ty.clone(),
+    }
 }
 
 fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
@@ -908,15 +932,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &
         // construct one yet (see index_expr_to_expr's own doc comment
         // for the matching "Phase 2 only" note on the index side).
         Type::Indexed(wrapped, index) => match wrapped.as_ref() {
-            Type::List(_) => build_checked(arena, e, to, |arena, v| {
-                let is_list = build_predicate_call(arena, "is_list", v);
-                let len_var = arena.push(Expr::Var("len".to_string()));
-                let len_call = arena.push(Expr::App(len_var, v));
-                let index_expr = index_expr_to_expr(arena, index);
-                let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, index_expr));
-                let false_lit = arena.push(Expr::Bool(false));
-                arena.push(Expr::If(is_list, len_eq, false_lit))
-            }),
+            Type::List(_) => build_checked(arena, e, to, |arena, v| build_indexed_shape_cond(arena, v, index)),
             _ => e,
         },
         // One level only, matching every other shape check in this
@@ -991,6 +1007,30 @@ fn index_expr_to_expr(arena: &mut Arena, e: &IndexExpr) -> ExprRef {
             arena.push(Expr::BinOp(BinOp::Mul, a2, b2))
         }
     }
+}
+
+// The raw boolean condition shared by build_boundary_check's and
+// build_shape_predicate's own Type::Indexed(List(_), _) arms: "is
+// `value_ref` list-shaped AND does its length equal `index`" -- the same
+// is_list-then-len composition Type::Tuple's own arity check uses
+// elsewhere in this file. `is_list` has to run BEFORE `len`, same reason
+// as Tuple's own arm: `len` panics internally (see machine.rs) on a
+// non-list argument, which would surface as an unrelated bare panic
+// instead of a clean "type error: expected ..., found ..." message.
+// Returning the bare condition (not a full Let/If/fail wrapper) lets
+// build_boundary_check wrap it via build_checked (evaluating `value_ref`
+// exactly once) while build_shape_predicate uses it directly as its own
+// bare predicate (no let-binding, callers may OR several of these
+// together) -- see each caller's own doc comment for why they need
+// different wrapping.
+fn build_indexed_shape_cond(arena: &mut Arena, value_ref: ExprRef, index: &IndexExpr) -> ExprRef {
+    let is_list = build_predicate_call(arena, "is_list", value_ref);
+    let len_var = arena.push(Expr::Var("len".to_string()));
+    let len_call = arena.push(Expr::App(len_var, value_ref));
+    let index_expr = index_expr_to_expr(arena, index);
+    let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, index_expr));
+    let false_lit = arena.push(Expr::Bool(false));
+    arena.push(Expr::If(is_list, len_eq, false_lit))
 }
 
 // `let __check_tmp = e in if <alt1-shape> then <alt1's OWN full check>
@@ -1105,13 +1145,24 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, named
             let unfolded = raw.clone();
             build_shape_predicate(arena, value_ref, &unfolded, named_types, &visiting)
         }
-        // An Indexed value IS, at runtime, just its wrapped type's own
-        // value (Vec(n) sugars over this -- see Type::Indexed's own doc
-        // comment); the index itself isn't a runtime shape trait this
-        // shallow check can observe, so delegate straight to the
-        // wrapped type's own predicate, same as Named's one-level
-        // unfold just above delegates to what it unfolds to.
-        Type::Indexed(wrapped, _) => build_shape_predicate(arena, value_ref, wrapped, named_types, visiting),
+        // Unlike Named's own one-level unfold just above (pure delegation
+        // to what it unfolds to), an Indexed value's LENGTH is real,
+        // provable shape information this check must not throw away --
+        // this is what lets build_union_check correctly fall through a
+        // Vec(3) alternative to try a plain [Int] alternative next
+        // instead of routing a length-5 list into Vec(3)'s own full
+        // check (which would then reject it) just because it merely
+        // "looks like some list." Reuses the SAME is_list-then-len
+        // condition build_boundary_check's own Indexed arm uses (see
+        // build_indexed_shape_cond's own doc comment) rather than
+        // shape-only delegation. A Type::Named-wrapped Indexed (derived
+        // index-refinement) is a later phase's own concern -- nothing
+        // before this phase can construct one yet -- so it still falls
+        // back to shape-only delegation, unchanged.
+        Type::Indexed(wrapped, index) => match wrapped.as_ref() {
+            Type::List(_) => build_indexed_shape_cond(arena, value_ref, index),
+            _ => build_shape_predicate(arena, value_ref, wrapped, named_types, visiting),
+        },
     }
 }
 
@@ -1437,6 +1488,13 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
             visiting.insert(id.clone());
             pattern_could_match(pat, unfolded, named_types, &visiting)
         }
+        // An Indexed-typed scrutinee is, at runtime, just its wrapped
+        // type's own value (Vec(n) sugars over this) -- coverage of
+        // []/:: is a purely structural question, independent of what the
+        // index is (see the design spec's own §5 note that exhaustiveness
+        // is unaffected by Vec). Delegate straight to the wrapped type,
+        // mirroring build_shape_predicate's own Type::Indexed arm exactly.
+        (_, Type::Indexed(wrapped, _)) => pattern_could_match(pat, wrapped, named_types, visiting),
         _ => consistent(ty, &pattern_type(pat)),
     }
 }
@@ -1545,7 +1603,13 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut 
         Pattern::Cons(head, tail) => {
             let elem_ty = infer.fresh_var("elem");
             let list_shape = Type::List(Rc::new(elem_ty.clone()));
-            unify(scrutinee_ty, &list_shape, infer, span)?;
+            // "Forget" an Indexed scrutinee's own tracked index before
+            // correlating its shape -- same widening as BinOp::Cons's own
+            // fix (see forget_index's own doc comment): matching `h :: t`
+            // against a Vec(3)-typed scrutinee needs to see its list
+            // shape, not hard-fail here just because Vec(3) isn't
+            // literally Type::List.
+            unify(&forget_index(scrutinee_ty), &list_shape, infer, span)?;
             let c = bind_pattern_vars(ctx, head, &elem_ty, infer, span)?;
             bind_pattern_vars(&c, tail, &list_shape, infer, span)
         }
@@ -2147,6 +2211,17 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // consistent types). Result type: whichever side is
                 // concretely known; Dyn if neither is.
                 BinOp::Concat => {
+                    // "Forget" either side's own tracked index for the
+                    // purposes of this operator -- Concat only cares
+                    // whether an operand is list-shaped, not what its
+                    // statically-known length is (see types::fits's own
+                    // new Type::Indexed arm for the same widening, used
+                    // for the App-argument case instead). Phase 1 has no
+                    // rule for the RESULT length of concatenating two
+                    // Vec(n)s, so this deliberately drops to the wrapped
+                    // type entirely rather than half-tracking it.
+                    let l_ty = forget_index(&l_ty);
+                    let r_ty = forget_index(&r_ty);
                     if !consistent(&l_ty, &r_ty) {
                         return Err(TypeError(
                             format!("type mismatch: cannot concat {l_ty} with {r_ty}"),
@@ -2201,7 +2276,13 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // fallback-to-Dyn.
                     let elem_ty = infer.fresh_var("elem");
                     let list_shape = Type::List(Rc::new(elem_ty.clone()));
-                    unify(&r_ty, &list_shape, infer, spans[r])?;
+                    // "Forget" the tail's own tracked index before
+                    // unifying its shape -- same widening as Concat's own
+                    // arm just above (see forget_index's own doc
+                    // comment); the result is always a plain Type::List
+                    // regardless, so there's nothing Indexed left to
+                    // preserve past this point anyway.
+                    unify(&forget_index(&r_ty), &list_shape, infer, spans[r])?;
                     unify(&l_ty, &elem_ty, infer, spans[l])?;
                     let result_ty = Type::List(Rc::new(infer.resolve_deep(&elem_ty)));
                     Ok((result_ty, row, arena.push(Expr::BinOp(op, l2, r2))))

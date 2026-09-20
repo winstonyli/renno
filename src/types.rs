@@ -337,6 +337,20 @@ pub fn fits(required: &Type, actual: &Type) -> bool {
         (Type::Record(required), Type::Record(actual)) => required
             .iter()
             .all(|(name, ty)| find_field(actual, name).is_some_and(|aty| fits(ty, aty))),
+        // "Forgetting" an Indexed value's own tracked index is a sound,
+        // one-directional widening -- an Indexed-typed value is usable
+        // anywhere its wrapped type is expected (e.g. a Vec(3)-typed list
+        // passed where a plain [T] is required), the same direction every
+        // other relation in this function already models. Guarded so this
+        // ONLY fires when `required` itself isn't Indexed: two Indexed
+        // types must still go through consistent()'s own exact-index arm
+        // above (via the catch-all below), and a plain, non-Indexed
+        // `actual` must NOT satisfy a required Indexed position -- that
+        // asymmetry is the entire point of tracking the index at all, so
+        // there is deliberately no symmetric arm the other way.
+        (required, Type::Indexed(actual_wrapped, _)) if !matches!(required, Type::Indexed(..)) => {
+            fits(required, actual_wrapped)
+        }
         _ => consistent(required, actual),
     }
 }

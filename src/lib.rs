@@ -3623,21 +3623,67 @@ mod tests {
     }
 
     #[test]
-    fn indexed_types_with_a_var_position_unify_the_wrapped_type() {
-        // Vec(3)-of-Dyn unifying against Vec(3)-of-Int should bind the
-        // Dyn/Var side the same way List(Var) unifying against List(Int)
-        // already does -- Indexed delegates its wrapped-type comparison to
-        // the SAME unify() recursion, not a separate check.
+    fn plain_dyn_to_int_program_still_runs_after_indexed_unify_changes() {
+        // Renamed from indexed_types_with_a_var_position_unify_the_wrapped_type
+        // (final review Finding 4): despite its old name and comment, this
+        // program never constructs a Type::Indexed at all -- it's a
+        // harness smoke test confirming Task 3's changes didn't break
+        // trivial end-to-end compilation, not a test of unify()'s own
+        // Indexed arm. See
+        // unifying_two_sop_equal_indexed_types_through_if_needs_no_runtime_check
+        // below for real coverage of that arm.
         let src = r#"
             let f: (Dyn -> Int) = fun v -> 1 in
             f(opaque)
         "#;
-        // Placeholder-free smoke test for this task: full dependent syntax
-        // doesn't exist until Phase 2, so this task's own real coverage is
-        // the direct unify()/fits() unit tests below, not a source-level
-        // program. Kept here only to confirm the harness still compiles a
-        // trivial program end to end after this task's changes.
         assert_eq!(run_untyped(src).as_int(), 1);
+    }
+
+    #[test]
+    fn unifying_two_sop_equal_indexed_types_through_if_needs_no_runtime_check() {
+        // Final review Finding 4: unify()'s own Type::Indexed arm had
+        // zero real test coverage -- deleting it entirely and re-running
+        // the suite still passed, because Expr::App's own unify_fits
+        // falls back to consistent() on a unify() failure, and
+        // consistent() already has its OWN, independent SOP-equality
+        // arm. The one call site where that's NOT true is If/Match's own
+        // unify_trial: its failure fallback is a silent widen-to-Dyn,
+        // with no consistent()-based rescue at all.
+        //
+        // `a`/`b` are Vec(3)/Vec(2+1)-typed PARAMETERS (never actually
+        // called -- this whole expression is elaborated, not run) --
+        // Lit(3) and Add(2,1) are SOP-equal but structurally different
+        // IndexExpr trees, forcing the equality check inside unify()'s
+        // own arm, not just a trivial identical-tree comparison. With
+        // that arm intact, `if true then a else b`'s result type stays
+        // PRECISELY Indexed(List(Dyn), 3) (unify succeeds, no widening),
+        // so annotating it `: Vec(3)` needs no runtime boundary check at
+        // all. If that arm is removed, the if's result degrades to Dyn,
+        // and the same annotation then HAS to splice one in -- a
+        // difference invisible to a plain pass/fail run (the check would
+        // still pass at runtime) but visible via contains_check, which
+        // is exactly why this test uses it instead of just running the
+        // program. Confirmed to actually fail (contains_check finds a
+        // spliced-in check) with unify()'s own Indexed arm commented out,
+        // then restored.
+        // Deliberately returns `c` directly rather than calling
+        // `len(c)`: `len` is an unbound builtin (Type::Dyn in the static
+        // ctx), so App's own Type::Dyn arm splices in an unconditional
+        // is_fun/wrap_fun_contract check on EVERY call to it, regardless
+        // of Vec/Indexed at all -- that would contaminate contains_check
+        // with a check unrelated to what this test is trying to isolate.
+        let src = r#"
+            fun a: Vec(3) ->
+            fun b: Vec(2 + 1) ->
+                let c: Vec(3) = if true then a else b in
+                c
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(
+            !contains_check(&arena, elaborated),
+            "expected unify()'s own Indexed arm to keep the if's result precisely Indexed(3), needing no runtime check for the following Vec(3) annotation"
+        );
     }
 
     #[test]
@@ -3650,6 +3696,97 @@ mod tests {
         assert!(types::fits(&a, &b));
         let c = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(4)));
         assert!(!types::fits(&a, &c));
+    }
+
+    #[test]
+    fn fits_lets_an_indexed_value_satisfy_its_own_plain_wrapped_type() {
+        // The "forget the index" widening (final review Finding 1+3): an
+        // Indexed-typed value is usable anywhere its wrapped type is
+        // required -- a real Vec(3) satisfies a required plain [Int].
+        use crate::index_expr::IndexExpr;
+        use std::rc::Rc;
+        use types::Type;
+        let vec3 = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(3)));
+        assert!(types::fits(&Type::List(Rc::new(Type::Int)), &vec3));
+        // The REVERSE must NOT hold -- a plain [Int] does not carry the
+        // length guarantee a required Vec(3) position promises, and
+        // silently letting it through would defeat the entire point of
+        // tracking the index in the first place.
+        assert!(!types::fits(&vec3, &Type::List(Rc::new(Type::Int))));
+    }
+
+    #[test]
+    fn a_vec_typed_value_can_be_pattern_matched_with_nil_and_cons() {
+        // Final review Finding 1+3: before the fix, pattern_could_match's
+        // Type::Indexed gap AND bind_pattern_vars's Pattern::Cons hard
+        // unify() call both rejected this -- []/:: matching against a
+        // Vec(n)-typed scrutinee is supposed to be exactly as possible as
+        // against the wrapped [T] itself (spec's own §5: exhaustiveness
+        // is unaffected by Vec). `v` is a genuinely Vec(3)-typed value
+        // (crossed a real Dyn boundary via `x`, not just a raw literal
+        // annotation), matching the same discipline every other Indexed
+        // Dyn-boundary test in this file already uses.
+        let src = r#"
+            let x: Dyn = [1, 2, 3] in
+            let v: Vec(3) = x in
+            match v
+            | [] -> 0
+            | h :: t -> h
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn a_vec_typed_value_can_be_passed_where_a_plain_dyn_list_is_expected() {
+        // Final review Finding 1+3: a Vec(3)-typed value must be usable
+        // anywhere its wrapped type ([Dyn]) is expected -- the fits()
+        // widening fix, exercised through a real function call rather
+        // than a direct fits() unit test.
+        let src = r#"
+            let x: Dyn = [1, 2, 3] in
+            let v: Vec(3) = x in
+            let f = fun ys: [Dyn] -> len(ys) in
+            f(v)
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 3);
+    }
+
+    #[test]
+    fn a_plain_list_typed_value_does_not_satisfy_a_required_vec_position() {
+        // The reverse of the test above, which must still correctly
+        // fail: a plain [Int]-typed value carries no length guarantee,
+        // so it must NOT statically satisfy a required Vec(3) parameter
+        // -- silently accepting it would defeat the entire point of
+        // tracking the index. This is a purely STATIC rejection (both
+        // sides fully concrete, no Dyn boundary involved at all).
+        let src = r#"
+            let x: Dyn = [1, 2, 3] in
+            let v: [Int] = x in
+            let f = fun ys: Vec(3) -> len(ys) in
+            f(v)
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("type mismatch"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_union_containing_a_vec_alternative_falls_through_to_the_other_alternative() {
+        // Final review Finding 3: before the fix, build_shape_predicate's
+        // Type::Indexed arm checked shape only (is_list), not length --
+        // so a length-5 list's shape predicate for the Vec(3) alternative
+        // wrongly reported "yes, matches," routing it into Vec(3)'s own
+        // full check (which then correctly rejects the length) instead
+        // of falling through to try the [Int] alternative next. With the
+        // fix, the Vec(3) alternative's own shape predicate correctly
+        // reports "no" for a length-5 value, and build_union_check falls
+        // through to [Int], which accepts it.
+        let src = r#"
+            type T = Vec(3) | [Int] in
+            let x: Dyn = [1, 2, 3, 4, 5] in
+            let y: T = x in
+            len(y)
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 5);
     }
 
     #[test]

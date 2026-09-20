@@ -32,7 +32,7 @@ type Monomial = Vec<String>;
 type Polynomial = BTreeMap<Monomial, i64>;
 
 // Deliberately practical, not a claim of unbounded decidability -- see
-// this plan's own Global Constraints. Checked after every merge, so a
+// the design spec's own section 3. Checked after every merge, so a
 // blow-up is caught as soon as it happens, not after fully expanding.
 const MAX_MONOMIALS: usize = 64;
 
@@ -43,16 +43,16 @@ fn normalize(e: &IndexExpr) -> Option<Polynomial> {
         IndexExpr::Var(name) => Some(BTreeMap::from([(vec![name.clone()], 1)])),
         IndexExpr::Add(a, b) => {
             let mut result = normalize(a)?;
-            merge_add(&mut result, &normalize(b)?);
+            merge_add(&mut result, &normalize(b)?)?;
             (result.len() <= MAX_MONOMIALS).then_some(result)
         }
         IndexExpr::Sub(a, b) => {
             let mut result = normalize(a)?;
             let mut rhs = normalize(b)?;
             for coeff in rhs.values_mut() {
-                *coeff = -*coeff;
+                *coeff = coeff.checked_neg()?;
             }
-            merge_add(&mut result, &rhs);
+            merge_add(&mut result, &rhs)?;
             (result.len() <= MAX_MONOMIALS).then_some(result)
         }
         IndexExpr::Mul(a, b) => {
@@ -63,7 +63,9 @@ fn normalize(e: &IndexExpr) -> Option<Polynomial> {
                 for (rm, rc) in rhs.iter() {
                     let mut monomial: Monomial = lm.iter().chain(rm.iter()).cloned().collect();
                     monomial.sort();
-                    *result.entry(monomial).or_insert(0) += lc * rc;
+                    let product = lc.checked_mul(*rc)?;
+                    let entry = result.entry(monomial).or_insert(0);
+                    *entry = entry.checked_add(product)?;
                     if result.len() > MAX_MONOMIALS {
                         return None;
                     }
@@ -74,10 +76,15 @@ fn normalize(e: &IndexExpr) -> Option<Polynomial> {
     }
 }
 
-fn merge_add(into: &mut Polynomial, other: &Polynomial) {
+// Returns `None` (never panics) on coefficient overflow, exactly like the
+// existing monomial-count cap -- propagated up through the `?` operator at
+// each call site, which index_exprs_equal already turns into `false`.
+fn merge_add(into: &mut Polynomial, other: &Polynomial) -> Option<()> {
     for (monomial, coeff) in other.iter() {
-        *into.entry(monomial.clone()).or_insert(0) += coeff;
+        let entry = into.entry(monomial.clone()).or_insert(0);
+        *entry = entry.checked_add(*coeff)?;
     }
+    Some(())
 }
 
 // Zero coefficients are noise (e.g. `n - n` normalizes to a `{[n]: 0}`
@@ -169,6 +176,16 @@ mod tests {
     fn structurally_different_expressions_are_not_equal() {
         // n+1 != n+2
         assert!(!index_exprs_equal(&add(var("n"), lit(1)), &add(var("n"), lit(2))));
+    }
+
+    #[test]
+    fn coefficient_overflow_returns_false_instead_of_panicking() {
+        // A large-literal multiplication (i64::MAX * 3) overflows an i64
+        // coefficient during normalize()'s Mul arm -- index_exprs_equal's
+        // own doc comment promises "false, never panics" even here, not
+        // just for the monomial-count cap.
+        let big = mul(lit(i64::MAX), lit(3));
+        assert!(!index_exprs_equal(&big, &big));
     }
 
     #[test]

@@ -54,9 +54,10 @@ pub fn parse_with_named_types(src: &str) -> Result<(Arena, SpanMap, ExprRef, Has
 }
 
 // Test-only entry point: parses a single, standalone type expression
-// (not a full program) -- used by this plan's own Vec(...) syntax
-// tests, which need to inspect a Type in isolation rather than run a
-// whole program. Not part of the language's own real parsing path.
+// (not a full program) -- used by the Vec(...) syntax tests (see the
+// design spec's own §1/§2), which need to inspect a Type in isolation
+// rather than run a whole program. Not part of the language's own real
+// parsing path.
 #[cfg(test)]
 pub fn parse_type_string(src: &str) -> Result<Type, String> {
     let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
