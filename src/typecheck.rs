@@ -311,13 +311,17 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
         // side effect of comparing two Named ids.
         (Type::Named(a), Type::Named(b)) if a == b => Ok(()),
         (Type::List(a), Type::List(b)) => unify(a, b, infer, span),
-        // The index expressions don't unify (no Type::Var can appear
-        // inside an IndexExpr's own narrow grammar -- see the spec's
-        // own §1) -- only the wrapped type recurses through unify()'s
-        // own Var-binding behavior; the index halves are compared by
-        // the SAME plain equality consistent() already uses.
-        (Type::Indexed(wa, ia), Type::Indexed(wb, ib)) if crate::index_expr::index_exprs_equal(ia, ib) => {
-            unify(wa, wb, infer, span)
+        // The wrapped type recurses through unify()'s own Var-binding
+        // behavior first (matching Type::Fun's own param-then-return
+        // order just below); the index halves then go through
+        // unify_index_expr -- a real, but deliberately narrow unifier
+        // (see its own doc comment) that binds a bare unbound
+        // IndexExpr::Var to the other side, rather than the plain
+        // SOP-equality check this arm used before Phase 2 Task 3 wired
+        // real index-variable inference in.
+        (Type::Indexed(wa, ia), Type::Indexed(wb, ib)) => {
+            unify(wa, wb, infer, span)?;
+            unify_index_expr(ia, ib, infer, span)
         }
         (Type::Fun(p1, _r1, ret1), Type::Fun(p2, _r2, ret2)) => {
             unify(p1, p2, infer, span)?;

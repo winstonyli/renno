@@ -4026,4 +4026,69 @@ mod tests {
         let rhs = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)));
         assert!(unify_index_expr(&IndexExpr::Var("n".to_string()), &rhs, &mut infer, span).is_err());
     }
+
+    // The brief's own literal Step-1 test -- `identity_vec(3)(v)`, `v:
+    // Vec(3)` -- was written and run against this task's own change
+    // (both with and without it) before landing this test. It turns out
+    // to be a DEAD END, not just "uninformative": it fails BOTH before
+    // and after this task's fix, for a reason unrelated to whether
+    // unify()'s own Type::Indexed arm is wired correctly. Expr::App's
+    // own elaboration (typecheck.rs, the `Type::Fun(param_ty, ...)` arm)
+    // calls `coerce(arena, a2, &a_ty, &param_ty_resolved, ...)` BEFORE
+    // it ever calls `unify_fits`/`unify()` -- and `coerce` has no
+    // `InferCtx` of its own, so it can only fall back to `consistent()`/
+    // `fits()` (types.rs), both of which require exact
+    // `index_exprs_equal` on the two index expressions with NO variable-
+    // binding capability at all. Unifying a parameter's bare `Vec(n)`
+    // against a caller's concrete `Vec(3)` (or `Vec(1 + 2)` -- the
+    // brief's own suggested strengthening changes nothing here, since
+    // SOP-normalization already treats those as the same shape of
+    // mismatch against an unbound `Var`) is REJECTED by `coerce()`
+    // itself, well before `unify_fits` would ever reach the
+    // `Type::Indexed` arm this task changed. Confirmed empirically:
+    // reverting this task's own diff and rerunning the brief's literal
+    // test produces the SAME error, at the SAME call site, from
+    // `coerce`, not from `unify`'s own catch-all -- so this task's fix
+    // cannot be exercised through an ordinary function call at all,
+    // only through a path that skips `coerce`.
+    //
+    // If/Match's own branch-combination is exactly that other path --
+    // confirmed by this file's own `unifying_two_sop_equal_indexed_types_
+    // through_if_needs_no_runtime_check` test just above, which already
+    // demonstrates `if`'s elaboration calls `unify_trial`/`unify()`
+    // DIRECTLY, with no `coerce()` pre-check at all (its own fallback on
+    // a unify() failure is a silent widen-to-Dyn, not a coerce-style
+    // static rejection). So THIS test reuses that same `if`-based shape,
+    // with a genuinely UNBOUND index variable on one branch (`a: Vec(n)`,
+    // `n` never bound to anything before this point) against a concrete
+    // `Vec(3)` on the other (`b`) -- exactly unify_index_expr's "bind a
+    // bare variable" case, not its SOP-equality fallback (Var("n") and
+    // Lit(3) are not already SOP-equal).
+    #[test]
+    fn unifying_an_indexed_type_with_a_bare_index_variable_through_if_binds_it_via_unify_index_expr() {
+        // Before this task's fix: unify()'s old guard
+        // (index_exprs_equal(Var("n"), Lit(3))) is false, so unify()
+        // fails, unify_trial rolls back cleanly, and If's own fallback
+        // silently widens the combined branch type to Dyn -- the
+        // subsequent `: Vec(3)` annotation then needs a REAL runtime
+        // check (coerce() sees `from: Dyn`, which always needs one).
+        // After this task's fix: unify_index_expr binds n := 3, the if's
+        // result type stays PRECISELY Indexed(List(Dyn), 3) (no
+        // widening), so the same annotation needs no check at all --
+        // confirmed by temporarily reverting this task's own diff:
+        // contains_check then finds a check (assertion fails), and
+        // restoring the diff removes it again (assertion passes).
+        let src = r#"
+            fun a: Vec(n) ->
+            fun b: Vec(3) ->
+                let c: Vec(3) = if true then a else b in
+                c
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert!(
+            !contains_check(&arena, elaborated),
+            "expected unify()'s own Type::Indexed arm to bind n := 3 via unify_index_expr, keeping the if's result precisely Indexed(3) so the Vec(3) annotation needs no runtime check"
+        );
+    }
 }
