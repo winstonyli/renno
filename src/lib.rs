@@ -3695,4 +3695,59 @@ mod tests {
             "expected a redefine-builtin error mentioning Vec, got: {err}"
         );
     }
+
+    // NOTE: uses run_source, not run_untyped -- run_untyped is plain
+    // parser::parse + machine::run with NO typecheck::check pass at all,
+    // so a plain `: T` annotation (unlike a `where` refinement, which the
+    // PARSER itself desugars into an embedded runtime check regardless of
+    // whether typecheck ever runs -- see desugar_refinement) is completely
+    // inert under it: machine.rs's own Expr::Let arm ignores its `_ann`
+    // field outright. Confirmed empirically before this fix: under
+    // run_untyped, the "matching length" case passed VACUOUSLY (no check
+    // ever ran, so [1,2,3] just flows through unchecked), the "wrong
+    // length" case FAILED outright (no panic at all -- [1,2] flows through
+    // unchecked and len(y) just returns 2), and the "non-list" case
+    // panicked for the WRONG reason (machine.rs's own bare `len expects a
+    // string or list` panic, not a clean type error) -- exactly the
+    // failure modes this task's own brief warned to watch for. Only
+    // run_source's full parse -> typecheck::check -> run pipeline (the
+    // same helper dyn_sourced_value_can_cross_into_an_arithmetic_position
+    // above already uses for this exact reason) actually exercises
+    // coerce/build_boundary_check.
+    #[test]
+    fn a_dyn_sourced_list_matching_its_declared_length_is_accepted_at_runtime() {
+        let src = r#"
+            let x: Dyn = [1, 2, 3] in
+            let y: Vec(3) = x in
+            len(y)
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 3);
+    }
+
+    #[test]
+    fn a_dyn_sourced_list_not_matching_its_declared_length_fails_at_runtime() {
+        let src = r#"
+            let x: Dyn = [1, 2] in
+            let y: Vec(3) = x in
+            len(y)
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("type error: expected"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_dyn_sourced_non_list_crossing_into_vec_fails_at_runtime_not_via_a_bare_len_panic() {
+        // Must go through the SAME is_list-then-len composition Tuple's own
+        // arity check already uses (typecheck.rs's build_shape_predicate,
+        // Type::Tuple arm) -- never a bare len() call that could panic
+        // internally on a non-list Value before the type-error path runs.
+        let src = r#"
+            let x: Dyn = 5 in
+            let y: Vec(3) = x in
+            len(y)
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("type error: expected"), "unexpected message: {err}");
+        assert!(!err.contains("len expects"), "leaked a bare len() panic instead of a clean type error: {err}");
+    }
 }

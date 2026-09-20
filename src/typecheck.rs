@@ -3,6 +3,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
+use crate::index_expr::IndexExpr;
 use crate::plist::PList;
 use crate::span::Span;
 use crate::types::{consistent, fits, row_consistent, EffectRow, Type};
@@ -888,12 +889,36 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &
         Type::Union(_) => build_union_check(arena, e, to, named_types, visiting),
         Type::Dyn => unreachable!("coerce only calls this once *to != Type::Dyn is already established"),
         Type::Var(_) => e,
-        // Placeholder only, to keep this match exhaustive -- real
-        // Indexed-aware boundary-check logic is Task 5's own job (see
-        // this plan's task list). Mirrors this function's own
-        // Type::Var(_) arm just above: "no real check built yet for
-        // this shape," return `e` unchecked rather than reject it.
-        Type::Indexed(..) => e,
+        // Same is_list-then-len composition as Type::Tuple's own arm
+        // above (build_shape_predicate's Tuple case), just checking the
+        // length AGAINST the index expression instead of a fixed arity
+        // literal -- reusing build_checked (rather than hand-rolling the
+        // Let/If/fail wrapper Tuple's own build_shape_check call already
+        // provides) keeps `e` evaluated exactly once, the same
+        // no-double-evaluation guarantee every other arm here gets.
+        // `is_list` has to run BEFORE `len`, same reason as Tuple's own
+        // arm: `len` panics internally (see machine.rs) on a non-list
+        // argument, which would surface as an unrelated bare panic
+        // instead of this function's own clean "type error: expected
+        // ..., found ..." message.
+        //
+        // Only Type::List-wrapped Indexed types are reachable this early
+        // -- a Type::Named-wrapped Indexed (derived index-refinement) is
+        // a later phase's own concern, nothing before this phase can
+        // construct one yet (see index_expr_to_expr's own doc comment
+        // for the matching "Phase 2 only" note on the index side).
+        Type::Indexed(wrapped, index) => match wrapped.as_ref() {
+            Type::List(_) => build_checked(arena, e, to, |arena, v| {
+                let is_list = build_predicate_call(arena, "is_list", v);
+                let len_var = arena.push(Expr::Var("len".to_string()));
+                let len_call = arena.push(Expr::App(len_var, v));
+                let index_expr = index_expr_to_expr(arena, index);
+                let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, index_expr));
+                let false_lit = arena.push(Expr::Bool(false));
+                arena.push(Expr::If(is_list, len_eq, false_lit))
+            }),
+            _ => e,
+        },
         // One level only, matching every other shape check in this
         // file: look up what this id unfolds to and build ITS OWN
         // boundary check, exactly as if `to` had been written directly
@@ -936,6 +961,34 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &
             visiting.insert(id.clone());
             let unfolded = raw.clone();
             build_boundary_check(arena, e, &unfolded, named_types, &visiting)
+        }
+    }
+}
+
+// Translates a (currently always closed -- no dependent parameters
+// exist until Phase 2) IndexExpr into an ordinary Expr the machine can
+// evaluate, for splicing into a synthesized runtime check. A bare
+// Var here has no binder yet in this phase; Phase 2 makes this
+// meaningful by ensuring any Var appearing in a REACHABLE Vec(n)
+// position is always a real, in-scope function parameter by then.
+fn index_expr_to_expr(arena: &mut Arena, e: &IndexExpr) -> ExprRef {
+    match e {
+        IndexExpr::Var(name) => arena.push(Expr::Var(name.clone())),
+        IndexExpr::Lit(n) => arena.push(Expr::Int(*n)),
+        IndexExpr::Add(a, b) => {
+            let a2 = index_expr_to_expr(arena, a);
+            let b2 = index_expr_to_expr(arena, b);
+            arena.push(Expr::BinOp(BinOp::Add, a2, b2))
+        }
+        IndexExpr::Sub(a, b) => {
+            let a2 = index_expr_to_expr(arena, a);
+            let b2 = index_expr_to_expr(arena, b);
+            arena.push(Expr::BinOp(BinOp::Sub, a2, b2))
+        }
+        IndexExpr::Mul(a, b) => {
+            let a2 = index_expr_to_expr(arena, a);
+            let b2 = index_expr_to_expr(arena, b);
+            arena.push(Expr::BinOp(BinOp::Mul, a2, b2))
         }
     }
 }
