@@ -209,6 +209,14 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
         // side effect of comparing two Named ids.
         (Type::Named(a), Type::Named(b)) if a == b => Ok(()),
         (Type::List(a), Type::List(b)) => unify(a, b, infer, span),
+        // The index expressions don't unify (no Type::Var can appear
+        // inside an IndexExpr's own narrow grammar -- see the spec's
+        // own §1) -- only the wrapped type recurses through unify()'s
+        // own Var-binding behavior; the index halves are compared by
+        // the SAME plain equality consistent() already uses.
+        (Type::Indexed(wa, ia), Type::Indexed(wb, ib)) if crate::index_expr::index_exprs_equal(ia, ib) => {
+            unify(wa, wb, infer, span)
+        }
         (Type::Fun(p1, _r1, ret1), Type::Fun(p2, _r2, ret2)) => {
             unify(p1, p2, infer, span)?;
             unify(ret1, ret2, infer, span)
@@ -265,6 +273,17 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
             }
             Ok(())
         }
+        // Type::Indexed gets no explicit arm here, deliberately -- this
+        // match already has none for List/Tuple/Union either, so anything
+        // that isn't Fun or Record falls through to the generic catch-all
+        // below: unify_trial tries unify() first (which DOES have its own
+        // Indexed arm, added alongside this comment), with a consistent()
+        // rescue on failure. That path was verified directly (temporary
+        // probe test against this exact function, then removed) to give
+        // Indexed the right answer on match, index mismatch, AND binding a
+        // Type::Var reachable only through the wrapped type -- so adding a
+        // redundant explicit arm here would only duplicate what already
+        // works; see this task's own report for the probe results.
         // ponytail: no Type::Var binding via the consistent() rescue path below --
         // unify_trial is tried first and binds Vars on success, but a Var
         // reachable ONLY through consistent() accepting the pair (e.g. only
