@@ -121,7 +121,14 @@ fn fresh_named_type_id(base: &str) -> String {
 // a plain structural walk, terminating because `ty` here is always a
 // FRESH parse result, never something already containing a completed
 // recursive reference of its own).
-fn contains_named(ty: &Type, id: &str) -> bool {
+//
+// `pub(crate)`, not private: Phase 4 Task 3's own Case B eligibility
+// check (typecheck.rs's `qualifying_named_alternatives`) needs to ask
+// this SAME question about an already-registered alias's own
+// alternatives (spec section 5, Case B point 1) -- same progressive,
+// only-as-far-as-needed visibility widening this project already uses
+// repeatedly for `InferCtx`/`Scheme`/`Ctx`/etc.
+pub(crate) fn contains_named(ty: &Type, id: &str) -> bool {
     match ty {
         Type::Named(n) => n == id,
         Type::List(elem) => contains_named(elem, id),
@@ -133,6 +140,25 @@ fn contains_named(ty: &Type, id: &str) -> bool {
         // has nothing to check here) -- same recurse-into-the-wrapped-
         // type precedent as List's own arm just above.
         Type::Indexed(wrapped, _) => contains_named(wrapped, id),
+    }
+}
+
+// `contains_named`'s own occurrence-COUNTING analog, same recursive
+// shape exactly (bool-returning `||`/`any` swapped for usize-returning
+// `+`/`sum`) -- Case B's own eligibility needs to tell "exactly once"
+// apart from "zero" or "two or more" (spec section 5, Case B point 2:
+// a step alternative referencing the recursive id twice or more, e.g. a
+// binary tree's `Node(Tree, Tree)` shape, deliberately doesn't qualify),
+// which a plain bool can't distinguish.
+pub(crate) fn count_named(ty: &Type, id: &str) -> usize {
+    match ty {
+        Type::Named(n) => usize::from(n == id),
+        Type::List(elem) => count_named(elem, id),
+        Type::Fun(param, _row, ret) => count_named(param, id) + count_named(ret, id),
+        Type::Tuple(items) | Type::Union(items) => items.iter().map(|t| count_named(t, id)).sum(),
+        Type::Record(fields) => fields.iter().map(|(_, t)| count_named(t, id)).sum(),
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Var(_) => 0,
+        Type::Indexed(wrapped, _) => count_named(wrapped, id),
     }
 }
 

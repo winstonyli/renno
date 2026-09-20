@@ -5272,4 +5272,231 @@ mod tests {
         let result = machine::run(&arena, elaborated.unwrap(), Env::prelude(), &spans);
         assert_eq!(result.as_int(), 1);
     }
+
+    // --- Task 3, Fix 1: per-arm index_subst restore ---
+
+    #[test]
+    fn stale_hypothesis_does_not_leak_into_a_later_ineligible_sibling_arm() {
+        // Task 2's own review found a real soundness gap in Task 1's
+        // mechanism: infer.index_subst is ONE shared map, mutated in
+        // place by each Case-A-eligible arm's own `insert` call, and
+        // used to be restored to its pre-match snapshot only ONCE, after
+        // the WHOLE arm loop -- not per arm. An arm that injects no
+        // hypothesis of its own (the compound-tail `h :: (h2 :: t2)`
+        // arm below -- Case A's own v1 "bare Var tail only" restriction
+        // means a nested Cons tail gets no override, no hypothesis) did
+        // nothing to reset whatever a PRECEDING sibling arm left behind
+        // in that same shared map. `[]` runs first (source order) and
+        // injects n := 0; the compound-tail arm runs second and used to
+        // silently inherit it, even though reaching a length->=2 pattern
+        // implies nothing at all about n's real value.
+        //
+        // `let proof: Vec(5) = v in 1` inside the compound-tail arm is
+        // the discriminator. `v`'s own real type is always the literal,
+        // bare `Vec(n)` (consistent()'s own bare-index-variable
+        // permissiveness means only a REAL comparison via
+        // unify_fits/unify_index_expr -- not coerce's own static
+        // permissiveness -- can ever observe what n resolves to, same
+        // technique `base_case_arm_alone_is_rejected_when_it_does_not_fit_vec_zero`
+        // above already established). With the FIX (no hypothesis active
+        // for this arm), n is genuinely free going in, so this simply
+        // unifies n := 5 -- accepted. With the BUG (n stuck at the
+        // leaked literal 0 from the `[]` arm just before it), the SAME
+        // comparison instead finds n already pinned to 0, conflicting
+        // with the required 5 -- a real, provable "5 != 0" rejection.
+        // So the fix makes this program type-check; the bug makes it
+        // wrongly fail.
+        //
+        // Verified empirically (comment-out-and-rerun): temporarily
+        // reverting to the single, once-only restore after the whole
+        // loop (removing this fix's own per-arm restore at the top of
+        // the loop) flips this test from passing to failing with
+        // exactly "type mismatch"/"does not unify" (5 vs the leaked 0),
+        // confirming the leak is real and this test genuinely depends
+        // on the fix.
+        //
+        // A trailing `h :: t -> 0` arm is included purely so
+        // missing_case's own coverage check accepts this as exhaustive
+        // (has_nil && has_full_cons, per its own doc comment) -- it
+        // plays no role in the leak scenario itself, which only needs
+        // `[]` to run before the compound-tail arm.
+        let src = r#"
+            let f: (Vec(n) -> Int) = fun v ->
+                match v
+                | [] -> 0
+                | h :: h2 :: t2 ->
+                    let proof: Vec(5) = v in 1
+                | h :: t -> 0
+            in
+            let x: Dyn = [1, 2, 3, 4, 5] in
+            let vx: Vec(5) = x in
+            f(vx)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans);
+        assert!(
+            elaborated.is_ok(),
+            "the compound-tail arm earns no hypothesis of its own and must not inherit the [] arm's leaked n=0 -- \
+             n should freely bind to 5 here, got: {:?}",
+            elaborated.err()
+        );
+        let result = machine::run(&arena, elaborated.unwrap(), Env::prelude(), &spans);
+        assert_eq!(result.as_int(), 1);
+    }
+
+    // --- Task 3, Step 1: bind_pattern_vars's own Union-correlation gap ---
+
+    #[test]
+    fn bind_pattern_vars_falls_back_to_an_unconstrained_type_for_a_named_union_scrutinee() {
+        // Task 3's own real prerequisite investigation (spec section 5,
+        // Case B): does bind_pattern_vars correlate a Type::Union-typed
+        // scrutinee's own alternative-specific field types to a
+        // Pattern::List (tagged-tuple-style) sub-binding, or does it
+        // fall back to some unconstrained fresh type with no real
+        // precision? Confirmed empirically BEFORE writing any Case B
+        // refinement logic, per this task's own brief: with the
+        // Pattern::List match's Type::Named/Type::Union arms removed
+        // (this fix reverted), this exact test fails -- `t`'s real type
+        // falls into the generic catch-all (a fresh, totally
+        // unconstrained Type::Var, permissive with anything exactly
+        // like Type::Dyn), so `let proof: Bool = t in 0` WRONGLY
+        // type-checks even though `t`'s real position in `(Int, List)`
+        // is the recursive `List` alternative, not `Bool` at all. With
+        // the fix, `t` is correctly `Type::Named(id)` (a `List`), and
+        // `Type::Named` is nominal-only (types::consistent's own
+        // Type::Named arm: consistent only when both ids match exactly,
+        // never structurally with anything else) -- so comparing it
+        // against a required `Bool` is a genuine, provable mismatch,
+        // correctly rejected.
+        let src = r#"
+            type List = (Int, List) | Bool in
+            let v: List = (1, false) in
+            match v
+            | (h, t) -> let proof: Bool = t in 0
+            | b -> 1
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let result = typecheck::check_with_named_types(&mut arena, root, &spans, named_types);
+        assert!(
+            result.is_err(),
+            "t's real type, if correctly correlated, is Type::Named(id) (a List), which must reject a Bool \
+             annotation -- got Ok, meaning bind_pattern_vars fell back to an unconstrained type instead: {result:?}"
+        );
+    }
+
+    // --- Task 3, Case B: Named+Union-derived pattern-match index refinement ---
+    //
+    // No surface syntax builds a `Type::Indexed(Type::Named(id), _)`
+    // value directly: `Vec(n)`'s own parser sugar (parser.rs's `parse_type`,
+    // the `name == "Vec"` arm) is hard-coded to wrap `Type::List(Type::Dyn)`
+    // only, confirmed by reading it -- there is no `List(n)`-style
+    // annotation syntax generalizing that sugar to a user-defined named
+    // type, and this task's own scope (typecheck.rs/parser.rs only, no
+    // new declaration OR annotation syntax, per the design spec's own
+    // "Generalizing to Type::Indexed" section) doesn't add one either.
+    // So both tests below parse an ordinary match EXPRESSION through the
+    // real parser (getting real Pattern nodes, a real Match ExprRef, and
+    // a real named_types registry for the recursive alias), then drive
+    // typecheck::check_against DIRECTLY against a hand-built Ctx binding
+    // the scrutinee to the Case-B shape this task's own eligibility
+    // logic is meant to recognize -- exactly mirroring this file's own
+    // existing `extend_generalized_and_lookup_mint_a_fresh_index_variable...`
+    // test's identical precedent for exercising typecheck's own
+    // internals below the parser's reach.
+
+    #[test]
+    fn case_b_base_case_hypothesis_is_real_and_enforced() {
+        // Case A's own `base_case_arm_alone_is_rejected_when_it_does_not_fit_vec_zero`
+        // test, adapted for Case B: the base alternative (`Bool`, the
+        // one NOT structurally containing List) implies index := 0.
+        // `v`'s own real type is always the literal, bare
+        // `Indexed(Named(id), n)` -- so the only way to observe the
+        // base arm's own n=0 hypothesis is through a REAL,
+        // index_subst-consulting comparison (unify_fits/
+        // unify_index_expr), not coerce's own static permissiveness.
+        // Requiring the base arm's own body (bare `v`) to fit
+        // `Indexed(Named(id), 1)` forces exactly that comparison: a
+        // genuine, provable "1 != 0" conflict if (and only if) the
+        // n=0 hypothesis is actually active.
+        //
+        // Base arm uses `true`/`false` literal patterns, not a bare
+        // `b`/wildcard Var -- a Var pattern trivially "could match"
+        // BOTH alternatives (pattern_could_match's own generic
+        // consistent()-with-Dyn fallback), which this task's own
+        // eligibility logic correctly treats as ambiguous (no
+        // hypothesis at all, the same safe fallback Case A's own
+        // catch-all `_ => {}` uses) -- exactly the arm shape needed
+        // to observe a REAL hypothesis, not a Var that would earn none.
+        // Both together also satisfy missing_case's own has_true &&
+        // has_false exhaustiveness heuristic.
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{check_against, extend, Ctx, InferCtx};
+        use std::rc::Rc;
+        use types::Type;
+
+        let src = r#"
+            type List = (Int, List) | Bool in
+            match v
+            | (h, t) -> let x: Dyn = 0 in x
+            | true -> v
+            | false -> v
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let id = named_types.keys().next().unwrap().clone();
+        let mut infer = InferCtx::new(named_types);
+        let scrut_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var("n".to_string())));
+        let ctx = extend(&Ctx::empty(), "v", scrut_ty);
+        let expected = Type::Indexed(Rc::new(Type::Named(id)), Rc::new(IndexExpr::Lit(1)));
+        let result = check_against(&mut arena, root, &expected, &ctx, &spans, &mut infer);
+        assert!(
+            result.is_err(),
+            "expected a real index conflict from the base alternative's own n=0 hypothesis (1 vs 0), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn case_b_step_case_hypothesis_and_retyping_enable_a_real_recursive_proof() {
+        // Case A's own `recursive_vec_function_typechecks_via_pattern_refinement`
+        // test, adapted for Case B: the step alternative (`(Int, List)`,
+        // the one containing List exactly once) mints a fresh index
+        // variable `m`, retypes the self-referential sub-binding `t` as
+        // `Indexed(Named(id), m)` (overriding bind_pattern_vars's own
+        // plain `Named(id)` binding), and hypothesizes the scrutinee's
+        // own index is `m + 1`. Requiring the step arm's own body (bare
+        // `t`) to fit `Indexed(Named(id), n - 1)` only type-checks if
+        // BOTH halves are real: resolve_index_deep must actually see
+        // n -> m + 1 (the hypothesis) for "(m + 1) - 1" to SOP-normalize
+        // to exactly "m" (t's own real, retyped index) -- exactly the
+        // same composition Case A's own analogous test relies on,
+        // independent of whether the wrapped type is List or a
+        // qualifying Named+Union.
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{check_against, extend, Ctx, InferCtx};
+        use std::rc::Rc;
+        use types::Type;
+
+        let src = r#"
+            type List = (Int, List) | Bool in
+            match v
+            | (h, t) -> t
+            | true -> let x: Dyn = 0 in x
+            | false -> let x: Dyn = 0 in x
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let id = named_types.keys().next().unwrap().clone();
+        let mut infer = InferCtx::new(named_types);
+        let scrut_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var("n".to_string())));
+        let ctx = extend(&Ctx::empty(), "v", scrut_ty);
+        let expected = Type::Indexed(
+            Rc::new(Type::Named(id)),
+            Rc::new(IndexExpr::Sub(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)))),
+        );
+        let result = check_against(&mut arena, root, &expected, &ctx, &spans, &mut infer);
+        assert!(
+            result.is_ok(),
+            "expected the step alternative's own m+1 hypothesis to make t: Indexed(Named(id), m) satisfy \
+             Indexed(Named(id), n - 1) via SOP normalization, got: {:?}",
+            result.err()
+        );
+    }
 }

@@ -605,7 +605,17 @@ pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
 // else that isn't a `let`. Row variables in `ty`, if any, stay exactly as
 // written: shared verbatim by every use within this one scope, not
 // instantiated fresh per use (that's what `extend_generalized` is for).
-fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
+//
+// `pub(crate)`, not private: Task 3's own Case B tests need to bind a
+// scrutinee variable directly to a hand-built `Type::Indexed(Type::
+// Named(id), _)` -- a shape no surface syntax can express (`Vec(n)`'s
+// own parser sugar is hard-coded to wrap `Type::List(Dyn)` only) -- and
+// drive `check_against` on it directly, mirroring this file's own
+// existing `extend_generalized_and_lookup_mint_a_fresh_index_variable...`
+// test's identical precedent for exercising typecheck's own internals
+// below the parser's reach. Same progressive, only-as-far-as-needed
+// visibility widening this project already uses repeatedly.
+pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
     ctx.bind(name, Scheme::mono(ty))
 }
 
@@ -1832,24 +1842,117 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
 // already catches for the cases IT can see -- this rewrite doesn't
 // replace that check, it adds a second, complementary one that can see
 // INTO a pattern's own sub-bindings, not just its top-level shape.
-// Case A eligibility (spec section 5): is `scrut_ty` (already resolved via
-// infer.resolve_deep) a Type::Indexed wrapping a plain Type::List, whose
-// own index expression (already resolved via infer.resolve_index_deep)
-// is a BARE variable? If so, returns that variable's name and the
-// wrapped element type -- everything a Match arm needs to compute its
-// own base/step hypothesis. Anything else (a non-Indexed scrutinee, an
-// Indexed-but-non-List wrapped type -- that's Case B, a later task's own
-// job -- a literal or compound index expression with no single name to
-// bind a hypothesis under) returns None: the safe "not applicable"
-// fallback used throughout this design.
-fn case_a_refinement_target(resolved_scrut_ty: &Type, resolved_index: Option<&IndexExpr>) -> Option<(String, Rc<Type>)> {
+// Eligibility (spec section 5): is `scrut_ty` (already resolved via
+// infer.resolve_deep) a Type::Indexed wrapping a shape Match's own arm
+// loop knows how to derive a base/step hypothesis from, whose own index
+// expression (already resolved via infer.resolve_index_deep) is a BARE
+// variable? Two wrapped shapes qualify -- Case A, a plain Type::List
+// (the fixed []/:: rule), and Case B, a qualifying Type::Named+
+// Type::Union pair (the rule derived from THAT type's own structure,
+// see `qualifying_named_alternatives`) -- anything else (a non-Indexed
+// scrutinee, a wrapped shape neither case recognizes, a literal or
+// compound index expression with no single name to bind a hypothesis
+// under) returns None: the safe "not applicable" fallback used
+// throughout this design. Renamed from Task 1's own
+// `case_a_refinement_target` now that Task 3 extends it to cover Case B
+// too.
+enum IndexedRefinementTarget {
+    List { index_var: String, elem_ty: Rc<Type> },
+    // `base_alt`/`step_alt` are the two alternatives
+    // `qualifying_named_alternatives` already sorted out -- the SAME
+    // per-alternative shapes Match's own arm loop re-checks a pattern
+    // against via `pattern_could_match` to decide which hypothesis (if
+    // any) that specific arm earns.
+    Named { index_var: String, id: String, base_alt: Rc<Type>, step_alt: Rc<Type> },
+}
+
+fn indexed_refinement_target(
+    resolved_scrut_ty: &Type,
+    resolved_index: Option<&IndexExpr>,
+    named_types: &HashMap<String, Type>,
+) -> Option<IndexedRefinementTarget> {
     match (resolved_scrut_ty, resolved_index) {
         (Type::Indexed(wrapped, _), Some(IndexExpr::Var(name))) => match &**wrapped {
-            Type::List(elem_ty) => Some((name.clone(), elem_ty.clone())),
+            Type::List(elem_ty) => Some(IndexedRefinementTarget::List { index_var: name.clone(), elem_ty: elem_ty.clone() }),
+            Type::Named(id) => qualifying_named_alternatives(id, named_types).map(|(base_alt, step_alt)| {
+                IndexedRefinementTarget::Named {
+                    index_var: name.clone(),
+                    id: id.clone(),
+                    base_alt: Rc::new(base_alt),
+                    step_alt: Rc::new(step_alt),
+                }
+            }),
             _ => None,
         },
         _ => None,
     }
+}
+
+// Case B eligibility, spec section 5 points 1-2: does `named_types[id]`
+// resolve to a Type::Union of EXACTLY two alternatives, one that
+// doesn't structurally contain `Named(id)` at all (the base case, 0
+// occurrences) and one that contains it EXACTLY once (the step case --
+// not zero, not two-or-more: a step alternative referencing the id
+// twice or more, e.g. a binary tree's `Node(Tree, Tree)` shape,
+// deliberately doesn't qualify either, per the spec's own Non-goals).
+// Anything else -- missing id, wrong alternative count, any other
+// occurrence-count pairing -- isn't eligible: the same safe "not
+// applicable" fallback used throughout this design. Returns
+// (base_alt, step_alt) in that fixed order regardless of which one
+// `named_types` happens to store first.
+fn qualifying_named_alternatives(id: &str, named_types: &HashMap<String, Type>) -> Option<(Type, Type)> {
+    let Type::Union(alts) = named_types.get(id)? else { return None };
+    let [a, b] = alts.as_slice() else { return None };
+    match (crate::parser::count_named(a, id), crate::parser::count_named(b, id)) {
+        (0, 1) => Some((a.clone(), b.clone())),
+        (1, 0) => Some((b.clone(), a.clone())),
+        _ => None,
+    }
+}
+
+// Case B's own analog of Case A's `Pattern::Cons(_, tail)` tail-position
+// check (spec section 5 point 3): locates the sub-pattern bound at the
+// step alternative's own single self-referential position -- guaranteed
+// to exist and be unique by `qualifying_named_alternatives`'s own
+// occurrence-count check -- so the caller can retype it as
+// `Type::Indexed(Named(id), fresh)`, the same override Case A already
+// does for a Cons's own tail. Only the spec's own worked shape is
+// recognized: the self-reference IS the whole alternative (`type X = Y
+// | X`), or the alternative is a Tuple with the self-reference as one
+// bare item (the spec's own `(Int, List)`) -- mirroring Case A's own
+// "bare Var tail only" v1 restriction, anything with the self-reference
+// nested deeper (inside a further Tuple/List/Record) returns None, the
+// same safe fallback.
+fn self_ref_pattern<'a>(pat: &'a Pattern, step_alt: &Type, id: &str) -> Option<&'a Pattern> {
+    match step_alt {
+        Type::Named(n) if n == id => Some(pat),
+        Type::Tuple(items) => match pat {
+            Pattern::List(pats) if pats.len() == items.len() => {
+                items.iter().zip(pats.iter()).find_map(|(item_ty, p)| match item_ty {
+                    Type::Named(n) if n == id => Some(p),
+                    _ => None,
+                })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// Shared "nothing real to correlate against" fallback: bind each of a
+// Pattern::List's own positions to its own independent fresh var.
+// Factored out of what used to be three separate, identically-bodied
+// arms in bind_pattern_vars's own Pattern::List match (Type::Var, the
+// final catch-all, and now the two new Type::Named/Type::Union arms'
+// own "no matching alternative found" cases below) -- same fallback,
+// same reasoning, one copy.
+fn bind_fresh_positions(ctx: &Ctx, pats: &[Pattern], infer: &mut InferCtx, span: Span) -> Result<Ctx, TypeError> {
+    let mut c = ctx.clone();
+    for p in pats {
+        let elem_ty = infer.fresh_var("elem");
+        c = bind_pattern_vars(&c, p, &elem_ty, infer, span)?;
+    }
+    Ok(c)
 }
 
 fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut InferCtx, span: Span) -> Result<Ctx, TypeError> {
@@ -1918,28 +2021,78 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut 
             // correlation via Cons's own arm, which is where my_map's
             // own precision genuinely comes from -- this arm never
             // forcing List costs nothing there.
-            Type::Var(_) => {
-                let mut c = ctx.clone();
-                for p in pats {
-                    let elem_ty = infer.fresh_var("elem");
-                    c = bind_pattern_vars(&c, p, &elem_ty, infer, span)?;
-                }
-                Ok(c)
-            }
-            // A concrete, non-Tuple, non-List scrutinee against a List
-            // pattern: pattern_could_match's own existing check (called
-            // by Expr::Match before this function ever runs) already
-            // rejects this case statically -- bind each position to its
-            // own independent fresh var (nothing real to correlate
-            // against) so nested sub-bindings still work.
-            _ => {
-                let mut c = ctx.clone();
-                for p in pats {
-                    let elem_ty = infer.fresh_var("elem");
-                    c = bind_pattern_vars(&c, p, &elem_ty, infer, span)?;
-                }
-                Ok(c)
-            }
+            Type::Var(_) => bind_fresh_positions(ctx, pats, infer, span),
+            // A Type::Indexed-wrapped scrutinee (Vec(n)-style, or Case
+            // B's own Named-wrapped analog per §2's generalization) --
+            // correlate against the WRAPPED type directly, "forgetting"
+            // the index the same way Pattern::Cons's own arm below
+            // already does via forget_index, and pattern_could_match's
+            // own Type::Indexed arm mirrors exactly. Needed for Case B:
+            // a Case-B-eligible scrutinee's own real stored type is
+            // `Type::Indexed(Type::Named(id), n)`, still wrapped, by the
+            // time a match arm's own pattern (e.g. the tagged-tuple-style
+            // `(h, t)`) gets here -- without this arm it fell into the
+            // generic catch-all below, no correlation at all.
+            Type::Indexed(wrapped, _) => bind_pattern_vars(ctx, pat, wrapped, infer, span),
+            // A Type::Named scrutinee (a `type X = ... in` alias
+            // reference) -- unfold ONE level via infer.named_types and
+            // recurse, mirroring pattern_could_match's own Type::Named
+            // arm exactly (including its "unknown id" permissive
+            // fallback: nothing registered to unfold into means nothing
+            // real to correlate against, same as the generic catch-all).
+            // This is Case B's own real prerequisite, found and fixed by
+            // this task's own investigation (see its report): without
+            // it, a Case-B-style scrutinee's own Type::Named(id) never
+            // even reaches the Type::Union arm just below -- it's still
+            // nominally Named at this point, not yet unfolded to a
+            // Union at all. No cycle guard is needed here (unlike
+            // pattern_could_match's own visiting set): this arm only
+            // ever recurses into a shape pattern_could_match ALREADY
+            // proved *could* match `pat` (Expr::Match's own check just
+            // above this function's own call site), and that proof
+            // itself only ever succeeds by bottoming out at a
+            // non-Named shape -- a genuinely unfoldable-forever cycle
+            // (two SEPARATE aliases referencing each other with no
+            // Tuple/List/Union in between) isn't expressible through
+            // this project's own single-name self-reference mechanism
+            // (parser::contains_named's own doc comment) in the first
+            // place.
+            Type::Named(id) => match infer.named_types.get(id).cloned() {
+                Some(unfolded) => bind_pattern_vars(ctx, pat, &unfolded, infer, span),
+                None => bind_fresh_positions(ctx, pats, infer, span),
+            },
+            // A Type::Union scrutinee (a resolved alias's own RHS, or an
+            // ordinary Union type written directly) -- Case B's own
+            // second real prerequisite: find WHICH alternative this
+            // pattern's own shape actually corresponds to (reusing
+            // pattern_could_match's own per-alternative logic -- the
+            // exact same question Expr::Match already asks, via that
+            // same function, before ever reaching bind_pattern_vars at
+            // all) and correlate against THAT alternative's own real
+            // structure, instead of falling through to the fresh,
+            // unconstrained-per-position fallback below. Without this,
+            // Case B's own step alternative sub-bindings (e.g. `t` in
+            // `(h, t)`) would keep NO type precision at all even after
+            // this task's own index-hypothesis injection lands --
+            // looking tested (the hypothesis fires) without actually
+            // working end-to-end (nothing observably depends on it
+            // being correct). If more than one alternative's shape
+            // admits `pat` (a genuinely ambiguous pattern, e.g. a Union
+            // of two same-arity Tuples), the first match wins --
+            // deterministic, same "best effort, not exhaustive" stance
+            // pattern_could_match's own Union arm already takes.
+            Type::Union(alts) => match alts.iter().find(|alt| pattern_could_match(pat, alt, &infer.named_types, &HashSet::new())) {
+                Some(matching_alt) => bind_pattern_vars(ctx, pat, matching_alt, infer, span),
+                None => bind_fresh_positions(ctx, pats, infer, span),
+            },
+            // A concrete, non-Tuple, non-List, non-Indexed/Named/Union
+            // scrutinee against a List pattern: pattern_could_match's
+            // own existing check (called by Expr::Match before this
+            // function ever runs) already rejects this case statically
+            // -- bind each position to its own independent fresh var
+            // (nothing real to correlate against) so nested sub-bindings
+            // still work.
+            _ => bind_fresh_positions(ctx, pats, infer, span),
         },
         Pattern::Cons(head, tail) => {
             let elem_ty = infer.fresh_var("elem");
@@ -2871,7 +3024,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 _ => None,
             };
             let refinement_target = match mode {
-                Mode::Check(_) => case_a_refinement_target(&resolved_scrut_ty, resolved_index.as_ref()),
+                Mode::Check(_) => indexed_refinement_target(&resolved_scrut_ty, resolved_index.as_ref(), &infer.named_types),
                 Mode::Synth => None,
             };
             let index_snapshot = refinement_target.as_ref().map(|_| infer.index_subst.clone());
@@ -2888,15 +3041,47 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         spans[expr],
                     ));
                 }
+                // Task 3 Fix 1: restore infer.index_subst to its
+                // pre-match snapshot BEFORE deciding THIS arm's own
+                // hypothesis (if any) -- not just once, after the whole
+                // loop. index_subst is one shared map, mutated in place
+                // by each eligible arm's own `insert` call below; without
+                // this per-arm restore, an arm that injects no
+                // hypothesis of its own (the `_ => {}`/no-override
+                // fallthroughs just below) would silently INHERIT
+                // whatever a PRECEDING sibling arm left behind in that
+                // same shared map, even though reaching THIS arm's own
+                // pattern shape implies nothing at all about the real
+                // hypothesis. Concretely: `match v | [] -> .. | h :: (h2
+                // :: t2) -> <body>` -- the compound-tail arm's own
+                // <body> used to wrongly see `n` still resolved to the
+                // `[]` arm's own 0, purely because `[]` happened to run
+                // first in source order. Restoring here, before every
+                // arm's own injection (if any) runs, makes every arm
+                // start from the SAME true ambient state regardless of
+                // processing order -- confirmed empirically (see this
+                // task's own report): reverting to a single restore
+                // after the whole loop flips
+                // `stale_hypothesis_does_not_leak_into_a_later_ineligible_sibling_arm`
+                // from passing to failing.
+                if let Some(snapshot) = &index_snapshot {
+                    infer.index_subst = snapshot.clone();
+                }
                 let mut arm_ctx = bind_pattern_vars(ctx, pat, &scrut_ty, infer, spans[expr])?;
-                // Case A hypothesis injection (spec section 5): base case
-                // ([]) implies the scrutinee's own index is 0; step case
-                // (x :: xs, xs a BARE Var -- see this plan's own v1 scope
-                // note) mints a fresh index variable, re-types `xs` as
-                // Vec(fresh) (overriding bind_pattern_vars's own plain,
-                // unindexed binding via a second `extend` call), and
-                // hypothesizes the scrutinee's own index is `fresh + 1`.
-                // Injecting into infer.index_subst (not a separate
+                // Hypothesis injection (spec section 5): base case implies
+                // the scrutinee's own index is 0; step case mints a fresh
+                // index variable, re-types the self-referential
+                // sub-binding as Indexed(_, fresh) (overriding
+                // bind_pattern_vars's own plain binding via a second
+                // `extend` call), and hypothesizes the scrutinee's own
+                // index is `fresh + 1`. Case A (List) derives base/step
+                // from the fixed []/:: patterns directly; Case B (Named+
+                // Union) derives the SAME shape of fact by asking which
+                // of the type's own two alternatives this specific arm's
+                // pattern corresponds to (reusing pattern_could_match's
+                // existing per-alternative logic, spec section 5 Case B
+                // point 4 -- no new exhaustiveness logic needed). Either
+                // case, injecting into infer.index_subst (not a separate
                 // ctx-rewrite pass) is sufficient: every Type::Indexed
                 // comparison this arm's own body-check can reach --
                 // unify, unify_index_expr, and transitively unify_fits/
@@ -2905,24 +3090,53 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // this same index variable, or `expected` itself if it
                 // mentions it, sees the hypothesis too, with no extra
                 // machinery.
-                if let Some((n_name, elem_ty)) = &refinement_target {
-                    match pat {
-                        Pattern::List(items) if items.is_empty() => {
-                            infer.index_subst.insert(n_name.clone(), IndexExpr::Lit(0));
-                        }
-                        Pattern::Cons(_, tail) => {
-                            if let Pattern::Var(tail_name) = &**tail {
-                                let m = fresh_index_name("m");
-                                let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
-                                infer.index_subst.insert(n_name.clone(), hypothesis);
-                                let refined_tail_ty = Type::Indexed(Rc::new(Type::List(elem_ty.clone())), Rc::new(IndexExpr::Var(m)));
-                                arm_ctx = extend(&arm_ctx, tail_name, refined_tail_ty);
+                if let Some(target) = &refinement_target {
+                    match target {
+                        IndexedRefinementTarget::List { index_var: n_name, elem_ty } => match pat {
+                            Pattern::List(items) if items.is_empty() => {
+                                infer.index_subst.insert(n_name.clone(), IndexExpr::Lit(0));
                             }
-                            // A compound/nested tail pattern: no override,
-                            // no hypothesis -- v1 scope boundary, see this
-                            // plan's own Global Constraints.
+                            Pattern::Cons(_, tail) => {
+                                if let Pattern::Var(tail_name) = &**tail {
+                                    let m = fresh_index_name("m");
+                                    let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
+                                    infer.index_subst.insert(n_name.clone(), hypothesis);
+                                    let refined_tail_ty = Type::Indexed(Rc::new(Type::List(elem_ty.clone())), Rc::new(IndexExpr::Var(m)));
+                                    arm_ctx = extend(&arm_ctx, tail_name, refined_tail_ty);
+                                }
+                                // A compound/nested tail pattern: no override,
+                                // no hypothesis -- v1 scope boundary, see this
+                                // plan's own Global Constraints.
+                            }
+                            _ => {}
+                        },
+                        IndexedRefinementTarget::Named { index_var: n_name, id, base_alt, step_alt } => {
+                            let matches_base = pattern_could_match(pat, base_alt, &infer.named_types, &HashSet::new());
+                            let matches_step = pattern_could_match(pat, step_alt, &infer.named_types, &HashSet::new());
+                            if matches_base && !matches_step {
+                                infer.index_subst.insert(n_name.clone(), IndexExpr::Lit(0));
+                            } else if matches_step && !matches_base {
+                                if let Some(Pattern::Var(self_ref_name)) = self_ref_pattern(pat, step_alt, id) {
+                                    let m = fresh_index_name("m");
+                                    let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
+                                    infer.index_subst.insert(n_name.clone(), hypothesis);
+                                    let refined_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var(m)));
+                                    arm_ctx = extend(&arm_ctx, self_ref_name, refined_ty);
+                                }
+                                // The self-referential position is bound
+                                // by something other than a bare Var (or
+                                // isn't found at all, e.g. a step
+                                // alternative shape self_ref_pattern
+                                // doesn't recognize): no override, no
+                                // hypothesis -- same v1 scope boundary as
+                                // Case A's own compound-tail restriction.
+                            }
+                            // Ambiguous (this arm's own pattern could
+                            // match BOTH alternatives, e.g. a bare `_`/Var
+                            // covering the whole scrutinee) or neither:
+                            // no hypothesis, the same safe fallback as
+                            // Case A's own catch-all `_ => {}` just above.
                         }
-                        _ => {}
                     }
                 }
                 // Same Bool coercion as If's own cond -- a Dyn-typed guard
@@ -2964,16 +3178,18 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 row = EffectRow::union(&row, &arm_row);
                 new_arms.push((pat.clone(), guard2, body2));
             }
-            // Restore, once, only after the WHOLE arm loop completes --
-            // never per-arm. This is the ONE deliberate exception to
+            // Final restore, after the WHOLE arm loop completes -- on top
+            // of the per-arm restore each iteration now ALSO does at its
+            // own start (Task 3 Fix 1, see the comment there for why a
+            // once-only restore silently leaked a preceding arm's own
+            // hypothesis into a later, unrelated one). This last restore
+            // is what makes a per-arm hypothesis fully undone once the
+            // LAST arm's own body-check finishes too, and is what keeps
             // infer.index_subst's otherwise strictly monotonic, never-
             // shrinks character (see InferCtx.index_subst's own doc
             // comment and unify_trial's identical snapshot/restore idiom,
-            // which this mirrors): a per-arm hypothesis is only ever
-            // valid while THAT arm's own body is being checked, and must
-            // not leak into a later arm (which may need an incompatible
-            // hypothesis for the SAME index variable) or into code after
-            // the match entirely.
+            // which this mirrors) from leaking a hypothesis into code
+            // after the match entirely.
             if let Some(snapshot) = index_snapshot {
                 infer.index_subst = snapshot;
             }
