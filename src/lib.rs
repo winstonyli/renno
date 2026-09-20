@@ -5499,4 +5499,53 @@ mod tests {
             result.err()
         );
     }
+
+    // --- Task 3, fix round 1: critical review finding ---
+
+    #[test]
+    fn bind_pattern_vars_union_arm_does_not_infinite_loop_on_a_bare_self_referential_alternative() {
+        // Critical review finding, confirmed via a traced counterexample
+        // (see this task's own fix-round-1 report entry): reachable via
+        // ORDINARY source syntax, no check_against-bypass needed.
+        // `named_types["List"]` resolves to `Union([Named("List"),
+        // Tuple([Int, Named("List")])])` -- the FIRST alternative is a
+        // BARE self-reference, not wrapped in anything structural. The
+        // pre-fix bind_pattern_vars's own Type::Union arm ran its
+        // `pattern_could_match` reachability probe with a fresh, empty
+        // `visiting` set every time, with no memory of the enclosing
+        // Type::Named arm's own unfolding -- so it would judge
+        // `Named("List")` "reachable" (via ITS OWN nested unfold finding
+        // the genuine Tuple alternative two levels down, using yet
+        // another fresh empty set), recurse into it, unfold to the same
+        // Union again, and repeat forever: unbounded recursion / stack
+        // overflow, purely from typechecking this one match expression.
+        //
+        // With the fix (visiting threaded through, mirroring
+        // pattern_could_match's own already-correct Type::Named/
+        // Type::Union arms exactly), the Union arm's reachability probe
+        // sees "List" already in `visiting` and correctly skips the bare
+        // self-referential alternative, landing on the genuine
+        // Tuple([Int, Named("List")]) alternative instead -- so this
+        // must terminate and type-check successfully (the match body
+        // just returns an Int literal from each arm; nothing further
+        // constrains t's own type).
+        let src = r#"
+            type List = List | (Int, List) in
+            let f: (List -> Int) = fun v ->
+                match v
+                | (h, t) -> 0
+                | x -> 1
+            in 0
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans);
+        assert!(
+            elaborated.is_ok(),
+            "expected the exact repro program to type-check successfully once the Union arm's own visiting set \
+             is correctly threaded (no cycle, t correlates against the genuine Tuple alternative), got: {:?}",
+            elaborated.err()
+        );
+        let result = machine::run(&arena, elaborated.unwrap(), Env::prelude(), &spans);
+        assert_eq!(result.as_int(), 0);
+    }
 }

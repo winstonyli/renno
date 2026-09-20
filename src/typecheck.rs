@@ -1946,16 +1946,41 @@ fn self_ref_pattern<'a>(pat: &'a Pattern, step_alt: &Type, id: &str) -> Option<&
 // final catch-all, and now the two new Type::Named/Type::Union arms'
 // own "no matching alternative found" cases below) -- same fallback,
 // same reasoning, one copy.
-fn bind_fresh_positions(ctx: &Ctx, pats: &[Pattern], infer: &mut InferCtx, span: Span) -> Result<Ctx, TypeError> {
+fn bind_fresh_positions(
+    ctx: &Ctx,
+    pats: &[Pattern],
+    infer: &mut InferCtx,
+    span: Span,
+    visiting: &HashSet<String>,
+) -> Result<Ctx, TypeError> {
     let mut c = ctx.clone();
     for p in pats {
         let elem_ty = infer.fresh_var("elem");
-        c = bind_pattern_vars(&c, p, &elem_ty, infer, span)?;
+        c = bind_pattern_vars(&c, p, &elem_ty, infer, span, visiting)?;
     }
     Ok(c)
 }
 
-fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut InferCtx, span: Span) -> Result<Ctx, TypeError> {
+// Fix round 1 (critical review finding): `visiting` mirrors
+// pattern_could_match's own parameter of the same name/position exactly
+// -- an accumulated set of Type::Named ids already being unfolded on
+// THIS recursion path, threaded unchanged through every existing arm
+// below and only ever grown by the Type::Named arm itself. Without this,
+// the Type::Union arm's own `pattern_could_match` probe used a fresh,
+// empty set on every call, with no memory of an enclosing Type::Named
+// arm's own unfolding -- letting a Union alternative that is itself a
+// bare self-reference (e.g. `type List = List | (Int, List)`, where the
+// FIRST alternative is `Named("List")` verbatim) look "reachable" via
+// its own fresh probe forever, recursing without end. See this task's
+// own fix-round-1 report entry for the traced counterexample.
+fn bind_pattern_vars(
+    ctx: &Ctx,
+    pat: &Pattern,
+    scrutinee_ty: &Type,
+    infer: &mut InferCtx,
+    span: Span,
+    visiting: &HashSet<String>,
+) -> Result<Ctx, TypeError> {
     match pat {
         // Resolve before storing, not just clone: by the time a Pattern::Var
         // binds, an enclosing Cons/List/Record arm may have ALREADY unified
@@ -1996,14 +2021,14 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut 
             Type::Tuple(items) if items.len() == pats.len() => {
                 let mut c = ctx.clone();
                 for (p, item_ty) in pats.iter().zip(items.iter()) {
-                    c = bind_pattern_vars(&c, p, item_ty, infer, span)?;
+                    c = bind_pattern_vars(&c, p, item_ty, infer, span, visiting)?;
                 }
                 Ok(c)
             }
             Type::List(shared_elem) => {
                 let mut c = ctx.clone();
                 for p in pats {
-                    c = bind_pattern_vars(&c, p, shared_elem, infer, span)?;
+                    c = bind_pattern_vars(&c, p, shared_elem, infer, span, visiting)?;
                 }
                 Ok(c)
             }
@@ -2021,7 +2046,7 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut 
             // correlation via Cons's own arm, which is where my_map's
             // own precision genuinely comes from -- this arm never
             // forcing List costs nothing there.
-            Type::Var(_) => bind_fresh_positions(ctx, pats, infer, span),
+            Type::Var(_) => bind_fresh_positions(ctx, pats, infer, span, visiting),
             // A Type::Indexed-wrapped scrutinee (Vec(n)-style, or Case
             // B's own Named-wrapped analog per §2's generalization) --
             // correlate against the WRAPPED type directly, "forgetting"
@@ -2033,7 +2058,7 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut 
             // time a match arm's own pattern (e.g. the tagged-tuple-style
             // `(h, t)`) gets here -- without this arm it fell into the
             // generic catch-all below, no correlation at all.
-            Type::Indexed(wrapped, _) => bind_pattern_vars(ctx, pat, wrapped, infer, span),
+            Type::Indexed(wrapped, _) => bind_pattern_vars(ctx, pat, wrapped, infer, span, visiting),
             // A Type::Named scrutinee (a `type X = ... in` alias
             // reference) -- unfold ONE level via infer.named_types and
             // recurse, mirroring pattern_could_match's own Type::Named
@@ -2045,22 +2070,36 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut 
             // it, a Case-B-style scrutinee's own Type::Named(id) never
             // even reaches the Type::Union arm just below -- it's still
             // nominally Named at this point, not yet unfolded to a
-            // Union at all. No cycle guard is needed here (unlike
-            // pattern_could_match's own visiting set): this arm only
-            // ever recurses into a shape pattern_could_match ALREADY
-            // proved *could* match `pat` (Expr::Match's own check just
-            // above this function's own call site), and that proof
-            // itself only ever succeeds by bottoming out at a
-            // non-Named shape -- a genuinely unfoldable-forever cycle
-            // (two SEPARATE aliases referencing each other with no
-            // Tuple/List/Union in between) isn't expressible through
-            // this project's own single-name self-reference mechanism
-            // (parser::contains_named's own doc comment) in the first
-            // place.
-            Type::Named(id) => match infer.named_types.get(id).cloned() {
-                Some(unfolded) => bind_pattern_vars(ctx, pat, &unfolded, infer, span),
-                None => bind_fresh_positions(ctx, pats, infer, span),
-            },
+            // Union at all.
+            //
+            // Fix round 1: a cycle guard IS needed here after all -- the
+            // "only ever recurses into an already-proved-reachable
+            // shape" argument this comment used to make was wrong
+            // because the Type::Union arm just below used to run its own
+            // reachability probe with a FRESH, empty visiting set every
+            // time, disconnected from whatever this arm had already
+            // unfolded -- so a Union alternative that is ITSELF a bare
+            // self-reference (`type List = List | (Int, List)`) could
+            // look reachable forever, recursing without end (see this
+            // task's own fix-round-1 report entry for the traced
+            // repro). Mirrors pattern_could_match's own Type::Named arm
+            // exactly: if `id` is already being unfolded on this path,
+            // stop and fall back to the safe fresh-vars-per-position
+            // behavior instead of unfolding again; otherwise recurse
+            // with `id` added to the accumulated set.
+            Type::Named(id) => {
+                if visiting.contains(id) {
+                    return bind_fresh_positions(ctx, pats, infer, span, visiting);
+                }
+                match infer.named_types.get(id).cloned() {
+                    Some(unfolded) => {
+                        let mut visiting = visiting.clone();
+                        visiting.insert(id.clone());
+                        bind_pattern_vars(ctx, pat, &unfolded, infer, span, &visiting)
+                    }
+                    None => bind_fresh_positions(ctx, pats, infer, span, visiting),
+                }
+            }
             // A Type::Union scrutinee (a resolved alias's own RHS, or an
             // ordinary Union type written directly) -- Case B's own
             // second real prerequisite: find WHICH alternative this
@@ -2081,9 +2120,20 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut 
             // of two same-arity Tuples), the first match wins --
             // deterministic, same "best effort, not exhaustive" stance
             // pattern_could_match's own Union arm already takes.
-            Type::Union(alts) => match alts.iter().find(|alt| pattern_could_match(pat, alt, &infer.named_types, &HashSet::new())) {
-                Some(matching_alt) => bind_pattern_vars(ctx, pat, matching_alt, infer, span),
-                None => bind_fresh_positions(ctx, pats, infer, span),
+            //
+            // Fix round 1: this arm's own `pattern_could_match` probe
+            // must reuse the SAME accumulated `visiting` set passed into
+            // this arm -- not a fresh `&HashSet::new()` -- and the
+            // subsequent recursive call into whichever alternative
+            // `.find()` picks must also pass that same set through
+            // unchanged (this arm never adds to it; only the Type::Named
+            // arm above does). A fresh set here was the actual bug: it
+            // let this arm "forget" that an enclosing Type::Named arm was
+            // already unfolding `id`, so a bare self-referential
+            // alternative could look reachable again and again forever.
+            Type::Union(alts) => match alts.iter().find(|alt| pattern_could_match(pat, alt, &infer.named_types, visiting)) {
+                Some(matching_alt) => bind_pattern_vars(ctx, pat, matching_alt, infer, span, visiting),
+                None => bind_fresh_positions(ctx, pats, infer, span, visiting),
             },
             // A concrete, non-Tuple, non-List, non-Indexed/Named/Union
             // scrutinee against a List pattern: pattern_could_match's
@@ -2092,7 +2142,7 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut 
             // -- bind each position to its own independent fresh var
             // (nothing real to correlate against) so nested sub-bindings
             // still work.
-            _ => bind_fresh_positions(ctx, pats, infer, span),
+            _ => bind_fresh_positions(ctx, pats, infer, span, visiting),
         },
         Pattern::Cons(head, tail) => {
             let elem_ty = infer.fresh_var("elem");
@@ -2104,8 +2154,8 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut 
             // shape, not hard-fail here just because Vec(3) isn't
             // literally Type::List.
             unify(&forget_index(scrutinee_ty), &list_shape, infer, span)?;
-            let c = bind_pattern_vars(ctx, head, &elem_ty, infer, span)?;
-            bind_pattern_vars(&c, tail, &list_shape, infer, span)
+            let c = bind_pattern_vars(ctx, head, &elem_ty, infer, span, visiting)?;
+            bind_pattern_vars(&c, tail, &list_shape, infer, span, visiting)
         }
         Pattern::Record(fields) => {
             let mut c = ctx.clone();
@@ -2114,7 +2164,7 @@ fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut 
                     Type::Record(type_fields) => find_field(type_fields, name).cloned().unwrap_or_else(|| infer.fresh_var(name)),
                     _ => infer.fresh_var(name),
                 };
-                c = bind_pattern_vars(&c, p, &field_ty, infer, span)?;
+                c = bind_pattern_vars(&c, p, &field_ty, infer, span, visiting)?;
             }
             Ok(c)
         }
@@ -3067,7 +3117,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 if let Some(snapshot) = &index_snapshot {
                     infer.index_subst = snapshot.clone();
                 }
-                let mut arm_ctx = bind_pattern_vars(ctx, pat, &scrut_ty, infer, spans[expr])?;
+                let mut arm_ctx = bind_pattern_vars(ctx, pat, &scrut_ty, infer, spans[expr], &HashSet::new())?;
                 // Hypothesis injection (spec section 5): base case implies
                 // the scrutinee's own index is 0; step case mints a fresh
                 // index variable, re-types the self-referential
