@@ -671,6 +671,50 @@ fn free_type_vars_resolved(ty: &Type, infer: &InferCtx) -> BTreeSet<String> {
     }
 }
 
+// Every index-variable name free anywhere inside `e` -- IndexExpr has
+// no binding forms of its own (see its own grammar), so every Var is
+// free by construction; this is a plain collection, not an occurs- or
+// scope-sensitive walk the way free_type_vars_resolved needs to be
+// for Type::Var.
+fn free_index_vars(e: &IndexExpr) -> BTreeSet<String> {
+    match e {
+        IndexExpr::Var(name) => BTreeSet::from([name.clone()]),
+        IndexExpr::Lit(_) => BTreeSet::new(),
+        IndexExpr::Add(a, b) | IndexExpr::Sub(a, b) | IndexExpr::Mul(a, b) => {
+            let mut vars = free_index_vars(a);
+            vars.extend(free_index_vars(b));
+            vars
+        }
+    }
+}
+
+// Type::Indexed's own index-variable analog of free_type_vars_resolved
+// -- walks both the wrapped type (for a NESTED Indexed, however deep)
+// and, at each Indexed layer, the index expression's own free
+// variables (resolved through infer.index_subst first, mirroring how
+// free_type_vars_resolved resolves through infer.subst before
+// collecting). Every other Type variant contributes nothing -- an
+// index variable can only ever appear inside a Type::Indexed's own
+// IndexExpr, never anywhere else in a Type.
+pub(crate) fn free_index_vars_resolved(ty: &Type, infer: &InferCtx) -> BTreeSet<String> {
+    match ty {
+        Type::Indexed(wrapped, index) => {
+            let mut vars = free_index_vars_resolved(wrapped, infer);
+            vars.extend(free_index_vars(&infer.resolve_index_deep(index)));
+            vars
+        }
+        Type::Fun(param, _row, ret) => {
+            let mut vars = free_index_vars_resolved(param, infer);
+            vars.extend(free_index_vars_resolved(ret, infer));
+            vars
+        }
+        Type::List(elem) => free_index_vars_resolved(elem, infer),
+        Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(|t| free_index_vars_resolved(t, infer)).collect(),
+        Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_index_vars_resolved(t, infer)).collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
 // Type::Var's own analog of free_row_vars_in_ctx: every type-variable
 // name free in any type currently bound in `ctx`, excluding each visited
 // scheme's own (sealed) type_vars -- see free_row_vars_in_ctx's own doc

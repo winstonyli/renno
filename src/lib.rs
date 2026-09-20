@@ -4091,4 +4091,41 @@ mod tests {
             "expected unify()'s own Type::Indexed arm to bind n := 3 via unify_index_expr, keeping the if's result precisely Indexed(3) so the Vec(3) annotation needs no runtime check"
         );
     }
+
+    #[test]
+    fn free_index_vars_resolved_finds_a_bare_index_variable() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{free_index_vars_resolved, InferCtx};
+        use std::collections::{BTreeSet, HashMap};
+        use std::rc::Rc;
+        use types::Type;
+        let infer = InferCtx::new(HashMap::new());
+        let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
+        let vars = free_index_vars_resolved(&ty, &infer);
+        assert_eq!(vars, BTreeSet::from(["n".to_string()]));
+    }
+
+    #[test]
+    fn free_index_vars_resolved_finds_variables_inside_a_compound_index() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{free_index_vars_resolved, InferCtx};
+        use std::collections::{BTreeSet, HashMap};
+        use std::rc::Rc;
+        use types::Type;
+        let infer = InferCtx::new(HashMap::new());
+        let index = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Var("m".to_string())));
+        let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index));
+        let vars = free_index_vars_resolved(&ty, &infer);
+        assert_eq!(vars, BTreeSet::from(["n".to_string(), "m".to_string()]));
+    }
+
+    #[test]
+    fn free_index_vars_resolved_finds_nothing_in_an_ordinary_type() {
+        use crate::typecheck::{free_index_vars_resolved, InferCtx};
+        use std::collections::{BTreeSet, HashMap};
+        use types::Type;
+        let infer = InferCtx::new(HashMap::new());
+        let vars = free_index_vars_resolved(&Type::Int, &infer);
+        assert!(vars.is_empty());
+    }
 }
