@@ -3993,6 +3993,13 @@ mod tests {
         let lhs = IndexExpr::Mul(Rc::new(IndexExpr::Var("m".to_string())), Rc::new(IndexExpr::Var("n".to_string())));
         let rhs = IndexExpr::Mul(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Var("m".to_string())));
         unify_index_expr(&lhs, &rhs, &mut infer, span).unwrap();
+        // The real property this test proves: no spurious binding. If
+        // shape-recursion ran before the SOP-equality check, it would
+        // recurse positionally into (m, n) and (n, m) and bind m := n --
+        // an unintended aliasing of two otherwise-independent variables,
+        // even though the whole expressions were already equal and
+        // needed no binding at all.
+        assert!(infer.index_subst.is_empty());
     }
 
     #[test]

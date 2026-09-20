@@ -259,13 +259,23 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
             infer.index_subst.insert(name.clone(), other.clone());
             Ok(())
         }
+        // SOP-equality is checked BEFORE the shape-recursion arms below.
+        // Two compound expressions can already be equal under SOP
+        // normalization (e.g. `m*n` vs `n*m`) without being pointwise
+        // equal operand-by-operand -- if shape-recursion ran first here,
+        // it would recurse positionally into (m, n) and (n, m) and bind
+        // `m := n`, aliasing two otherwise-independent variables as an
+        // unintended side effect. Checking equality first means a pair
+        // that's already SOP-equal needs no binding at all; a pair that
+        // ISN'T SOP-equal (e.g. `Add(n, 1)` vs `Add(3, 1)`, not equal
+        // while `n` is unbound) correctly falls through to recursion.
+        _ if crate::index_expr::index_exprs_equal(&a, &b) => Ok(()),
         (IndexExpr::Add(a1, a2), IndexExpr::Add(b1, b2))
         | (IndexExpr::Sub(a1, a2), IndexExpr::Sub(b1, b2))
         | (IndexExpr::Mul(a1, a2), IndexExpr::Mul(b1, b2)) => {
             unify_index_expr(a1, b1, infer, span)?;
             unify_index_expr(a2, b2, infer, span)
         }
-        _ if crate::index_expr::index_exprs_equal(&a, &b) => Ok(()),
         _ => Err(TypeError(format!("type mismatch: index {a} does not unify with index {b}"), span)),
     }
 }
