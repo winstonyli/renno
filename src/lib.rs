@@ -4754,4 +4754,32 @@ mod tests {
             other => panic!("expected an unwrapped Expr::Match, got {other:?}"),
         }
     }
+
+    // Phase 3, Task 5: the one shape not yet covered by Tasks 3/4's own
+    // tests -- a CURRIED function (two Lambda layers, exercising Task 2's
+    // own cur_mode descent through both, not just one, the way
+    // `check_against_threads_expected_return_type_through_a_curried_lambda`
+    // does) whose innermost tail is an `If` (not a `Match`) reached
+    // directly, with no intervening `let` re-annotating the tail's own
+    // expected type. `make`'s declared type `(Int -> Vec(3) -> [Int])`
+    // flows down through both Lambda layers -- `n: Int`, then `v: Vec(3)`
+    // -- to the tail `if n == 0 then v else [9, 9, 9]`, whose two branches
+    // (`v: Vec(3)` and `[9, 9, 9]: [Int]`) have no unify() arm pairing them
+    // directly and would only reconcile via Synth's widen-to-Dyn fallback;
+    // under Check mode each is checked directly against the same
+    // already-known `[Int]`, exactly like
+    // `if_check_mode_accepts_branches_that_only_agree_via_the_expected_type`
+    // and `match_check_mode_accepts_arms_that_only_agree_via_the_expected_type`
+    // above, but reached through two curried layers instead of a hand-built
+    // single node.
+    #[test]
+    fn curried_vec_returning_function_with_a_tail_if_checks_against_its_declared_type() {
+        let src = r#"
+            let make: (Int -> Vec(3) -> [Int]) = fun n -> fun v -> if n == 0 then v else [9, 9, 9] in
+            let x: Dyn = [1, 2, 3] in
+            let vx: Vec(3) = x in
+            len(make(0)(vx))
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 3);
+    }
 }
