@@ -1053,7 +1053,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     saw_type_alias = true;
                     let name = self.ident()?;
-                    if Self::builtin_type(&name).is_some() {
+                    if Self::builtin_type(&name).is_some() || name == "Vec" {
                         // Int/Bool/Str/Dyn resolve contextually in
                         // parse_type rather than being reserved lexer
                         // keywords (see builtin_type's own doc comment) --
@@ -1064,6 +1064,11 @@ impl<'a> Parser<'a> {
                         // type checks builtin_type before type_aliases),
                         // silently discarding the alias. Reject it here
                         // instead of leaving that footgun undiagnosed.
+                        // `Vec` gets the same treatment even though it's
+                        // not a `builtin_type`: parse_type's `Vec(` check
+                        // (above) runs before the type_aliases lookup too,
+                        // so a `Vec` alias would be silently discarded the
+                        // same way whenever parens follow it.
                         return Err(self.err_at(
                             self.span_before(),
                             format!("cannot redefine builtin type {name} as an alias"),

@@ -3681,4 +3681,18 @@ mod tests {
         assert!(parser::parse_type_string("Vec").is_err());
         assert!(parser::parse_type_string("Vec()").is_err());
     }
+
+    #[test]
+    fn type_alias_cannot_redefine_vec() {
+        // Same guard as `type Int = ... in ...` etc: parse_type's `Vec(`
+        // recognition (see the Vec tests above) runs before the
+        // type_aliases lookup, so a `type Vec = ... in ...` alias would
+        // otherwise parse fine but be silently discarded the moment it's
+        // used as `Vec(...)` -- reject it at the binder instead.
+        let err = parser::parse("type Vec = Int in 5").unwrap_err();
+        assert!(
+            err.contains("cannot redefine builtin type Vec"),
+            "expected a redefine-builtin error mentioning Vec, got: {err}"
+        );
+    }
 }
