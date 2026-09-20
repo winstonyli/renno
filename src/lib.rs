@@ -4782,4 +4782,42 @@ mod tests {
         "#;
         assert_eq!(run_source(src).unwrap().as_int(), 3);
     }
+
+    // Final-review fix wave, Minor 6: proves Check mode's real precision
+    // through the FULL Let->Lambda->Match threading (not a hand-built
+    // `check_against` call bypassing it, like
+    // `match_check_mode_accepts_arms_that_only_agree_via_the_expected_type`
+    // above does) actually REJECTS a genuine mismatch, not just accepts a
+    // legitimate one. `f`'s declared type is `(Bool -> [Int])`; the `true`
+    // arm's body is a bare `Str`, which cannot fit `[Int]` under any
+    // widening rule -- a real error.
+    //
+    // Verified empirically (temporarily reverting Finding 1's own
+    // tail-level-check fix and rerunning just this test) that this
+    // particular program is rejected EITHER WAY, fix or no fix -- it does
+    // NOT isolate Finding 1's own gap. That's because Match already got
+    // its own real Check-mode arm back in Task 4
+    // (`Expr::Match`'s `Mode::Check(expected) =>
+    // check_against(arena, *body, expected, ...)` branch): once the Lambda
+    // peel puts `cur_mode` at `Check([Int])` for the Match tail,
+    // `elaborate_node` dispatches straight into that per-arm
+    // `check_against`, independently of the new tail-level check this fix
+    // wave added around the dispatch call itself. Synth mode's own
+    // widen-to-Dyn fallback (`unify_trial` failure -> `Type::Dyn`, see
+    // Expr::Match's Synth arm) is what WOULD have silently reconciled
+    // `Str` and `List(Int)` -- but only if Match were ever reached in Synth
+    // mode here, which it isn't. Finding 1's actual gap needs a tail shape
+    // with no Check-mode arm of its own (a bare literal, Var, or call) --
+    // this test is still worth having as Task 6 asks: proof that real,
+    // full-chain threading produces a real rejection, not a synthetic
+    // single-node `check_against` call.
+    #[test]
+    fn match_check_mode_through_full_threading_rejects_a_genuine_arm_mismatch() {
+        let src = r#"
+            let f: (Bool -> [Int]) = fun flag -> match flag | true -> "a" | false -> [1, 2] in
+            f(true)
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected"), "expected a real type mismatch, got: {err}");
+    }
 }
