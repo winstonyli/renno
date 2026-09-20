@@ -5119,4 +5119,157 @@ mod tests {
         let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
         assert_eq!(result.as_int(), 8);
     }
+
+    // --- Task 2: ambient-context and hypothesis-composition tests ---
+    //
+    // Both tests below deliberately use Case A's BASE-case hypothesis
+    // (`[]` -> index := 0, a CONCRETE LITERAL), not the step-case
+    // hypothesis (`x :: xs` -> index := m + 1, a FRESH VARIABLE), as
+    // their discriminating mechanism. This was NOT an arbitrary choice:
+    // hand-tracing unify_index_expr (and confirming empirically, see
+    // below) shows the step-case hypothesis alone is NOT safe to build a
+    // "must succeed when correct, must fail when broken" test around,
+    // because unify_index_expr is a DELIBERATELY NARROW unifier (its own
+    // doc comment: "binds a BARE unbound variable to whatever it's
+    // compared against... does NOT solve equations") -- so a check of
+    // the shape "v2 : Vec(<fresh-var-derived expression>)" will happily
+    // rescue itself by just binding whichever fresh var is still free at
+    // that point to whatever's needed, REGARDLESS of whether the
+    // intended hypothesis ever fired. Confirmed empirically: surgically
+    // disabling ONLY `infer.index_subst.insert(n_name.clone(),
+    // hypothesis)` in the step-case arm (src/typecheck.rs, leaving the
+    // tail's own `arm_ctx = extend(..., Vec(m))` retyping intact) does
+    // NOT make `recursive_vec_function_typechecks_via_pattern_refinement`
+    // fail -- it keeps passing, because `m` (t's own fresh index var)
+    // simply free-binds to whatever `n - 1` resolves to instead of
+    // genuinely deriving it from the (missing) hypothesis. The base-case
+    // hypothesis (0, a literal) has no such escape hatch: once "n" (or
+    // whatever the outer index var is) is bound to a concrete literal,
+    // EVERY later comparison touching it is a real, non-rescuable
+    // structural fact -- exactly the property these two tests need.
+
+    #[test]
+    fn refining_one_vec_via_match_also_refines_an_ambient_vec_sharing_the_same_index_var() {
+        // Property (a) from the spec's own design review: "It must apply
+        // everywhere the refined variable occurs in the ambient context,
+        // not only to the matched scrutinee." `v1` and `v2` are two
+        // SEPARATE parameters of the SAME curried function, both
+        // annotated `Vec(n)` -- the SAME index variable, exactly the
+        // spec's own `zip(v1: Vec(n), v2: Vec(n))` shape. Only `v1` is
+        // ever matched; `v2` is never touched by any pattern at all.
+        //
+        // Matching v1's `[]` arm injects the CONCRETE hypothesis n := 0
+        // into infer.index_subst (Case A's base-case rule). `v2`'s own
+        // stored type in `arm_ctx` is untouched -- still literally
+        // `Vec(n)` -- so the ONLY way `let proof: Vec(1) = v2 in ...`
+        // can be judged is by resolving v2's index ("n") through the
+        // SAME shared index_subst map v1's own match just wrote into.
+        // With the hypothesis correctly applied, n resolves to the
+        // concrete literal 0, so comparing it against the required
+        // literal 1 is a real, unrescuable mismatch (0 != 1) --
+        // correctly REJECTED. If the ambient hypothesis did NOT reach
+        // v2 (n stayed a free, unbound variable at this point instead),
+        // unify_index_expr's own default-bind rule would happily bind n
+        // := 1 right there and ACCEPT the program instead -- the wrong
+        // answer. So `is_err()` here is the demonstration: it can only
+        // be true because v2, an entirely separate ambient binding, saw
+        // the SAME concrete hypothesis v1's own match arm produced.
+        let src = r#"
+            let f: (Vec(n) -> Vec(n) -> Int) = fun v1 -> fun v2 ->
+                match v1
+                | [] -> let proof: Vec(1) = v2 in 0
+                | h :: t -> 0
+            in
+            let x1: Dyn = [] in
+            let vx1: Vec(0) = x1 in
+            let x2: Dyn = [] in
+            let vx2: Vec(0) = x2 in
+            f(vx1)(vx2)
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(
+            err.contains("does not unify") || err.contains("mismatch"),
+            "v2 should be refined to n=0 alongside v1 inside the [] arm, making Vec(1) a real (rejected) conflict, not silently accepted: got {err}"
+        );
+    }
+
+    #[test]
+    fn nested_match_hypotheses_compose_through_resolve_index_deep() {
+        // Property (b) from the spec's own design review: hypotheses
+        // compose to a fixed point across nested matches. Outer match on
+        // `v` (Vec(n)): the step arm hypothesizes n := m + 1 (m fresh)
+        // and retypes `t` as Vec(m). A SECOND, NESTED match on `t`
+        // (itself now Vec(m), eligible for its own Case A refinement):
+        // its OWN base-case arm hypothesizes m := 0 (concrete). At the
+        // point both `proof1`/`proof2` below are checked,
+        // infer.index_subst holds BOTH "n" -> m + 1 AND "m" -> 0
+        // simultaneously (neither match's own restore has run yet --
+        // both are still mid-arm).
+        //
+        // `proof1: Vec(n - 1) = t` alone is NOT sufficient to prove real
+        // two-hop composition, despite looking like it should be: `t`'s
+        // own stored type is ALREADY the literal `Vec(m)` (set by the
+        // OUTER match's own retyping alone), so `n - 1` only needs to
+        // SOP-normalize to the bare symbol `m` -- which it does as soon
+        // as the OUTER hop alone (n -> m+1) is resolved, REGARDLESS of
+        // whether `m` itself further resolves to anything. Confirmed
+        // empirically: with ONLY the inner match's own base-case
+        // hypothesis (m := 0) disabled, `proof1` alone still
+        // type-checks (`(m+1)-1` SOP-normalizes to the free variable
+        // `m`, which then structurally matches t's own still-unresolved
+        // `m` via unify_index_expr's occurs-check-then-SOP-equality
+        // rescue -- a fact about symbolic cancellation, not about the
+        // inner hop's own value at all).
+        //
+        // `w` closes that gap: a THIRD parameter, also declared
+        // `Vec(n)` (the very same outer index variable, ambient --
+        // never itself pattern-matched, exactly like property (a)'s
+        // `v2`), checked against the CONCRETE literal `Vec(1)` from
+        // inside the innermost arm. Resolving `w`'s own index all the
+        // way down to a bare literal genuinely requires BOTH hops:
+        // n -> m+1 -> (0)+1, which only SOP-normalizes to the literal 1
+        // if `m` itself was ALSO correctly resolved to 0 -- a partial,
+        // one-hop resolution leaves a residual `m` term that can NEVER
+        // SOP-cancel against a pure literal (no free-variable rescue is
+        // available once the other side is a concrete Lit, per
+        // unify_index_expr's own arms). `proof1` is kept anyway: it
+        // isolates a broken OUTER hop specifically (if n never learns
+        // m+1 at all, comparing t, whose real value is the concrete 0
+        // via the inner hypothesis alone, against the still-fully-free
+        // "n - 1" is ALSO a genuine, non-rescuable mismatch).
+        //
+        // Empirically confirmed (see task-2-report.md for the exact
+        // transcripts): disabling EITHER hop's own hypothesis insert
+        // alone flips this test from passing to failing; both hops
+        // active together makes it pass, matching the SOP-normalized,
+        // fully-composed answer (0 + 1 = 1) instead of any partially-
+        // resolved intermediate.
+        let src = r#"
+            let f: (Vec(n) -> Vec(n) -> Int) = fun v -> fun w ->
+                match v
+                | [] -> 0
+                | h :: t ->
+                    match t
+                    | [] ->
+                        let proof1: Vec(n - 1) = t in
+                        let proof2: Vec(1) = w in
+                        1
+                    | h2 :: t2 -> 2
+            in
+            let x1: Dyn = [9] in
+            let vx: Vec(1) = x1 in
+            let x2: Dyn = [9] in
+            let vw: Vec(1) = x2 in
+            f(vx)(vw)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans);
+        assert!(
+            elaborated.is_ok(),
+            "n should SOP-normalize to the concrete literal 1 by composing BOTH n->m+1 and m->0 through resolve_index_deep: {:?}",
+            elaborated.err()
+        );
+        let result = machine::run(&arena, elaborated.unwrap(), Env::prelude(), &spans);
+        assert_eq!(result.as_int(), 1);
+    }
 }
