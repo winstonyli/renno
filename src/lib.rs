@@ -4620,4 +4620,138 @@ mod tests {
             other => panic!("expected an unwrapped Expr::If, got {other:?}"),
         }
     }
+
+    // Phase 3, Task 4: `Expr::Match` gets the same Synth/Check split as
+    // `Expr::If` just above. Synth-mode behavior is unchanged -- see
+    // `mismatched_match_arms_still_widen_to_dyn_not_a_new_rejection` above
+    // (still exercising the exact same widen-to-Dyn fallback, now routed
+    // through the `mode`-branching arm instead of the old unconditional
+    // one). This test is the negative Check-mode case: `match true | true
+    // -> 1 | false -> "a"` checked against Int -- the second arm's body
+    // ("a": Str) does NOT fit Int, and Check mode must now catch that
+    // statically via check_against's own coerce failure, the same real-
+    // rejection semantics `if_check_mode_rejects_a_branch_that_does_not_fit_the_expected_type`
+    // already established for If.
+    #[test]
+    fn match_check_mode_rejects_an_arm_that_does_not_fit_the_expected_type() {
+        use crate::typecheck::{check_against, Ctx, InferCtx};
+        use crate::span::Span;
+        use crate::expr::{Arena, Expr, Pattern, SpanMap};
+        use crate::types::Type;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+
+        let mut arena = Arena::new();
+        let mut spans = SpanMap::new();
+        // Build Match(Bool(true), [(Bool(true), None, Int(1)), (Bool(false), None, Str("a"))])
+        // by hand -- spans pushed in lockstep with arena, same idiom every
+        // other hand-built-Arena test in this file already uses.
+        let scrutinee = arena.push(Expr::Bool(true));
+        spans.push(Span { start: 0, end: 0 });
+        let arm1_body = arena.push(Expr::Int(1));
+        spans.push(Span { start: 0, end: 0 });
+        let arm2_body = arena.push(Expr::Str("a".to_string()));
+        spans.push(Span { start: 0, end: 0 });
+        let arms = Rc::new(vec![
+            (Pattern::Bool(true), None, arm1_body),
+            (Pattern::Bool(false), None, arm2_body),
+        ]);
+        let match_expr = arena.push(Expr::Match(scrutinee, arms));
+        spans.push(Span { start: 0, end: 0 });
+        let mut infer = InferCtx::new(HashMap::new());
+        let err = check_against(&mut arena, match_expr, &Type::Int, &Ctx::empty(), &spans, &mut infer).unwrap_err();
+        assert!(err.0.contains("expected Int, found Str"), "unexpected message: {}", err.0);
+    }
+
+    // Same task, the actual Phase-3 payoff end to end: `make`'s inner `f`
+    // has a declared return type (`[Int]`) that must flow down through
+    // Let->Lambda->Match (the exact threading built in Tasks 2-4) to
+    // check EACH Match arm against `[Int]` directly. `v` is a genuinely
+    // Vec(n)-typed value (crossed a real Dyn boundary, same discipline as
+    // every other Indexed Dyn-boundary test in this file), so this is the
+    // real end-to-end case, not a hand-built one. Confirms it type-checks
+    // and runs to completion with the right answer.
+    //
+    // (contains_check isn't used here to prove Check-mode precision --
+    // `let vx: Vec(3) = x` above needs, and gets, its own perfectly
+    // legitimate runtime boundary check completely unrelated to the
+    // Match; a whole-tree "no check anywhere" assertion would conflate
+    // the two. The dedicated structural precision test just below --
+    // mirroring If's own `if_check_mode_accepts_branches_that_only_agree_via_the_expected_type`
+    // -- is what actually isolates and proves the Match-specific claim.)
+    #[test]
+    fn vec_returning_function_with_a_tail_match_checks_against_its_declared_type() {
+        let src = r#"
+            let make = fun n: Int -> fun v: Vec(n) ->
+                let f: (Bool -> [Int]) = fun flag -> match flag | true -> v | false -> [1, 2] in
+                f(true)
+            in
+            let x: Dyn = [1, 2, 3] in
+            let vx: Vec(3) = x in
+            len(make(3)(vx))
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 3);
+    }
+
+    // The structural payoff isolated, same technique as
+    // `if_check_mode_accepts_branches_that_only_agree_via_the_expected_type`:
+    // `v` (Vec(n), n an unbound rigid index variable) and `[1, 2]` (plain
+    // List(Int)) have no unify() arm pairing them directly (only
+    // Indexed-Indexed and List-List are handled) -- under Synth these two
+    // arms would only reconcile via a widen-to-Dyn fallback. Under Check
+    // mode, each is checked against the SAME already-known `[Int]`
+    // directly: `v` fits via Vec(n)'s own index-forgetting widening
+    // (types::fits's Indexed rescue arm), `[1, 2]` fits trivially, and
+    // the reconstructed Match's own arm bodies are exactly the ORIGINAL
+    // ExprRefs pushed below -- no Dyn-boundary check scaffold wrapping
+    // either one. This is the genuine, isolated "static precision, not a
+    // lucky runtime pass" evidence for Match's own Check-mode arm.
+    #[test]
+    fn match_check_mode_accepts_arms_that_only_agree_via_the_expected_type() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{check_against, extend_generalized, Ctx, InferCtx};
+        use crate::span::Span;
+        use crate::expr::{Arena, Expr, Pattern, SpanMap};
+        use crate::types::Type;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+
+        let mut infer = InferCtx::new(HashMap::new());
+        let vec_ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
+        let ctx = extend_generalized(&Ctx::empty(), "v", vec_ty, &infer);
+
+        let mut arena = Arena::new();
+        let mut spans = SpanMap::new();
+        let scrutinee = arena.push(Expr::Bool(true));
+        spans.push(Span { start: 0, end: 0 });
+        let arm1_body = arena.push(Expr::Var("v".to_string()));
+        spans.push(Span { start: 0, end: 0 });
+        let one = arena.push(Expr::Int(1));
+        spans.push(Span { start: 0, end: 0 });
+        let two = arena.push(Expr::Int(2));
+        spans.push(Span { start: 0, end: 0 });
+        let arm2_body = arena.push(Expr::ListLit(vec![one, two]));
+        spans.push(Span { start: 0, end: 0 });
+        let arms = Rc::new(vec![
+            (Pattern::Bool(true), None, arm1_body),
+            (Pattern::Bool(false), None, arm2_body),
+        ]);
+        let match_expr = arena.push(Expr::Match(scrutinee, arms));
+        spans.push(Span { start: 0, end: 0 });
+
+        let expected = Type::List(Rc::new(Type::Int));
+        let (_, result_expr) = check_against(&mut arena, match_expr, &expected, &ctx, &spans, &mut infer)
+            .expect("both arms individually fit [Int] via Check-mode's own per-arm dispatch, even though they'd never mutually unify under Synth");
+
+        match &arena[result_expr] {
+            Expr::Match(_, new_arms) => {
+                assert_eq!(new_arms[0].2, arm1_body, "Vec(n)'s own index-forgetting widening is a zero-overhead static fit, no boundary check wrapping expected");
+                match &arena[new_arms[1].2] {
+                    Expr::ListLit(items) => assert_eq!(items, &vec![one, two]),
+                    other => panic!("expected an unwrapped ListLit, got {other:?}"),
+                }
+            }
+            other => panic!("expected an unwrapped Expr::Match, got {other:?}"),
+        }
+    }
 }

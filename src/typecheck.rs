@@ -2837,15 +2837,31 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     }
                     None => None,
                 };
-                let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, spans, infer)?;
+                // Same If-style split as Expr::If's own Check-mode arm:
+                // Synth infers each arm independently and reconciles them
+                // against EACH OTHER via unify_trial (today's exact,
+                // unchanged behavior); Check instead checks each arm's
+                // body directly against the SAME already-known `expected`
+                // type, so arms that wouldn't mutually unify under Synth
+                // can still both type-check as long as each individually
+                // satisfies `expected`. No per-arm reconciliation is
+                // needed in Check mode -- `expected` is already the
+                // answer -- so `result_ty` is simply never touched there.
+                let (arm_row, body2) = match mode {
+                    Mode::Synth => {
+                        let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, spans, infer)?;
+                        result_ty = Some(match result_ty {
+                            None => arm_ty,
+                            Some(t) => match unify_trial(&t, &arm_ty, infer, spans[expr]) {
+                                Ok(()) => infer.resolve_deep(&t),
+                                Err(_) => Type::Dyn,
+                            },
+                        });
+                        (arm_row, body2)
+                    }
+                    Mode::Check(expected) => check_against(arena, *body, expected, &arm_ctx, spans, infer)?,
+                };
                 row = EffectRow::union(&row, &arm_row);
-                result_ty = Some(match result_ty {
-                    None => arm_ty,
-                    Some(t) => match unify_trial(&t, &arm_ty, infer, spans[expr]) {
-                        Ok(()) => infer.resolve_deep(&t),
-                        Err(_) => Type::Dyn,
-                    },
-                });
                 new_arms.push((pat.clone(), guard2, body2));
             }
             // A guarded arm's pattern can't be relied on to cover
@@ -2862,7 +2878,11 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             if let Some(missing) = missing_case(&unguarded_pats, &scrut_ty) {
                 return Err(TypeError(format!("non-exhaustive match: {missing}"), spans[expr]));
             }
-            Ok((result_ty.unwrap_or(Type::Dyn), row, arena.push(Expr::Match(scrutinee2, Rc::new(new_arms)))))
+            let final_ty = match mode {
+                Mode::Synth => result_ty.unwrap_or(Type::Dyn),
+                Mode::Check(expected) => expected.clone(),
+            };
+            Ok((final_ty, row, arena.push(Expr::Match(scrutinee2, Rc::new(new_arms)))))
         }
 
         // Constructing the handler value is pure -- the clause body's own
