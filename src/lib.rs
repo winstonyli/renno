@@ -4820,4 +4820,68 @@ mod tests {
         let err = run_source(src).unwrap_err();
         assert!(err.contains("expected"), "expected a real type mismatch, got: {err}");
     }
+
+    // Final-review fix wave, Finding 1's own isolating regression test.
+    // The test just above (mirroring the earlier reviewer's own attempt)
+    // does NOT isolate Finding 1's tail-level check: its tail is a
+    // `Match`, which has its own independent Check-mode arm
+    // (`check_against` per arm, added back in Task 4) that catches the
+    // mismatch regardless of whether the NEW tail-level check exists.
+    //
+    // `f`'s tail here is a bare `Var` (`x`) instead -- `elaborate_node`'s
+    // `Expr::Var` arm ignores `mode` entirely (ctx lookup only), so a
+    // bare Var has NO Check-mode arm of its own. `x`'s own static type is
+    // `Dyn` (crossed via the explicit `: Dyn` annotation on the `let`
+    // immediately above it, same discipline every other Indexed
+    // Dyn-boundary test in this file uses), so the only way a runtime
+    // `Vec(3)` boundary check can ever get spliced in here is the NEW
+    // tail-level check -- the one right after the tail-dispatch
+    // `elaborate_node` call in `elaborate_mode` (currently
+    // src/typecheck.rs:2300-2304), which runs `coerce`/`unify_fits`
+    // while `cur_mode` is still `Check(Vec(3))` and the tail's own type
+    // is still the BARE `Dyn`.
+    //
+    // Confirmed empirically (temporarily commenting out just that
+    // 2300-2304 block, leaving the pre-existing trailing check at the
+    // very end of `elaborate_mode` untouched, then `cargo test
+    // lambda_body_bare_dyn_tail`): with the block removed, BOTH
+    // assertions below flip -- `contains_check` becomes `false` and
+    // `run_source` returns `Ok` instead of `Err`. Restoring the block
+    // makes both pass again. Root cause: without the tail-level check,
+    // the reconstructed type after the Lambda unwind is `(Int -> Dyn)`
+    // (not `(Int -> Vec(3))`) -- the trailing check (using the call's
+    // OWN original `mode`, `Check((Int -> Vec(3)))`) then calls
+    // `coerce(lambda_expr, (Int -> Dyn), (Int -> Vec(3)), ...)`, but
+    // `coerce`'s Dyn-boundary branch only fires when `from` is LITERALLY
+    // `Type::Dyn` (its own `matches!(from, Type::Dyn | Type::Var(_))`
+    // guard) -- not when `from` is a concrete `Type::Fun` whose return
+    // position merely happens to resolve to `Dyn`. `consistent((Int ->
+    // Dyn), (Int -> Vec(3)))` is trivially true (Dyn is consistent with
+    // anything), so `coerce` returns the Lambda completely UNCHANGED --
+    // no wrapping, no runtime check -- and `unify_fits` is equally
+    // permissive on an unresolved Dyn return position. So without the
+    // tail-level check, the trailing check is a silent no-op here: the
+    // function is accepted as `(Int -> Vec(3))` on paper while its real
+    // body can return a list of ANY length, completely unchecked.
+    #[test]
+    fn lambda_body_bare_dyn_tail_gets_the_new_tail_level_check() {
+        let src = r#"
+            let f: (Int -> Vec(3)) = fun n -> let x: Dyn = [1, 2] in x in
+            f(0)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans)
+            .expect("Dyn is always consistent with Vec(3) -- this must type-check, the mismatch is only caught at runtime");
+        assert!(
+            contains_check(&arena, elaborated),
+            "the tail-level check should have spliced a real Vec(3) runtime boundary check around x -- \
+             without it, f's body is silently accepted as Vec(3)-typed with no check at all"
+        );
+
+        let err = run_source(src).unwrap_err();
+        // Type::Indexed's own Display renders as "[Dyn](3)", not "Vec(3)"
+        // (see types.rs's own Display impl) -- this is the same runtime
+        // message format build_checked's fail() call always produces.
+        assert!(err.contains("expected [Dyn](3)"), "expected a genuine Vec(3) length mismatch at runtime, got: {err}");
+    }
 }
