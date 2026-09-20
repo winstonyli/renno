@@ -251,7 +251,27 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         // consistent AND their index expressions are equal (§3's SOP
         // normalization) -- both halves required, mirroring how List's
         // own arm requires its element type to match.
-        (Type::Indexed(wa, ia), Type::Indexed(wb, ib)) => consistent(wa, wb) && index_exprs_equal(ia, ib),
+        //
+        // A bare, unbound index variable on EITHER side is permissive,
+        // mirroring Type::Var's own unconditional permissiveness just
+        // above -- this is specifically what lets coerce() no-op on a
+        // Vec(n) parameter/annotation the same way it already no-ops
+        // on an ordinary Type::Var one, so a REAL binding can happen
+        // afterward via unify_fits (see Expr::App/Let/LetRec's own
+        // elaboration). The guard is IndexExpr::Var specifically, not
+        // "contains a variable anywhere" -- Vec(n+1) against Vec(4)
+        // still correctly requires exact SOP-equality, matching
+        // unify_index_expr's own identical no-equation-solving limit.
+        // NOTE: consistent() is symmetric and also backs `==`/Union-
+        // membership -- this permissiveness applies there too, which is
+        // why Expr::Let/LetRec also gain a follow-up unify_fits call:
+        // without one, a bare index variable accepted here can be left
+        // silently UNBOUND with no runtime check at all (rigid vs.
+        // flexible index variables is a deeper, still-open concern).
+        (Type::Indexed(wa, ia), Type::Indexed(wb, ib)) => {
+            consistent(wa, wb)
+                && (index_exprs_equal(ia, ib) || matches!(**ia, IndexExpr::Var(_)) || matches!(**ib, IndexExpr::Var(_)))
+        }
         // Positional, structural, no name/registry involved -- same idea
         // as List's own element comparison, just per-position instead of
         // one shared element type.

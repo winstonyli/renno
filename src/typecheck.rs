@@ -439,6 +439,30 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
         _ => match unify_trial(&required, &actual, infer, span) {
             Ok(()) => Ok(()),
             Err(e) => {
+                // An Indexed-vs-Indexed pair already has full, authoritative
+                // handling via unify()'s own dedicated Indexed arm (see this
+                // match's own doc comment above) -- but consistent()'s
+                // Type::Indexed arm is now permissive for a bare index
+                // variable on either side (Task 6, added so coerce() itself
+                // can no-op on a Vec(n) position -- see its own doc
+                // comment), and fits()'s own Indexed arm is guarded to
+                // exclude an Indexed `required` (see its doc comment), so
+                // it falls straight through to that SAME consistent() call
+                // for this exact pair shape. Left unguarded, EITHER would
+                // wrongly rescue a genuine index conflict unify_index_expr
+                // just correctly rejected here (e.g. n already bound to 3
+                // by an earlier Vec(n) annotation, freshly compared against
+                // a second, incompatible Vec(2)) purely because the
+                // required/actual side happens to still be written as a
+                // bare `n` -- silently undoing the very binding this
+                // function exists to enforce. unify()'s verdict is already
+                // authoritative for this one pair shape, so skip the
+                // rescue entirely rather than let it re-litigate what
+                // unify_index_expr (which DOES resolve through
+                // infer.index_subst) already decided.
+                if matches!((&required, &actual), (Type::Indexed(..), Type::Indexed(..))) {
+                    return Err(e);
+                }
                 // fits(), not just consistent(): an Indexed-typed `actual`
                 // satisfying a plain-typed `required` position (types::fits's
                 // own new Indexed arm, "forgetting" the index) is a real
@@ -2095,7 +2119,19 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
             Expr::Let(var, ann, val, body) => {
                 let (val_ty, val_row, val2) = elaborate(arena, val, &cur_ctx, spans, infer)?;
                 let (bound_ty, val3) = match ann {
-                    Some(t) => (t.clone(), coerce(arena, val2, &val_ty, &t, spans[val], &infer.named_types)?),
+                    Some(t) => {
+                        let val4 = coerce(arena, val2, &val_ty, &t, spans[val], &infer.named_types)?;
+                        // Mirrors Expr::App's own coerce-then-unify_fits
+                        // pattern: coerce still runs first and stays the
+                        // error-message authority (unchanged from before),
+                        // this just ADDS a follow-up unify_fits so a bare
+                        // index variable that consistent()'s new
+                        // permissiveness let coerce() no-op on (see
+                        // types::consistent's Type::Indexed arm) actually
+                        // gets bound instead of silently left unconstrained.
+                        unify_fits(&t, &val_ty, infer, spans[val])?;
+                        (t.clone(), val4)
+                    }
                     None => (val_ty, val2),
                 };
                 cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone(), infer);
@@ -2124,7 +2160,13 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
                 for (name, ann, val) in bindings.iter() {
                     let (val_ty, val_row, val2) = elaborate(arena, *val, &val_ctx, spans, infer)?;
                     let (bound_ty, val3) = match ann {
-                        Some(t) => (t.clone(), coerce(arena, val2, &val_ty, t, spans[*val], &infer.named_types)?),
+                        Some(t) => {
+                            let val4 = coerce(arena, val2, &val_ty, t, spans[*val], &infer.named_types)?;
+                            // Identical fix as Expr::Let just above -- see
+                            // its own comment.
+                            unify_fits(t, &val_ty, infer, spans[*val])?;
+                            (t.clone(), val4)
+                        }
                         None => (val_ty, val2),
                     };
                     elaborated.push((name.clone(), bound_ty, val_row, val3));

@@ -4212,12 +4212,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "uninformative for this task: fails on the separate, already-flagged \
-        Expr::App/coerce gap (Task 3's own finding) -- coerce() checks call \
-        arguments structurally, not via unify()/unify_fits(), so it rejects \
-        Vec(n) against Vec(3) even when n WOULD unify. Not this task's job to \
-        fix; see the direct extend_generalized/lookup unit test below for the \
-        real proof that index-variable generalization works."]
     fn a_let_bound_vec_producing_function_generalizes_over_its_own_index_variable() {
         // identity_vec's own `n` must be generalized so it can be called
         // at two DIFFERENT lengths from the same let-binding, the same way
@@ -4294,5 +4288,89 @@ mod tests {
         assert_ne!(name_a, "n", "lookup should instantiate a FRESH name, not return the generalized `n` verbatim");
         assert_ne!(name_b, "n", "lookup should instantiate a FRESH name, not return the generalized `n` verbatim");
         assert_ne!(name_a, name_b, "two separate lookups of a generalized index variable must get INDEPENDENT fresh names");
+    }
+
+    // Task 6: closes the Expr::App/coerce gap the test just above
+    // documents (and Expr::Let/LetRec's identical gap) -- coerce() alone
+    // can't bind an index variable, so consistent()'s Type::Indexed arm
+    // is now permissive for a bare index variable on either side (mirrors
+    // Type::Var), and Let/LetRec each gain a unify_fits call after their
+    // own coerce succeeds, mirroring the pattern Expr::App already had.
+    #[test]
+    fn calling_a_vec_producing_function_through_an_ordinary_call_infers_its_index() {
+        // The spec's own §4 motivating example.
+        let src = r#"
+            let f = fun v: Vec(n) -> v in
+            let x: Dyn = [1, 2, 3] in
+            let arg: Vec(3) = x in
+            len(f(arg))
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 3);
+    }
+
+    #[test]
+    fn a_let_bound_vec_annotation_with_a_bare_index_variable_actually_binds_it() {
+        // Not just "accepted" (the new consistent() permissiveness alone
+        // would allow this silently, with n left UNBOUND and no check at
+        // all) -- REALLY bound, provably, by using the SAME n again
+        // immediately after in a position that can only succeed if n is
+        // genuinely 3.
+        //
+        // Routed through an intermediate concrete `w: Vec(3)` rather than
+        // annotating `x` (a genuine Dyn value) directly as `Vec(n)`: a bare
+        // index variable crossing an ACTUAL Dyn boundary hits a separate,
+        // pre-existing gap this task does not touch -- coerce()'s runtime
+        // boundary check (build_boundary_check/index_expr_to_expr) splices
+        // the index variable into the check as an ordinary Expr::Var, which
+        // assumes (see index_expr_to_expr's own doc comment) it is always a
+        // real, in-scope RUNTIME parameter by this phase -- true for a
+        // dependently-typed function parameter (`fun n: Int -> fun v:
+        // Vec(n) -> v`), but not for a bare index variable minted by a
+        // plain `let` annotation, which has no runtime binder at all. That
+        // gap is a manifestation of the still-open rigid-vs-flexible index
+        // variable distinction this task's own brief explicitly defers to
+        // Phase 3/5, not something Task 6 is scoped to fix -- so this test
+        // reaches `Vec(n)` only from an already-concrete `Vec(3)` (`w`),
+        // never straight from Dyn, keeping it a pure static-inference check
+        // of coerce()/unify_fits, the actual subject of this task.
+        let src = r#"
+            let x: Dyn = [1, 2, 3] in
+            let w: Vec(3) = x in
+            let y: Vec(n) = w in
+            let z: Vec(n) = y in
+            len(z)
+        "#;
+        assert_eq!(run_source(src).unwrap().as_int(), 3);
+    }
+
+    #[test]
+    fn a_let_bound_vec_annotation_still_rejects_a_genuinely_mismatched_reuse() {
+        // The soundness check for the fix above: if n really got bound to
+        // 3 by the first Vec(n) annotation, a SECOND, incompatible use of
+        // the SAME n (via a fresh let-bound name reusing n at a different
+        // concrete length) must still fail -- proving unify_fits actually
+        // ran and bound n, rather than consistent()'s own permissiveness
+        // silently accepting both independently. A static rejection here
+        // is a plain Err (this codebase's own convention for a coerce/
+        // unify failure -- see e.g. union_type_dyn_boundary_rejects_no_
+        // matching_alternative_at_runtime above), not a panic, so
+        // unwrap_err() is the right check, not catch_unwind.
+        //
+        // Same reasoning as the test above for routing through concrete
+        // `ca: Vec(3)`/`cb: Vec(2)` rather than annotating `a`/`b` (genuine
+        // Dyn values) directly as `Vec(n)` -- keeps this a pure static
+        // check of unify_fits/unify_index_expr, not a collision with the
+        // separate pre-existing runtime-boundary-check gap described there.
+        let src = r#"
+            let a: Dyn = [1, 2, 3] in
+            let b: Dyn = [1, 2] in
+            let ca: Vec(3) = a in
+            let cb: Vec(2) = b in
+            let ya: Vec(n) = ca in
+            let yb: Vec(n) = cb in
+            1
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("index 3 does not unify with index 2"), "unexpected message: {err}");
     }
 }
