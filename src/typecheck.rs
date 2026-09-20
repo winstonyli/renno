@@ -1832,6 +1832,26 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
 // already catches for the cases IT can see -- this rewrite doesn't
 // replace that check, it adds a second, complementary one that can see
 // INTO a pattern's own sub-bindings, not just its top-level shape.
+// Case A eligibility (spec section 5): is `scrut_ty` (already resolved via
+// infer.resolve_deep) a Type::Indexed wrapping a plain Type::List, whose
+// own index expression (already resolved via infer.resolve_index_deep)
+// is a BARE variable? If so, returns that variable's name and the
+// wrapped element type -- everything a Match arm needs to compute its
+// own base/step hypothesis. Anything else (a non-Indexed scrutinee, an
+// Indexed-but-non-List wrapped type -- that's Case B, a later task's own
+// job -- a literal or compound index expression with no single name to
+// bind a hypothesis under) returns None: the safe "not applicable"
+// fallback used throughout this design.
+fn case_a_refinement_target(resolved_scrut_ty: &Type, resolved_index: Option<&IndexExpr>) -> Option<(String, Rc<Type>)> {
+    match (resolved_scrut_ty, resolved_index) {
+        (Type::Indexed(wrapped, _), Some(IndexExpr::Var(name))) => match &**wrapped {
+            Type::List(elem_ty) => Some((name.clone(), elem_ty.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn bind_pattern_vars(ctx: &Ctx, pat: &Pattern, scrutinee_ty: &Type, infer: &mut InferCtx, span: Span) -> Result<Ctx, TypeError> {
     match pat {
         // Resolve before storing, not just clone: by the time a Pattern::Var
@@ -2836,6 +2856,25 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             }
 
             let (scrut_ty, scrut_row, scrutinee2) = elaborate(arena, scrutinee, ctx, spans, infer)?;
+            // Refinement (spec section 5) only ever applies in Check mode
+            // -- Synth mode's own escape-variable risk is exactly what
+            // Phase 3's bidirectional retrofit was built to avoid (spec
+            // section 6's own rationale) -- and only when the scrutinee's
+            // own resolved type is genuinely Type::Indexed with a bare
+            // index variable (a literal or compound index has no single
+            // name to hypothesize about). `index_snapshot` is only ever
+            // Some when refinement is eligible at all, so an ordinary,
+            // non-Vec match pays no extra cost.
+            let resolved_scrut_ty = infer.resolve_deep(&scrut_ty);
+            let resolved_index = match &resolved_scrut_ty {
+                Type::Indexed(_, idx) => Some(infer.resolve_index_deep(idx)),
+                _ => None,
+            };
+            let refinement_target = match mode {
+                Mode::Check(_) => case_a_refinement_target(&resolved_scrut_ty, resolved_index.as_ref()),
+                Mode::Synth => None,
+            };
+            let index_snapshot = refinement_target.as_ref().map(|_| infer.index_subst.clone());
             let mut row = scrut_row;
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
@@ -2849,7 +2888,43 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         spans[expr],
                     ));
                 }
-                let arm_ctx = bind_pattern_vars(ctx, pat, &scrut_ty, infer, spans[expr])?;
+                let mut arm_ctx = bind_pattern_vars(ctx, pat, &scrut_ty, infer, spans[expr])?;
+                // Case A hypothesis injection (spec section 5): base case
+                // ([]) implies the scrutinee's own index is 0; step case
+                // (x :: xs, xs a BARE Var -- see this plan's own v1 scope
+                // note) mints a fresh index variable, re-types `xs` as
+                // Vec(fresh) (overriding bind_pattern_vars's own plain,
+                // unindexed binding via a second `extend` call), and
+                // hypothesizes the scrutinee's own index is `fresh + 1`.
+                // Injecting into infer.index_subst (not a separate
+                // ctx-rewrite pass) is sufficient: every Type::Indexed
+                // comparison this arm's own body-check can reach --
+                // unify, unify_index_expr, and transitively unify_fits/
+                // check_against -- already resolves through index_subst
+                // on demand (Phase 1-3), so an ambient binding sharing
+                // this same index variable, or `expected` itself if it
+                // mentions it, sees the hypothesis too, with no extra
+                // machinery.
+                if let Some((n_name, elem_ty)) = &refinement_target {
+                    match pat {
+                        Pattern::List(items) if items.is_empty() => {
+                            infer.index_subst.insert(n_name.clone(), IndexExpr::Lit(0));
+                        }
+                        Pattern::Cons(_, tail) => {
+                            if let Pattern::Var(tail_name) = &**tail {
+                                let m = fresh_index_name("m");
+                                let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
+                                infer.index_subst.insert(n_name.clone(), hypothesis);
+                                let refined_tail_ty = Type::Indexed(Rc::new(Type::List(elem_ty.clone())), Rc::new(IndexExpr::Var(m)));
+                                arm_ctx = extend(&arm_ctx, tail_name, refined_tail_ty);
+                            }
+                            // A compound/nested tail pattern: no override,
+                            // no hypothesis -- v1 scope boundary, see this
+                            // plan's own Global Constraints.
+                        }
+                        _ => {}
+                    }
+                }
                 // Same Bool coercion as If's own cond -- a Dyn-typed guard
                 // gets a runtime is_bool check inserted, same as
                 // everywhere else Dyn meets an expected concrete type.
@@ -2888,6 +2963,19 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 };
                 row = EffectRow::union(&row, &arm_row);
                 new_arms.push((pat.clone(), guard2, body2));
+            }
+            // Restore, once, only after the WHOLE arm loop completes --
+            // never per-arm. This is the ONE deliberate exception to
+            // infer.index_subst's otherwise strictly monotonic, never-
+            // shrinks character (see InferCtx.index_subst's own doc
+            // comment and unify_trial's identical snapshot/restore idiom,
+            // which this mirrors): a per-arm hypothesis is only ever
+            // valid while THAT arm's own body is being checked, and must
+            // not leak into a later arm (which may need an incompatible
+            // hypothesis for the SAME index variable) or into code after
+            // the match entirely.
+            if let Some(snapshot) = index_snapshot {
+                infer.index_subst = snapshot;
             }
             // A guarded arm's pattern can't be relied on to cover
             // anything for exhaustiveness -- its guard might reject --

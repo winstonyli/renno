@@ -4884,4 +4884,194 @@ mod tests {
         // message format build_checked's fail() call always produces.
         assert!(err.contains("expected [Dyn](3)"), "expected a genuine Vec(3) length mismatch at runtime, got: {err}");
     }
+
+    // Phase 4 Task 1 -- Case A pattern-match index refinement (spec
+    // section 5). All four tests below were hand-verified empirically
+    // (temporarily disabling first the base-case hypothesis, then the
+    // whole snapshot/restore block, and confirming each specific test
+    // flips from pass to fail) rather than trusted from the plan's own
+    // illustrative snippets -- see this task's own report for the two
+    // real architectural facts that forced the source strings below to
+    // diverge from the plan's:
+    //
+    //   1. BinOp::Cons and Expr::ListLit are NOT mode-aware -- they
+    //      unconditionally produce a plain Type::List, never a
+    //      Type::Indexed, regardless of what Check-mode `expected` is in
+    //      force (see their own arms in elaborate_node). Neither
+    //      consistent() nor fits() (types.rs) has any arm letting a
+    //      plain List satisfy a required Indexed type -- only two
+    //      Type::Indexed values can ever be compared that way. So a
+    //      Match arm whose body FRESHLY CONSTRUCTS a list (`[]`, or
+    //      `h :: rest`) can never itself satisfy an Indexed `expected`,
+    //      no matter what hypothesis this task injects -- confirmed by
+    //      hand-running the plan's own literal example, which fails with
+    //      "type mismatch: expected [Dyn](n), found [Dyn]" even for the
+    //      textually-correct `[] -> []` arm. The only arm SHAPE that can
+    //      satisfy an Indexed `expected` is one whose body is already a
+    //      Var/parameter carrying a real Type::Indexed type (e.g. `t`
+    //      after this task's own Case A override, or `v` itself) --
+    //      consistent()'s existing Indexed-vs-Indexed arm is permissive
+    //      whenever EITHER side is a bare index variable (see its own
+    //      doc comment), which is what actually admits these tests.
+    //   2. `let rec`'s own body is elaborated with the binding's
+    //      annotation entered via a plain (monomorphic) `extend`, not
+    //      `extend_generalized` -- see Expr::LetRec's own doc comment
+    //      ("every binding needs to resolve to its own... type WHILE
+    //      elaborating every value in the group"). So a self-recursive
+    //      call made from INSIDE that same body sees its own callee type
+    //      as the literal, un-instantiated `Vec(n) -> Vec(n)` -- the
+    //      SAME "n" as the enclosing scope, not a fresh per-call
+    //      instantiation. Recursing on a tail (whose real length is one
+    //      LESS than n) then requires unifying that same rigid "n"
+    //      against "n - 1", a genuine, correct contradiction this
+    //      checker properly rejects ("infinite index expression: m
+    //      occurs in m + 1") -- confirmed by hand-running a `let rec
+    //      same_length` version of the plan's own test. This is a
+    //      pre-existing `let rec` limitation, orthogonal to Case A and
+    //      out of this task's scope (real polymorphic recursion over
+    //      index variables would need `let rec` to generalize before
+    //      elaborating its own body, a materially bigger change) -- so
+    //      the "recursive" test below demonstrates the same spec section
+    //      5 payoff (a Vec(n)-returning function that only type-checks
+    //      because each arm's own index hypothesis is visible while
+    //      checking that arm) via a plain, non-self-recursive `let`
+    //      instead of `let rec`.
+    //
+    // Both facts are pre-existing, unrelated to this task's own change,
+    // and unaffected by it either way -- Case A only ever adds entries to
+    // infer.index_subst, it doesn't touch BinOp::Cons/ListLit or
+    // LetRec's own elaboration at all.
+
+    #[test]
+    fn recursive_vec_function_typechecks_via_pattern_refinement() {
+        // The real spec section 5 payoff: `f`'s step arm returns `v`
+        // unchanged (always trivially Vec(n), needing no refinement) --
+        // but it ALSO proves, via a nested `Vec(n - 1)` annotation on the
+        // tail `t`, that `t`'s real length is exactly one less than `v`'s.
+        // Without a correct hypothesis in scope while checking this arm,
+        // `t`'s real (Case A-assigned) type `Vec(m)` could never satisfy
+        // `Vec(n - 1)` -- SOP-normalized equality (index_expr.rs's own
+        // §3) needs `index_subst` to actually resolve "n" to "m + 1"
+        // first (`(m + 1) - 1` normalizes to `m`, matching `t`'s type
+        // exactly). Confirmed empirically: with the step-arm hypothesis
+        // injection disabled, this exact program fails with "type
+        // mismatch: expected [Dyn](m + 1), found [Dyn](3)" instead of
+        // type-checking.
+        let src = r#"
+            let f: (Vec(n) -> Vec(n)) = fun v ->
+                match v
+                | [] -> v
+                | h :: t ->
+                    let proof: Vec(n - 1) = t in
+                    v
+            in
+            let x: Dyn = [1, 2, 3] in
+            let vx: Vec(3) = x in
+            len(f(vx))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
+        assert_eq!(result.as_int(), 3);
+    }
+
+    #[test]
+    fn base_case_arm_alone_is_rejected_when_it_does_not_fit_vec_zero() {
+        // Confirms the base-case hypothesis is REAL, not a no-op: `v`'s
+        // real type is always the literal, bare `Vec(n)` (consistent()'s
+        // own bare-index-variable permissiveness accepts comparing it
+        // against ANY other Indexed type at the static coerce step,
+        // regardless of what n actually resolves to) -- so the only way
+        // to observe the base arm's own n=0 hypothesis taking effect is
+        // through a REAL, index_subst-consulting comparison
+        // (unify_fits/unify_index_expr), not through coerce's own static
+        // permissiveness. `let proof: Vec(1) = v in ...`, checked while
+        // v's own hypothesized index is 0, does exactly that: it forces
+        // unify_index_expr to compare the literal 1 against n's
+        // hypothesized value 0, a genuine, provable conflict. Without the
+        // n=0 injection (confirmed empirically by disabling it), n is
+        // simply unbound here and freely binds to 1 instead -- this
+        // exact program type-checks fine, proving the rejection below
+        // really does depend on the hypothesis being injected.
+        let src = r#"
+            let f: (Vec(n) -> Int) = fun v ->
+                match v
+                | [] -> let proof: Vec(1) = v in 0
+                | h :: t -> 0
+            in
+            let x: Dyn = [] in
+            let vx: Vec(0) = x in
+            f(vx)
+        "#;
+        let err = run_source(src).unwrap_err();
+        assert!(
+            err.contains("does not unify"),
+            "expected a real index conflict from the n=0 hypothesis (1 vs 0), got: {err}"
+        );
+    }
+
+    #[test]
+    fn synth_mode_match_on_an_indexed_scrutinee_gets_no_refinement() {
+        // The Global Constraint this whole task exists to protect: with NO
+        // expected type flowing in (an unannotated `let`, so the match is
+        // elaborated in Synth mode), no hypothesis is injected -- `t`
+        // stays plainly List(Dyn) (bind_pattern_vars's own untouched
+        // Cons arm), exactly as before this task. `f` itself still needs
+        // an explicit Dyn round-trip to be called with a concrete Vec(3)
+        // (see this test module's own established idiom, e.g.
+        // `identity_vec_dyn_boundary_gets_a_real_runtime_check` above) --
+        // that part is unrelated to Case A, just how every other
+        // Vec(n)-parameterized call in this file already works.
+        let src = r#"
+            let f = fun v: Vec(3) ->
+                let r = match v | [] -> [] | h :: t -> t in
+                r
+            in
+            let x: Dyn = [1, 2, 3] in
+            let vx: Vec(3) = x in
+            f(vx)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans);
+        assert!(elaborated.is_ok(), "an unannotated let's own Match must still type-check with no refinement, exactly as before this task");
+    }
+
+    #[test]
+    fn index_subst_hypothesis_does_not_leak_past_the_whole_match() {
+        // Self-review's own most important correctness property, made
+        // concrete: two INDEPENDENT calls to the SAME Vec(n)->Vec(n)
+        // function, with two DIFFERENT concrete lengths, must both
+        // succeed. This is only possible if "n" comes out of `f`'s own
+        // body elaboration genuinely free (so the enclosing `let`
+        // generalizes it, and each call gets its own fresh instantiation)
+        // -- which in turn is only true if BOTH arms' own per-arm
+        // hypothesis (n=0 for the base arm, n=m+1 for the step arm) were
+        // fully undone (via the snapshot/restore) once the match's own
+        // arm loop finished, not left bound to whichever arm happened to
+        // run last. Confirmed empirically: temporarily skipping the
+        // restore (leaving the loop's final -- step-arm -- hypothesis
+        // n=m+1 permanently in infer.index_subst) makes the SECOND call
+        // below fail with "type mismatch: expected [Dyn](m + 1), found
+        // [Dyn](5)", since "n" is then permanently, incorrectly pinned to
+        // "one more than SOME fixed, never-reconstrained m" instead of
+        // being free to instantiate per call.
+        let src = r#"
+            let f: (Vec(n) -> Vec(n)) = fun v ->
+                match v
+                | [] -> v
+                | h :: t ->
+                    let proof: Vec(n - 1) = t in
+                    v
+            in
+            let x3: Dyn = [1, 2, 3] in
+            let v3: Vec(3) = x3 in
+            let x5: Dyn = [1, 2, 3, 4, 5] in
+            let v5: Vec(5) = x5 in
+            len(f(v3)) + len(f(v5))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
+        assert_eq!(result.as_int(), 8);
+    }
 }
