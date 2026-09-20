@@ -2355,7 +2355,7 @@ pub(crate) fn check_against(arena: &mut Arena, expr: ExprRef, expected: &Type, c
 // `spans[expr]` is a valid, always-available "point at this whole
 // construct" location for any error an arm below doesn't have a more
 // specific sub-expression to blame instead.
-fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx, _mode: Mode) -> Result<(Type, EffectRow, ExprRef), TypeError> {
+fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx, mode: Mode) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     let node = arena[expr].clone();
     match node {
         Expr::Int(_) => Ok((Type::Int, EffectRow::pure(), expr)),
@@ -2720,15 +2720,39 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         Expr::If(c, t, e) => {
             let (c_ty, c_row, c2) = elaborate(arena, c, ctx, spans, infer)?;
             let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans[c], &infer.named_types)?;
-            let (t_ty, t_row, t2) = elaborate(arena, t, ctx, spans, infer)?;
-            let (e_ty, e_row, e2) = elaborate(arena, e, ctx, spans, infer)?;
-            // Try unify first (resolves open type variables when
-            // possible); fall back to today's exact widen-to-Dyn
-            // behavior on genuine failure, never a new rejection -- see
-            // this plan's own Global Constraints.
-            let result_ty = match unify_trial(&t_ty, &e_ty, infer, spans[expr]) {
-                Ok(()) => infer.resolve_deep(&t_ty),
-                Err(_) => Type::Dyn,
+            let (result_ty, t_row, e_row, t2, e2) = match mode {
+                // Today's exact behavior, unchanged: infer both branches
+                // independently, try unify first (resolves open type
+                // variables when possible), and fall back to widen-to-Dyn
+                // on genuine failure, never a new rejection -- see this
+                // plan's own Global Constraints.
+                Mode::Synth => {
+                    let (t_ty, t_row, t2) = elaborate(arena, t, ctx, spans, infer)?;
+                    let (e_ty, e_row, e2) = elaborate(arena, e, ctx, spans, infer)?;
+                    let result_ty = match unify_trial(&t_ty, &e_ty, infer, spans[expr]) {
+                        Ok(()) => infer.resolve_deep(&t_ty),
+                        Err(_) => Type::Dyn,
+                    };
+                    (result_ty, t_row, e_row, t2, e2)
+                }
+                // New: both branches are checked directly against the
+                // SAME already-known `expected` type instead of being
+                // inferred independently and reconciled against EACH
+                // OTHER -- this lets two branches that wouldn't mutually
+                // unify under Synth (e.g. one carries an unbound index
+                // variable, the other a concrete/differently-shaped type)
+                // still both type-check, each against `expected`
+                // directly, whenever `expected` itself is something both
+                // individually satisfy. A genuine mismatch is now a real
+                // error (via check_against's own coerce failure) rather
+                // than a silent widen-to-Dyn -- intentional, ordinary
+                // Check-mode subsumption, matching every other Check-mode
+                // site in this file (e.g. Expr::App's argument check).
+                Mode::Check(expected) => {
+                    let (t_row, t2) = check_against(arena, t, expected, ctx, spans, infer)?;
+                    let (e_row, e2) = check_against(arena, e, expected, ctx, spans, infer)?;
+                    (expected.clone(), t_row, e_row, t2, e2)
+                }
             };
             // Only one branch runs, but which one isn't known statically,
             // so the possible effects are the union of both.

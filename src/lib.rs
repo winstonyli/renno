@@ -4519,4 +4519,105 @@ mod tests {
         let mut infer = InferCtx::new(HashMap::new());
         assert!(check_against(&mut arena, e, &Type::Bool, &Ctx::empty(), &spans, &mut infer).is_err());
     }
+
+    // Phase 3, Task 3: `Expr::If` gets a real `Mode::Check` arm -- both
+    // branches are now checked directly against the caller's `expected`
+    // type via `check_against`, instead of only being inferred
+    // independently and reconciled via `unify_trial`. `if true then 1
+    // else "a"` checked against Int: the `then` branch obviously fits,
+    // but the `else` branch ("a": Str) does NOT -- under the OLD (Synth-
+    // only) behavior this pair would have silently widened to Dyn and
+    // only failed (if at all) at runtime; Check mode now catches it
+    // statically, the same real-rejection semantics every other
+    // Check-mode site in this file already has (e.g. Expr::App's
+    // argument check).
+    #[test]
+    fn if_check_mode_rejects_a_branch_that_does_not_fit_the_expected_type() {
+        use crate::typecheck::{check_against, Ctx, InferCtx};
+        use crate::span::Span;
+        use crate::expr::{Arena, Expr, SpanMap};
+        use crate::types::Type;
+        use std::collections::HashMap;
+        let mut arena = Arena::new();
+        let mut spans = SpanMap::new();
+        // Build If(Bool(true), Int(1), Str("a")) by hand -- spans pushed
+        // in lockstep with arena, same append-only-PrimaryMap idiom every
+        // other hand-built-Arena test in this file already uses.
+        let c = arena.push(Expr::Bool(true));
+        spans.push(Span { start: 0, end: 0 });
+        let t = arena.push(Expr::Int(1));
+        spans.push(Span { start: 0, end: 0 });
+        let e = arena.push(Expr::Str("a".to_string()));
+        spans.push(Span { start: 0, end: 0 });
+        let if_expr = arena.push(Expr::If(c, t, e));
+        spans.push(Span { start: 0, end: 0 });
+        let mut infer = InferCtx::new(HashMap::new());
+        let err = check_against(&mut arena, if_expr, &Type::Int, &Ctx::empty(), &spans, &mut infer).unwrap_err();
+        assert!(err.0.contains("expected Int, found Str"), "unexpected message: {}", err.0);
+    }
+
+    // Same task, the positive case: two branches whose SYNTHESIZED types
+    // would never mutually unify under Synth (a Vec(n)-shaped value with
+    // an unbound index variable has no unify() arm pairing it against a
+    // plain Type::List -- only Indexed-Indexed and List-List are
+    // handled), yet each individually satisfies a plain `[Int]` expected
+    // type -- `x` via Type::Indexed's own "forget the index" widening
+    // (types::fits's Indexed rescue arm), the list literal trivially.
+    // Confirms Check mode's own per-branch dispatch makes this succeed
+    // with NO runtime boundary check inserted (the reconstructed
+    // Expr::If's children are exactly the ORIGINAL ExprRefs pushed below,
+    // not wrapped in a Dyn-boundary check scaffold) -- real static
+    // precision, not a lucky runtime pass.
+    #[test]
+    fn if_check_mode_accepts_branches_that_only_agree_via_the_expected_type() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{check_against, extend_generalized, Ctx, InferCtx};
+        use crate::span::Span;
+        use crate::expr::{Arena, Expr, SpanMap};
+        use crate::types::Type;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+
+        let mut infer = InferCtx::new(HashMap::new());
+        let vec_ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
+        let ctx = extend_generalized(&Ctx::empty(), "x", vec_ty, &infer);
+
+        let mut arena = Arena::new();
+        let mut spans = SpanMap::new();
+        let c = arena.push(Expr::Bool(true));
+        spans.push(Span { start: 0, end: 0 });
+        let t = arena.push(Expr::Var("x".to_string()));
+        spans.push(Span { start: 0, end: 0 });
+        let one = arena.push(Expr::Int(1));
+        spans.push(Span { start: 0, end: 0 });
+        let two = arena.push(Expr::Int(2));
+        spans.push(Span { start: 0, end: 0 });
+        let e = arena.push(Expr::ListLit(vec![one, two]));
+        spans.push(Span { start: 0, end: 0 });
+        let if_expr = arena.push(Expr::If(c, t, e));
+        spans.push(Span { start: 0, end: 0 });
+
+        let expected = Type::List(Rc::new(Type::Int));
+        let (_, result_expr) = check_against(&mut arena, if_expr, &expected, &ctx, &spans, &mut infer)
+            .expect("both branches individually fit [Int] via Check-mode's own per-branch dispatch, even though they'd never mutually unify under Synth");
+
+        match &arena[result_expr] {
+            Expr::If(c2, t2, e2) => {
+                assert_eq!(*c2, c, "condition should be unchanged -- Bool needs no coercion to Bool");
+                assert_eq!(*t2, t, "Vec(n)'s own index-forgetting widening is a zero-overhead static fit, no boundary check wrapping expected");
+                // ListLit's own elaboration always rebuilds a fresh node
+                // (it re-pushes `refs` unconditionally, even when no
+                // element needed a coercion -- see its arm in
+                // elaborate_node), so e2 is a NEW ExprRef on principle,
+                // unrelated to Check mode. What matters here is that it's
+                // still a plain, unwrapped ListLit of the same two
+                // elements -- not a Dyn-boundary check scaffold.
+                match &arena[*e2] {
+                    Expr::ListLit(items) => assert_eq!(items, &vec![one, two]),
+                    other => panic!("expected an unwrapped ListLit, got {other:?}"),
+                }
+            }
+            other => panic!("expected an unwrapped Expr::If, got {other:?}"),
+        }
+    }
 }
