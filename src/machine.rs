@@ -22,7 +22,7 @@ thread_local! {
     // AFTER a panic is caught, to attach a "line L, column C" location to
     // whatever runtime panic just fired (unbound variable, a failed
     // Check, a non-function call, `perform` with no handler, ...), no
-    // matter which function actually called panic! -- env.rs's,
+    // matter which function actually called panic! -- frame.rs's,
     // value.rs's, and machine.rs's own panics all get this for free, with
     // no Span parameter threaded into any of them.
     //
@@ -118,13 +118,14 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     cont = Cont::cons(Frame::ListElems { remaining, done: Vec::new(), env: env.clone() }, cont);
                     control = Control::Eval(first, env);
                 }
-                // Same left-to-right field-value evaluation shape as
-                // LetRec's own binding-value evaluation just below (names
-                // fixed upfront, remaining/done accumulate) -- not
-                // ListElems, since the final wrap differs (Value::Record,
-                // not Value::List; see Frame::RecordElems's own doc
-                // comment). Always 1+ fields: parser::parse_record_fields
-                // rejects `{}` (see its own doc comment), the same "no
+                // Same left-to-right remaining/done accumulation shape as
+                // LetRec's own non-group fallback just below (Frame::
+                // LetRecBody) -- not ListElems, since the final wrap
+                // differs (Value::Record, not Value::List; see
+                // Frame::RecordElems's own doc comment, including how it
+                // differs from LetRecBody's own shape). Always 1+ fields:
+                // parser::parse_record_fields rejects `{}` (see its own
+                // doc comment), the same "no
                 // empty case to special-case" guarantee Tuple's own arm
                 // above relies on.
                 Expr::Record(fields) => {
@@ -411,10 +412,12 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                             }
                         }
                         // Same left-to-right accumulation as ListElems just
-                        // above, differing only in the final wrap: `names`
-                        // (fixed for the whole record, like LetRecBody's
-                        // own `names`) zipped back together with `done`
-                        // into a Value::Record instead of a bare Value::List.
+                        // above (and as Frame::LetRecBody's own fallback
+                        // below, which has no `names` of its own to zip
+                        // back in), differing only in the final wrap:
+                        // `names` (fixed for the whole record) zipped
+                        // together with `done` into a Value::Record instead
+                        // of a bare Value::List.
                         Frame::RecordElems { names, remaining, done, env } => {
                             let (names, mut remaining, mut done, env) =
                                 (names.clone(), remaining.clone(), done.clone(), env.clone());

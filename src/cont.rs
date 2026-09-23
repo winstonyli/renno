@@ -54,11 +54,15 @@ pub enum Frame {
     ListElems { remaining: Vec<ExprRef>, done: Vec<Value>, env: Env },
     // Evaluating a record's field VALUES left to right -- `names` is the
     // fixed, full field-name list for the whole record (needed once every
-    // value is in, to zip back together into the final Value::Record; see
-    // LetRecBody just above for the same names+remaining+done shape, used
-    // for the same reason). Not ListElems: that always wraps its `done`
-    // as a plain Value::List, which is right for Tuple/ListLit but wrong
-    // here -- see Value::Record's own doc comment for why records need a
+    // value is in, to zip back together into the final Value::Record;
+    // LetRecBody just above accumulates `remaining`/`done` the same way,
+    // but has no `names` field of its own -- its fallback just binds the
+    // finished values in order via a runtime Bindings frame, since the
+    // resolver already fixed each name's slot by position, with no
+    // Value::Record-shaped result to zip back together). Not ListElems:
+    // that always wraps its `done` as a plain Value::List, which is right
+    // for Tuple/ListLit but wrong here -- see Value::Record's own doc
+    // comment for why records need a
     // name-keyed runtime shape ListElems has no way to produce.
     RecordElems { names: Rc<Vec<String>>, remaining: Vec<ExprRef>, done: Vec<Value>, env: Env },
     PerformPayload { effect: String },

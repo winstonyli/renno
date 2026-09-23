@@ -2394,11 +2394,13 @@ mod tests {
 
     #[test]
     fn unbound_variable_panic_reports_its_location() {
-        // `m` is unbound -- machine::run panics inside env.rs, with no
-        // Span parameter anywhere near that panic site; the location
-        // still comes through via machine::current_span (set centrally
-        // in run_loop's Eval step, read back after catch_unwind catches
-        // the panic in lib.rs).
+        // `m` is unbound -- resolve.rs resolves it to VarRef::Unbound (not
+        // a resolve-time error; gradual typing means an unbound name in
+        // source is not itself illegal) and machine::run_loop's
+        // Expr::Var arm panics on it lazily, with no Span parameter
+        // anywhere near that panic site; the location still comes through
+        // via machine::current_span (set centrally in run_loop's Eval
+        // step, read back after catch_unwind catches the panic in lib.rs).
         let src = "let f = fun n -> n + m in\nf(3)";
         let err = run_source(src).unwrap_err();
         assert!(err.starts_with("line 1, column 22:"), "unexpected message: {err}");
@@ -6184,5 +6186,57 @@ mod tests {
                     and b = fun m -> if m == 0 then 0 else a(m - 1) + 1 \
                     in a(9)";
         assert_eq!(run_source(src).unwrap(), Outcome::Int(9));
+    }
+
+    // Non-group `let rec` fallback (Frame::LetRecBody, machine.rs's
+    // Expr::LetRec else-branch): `x` and `w` are not functions, so they
+    // evaluate left to right in the OUTER scope (both see the lambda's `z`,
+    // neither sees the other) and are bound plainly for the body only.
+    #[test]
+    fn let_rec_fallback_binds_non_function_values_for_the_body() {
+        let src = "(fun z -> let rec x = z + 1 and w = z * 2 in x + w)(10)";
+        assert_eq!(run_source(src).unwrap(), Outcome::Int(31));
+    }
+
+    // A duplicate pattern binder (`x` twice in one arm): resolve.rs's
+    // `lookup` takes the LAST slot with that name, so the second `x` (bound
+    // to 2) is what the arm body sees.
+    #[test]
+    fn duplicate_pattern_binder_last_one_wins() {
+        let src = "match [1, 2] | [x, x] -> x | _ -> -1";
+        assert_eq!(run_source(src).unwrap(), Outcome::Int(2));
+    }
+
+    // Three-member mutual recursion group (Frame::Many, not One/Two): each
+    // function body's frame is [a, b, c, n], modelled on
+    // corpus/mutual_three_way.rn. a(9) -> b(8) -> c(7) -> ... -> a(0) = 1.
+    #[test]
+    fn three_way_mutual_recursion_group_shares_a_many_slot_frame() {
+        let src = "let rec a = fun n -> if n == 0 then 1 else b(n - 1) \
+                    and b = fun n -> if n == 0 then 2 else c(n - 1) \
+                    and c = fun n -> if n == 0 then 3 else a(n - 1) \
+                    in a(9)";
+        assert_eq!(run_source(src).unwrap(), Outcome::Int(1));
+    }
+
+    // Spec §2 decision lock: `f`'s value is an `If`, not a direct Lambda, so
+    // is_direct_group is false even though both branches are functions --
+    // is_direct_group is syntactic, not semantic. That routes the whole
+    // group through the same non-recursive fallback as
+    // `let_rec_fallback_binds_non_function_values_for_the_body` above, so
+    // `f` is NOT in scope while its own value is elaborated/evaluated.
+    // Typecheck accepts this (LetRec's val_ctx binds every name, including
+    // `f`, with a fresh type var while elaborating each value -- see
+    // typecheck.rs's Expr::LetRec arm), but the runtime resolver does not:
+    // calling `f` recurses into the `if`'s `fun n -> ... f(n - 1) ...`
+    // branch, where `f` was resolved in the OUTER scope and is nowhere
+    // bound, so it panics lazily via VarRef::Unbound the same way
+    // `unbound_variable_panic_reports_its_location` does.
+    #[test]
+    fn non_direct_let_rec_self_reference_is_unbound_at_runtime() {
+        let src = "let rec f = if true then fun n -> if n == 0 then 0 else f(n - 1) \
+                    else fun n -> n in f(3)";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("unbound variable: f"), "unexpected message: {err}");
     }
 }

@@ -163,13 +163,19 @@ pub enum Expr {
     // `let rec f = val_f [and g = val_g ...] in body` -- one or more
     // SIMULTANEOUSLY recursive bindings, each visible to every other
     // one's value (and its own), not just sequentially in scope like Let.
-    // Meaningful only when every value evaluates to a function -- machine.rs
-    // wraps the whole group into mutually-referencing Value::RecClosure
-    // values so each can call any sibling (including itself) by name (see
+    // Recursive only when the group is "direct": every value is
+    // SYNTACTICALLY a Lambda (resolve::is_direct_group -- a purely
+    // syntactic test, not "evaluates to a function"; an `if` whose every
+    // branch is a Lambda does NOT qualify). Only then does machine.rs wrap
+    // the whole group into mutually-referencing Value::RecClosure values so
+    // each can call any sibling (including itself) by name (see
     // Value::RecClosure's doc comment for how that avoids needing
-    // mutation or an AST-rewriting Y-combinator encoding). A single
-    // binding (`let rec f = ... in ...`, no `and`) is just the length-1
-    // case -- no separate representation for plain self-recursion.
+    // mutation or an AST-rewriting Y-combinator encoding); otherwise the
+    // values evaluate in the outer scope and the names are bound only for
+    // `body`, non-recursively (see resolve.rs's LetRec arm and machine.rs's
+    // Frame::LetRecBody fallback). A single binding (`let rec f = ... in
+    // ...`, no `and`) is just the length-1 case of the direct-group form --
+    // no separate representation for plain self-recursion.
     LetRec(Rc<Vec<(String, Option<Type>, ExprRef)>>, ExprRef),
     BinOp(BinOp, ExprRef, ExprRef),
     // cond must evaluate to Bool.
@@ -177,7 +183,8 @@ pub enum Expr {
     Perform(String, ExprRef),
     // `handler` evaluates to a Value::Handler. Handle itself carries no
     // deep/shallow flag -- that lives on the handler value, set by the
-    // `deep`/`shallow` builtins (see env::prelude), not on this AST node.
+    // `deep`/`shallow` builtins (see env::PRELUDE, indexed at runtime via
+    // resolve::VarRef::Prelude), not on this AST node.
     Handle {
         body: ExprRef,
         handler: ExprRef,

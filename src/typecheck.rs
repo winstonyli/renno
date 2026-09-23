@@ -1573,10 +1573,11 @@ fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &Has
     build_checked(arena, e, to, |arena, v| build_shape_predicate(arena, v, to, named_types, visiting))
 }
 
-// `predicate` is looked up by name through the ordinary prelude Env
-// (`is_int`/`is_bool`/`is_str`/`is_list`/`is_fun`), the same way
-// `fail`/`type_name` already are -- see their own doc comments on the
-// (pre-existing, accepted) shadowing risk that implies.
+// `predicate` becomes an ordinary `Expr::Var(predicate)` node, resolved
+// the same as any other name -- to whichever prelude builtin that name
+// currently names (`is_int`/`is_bool`/`is_str`/`is_list`/`is_fun`), the
+// same way `fail`/`type_name` already are -- see their own doc comments on
+// the (pre-existing, accepted) shadowing risk that implies.
 fn build_shallow_check(arena: &mut Arena, e: ExprRef, to: &Type, predicate: &str) -> ExprRef {
     build_checked(arena, e, to, |arena, v| build_predicate_call(arena, predicate, v))
 }

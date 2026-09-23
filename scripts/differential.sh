@@ -18,6 +18,7 @@ NEW="target/release/renno.exe"
 [ -x "$BASE" ] || { echo "missing baseline binary: $BASE"; exit 2; }
 [ -x "$NEW" ] || { echo "missing $NEW (run: cargo build --release)"; exit 2; }
 tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
 fail=0
 count=0
 for f in examples/*.rn corpus/*.rn; do
@@ -45,6 +46,9 @@ for f in examples/*.rn corpus/*.rn; do
     fail=1
   fi
 done
-rm -rf "$tmp"
+if [ "$count" = 0 ]; then
+  echo "no programs compared (examples/*.rn and corpus/*.rn both empty or missing)"
+  exit 2
+fi
 echo "$count programs compared, $([ $fail = 0 ] && echo 'all identical' || echo 'DIFFERENCES FOUND')"
 exit $fail

@@ -73,11 +73,13 @@ let add = fun a -> fun b -> a + b in add(1)(2)   -- 3
 let add = fun a -> fun b -> a + b in add 1 2     -- 3, identical
 ```
 
-`let rec` makes a binding visible inside its own value, for recursion that an ordinary `let` can't express:
+`let rec` makes a binding visible inside its own value, for recursion that an ordinary `let` can't express — but only when every value in the group is written as a direct `fun ...` (a syntactic test: `if cond then fun ... else fun ...` does not qualify, even though both branches are functions). When that holds, every name is visible to every value (including its own), simultaneously, not just sequentially in scope like `let`:
 
 ```
 let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in fact(5)   -- 120
 ```
+
+Otherwise (any value not written directly as `fun ...`) the group is not recursive: the names are bound only for the body, and each value is evaluated in the outer scope, left to right, the same as a sequence of plain `let`s. A value that references one of the group's own names in that case is not in scope yet and fails at runtime with `unbound variable`, not at typecheck time (typecheck accepts every group member referencing every other, including itself, regardless of whether the group ends up recursive at runtime — see Known limitations).
 
 `and` extends this to a group of mutually recursive functions:
 
@@ -232,9 +234,12 @@ More complete examples for every feature above live in [`examples/`](examples/).
 - `lexer.rs` — logos-based tokenizer.
 - `parser.rs` — recursive-descent parser into an arena-allocated AST (`expr.rs`); iteratively flattens long `let`/`fun` chains to keep native stack usage O(1) regardless of chain length.
 - `typecheck.rs` — bidirectional-lite gradual type checker: infers types and effect rows in one pass, desugars a `Dyn`-to-concrete boundary into an ordinary `if <predicate> then value else fail(...)` (a real per-call contract for a `Fun` target) built from prelude builtins rather than a dedicated AST node, and checks match exhaustiveness/reachability.
-- `machine.rs` — a trampolined CEK-style step loop (`cont.rs` holds the defunctionalized continuation frames). No native recursion during evaluation, so no stack-overflow risk from deep programs or from resuming captured continuations.
+- `resolve.rs` — static resolver: walks the (already typechecked) AST once and records, for every variable reference, exactly where it lives at runtime (`VarRef::Local { hops, slot }`, `VarRef::Prelude(index)`, or `VarRef::Unbound`) — no name comparison happens during evaluation.
+- `machine.rs` — a trampolined CEK-style step loop (`cont.rs` holds the defunctionalized continuation frames), reading `resolve.rs`'s `VarRef`s to look variables up. No native recursion during evaluation, so no stack-overflow risk from deep programs or from resuming captured continuations.
+- `frame.rs` — the runtime `Env`: a persistent chain of immutable per-scope frames (`Env::get(hops, slot)`), indexed by resolve.rs's static `VarRef::Local`, not by name.
+- `env.rs` — `env::PRELUDE`, the single builtin table both `resolve.rs` (assigning `VarRef::Prelude` indices) and `machine.rs` (looking a builtin up by that index) read.
 - `value.rs` — runtime value representation.
-- `plist.rs` — the persistent linked list `Env` and typecheck's context are both built from.
+- `plist.rs` — the persistent linked list typecheck's context (`Ctx`) is built from; no longer used by the runtime `Env` (see `frame.rs`).
 - `span.rs` — source locations and the snippet-with-caret error rendering shared by every error path.
 
 `run_source` (`lib.rs`) runs the whole parse → typecheck → run pipeline on a dedicated large-stack worker thread, since the parser and type checker are ordinary native recursive descent (unlike the machine, which is trampolined).
@@ -242,6 +247,7 @@ More complete examples for every feature above live in [`examples/`](examples/).
 ## Known limitations
 
 - Effect-row inference doesn't look inside a handler clause's own body — what a handler does when it resumes isn't modeled.
+- `let rec`'s recursion is a purely syntactic, group-wide test (every value directly `fun ...`), not a semantic one: typecheck itself is more permissive — it binds every name in the group (with a fresh type variable, or a generalized one if annotated) while elaborating every value, so a self/sibling reference type-checks in EITHER case. When the group doesn't qualify as recursive at runtime, that same reference is unbound at the point each value actually runs, and fails lazily with `unbound variable: <name>` the first time (if ever) that code path is reached — not at typecheck time, and not necessarily on every call (e.g. inside a branch that's never taken).
 - A branded value's hidden `opaque` tag is not hidden from `Value`'s own `Display`/`Outcome` conversion — a branded tuple printed or returned at the top level shows an extra trailing `<brand>` element, since neither knows a value's static type well enough to leave it out (the id itself is never printed: the brand tag is its own `Value::Token`/`Outcome::Token` kind, not a plain `Int`, so it can't be mistaken for one either).
 - Match exhaustiveness and reachability are checked only where cheaply provable (see the doc comments on `missing_case`/`first_unreachable` in `typecheck.rs`); anything past that silently falls back to a runtime panic.
 - A runtime panic's reported location generally falls back to the last expression *evaluated*, not necessarily the exact sub-expression at fault a few steps later. Two common cases are threaded through precisely instead of relying on that fallback: `apply_binop`'s operand-type/div-by-zero/etc panics blame whichever operand is actually at fault (or their combined span, when neither alone explains it), and "attempt to call a non-function value" blames the callee, not an unrelated argument evaluated afterward. Everywhere else (builtin argument-type panics, match failure, ...) still uses the last-evaluated fallback.

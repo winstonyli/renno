@@ -1,11 +1,14 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use renno::run_source;
 
-// `let x0 = 0 in let x1 = x0 + 1 in ... in x{n-1}`. Exercises Env/Ctx
-// extend+lookup scaling: both are the shared PList (src/plist.rs), an
-// Rc-based persistent list with O(1) extend -- this benchmark is the
-// direct proof that a chain of n bindings costs O(n), not the O(n^2) the
-// old Vec-cloning Ctx used to cost before that fix.
+// `let x0 = 0 in let x1 = x0 + 1 in ... in x{n-1}`. Exercises both Env's
+// (src/frame.rs) and Ctx's (typecheck's context, src/plist.rs) extend+lookup
+// scaling: Env is a persistent chain of per-scope frames with O(1) extend
+// and O(hops) lookup (statically resolved by resolve.rs, so no name
+// comparison at runtime); Ctx is the older Rc-based persistent PList, also
+// O(1) extend. This benchmark is the direct proof that a chain of n
+// bindings costs O(n) end to end, not the O(n^2) the old Vec-cloning Ctx
+// used to cost before that fix.
 //
 // n=1000 used to crash the process here with STATUS_STACK_OVERFLOW:
 // unlike machine::run (trampolined, stack-safe at any depth), the parser
@@ -51,8 +54,10 @@ fn deep_chain_source(n: usize) -> String {
 // sum(n)` -- a realistic recursive hot loop, using the two features that
 // have replaced hand-rolled recursion as renno's idiomatic style this
 // session (let rec, match) but had zero benchmark coverage before now.
-// Exercises Value::RecClosure's rebind-on-every-call path and
-// Frame::MatchArms's dispatch (match_pattern), n times each.
+// Exercises Value::RecClosure's per-call frame rebuild (one Env::push per
+// application, binding the group's siblings plus this call's own param --
+// see frame::Env's own doc comment) and Frame::MatchArms's dispatch
+// (match_pattern), n times each.
 fn recursive_match_source(n: i64) -> String {
     format!("let rec sum = fun n -> match n | 0 -> 0 | _ -> n + sum(n - 1) in sum({n})")
 }

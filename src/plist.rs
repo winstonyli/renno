@@ -47,8 +47,8 @@ impl<T: Clone> PList<T> {
     // node, unconditionally. Harmless for today's only caller (Ctx, and
     // even that's short-circuited one level up by
     // typecheck::generalizable_row_vars before it ever reaches here), but
-    // worth knowing before reusing this against a much deeper PList<Value>
-    // Env in a hot path: add a variant that lets `f` signal "stop" first.
+    // worth knowing before reusing this against a much deeper PList<T> in a
+    // hot path: add a variant that lets `f` signal "stop" first.
     pub fn for_each(&self, mut f: impl FnMut(&T)) {
         let mut node = self.clone();
         loop {

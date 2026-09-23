@@ -5,9 +5,11 @@ use crate::cont::Cont;
 use crate::env::Env;
 use crate::expr::ExprRef;
 
-// A handler as data: which effect it handles, the clause body plus its two
-// binder names, the env it closes over, and whether it reinstalls itself
-// around the resumed continuation (deep) or not (shallow, the default from
+// A handler as data: which effect it handles, the clause body, the env it
+// closes over (the body's two binders, payload and resume, are pushed as a
+// frame at call time -- resolve.rs assigns them fixed slots, so their names
+// don't need to be carried here), and whether it reinstalls itself around
+// the resumed continuation (deep) or not (shallow, the default from
 // MakeHandler). `deep`/`shallow` builtins just flip this bit on a clone --
 // no AST-level distinction needed.
 #[derive(Clone)]
