@@ -6094,7 +6094,7 @@ mod tests {
     }
 
     #[test]
-    fn case_b_base_case_hook_excludes_dyn_valued_base_alternative() {
+    fn case_b_base_case_hook_excludes_an_already_indexed_actual_type() {
         // Final-review Finding 1: the base-case hook's Dyn/Var guard only
         // excluded Type::Dyn/Type::Var on the `actual_ty` side, not on
         // `base_alt`. `consistent` treats Dyn as universally consistent
@@ -6103,14 +6103,46 @@ mod tests {
         // wrongly treat ANY actual_ty -- including `w`'s real
         // Indexed(Named(T), 2) -- as satisfying the base case, force-
         // asserting its index to 0 (a genuine conflict with the real
-        // index 2) and failing typecheck with a spurious error. With the
-        // guard made symmetric (excluding Dyn/Var on `base_alt` too),
-        // this falls through to the ordinary trailing unify_fits check
-        // instead, which correctly confirms `w`'s type is still T(2).
+        // index 2) and failing typecheck with a spurious error.
+        //
+        // The fix shipped is NOT a symmetric Dyn/Var exclusion on
+        // `base_alt` -- that was tried and found to regress the
+        // legitimate `let x: T(0) = 5 in x` case (Int can only ever
+        // satisfy an Indexed(Named(_), _) through base_alt's own Dyn
+        // permissiveness, since `consistent` has no Indexed-vs-non-
+        // Indexed arm). Instead, `actual_ty` itself is excluded when it
+        // already resolves to Type::Indexed AND base_alt is Dyn/Var --
+        // the real discriminator is whether `actual_ty` already carries
+        // its own independently-established index, not what base_alt
+        // looks like. With that guard, `w`'s case falls through to the
+        // ordinary trailing unify_fits check instead, which correctly
+        // confirms `w`'s type is still T(2).
         let src = r#"
             type T = Dyn | (Int, T) in
             let v: T(2) = (1, (2, 5)) in
             let w: T(2) = v in
+            0
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 0);
+    }
+
+    #[test]
+    fn case_b_base_case_hook_still_handles_an_indexed_base_alternative() {
+        // Scoped re-review of Finding 1's fix (see the base-case hook's
+        // own comment in typecheck.rs): excluding Type::Indexed(..)
+        // actual_ty unconditionally would also block the legitimate case
+        // where base_alt is ITSELF Indexed (not Dyn/Var) and actual_ty
+        // genuinely is that base case. The shipped guard only excludes
+        // Indexed actual_ty when base_alt is Dyn/Var, so this must still
+        // unify the index to 0 via the hook, not fall through to the
+        // fallback (which has no Indexed-vs-Named consistent arm and
+        // would reject it).
+        let src = r#"
+            type T = Vec(3) | (Int, T) in
+            let v: Vec(3) = [1, 2, 3] in
+            let b: T(0) = v in
             0
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();

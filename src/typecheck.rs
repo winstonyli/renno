@@ -2729,19 +2729,36 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // risk overriding real, already-known index information;
                 // a plain concrete actual_ty (Int, Bool, Tuple, Fun, ...)
                 // has no pre-existing index to conflict with, so treating
-                // it as the base case is always sound. This also subsumes
-                // the original actual_ty Dyn/Var exclusion's own case
-                // (Type::Indexed is excluded regardless of what base_alt
-                // is), so it replaces that exclusion rather than adding to
-                // it. Confirmed by direct repro: `w: T(2) = v` (actual_ty
-                // = Indexed(Named(T), 2)) now falls through to the
-                // trailing unify_fits, which already has full, correct
-                // Indexed-vs-Indexed handling via unify() -- while `let x:
-                // T(0) = 5 in x` and the deeper `let v: T(2) = (1, (2, 5))`
-                // (whose innermost `5` is checked against a still-symbolic
-                // `T(2 - 1 - 1)`) both keep working, since Int is never
-                // Type::Indexed.
-                if !matches!(actual_ty, Type::Dyn | Type::Var(_) | Type::Indexed(..)) && consistent(&actual_ty, &base_alt) {
+                // it as the base case is always sound. This ADDS an
+                // Indexed(..) exclusion to the original actual_ty Dyn/Var
+                // exclusion (both are still needed -- Dyn/Var alone would
+                // miss the bug below, and Indexed alone would reopen the
+                // Task 6 regression `case_b_step_case_hypothesis_and_...`
+                // that motivated the original Dyn/Var exclusion). The
+                // Indexed exclusion only applies when base_alt is itself
+                // Dyn/Var -- an Indexed actual_ty against a concrete,
+                // non-Dyn/Var base_alt (e.g. `type T = Vec(3) | (Int, T)`)
+                // still gets a chance here, since the generic fallback's
+                // `consistent` has no Indexed-vs-Named arm to catch that
+                // case on its own.
+                //
+                // Confirmed by direct repro: `w: T(2) = v` (actual_ty =
+                // Indexed(Named(T), 2), base_alt = Dyn) now falls through
+                // to the trailing unify_fits, which already has full,
+                // correct Indexed-vs-Indexed handling via unify() -- while
+                // `let x: T(0) = 5 in x` and the deeper `let v: T(2) =
+                // (1, (2, 5))` (whose innermost `5` is checked against a
+                // still-symbolic `T(2 - 1 - 1)`) both keep working, since
+                // Int is never Type::Indexed; and `type T = Vec(3) |
+                // (Int, T) in let b: T(0) = [1,2,3] in ...` (actual_ty =
+                // Indexed(List,3), base_alt = Indexed(List,3), not
+                // Dyn/Var) still unifies index 0 correctly.
+                let actual_is_indexed = matches!(actual_ty, Type::Indexed(..));
+                let base_is_dyn_or_var = matches!(base_alt, Type::Dyn | Type::Var(_));
+                if !matches!(actual_ty, Type::Dyn | Type::Var(_))
+                    && !(actual_is_indexed && base_is_dyn_or_var)
+                    && consistent(&actual_ty, &base_alt)
+                {
                     unify_index_expr(&idx, &IndexExpr::Lit(0), infer, spans[cur_expr])?;
                     (expected.clone(), row, expr2)
                 } else {
