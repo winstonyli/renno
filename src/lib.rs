@@ -3875,6 +3875,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn indexed_syntax_generalizes_to_a_user_defined_alias() {
+        use expr::Expr;
+        use types::Type;
+        use index_expr::IndexExpr;
+        let src = r#"
+            type List = (Int, List) | Bool in
+            let _x: List(2) = (1, (2, false)) in
+            5
+        "#;
+        let (arena, _spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        // Scoped to the parser change alone: inspect the parsed annotation
+        // directly rather than running typecheck (Task 6 -- not yet
+        // implemented -- owns whether a value can actually be CONSTRUCTED
+        // against this type).
+        match &arena[root] {
+            Expr::Let(_, Some(Type::Indexed(wrapped, idx)), ..) => {
+                assert!(matches!(wrapped.as_ref(), Type::Named(_)), "expected the wrapped type to be Type::Named, got {wrapped:?}");
+                assert_eq!(**idx, IndexExpr::Lit(2));
+            }
+            other => panic!("expected a Let with an Indexed(Named(_), 2) annotation, got {other:?}"),
+        }
+        assert_eq!(named_types.len(), 1);
+    }
+
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain
     // parser::parse + machine::run with NO typecheck::check pass at all,
     // so a plain `: T` annotation (unlike a `where` refinement, which the

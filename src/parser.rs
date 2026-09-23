@@ -578,6 +578,23 @@ impl<'a> Parser<'a> {
                     self.expect(&Token::RParen)?;
                     return Ok(Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index)));
                 }
+                // Case B syntax generalization (design spec 2026-09-20
+                // sec 3): the SAME indexing syntax works for any other
+                // alias currently in scope -- no eligibility check here,
+                // that's Phase 4's existing pattern-matching-side
+                // qualifying_named_alternatives, unchanged. Zero syntax
+                // conflicts: nothing in this grammar expects '(' right
+                // after a bare alias reference, since parse_type's own
+                // Ident arm otherwise returns immediately once resolved.
+                if matches!(self.peek(), Some(Token::LParen)) {
+                    if let Some(resolved) = self.type_aliases.get(&name) {
+                        let resolved_clone = resolved.clone();
+                        self.bump();
+                        let index = self.parse_index_expr()?;
+                        self.expect(&Token::RParen)?;
+                        return Ok(Type::Indexed(Rc::new(resolved_clone), Rc::new(index)));
+                    }
+                }
                 match Self::builtin_type(&name) {
                     Some(ty) => Ok(ty),
                     None => match self.type_aliases.get(&name) {
