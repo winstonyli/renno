@@ -5766,4 +5766,26 @@ mod tests {
         let result = machine::run(&arena, elaborated.unwrap(), Env::prelude(), &spans);
         assert_eq!(result.as_int(), 0);
     }
+
+    #[test]
+    fn list_lit_checked_against_indexed_synthesizes_precise_length() {
+        let src = r#"
+            let f: (Int -> Vec(3)) = fun n -> [n, n, n] in
+            f(5)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[5, 5, 5]");
+    }
+
+    #[test]
+    fn list_lit_checked_against_indexed_rejects_wrong_length() {
+        let src = r#"
+            let f: (Int -> Vec(3)) = fun n -> [n, n] in
+            f(5)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("(2)") && err.0.contains("(3)"), "expected an index-mismatch error showing 2 vs 3, got: {}", err.0);
+    }
 }

@@ -2738,6 +2738,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         }
 
         Expr::ListLit(items) => {
+            let item_count = items.len();
             let mut row = EffectRow::pure();
             let mut elem_ty: Option<Type> = None;
             let mut refs = Vec::with_capacity(items.len());
@@ -2758,7 +2759,23 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // combination, right below) has something real to unify
             // against instead of a Dyn that would otherwise immediately
             // flatten the whole result.
-            let list_ty = Type::List(Rc::new(elem_ty.unwrap_or_else(|| infer.fresh_var("elem"))));
+            let elem_ty = elem_ty.unwrap_or_else(|| infer.fresh_var("elem"));
+            // Case A construction (design spec 2026-09-20 sec 1): checked
+            // against an Indexed(List(_), _) expected type, synthesize the
+            // PRECISE length-indexed type instead of a plain List --
+            // elaborate_mode's own trailing Check-mode enforcement (the
+            // unify_fits call right after this function returns) then
+            // confirms this literal's actual length against whatever index
+            // the expected type carries, so no explicit check is needed here.
+            if let Mode::Check(expected) = mode {
+                if let Type::Indexed(wrapped, _) = infer.resolve_deep(expected) {
+                    if matches!(wrapped.as_ref(), Type::List(_)) {
+                        let list_ty = Type::Indexed(Rc::new(Type::List(Rc::new(elem_ty))), Rc::new(IndexExpr::Lit(item_count as i64)));
+                        return Ok((list_ty, row, arena.push(Expr::ListLit(refs))));
+                    }
+                }
+            }
+            let list_ty = Type::List(Rc::new(elem_ty));
             Ok((list_ty, row, arena.push(Expr::ListLit(refs))))
         }
 
