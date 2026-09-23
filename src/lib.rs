@@ -5939,4 +5939,65 @@ mod tests {
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("type mismatch"), "expected a type-mismatch error, got: {}", err.0);
     }
+
+    #[test]
+    fn tuple_checked_against_case_b_indexed_checks_step_case() {
+        // Deviation from the task-6 brief's literal test source: the
+        // brief wrote only `| false -> 0` for the Bool arm. missing_case
+        // (unaffected by Case B, confirmed by this same file's own
+        // case_b_base_case_hypothesis_is_real_and_enforced comment) is a
+        // purely structural, type-agnostic heuristic that requires BOTH
+        // `true` and `false` literals (or a bare Var) once any Bool
+        // literal pattern appears -- a lone `false` reports "the missing
+        // Bool case" regardless of what the scrutinee's real type is.
+        // Adding the dead `true -> 0` arm satisfies that pre-existing,
+        // deliberately-unrelated exhaustiveness rule without touching
+        // what this test actually exercises (Case B step construction).
+        let src = r#"
+            type List = (Int, List) | Bool in
+            let f: (Int -> List(1)) = fun n -> (n, false) in
+            match f(9)
+            | (h, t) -> h
+            | true -> 0
+            | false -> 0
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 9);
+    }
+
+    #[test]
+    fn tuple_checked_against_case_b_indexed_rejects_wrong_arity() {
+        let src = r#"
+            type List = (Int, List) | Bool in
+            let f: (Int -> List(1)) = fun n -> (n, n, false) in
+            f(9)
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let err = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap_err();
+        assert!(err.0.contains("type mismatch"), "expected a plain type mismatch (3-tuple isn't step-shaped), got: {}", err.0);
+    }
+
+    #[test]
+    fn base_case_construction_against_case_b_indexed_unifies_index_to_zero() {
+        let src = r#"
+            type List = (Int, List) | Bool in
+            let f: (Int -> List(0)) = fun n -> false in
+            f(9)
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        assert!(!machine::run(&arena, elaborated, Env::prelude(), &spans).as_bool());
+    }
+
+    #[test]
+    fn plain_tuple_construction_with_no_indexed_expected_type_is_unaffected() {
+        let src = "let t: (Int, Int) = (1, 2) in t";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        match machine::run(&arena, elaborated, Env::prelude(), &spans) {
+            Value::List(items) => assert_eq!((items[0].as_int(), items[1].as_int()), (1, 2)),
+            other => panic!("expected a tuple, got {other}"),
+        }
+    }
 }

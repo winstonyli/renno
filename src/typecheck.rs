@@ -1927,6 +1927,61 @@ fn self_ref_pattern<'a>(pat: &'a Pattern, step_alt: &Type, id: &str) -> Option<&
     }
 }
 
+// Case B construction, step case (design spec 2026-09-20 sec 4):
+// mirrors self_ref_pattern's own Type::Tuple sub-case (used on the
+// pattern-matching side, Phase 4) but returns a POSITION into the
+// Tuple's items instead of a &Pattern, since a Tuple literal's items
+// at a construction site are ExprRefs, not Patterns to recurse into.
+fn self_ref_position(step_alt: &Type, id: &str) -> Option<usize> {
+    match step_alt {
+        Type::Tuple(items) => items.iter().position(|item_ty| matches!(item_ty, Type::Named(n) if n == id)),
+        _ => None,
+    }
+}
+
+// Case B construction, base-case detection for elaborate_mode's own
+// tail dispatch (design spec 2026-09-20 sec 4): `expected` must
+// resolve to Indexed(Named(id), idx) with a qualifying 2-alternative
+// union (qualifying_named_alternatives), and `cur_expr` must NOT
+// already be a step-shaped Tuple literal -- that case is handled
+// entirely inside Expr::Tuple's own Mode::Check arm below, dispatched
+// normally; treating it as a base-case candidate here too would
+// double-elaborate it.
+//
+// DEVIATION from the task-6 brief's literal text: the brief's own
+// version excluded only the step-shaped Tuple case. That missed a real
+// regression -- If/Match ALSO already have their own Mode-aware
+// Check-mode arms inside elaborate_node (Phase 3's own If/Match
+// retrofit, plus Match's Phase 4 Case B refinement-hypothesis
+// machinery). Treating an If/Match tail as a base-case candidate here
+// routes it through this hook's plain Mode::Synth `elaborate()` call
+// instead of `elaborate_node(..., Mode::Check(expected))`, silently
+// discarding that machinery -- confirmed by a real regression in
+// `case_b_step_case_hypothesis_and_retyping_enable_a_real_recursive_proof`
+// (a pre-existing, passing Phase 4 test) when the brief's version was
+// tried verbatim: the match's own step-arm hypothesis (`t`'s retyped
+// `Indexed(Named(id), m)`) never got computed under Synth, so checking
+// its body against `Indexed(Named(id), n - 1)` failed. Excluding
+// If/Match here, exactly like Tuple's own step-shape exclusion, lets
+// elaborate_node's normal dispatch handle them and fixes it.
+fn case_b_base_candidate(arena: &Arena, cur_expr: ExprRef, expected: &Type, infer: &InferCtx) -> Option<(Type, Rc<IndexExpr>)> {
+    let Type::Indexed(wrapped, idx) = infer.resolve_deep(expected) else { return None };
+    let Type::Named(id) = wrapped.as_ref() else { return None };
+    let (base_alt, step_alt) = qualifying_named_alternatives(id, &infer.named_types)?;
+    match &arena[cur_expr] {
+        Expr::If(..) | Expr::Match(..) => return None,
+        Expr::Tuple(items) => {
+            if let Type::Tuple(step_items) = &step_alt {
+                if items.len() == step_items.len() {
+                    return None;
+                }
+            }
+        }
+        _ => {}
+    }
+    Some((base_alt, idx))
+}
+
 // Shared "nothing real to correlate against" fallback: bind each of a
 // Pattern::List's own positions to its own independent fresh var.
 // Factored out of what used to be three separate, identically-bodied
@@ -2579,8 +2634,54 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     // fire and `cur_mode` was downgraded to Synth, silently dropping the
     // outer obligation -- this tail-level check can't see that, since by
     // then `cur_mode` is already Synth. Both checks are needed.
-    let (mut result_ty, mut result_row, mut result_expr) =
-        elaborate_node(arena, cur_expr, &cur_ctx, spans, infer, cur_mode)?;
+    // Case B construction, base case (design spec 2026-09-20 sec 4):
+    // give the tail one extra dispatch option alongside plain
+    // elaborate_node, the same tail-dispatch point Phase 3 built for
+    // If/Match's own Check-mode treatment. When it doesn't qualify (or
+    // qualifies but the actual type isn't consistent with the base
+    // alternative), this falls through to elaborate_node's own Synth
+    // result, and the UNCHANGED trailing coerce/unify_fits check right
+    // below does today's ordinary generic fallback -- correctly
+    // rejecting a value that's neither shape.
+    let (mut result_ty, mut result_row, mut result_expr) = match cur_mode {
+        Mode::Check(expected) => match case_b_base_candidate(arena, cur_expr, expected, infer) {
+            Some((base_alt, idx)) => {
+                let (actual_ty, row, expr2) = elaborate(arena, cur_expr, &cur_ctx, spans, infer)?;
+                // DEVIATION from the task-6 brief's literal text: the
+                // brief's own condition was bare `consistent(&actual_ty,
+                // &base_alt)`. `consistent` treats Dyn/Var as
+                // universally consistent with anything (types.rs's own
+                // doc comment) -- exactly the "no real information here"
+                // signal this codebase treats specially everywhere else
+                // (pattern_could_match, build_shape_predicate, etc.), not
+                // proof that a value genuinely IS the base alternative.
+                // Firing unify_index_expr(idx, 0) on that trivial
+                // consistency force-committed the scrutinee's index to 0
+                // for values that were never actually shown to be the
+                // base case -- confirmed by a real regression in
+                // `case_b_step_case_hypothesis_and_retyping_enable_a_real_recursive_proof`
+                // (a pre-existing, passing Phase 4 test): its true/false
+                // arms deliberately use `let x: Dyn = 0 in x` bodies, and
+                // this hook's tail dispatch (reached again for the
+                // Let-peeled `x`) wrongly asserted index 0 against the
+                // ALREADY-hypothesized `n - 1`, a real conflict. Excluding
+                // Dyn/Var here restores the original fallback (falls to
+                // the trailing unify_fits, which is permissive with Dyn/
+                // Var exactly as before this task) while keeping the
+                // genuine case (a real, concrete base-alternative value
+                // like a `false` literal) working exactly as the brief
+                // intended.
+                if !matches!(actual_ty, Type::Dyn | Type::Var(_)) && consistent(&actual_ty, &base_alt) {
+                    unify_index_expr(&idx, &IndexExpr::Lit(0), infer, spans[cur_expr])?;
+                    (expected.clone(), row, expr2)
+                } else {
+                    (actual_ty, row, expr2)
+                }
+            }
+            None => elaborate_node(arena, cur_expr, &cur_ctx, spans, infer, cur_mode)?,
+        },
+        Mode::Synth => elaborate_node(arena, cur_expr, &cur_ctx, spans, infer, cur_mode)?,
+    };
     if let Mode::Check(expected) = cur_mode {
         result_expr = coerce(arena, result_expr, &result_ty, expected, spans[cur_expr], &infer.named_types)?;
         unify_fits(expected, &result_ty, infer, spans[cur_expr])?;
@@ -2681,6 +2782,42 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         // homogeneous sequence. `(1, "a")` is `Type::Tuple([Int, Str])`,
         // not widened to `List(Dyn)`.
         Expr::Tuple(items) => {
+            // Case B construction, step case (design spec 2026-09-20
+            // sec 4): checked against an Indexed(Named(id), idx) type
+            // whose named union qualifies and whose step alternative
+            // is a same-arity Tuple, check each non-recursive item
+            // against its corresponding step_alt element and the
+            // recursive item (self_ref_position) against
+            // Named(id)(idx - 1) -- Case A's Cons arm (Task 2),
+            // generalized from a fixed List/Cons shape to an
+            // arbitrary 2-alternative named union.
+            if let Mode::Check(expected) = mode {
+                if let Type::Indexed(wrapped, idx) = infer.resolve_deep(expected) {
+                    if let Type::Named(id) = wrapped.as_ref() {
+                        if let Some((_, step_alt)) = qualifying_named_alternatives(id, &infer.named_types) {
+                            if let Type::Tuple(step_items) = &step_alt {
+                                if step_items.len() == items.len() {
+                                    if let Some(rec_pos) = self_ref_position(&step_alt, id) {
+                                        let mut row = EffectRow::pure();
+                                        let mut refs = Vec::with_capacity(items.len());
+                                        for (i, item) in items.into_iter().enumerate() {
+                                            let (item_row, item2) = if i == rec_pos {
+                                                let rec_expected = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Sub(idx.clone(), Rc::new(IndexExpr::Lit(1)))));
+                                                check_against(arena, item, &rec_expected, ctx, spans, infer)?
+                                            } else {
+                                                check_against(arena, item, &step_items[i], ctx, spans, infer)?
+                                            };
+                                            row = EffectRow::union(&row, &item_row);
+                                            refs.push(item2);
+                                        }
+                                        return Ok((expected.clone(), row, arena.push(Expr::Tuple(refs))));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let mut row = EffectRow::pure();
             let mut tys = Vec::with_capacity(items.len());
             let mut refs = Vec::with_capacity(items.len());
