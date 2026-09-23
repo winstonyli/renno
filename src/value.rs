@@ -13,8 +13,6 @@ use crate::expr::ExprRef;
 #[derive(Clone)]
 pub struct HandlerData {
     pub effect: String,
-    pub payload_var: String,
-    pub resume_var: String,
     pub body: ExprRef,
     pub env: Env,
     pub deep: bool,
@@ -225,21 +223,18 @@ pub enum Value {
     // Pattern::Record arm), though the parser's existing sort-by-name
     // behavior is harmless and left in place.
     Record(Rc<Vec<(String, Value)>>),
-    Closure(String, ExprRef, Env),
-    // `let rec f = fun p -> body [and g = ... ...] in ...`: `group[i]` is
-    // (name_i, param_i, body_i) for the i-th binding in one mutually-
-    // recursive group (a plain single-function `let rec`, no `and`, is
-    // just the length-1 case -- no separate representation for it). This
-    // value IS group[index]; calling it rebinds EVERY name in the group
-    // into the environment used to evaluate group[index]'s body, every
-    // time it's called (not once, at construction) -- each pointing at
-    // its own fresh RecClosure over the same group. That's what lets any
-    // member's body call ANY sibling (including itself) by name, with no
-    // mutation and no AST-rewriting Y-combinator encoding -- Env is
-    // already persistent and cheap to extend, so re-deriving "an env with
-    // the whole group bound" on each call is just N more `bind`s, same
-    // idea as binding the parameter itself.
-    RecClosure(Rc<Vec<(String, String, ExprRef)>>, usize, Env),
+    Closure(ExprRef, Env),
+    // `let rec f = fun p -> body [and g = ... ...] in ...` where EVERY value
+    // is a direct Lambda (resolve::is_direct_group): `group[i]` is the body
+    // of the i-th function in one mutually-recursive group (a plain
+    // single-function `let rec`, no `and`, is just the length-1 case). This
+    // value IS group[index]; calling it builds ONE frame [every group
+    // member's RecClosure..., the argument] on the closure env (the layout
+    // resolve.rs assigns) every time it's called -- not once, at
+    // construction -- which is what lets any member's body call ANY sibling
+    // (including itself) with no mutation and no Rc cycle: each call
+    // re-derives its own siblings.
+    RecClosure(Rc<[ExprRef]>, usize, Env),
     Continuation(Cont),
     Handler(Rc<HandlerData>),
     Builtin(Builtin),

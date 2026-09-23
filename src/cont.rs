@@ -22,14 +22,11 @@ pub enum Frame {
     // isn't callable).
     AppFunc { arg: ExprRef, env: Env, callee_span: Option<Span> },
     AppArg { func: Value, callee_span: Option<Span> },
-    LetBody { var: String, body: ExprRef, env: Env },
-    // Evaluating one `let rec` group's binding values left to right
-    // (Lambdas in practice, but evaluated properly rather than assumed --
-    // see machine.rs's Eval arm for Expr::LetRec). `names` is the fixed,
-    // full list for the whole group (needed once every value is in, to
-    // build the mutually-referencing Value::RecClosure set); `remaining`/
-    // `done` mirror ListElems's own left-to-right accumulation shape.
-    LetRecBody { names: Rc<Vec<String>>, remaining: Vec<ExprRef>, done: Vec<Value>, body: ExprRef, env: Env },
+    LetBody { body: ExprRef, env: Env },
+    // Non-group `let rec` fallback (see machine.rs's Expr::LetRec arm):
+    // evaluating the binding values left to right in the OUTER scope;
+    // `remaining`/`done` mirror ListElems's accumulation shape.
+    LetRecBody { remaining: Vec<ExprRef>, done: Vec<Value>, body: ExprRef, env: Env },
     // Scrutinee has just been evaluated to `value` -- try `arms` in order.
     MatchArms { arms: Rc<Vec<(Pattern, Option<ExprRef>, ExprRef)>>, env: Env },
     // A pattern matched (binding `guard_env`) but its arm has a guard,

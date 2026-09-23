@@ -1,16 +1,11 @@
-use crate::plist::PList;
-use crate::value::{Builtin, Value};
+use crate::value::Builtin;
 
-// Persistent environment: extending never mutates the parent, so any Env
-// captured by a closure or continuation stays valid forever.
-pub type Env = PList<Value>;
+pub use crate::frame::Env;
 
-// Single source of truth for the builtin prelude: Env::prelude() folds it
-// into a chain today, and resolve::resolve looks names up in it (as
-// VarRef::Prelude(index)). ORDER MATTERS in two ways: it is the order the
-// bind chain is built in (first entry = deepest), and it fixes the
-// VarRef::Prelude(i) indices (harmless: both consumers read this one table).
-// Names are unique.
+// Single source of truth for the builtin prelude: Env::prelude() is the
+// empty root frame chain, and resolve::resolve looks names up in it (as
+// VarRef::Prelude(index)). ORDER MATTERS: it fixes the VarRef::Prelude(i)
+// indices -- harmless, both consumers read this one table. Names are unique.
 pub static PRELUDE: &[(&str, Builtin)] = &[
     // `deep`/`shallow` bound as ordinary values -- functions that take a
     // handler value and return a new one with the reinstall bit flipped.
@@ -50,13 +45,13 @@ pub static PRELUDE: &[(&str, Builtin)] = &[
     ("trim", Builtin::Trim),
 ];
 
-impl PList<Value> {
+impl Env {
+    // The runtime root. The builtin prelude lives in PRELUDE, not in any
+    // frame: resolve::VarRef::Prelude(i) indexes it directly. Kept as a
+    // constructor so every `machine::run(.., Env::prelude(), ..)` call site
+    // is unchanged.
     pub fn prelude() -> Env {
-        PRELUDE.iter().fold(Env::empty(), |env, (name, b)| env.bind(*name, Value::Builtin(*b)))
-    }
-
-    pub fn lookup(&self, name: &str) -> Value {
-        self.get(name).unwrap_or_else(|| panic!("unbound variable: {name}"))
+        Env::root()
     }
 }
 
@@ -74,13 +69,7 @@ mod tests {
     }
 
     #[test]
-    fn prelude_env_matches_table() {
-        let env = Env::prelude();
-        for (name, b) in PRELUDE {
-            match env.get(name) {
-                Some(Value::Builtin(got)) => assert!(got == *b, "wrong builtin bound to {name}"),
-                _ => panic!("{name} not bound to a Builtin in Env::prelude()"),
-            }
-        }
+    fn prelude_env_is_the_empty_root() {
+        assert!(Env::prelude().is_root());
     }
 }

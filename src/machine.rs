@@ -2,8 +2,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
-use crate::env::Env;
+use crate::env::{Env, PRELUDE};
 use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
+use crate::frame::Bindings;
+use crate::resolve::{is_direct_group, resolve, Resolved, VarRef};
 use crate::span::Span;
 use crate::util::find_field;
 use crate::value::{Builtin, HandlerData, Value};
@@ -58,7 +60,10 @@ pub fn current_span() -> Option<Span> {
 // references through Control/Frame costs nothing beyond a plain integer
 // copy -- no Rc bump, unlike when this held Rc<Expr>.
 pub fn run(arena: &Arena, expr: ExprRef, env: Env, spans: &SpanMap) -> Value {
-    run_loop(arena, Control::Eval(expr, env), Cont::nil(), spans)
+    debug_assert!(env.is_root(), "machine::run expects Env::prelude() (the root)");
+    // One static pass, then the trampoline only ever indexes: see resolve.rs.
+    let resolved = resolve(arena, expr);
+    run_loop(arena, Control::Eval(expr, env), Cont::nil(), spans, &resolved)
 }
 
 // Calls a renno function VALUE from native Rust code (used by fold/map's
@@ -76,11 +81,11 @@ pub fn run(arena: &Arena, expr: ExprRef, env: Env, spans: &SpanMap) -> Value {
 // an FFI-like boundary) that this feature doesn't attempt. In practice
 // this is the expected shape for a structural-recursion primitive anyway
 // -- fold/map are conventionally pure transformations.
-pub fn apply(arena: &Arena, func: Value, arg: Value, spans: &SpanMap) -> Value {
-    run_loop(arena, Control::Apply(arg), Cont::cons(Frame::AppArg { func, callee_span: None }, Cont::nil()), spans)
+pub fn apply(arena: &Arena, func: Value, arg: Value, spans: &SpanMap, resolved: &Resolved) -> Value {
+    run_loop(arena, Control::Apply(arg), Cont::cons(Frame::AppArg { func, callee_span: None }, Cont::nil()), spans, resolved)
 }
 
-fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap) -> Value {
+fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap, resolved: &Resolved) -> Value {
     loop {
         match control {
             Control::Eval(expr, env) => {
@@ -162,31 +167,62 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                         control = Control::Eval(first, env);
                     }
                 }
-                Expr::Var(name) => control = Control::Apply(env.lookup(name)),
-                Expr::Lambda(param, _ann, body) => {
-                    control = Control::Apply(Value::Closure(param.clone(), *body, env));
+                Expr::Var(name) => {
+                    control = Control::Apply(match resolved.get(expr) {
+                        Some(VarRef::Local { hops, slot }) => env.get(hops, slot),
+                        Some(VarRef::Prelude(i)) => Value::Builtin(PRELUDE[i as usize].1),
+                        // Lazy, at evaluation time -- CURRENT_SPAN was set at
+                        // the top of this Eval step, so the message keeps its
+                        // source location exactly as before the resolver.
+                        Some(VarRef::Unbound) => panic!("unbound variable: {name}"),
+                        None => panic!("internal: variable `{name}` was never resolved"),
+                    });
+                }
+                Expr::Lambda(_, _, body) => {
+                    control = Control::Apply(Value::Closure(*body, env));
                 }
                 Expr::App(f, a) => {
                     let callee_span = spans.get(*f).copied();
                     cont = Cont::cons(Frame::AppFunc { arg: *a, env: env.clone(), callee_span }, cont);
                     control = Control::Eval(*f, env);
                 }
-                Expr::Let(var, _ann, val_expr, body) => {
-                    cont = Cont::cons(Frame::LetBody { var: var.clone(), body: *body, env: env.clone() }, cont);
+                Expr::Let(_, _, val_expr, body) => {
+                    cont = Cont::cons(Frame::LetBody { body: *body, env: env.clone() }, cont);
                     control = Control::Eval(*val_expr, env);
                 }
                 Expr::LetRec(bindings, body) => {
-                    let names: Rc<Vec<String>> = Rc::new(bindings.iter().map(|(n, _, _)| n.clone()).collect());
-                    // Reversed, same reason as ListLit: pop() (O(1))
-                    // instead of remove(0) as each binding finishes.
-                    let mut remaining: Vec<ExprRef> = bindings.iter().map(|(_, _, v)| *v).collect();
-                    remaining.reverse();
-                    let first = remaining.pop().unwrap(); // parser never emits an empty group
-                    cont = Cont::cons(
-                        Frame::LetRecBody { names, remaining, done: Vec::new(), body: *body, env: env.clone() },
-                        cont,
-                    );
-                    control = Control::Eval(first, env);
+                    if is_direct_group(arena, bindings) {
+                        // Every value is a direct Lambda: build the group
+                        // straight from the lambda bodies -- evaluating a
+                        // Lambda is pure, so skipping it is unobservable --
+                        // and bind all the RecClosures in ONE frame [names…],
+                        // the layout resolve.rs assigns the `let rec` body.
+                        let bodies: Rc<[ExprRef]> = bindings
+                            .iter()
+                            .map(|(_, _, v)| match &arena[*v] {
+                                Expr::Lambda(_, _, b) => *b,
+                                _ => unreachable!("is_direct_group checked"),
+                            })
+                            .collect();
+                        let mut frame = Bindings::default();
+                        for i in 0..bodies.len() {
+                            frame.push(Value::RecClosure(bodies.clone(), i, env.clone()));
+                        }
+                        control = Control::Eval(*body, frame.extend(&env));
+                    } else {
+                        // Not a function group (spec §2 fallback): values
+                        // evaluate in the OUTER scope, left to right, and the
+                        // names are bound plainly (non-recursively) for the
+                        // body only. Reversed, same reason as ListLit: pop().
+                        let mut remaining: Vec<ExprRef> = bindings.iter().map(|(_, _, v)| *v).collect();
+                        remaining.reverse();
+                        let first = remaining.pop().unwrap(); // parser never emits an empty group
+                        cont = Cont::cons(
+                            Frame::LetRecBody { remaining, done: Vec::new(), body: *body, env: env.clone() },
+                            cont,
+                        );
+                        control = Control::Eval(first, env);
+                    }
                 }
                 Expr::BinOp(op, l, r) => {
                     let (l_span, r_span) = (spans.get(*l).copied(), spans.get(*r).copied());
@@ -209,11 +245,9 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     cont = Cont::cons(Frame::MatchArms { arms: arms.clone(), env: env.clone() }, cont);
                     control = Control::Eval(*scrutinee, env);
                 }
-                Expr::MakeHandler { effect, payload_var, resume_var, body } => {
+                Expr::MakeHandler { effect, body, .. } => {
                     control = Control::Apply(Value::Handler(Rc::new(HandlerData {
                         effect: effect.clone(),
-                        payload_var: payload_var.clone(),
-                        resume_var: resume_var.clone(),
                         body: *body,
                         env,
                         deep: false,
@@ -246,30 +280,24 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                             let func = func.clone();
                             cont = rest;
                             match func {
-                                Value::Closure(param, body, closure_env) => {
-                                    control = Control::Eval(body, closure_env.bind(param, value));
+                                Value::Closure(body, closure_env) => {
+                                    control = Control::Eval(body, closure_env.push1(value));
                                 }
                                 Value::RecClosure(group, index, closure_env) => {
-                                    // Rebind EVERY name in the group to (a
-                                    // fresh copy of) its own RecClosure
-                                    // every call, not just once at
-                                    // construction -- that's what makes a
+                                    // Rebuild the whole group in ONE frame,
+                                    // argument last -- [names…, param], the
+                                    // layout resolve::visit assigns a group
+                                    // function body -- on EVERY call, so a
                                     // reference to any sibling (including
-                                    // this one's own name) inside `body`
-                                    // resolve recursively, with Env's
-                                    // ordinary persistent bind/lookup doing
-                                    // all the work. No mutation, no AST
-                                    // rewriting. A plain single-function
-                                    // `let rec` is just the group.len()==1
-                                    // case -- same loop, one iteration.
-                                    let (_, param, body) = group[index].clone();
-                                    let mut env2 = closure_env.clone();
+                                    // this one) resolves recursively with no
+                                    // mutation and no Rc cycle. A length-1
+                                    // group is two values: no Vec allocated.
+                                    let mut frame = Bindings::default();
                                     for i in 0..group.len() {
-                                        let (name, _, _) = group[i].clone();
-                                        env2 = env2.bind(name, Value::RecClosure(group.clone(), i, closure_env.clone()));
+                                        frame.push(Value::RecClosure(group.clone(), i, closure_env.clone()));
                                     }
-                                    env2 = env2.bind(param, value);
-                                    control = Control::Eval(body, env2);
+                                    frame.push(value);
+                                    control = Control::Eval(group[index], frame.extend(&closure_env));
                                 }
                                 Value::Continuation(k) => {
                                     // resume(value): splice the captured
@@ -282,11 +310,11 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                     control = Control::Apply(value);
                                 }
                                 Value::Builtin(b) => {
-                                    control = Control::Apply(collect_builtin_arg(arena, b, Vec::new(), value, spans));
+                                    control = Control::Apply(collect_builtin_arg(arena, b, Vec::new(), value, spans, resolved));
                                 }
                                 Value::PartialBuiltin(b, prev_args) => {
                                     let args = (*prev_args).clone();
-                                    control = Control::Apply(collect_builtin_arg(arena, b, args, value, spans));
+                                    control = Control::Apply(collect_builtin_arg(arena, b, args, value, spans, resolved));
                                 }
                                 _ => {
                                     set_current_span(callee_span);
@@ -305,68 +333,28 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                 _ => panic!("handle: expected a handler value"),
                             }
                         }
-                        Frame::LetBody { var, body, env } => {
-                            let (var, body, env) = (var.clone(), *body, env.clone());
+                        Frame::LetBody { body, env } => {
+                            let (body, env) = (*body, env.clone());
                             cont = rest;
-                            control = Control::Eval(body, env.bind(var, value));
+                            control = Control::Eval(body, env.push1(value));
                         }
-                        Frame::LetRecBody { names, remaining, done, body, env } => {
-                            let (names, mut remaining, mut done, body, env) =
-                                (names.clone(), remaining.clone(), done.clone(), *body, env.clone());
+                        Frame::LetRecBody { remaining, done, body, env } => {
+                            let (mut remaining, mut done, body, env) = (remaining.clone(), done.clone(), *body, env.clone());
                             done.push(value);
                             cont = rest;
                             match remaining.pop() {
                                 Some(next) => {
-                                    cont = Cont::cons(
-                                        Frame::LetRecBody { names, remaining, done, body, env: env.clone() },
-                                        cont,
-                                    );
+                                    cont = Cont::cons(Frame::LetRecBody { remaining, done, body, env: env.clone() }, cont);
                                     control = Control::Eval(next, env);
                                 }
                                 None => {
-                                    // Every binding's value is in (`done`,
-                                    // same order as `names`). If they're
-                                    // ALL functions, wrap the whole group
-                                    // into mutually-referencing RecClosure
-                                    // values (see its own doc comment). A
-                                    // group with any non-function value is
-                                    // meaningless as `let rec` (same as the
-                                    // single-binding case) but not an
-                                    // error -- just bind everything as-is,
-                                    // no recursion magic.
-                                    let all_closures = done.iter().all(|v| matches!(v, Value::Closure(..)));
-                                    // Every RecClosure's own stored env is
-                                    // this ORIGINAL one -- fixed, never the
-                                    // progressively-growing `env2` below --
-                                    // so rebuilding the group on a call
-                                    // always starts from the same base,
-                                    // not one that already has some
-                                    // members bound from THIS construction.
-                                    let base_env = env;
-                                    let mut env2 = base_env.clone();
-                                    if all_closures {
-                                        let group: Rc<Vec<(String, String, ExprRef)>> = Rc::new(
-                                            names
-                                                .iter()
-                                                .zip(done.iter())
-                                                .map(|(name, v)| match v {
-                                                    Value::Closure(param, cbody, _) => {
-                                                        (name.clone(), param.clone(), *cbody)
-                                                    }
-                                                    _ => unreachable!("all_closures already checked"),
-                                                })
-                                                .collect(),
-                                        );
-                                        for (i, name) in names.iter().enumerate() {
-                                            env2 =
-                                                env2.bind(name.clone(), Value::RecClosure(group.clone(), i, base_env.clone()));
-                                        }
-                                    } else {
-                                        for (name, v) in names.iter().zip(done) {
-                                            env2 = env2.bind(name.clone(), v);
-                                        }
+                                    // Non-group fallback: bind every value
+                                    // (same order as the names) in one frame.
+                                    let mut frame = Bindings::default();
+                                    for v in done {
+                                        frame.push(v);
                                     }
-                                    control = Control::Eval(body, env2);
+                                    control = Control::Eval(body, frame.extend(&env));
                                 }
                             }
                         }
@@ -658,16 +646,16 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
 // Appends one argument to a builtin's collected-so-far list, dispatching
 // the real operation once `b`'s declared arity is reached, otherwise
 // handing back a PartialBuiltin waiting for the rest.
-fn collect_builtin_arg(arena: &Arena, b: Builtin, mut args: Vec<Value>, arg: Value, spans: &SpanMap) -> Value {
+fn collect_builtin_arg(arena: &Arena, b: Builtin, mut args: Vec<Value>, arg: Value, spans: &SpanMap, resolved: &Resolved) -> Value {
     args.push(arg);
     if args.len() == b.arity() {
-        dispatch_builtin(arena, b, args, spans)
+        dispatch_builtin(arena, b, args, spans, resolved)
     } else {
         Value::PartialBuiltin(b, Rc::new(args))
     }
 }
 
-fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &SpanMap) -> Value {
+fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &SpanMap, resolved: &Resolved) -> Value {
     match b {
         // deep/shallow: clone the handler data, flip the `deep` bit, hand
         // back a new handler value. No AST-level flag.
@@ -766,7 +754,7 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             match (f, list) {
                 (Some(f), Some(Value::List(items))) => {
                     let mapped: Vec<Value> =
-                        items.iter().map(|v| apply(arena, f.clone(), v.clone(), spans)).collect();
+                        items.iter().map(|v| apply(arena, f.clone(), v.clone(), spans, resolved)).collect();
                     Value::List(Rc::new(mapped))
                 }
                 _ => panic!("map expects a function and a list"),
@@ -780,8 +768,8 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                     for item in items.iter() {
                         // f is curried (one renno-level argument at a
                         // time): f(acc) yields a closure, applied to item.
-                        let partial = apply(arena, f.clone(), acc, spans);
-                        acc = apply(arena, partial, item.clone(), spans);
+                        let partial = apply(arena, f.clone(), acc, spans, resolved);
+                        acc = apply(arena, partial, item.clone(), spans, resolved);
                     }
                     acc
                 }
@@ -794,7 +782,7 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 (Some(pred), Some(Value::List(items))) => {
                     let filtered: Vec<Value> = items
                         .iter()
-                        .filter(|v| apply(arena, pred.clone(), (*v).clone(), spans).as_bool())
+                        .filter(|v| apply(arena, pred.clone(), (*v).clone(), spans, resolved).as_bool())
                         .cloned()
                         .collect();
                     Value::List(Rc::new(filtered))
@@ -830,10 +818,10 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 (Some(cmp), Some(Value::List(items))) => {
                     let mut items = (*items).clone();
                     items.sort_by(|a, b| {
-                        let a_first = apply(arena, apply(arena, cmp.clone(), a.clone(), spans), b.clone(), spans).as_bool();
+                        let a_first = apply(arena, apply(arena, cmp.clone(), a.clone(), spans, resolved), b.clone(), spans, resolved).as_bool();
                         if a_first {
                             std::cmp::Ordering::Less
-                        } else if apply(arena, apply(arena, cmp.clone(), b.clone(), spans), a.clone(), spans).as_bool() {
+                        } else if apply(arena, apply(arena, cmp.clone(), b.clone(), spans, resolved), a.clone(), spans, resolved).as_bool() {
                             std::cmp::Ordering::Greater
                         } else {
                             std::cmp::Ordering::Equal
@@ -900,7 +888,20 @@ enum ArmOutcome {
 // any arm's pattern bindings), extended per-candidate by match_pattern.
 fn first_match(arms: &[(Pattern, Option<ExprRef>, ExprRef)], start: usize, value: &Value, env: &Env) -> Option<ArmOutcome> {
     arms[start..].iter().enumerate().find_map(|(i, (pat, guard, body))| {
-        match_pattern(pat, value, env.clone()).map(|env2| match guard {
+        let mut bound = Bindings::default();
+        if !match_pattern(pat, value, &mut bound) {
+            return None;
+        }
+        // The resolver and this function must bind the same names in the
+        // same order (resolve::pattern_vars is the shared contract).
+        debug_assert_eq!(
+            bound.len(),
+            crate::resolve::pattern_vars(pat).len(),
+            "match_pattern and resolve::pattern_vars disagree"
+        );
+        // Zero binders => no frame, exactly like the resolver's scope table.
+        let env2 = bound.extend(env);
+        Some(match guard {
             None => ArmOutcome::Body(*body, env2),
             Some(g) => ArmOutcome::Guard { idx: start + i, guard: *g, guard_env: env2 },
         })
@@ -927,48 +928,39 @@ fn dispatch_arm_outcome(
     }
 }
 
-// Native recursion here is bounded by the PATTERN's own size (as written
-// in source), not by the data it's matched against -- a Cons/List pattern
-// can only nest as deep as the program text does, so this can't overflow
-// the way recursing over arbitrary runtime data would.
-fn match_pattern(pat: &Pattern, value: &Value, env: Env) -> Option<Env> {
+// Native recursion here is bounded by the PATTERN's own size (as written in
+// source), not by the data it's matched against. Pushes each binder's value
+// into `out` in resolve::pattern_vars order; on failure `out` holds a
+// partial result the caller discards.
+fn match_pattern(pat: &Pattern, value: &Value, out: &mut Bindings) -> bool {
     match pat {
-        Pattern::Var(name) => Some(env.bind(name.clone(), value.clone())),
-        Pattern::Int(n) => matches!(value, Value::Int(v) if v == n).then_some(env),
-        Pattern::Bool(b) => matches!(value, Value::Bool(v) if v == b).then_some(env),
-        Pattern::Str(s) => matches!(value, Value::Str(v) if &**v == s.as_str()).then_some(env),
+        Pattern::Var(_) => {
+            out.push(value.clone());
+            true
+        }
+        Pattern::Int(n) => matches!(value, Value::Int(v) if v == n),
+        Pattern::Bool(b) => matches!(value, Value::Bool(v) if v == b),
+        Pattern::Str(s) => matches!(value, Value::Str(v) if &**v == s.as_str()),
         Pattern::List(pats) => match value {
             Value::List(items) if items.len() == pats.len() => {
-                let mut env = env;
-                for (p, v) in pats.iter().zip(items.iter()) {
-                    env = match_pattern(p, v, env)?;
-                }
-                Some(env)
+                pats.iter().zip(items.iter()).all(|(p, v)| match_pattern(p, v, out))
             }
-            _ => None,
+            _ => false,
         },
         Pattern::Cons(head, tail) => match value {
             Value::List(items) if !items.is_empty() => {
                 let tail_val = Value::List(Rc::new(items[1..].to_vec()));
-                let env = match_pattern(head, &items[0], env)?;
-                match_pattern(tail, &tail_val, env)
+                match_pattern(head, &items[0], out) && match_pattern(tail, &tail_val, out)
             }
-            _ => None,
+            _ => false,
         },
-        // Width-tolerant, unlike Pattern::List above: looked up by NAME,
-        // not position, and a field the pattern doesn't name is simply
-        // never looked at -- see Pattern::Record's own doc comment. A
-        // name the pattern DOES need but the value doesn't have fails
-        // the match, same "no match" story as any other shape mismatch.
+        // Width-tolerant, looked up by NAME -- see Pattern::Record's doc
+        // comment (unchanged behavior).
         Pattern::Record(fields) => match value {
             Value::Record(entries) => {
-                let mut env = env;
-                for (name, p) in fields {
-                    env = match_pattern(p, find_field(entries, name)?, env)?;
-                }
-                Some(env)
+                fields.iter().all(|(name, p)| find_field(entries, name).is_some_and(|v| match_pattern(p, v, out)))
             }
-            _ => None,
+            _ => false,
         },
     }
 }
@@ -1048,10 +1040,7 @@ fn perform(cont: &mut Cont, effect: &str, payload: Value) -> Control {
                         // escapes to whatever handler sits further out.
                         let base = if data.deep { Cont::cons(frame.clone(), Cont::nil()) } else { Cont::nil() };
                         let k = Cont::from_frames(captured, base);
-                        let handler_env = data
-                            .env
-                            .bind(data.payload_var.clone(), payload)
-                            .bind(data.resume_var.clone(), Value::Continuation(k));
+                        let handler_env = data.env.push2(payload, Value::Continuation(k));
                         *cont = rest.clone();
                         return Control::Eval(data.body, handler_env);
                     }

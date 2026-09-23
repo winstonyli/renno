@@ -17,7 +17,7 @@ pub mod value;
 // SPIKE, not yet a settled decision -- profiling a heavy recursive workload
 // (samply, 2026-09-23) found ~63% of self-time inside ntdll's own heap
 // manager (RtlAllocateHeap/RtlFreeHeap), not in any renno logic -- every
-// Frame::cons/PList::extend/closure Env capture is a small Rc::new, and the
+// Frame::cons/Env frame push/closure Env capture is a small Rc::new, and the
 // interpreter is allocation-bound, not logic-bound. mimalloc specializes in
 // exactly this workload shape (many small, short-lived allocations).
 #[global_allocator]
@@ -6159,5 +6159,30 @@ mod tests {
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
         let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 0);
+    }
+
+    // Typecheck does NOT reject unbound names (gradual typing), so an
+    // unbound name in a function that is never called must stay harmless:
+    // the panic is lazy (VarRef::Unbound), not raised when the program is
+    // resolved.
+    #[test]
+    fn unbound_variable_in_an_uncalled_function_is_harmless() {
+        assert_eq!(run_source("let f = fun n -> n + m in 3").unwrap(), Outcome::Int(3));
+    }
+
+    // A local binding shadows a prelude builtin (Local wins over Prelude).
+    #[test]
+    fn local_binding_shadows_a_prelude_builtin_at_runtime() {
+        assert_eq!(run_source("let len = fun x -> 42 in len([1, 2, 3])").unwrap(), Outcome::Int(42));
+    }
+
+    // A group function reaches a sibling defined later, through its own
+    // rebuilt [names…, param] frame.
+    #[test]
+    fn let_rec_group_sibling_and_param_share_one_frame() {
+        let src = "let rec a = fun n -> if n == 0 then 0 else b(n - 1) + 1 \
+                    and b = fun m -> if m == 0 then 0 else a(m - 1) + 1 \
+                    in a(9)";
+        assert_eq!(run_source(src).unwrap(), Outcome::Int(9));
     }
 }

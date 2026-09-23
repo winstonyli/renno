@@ -1,10 +1,10 @@
 use std::rc::Rc;
 
 // Generic persistent, singly-linked, prepend-only list keyed by name. O(1)
-// extend (an Rc clone), O(depth) lookup (most-recent-binding-wins). Shared
-// by the runtime Env (payload = Value) and the typechecker's Ctx (payload =
-// Type) so a fix to the shadowing/lookup semantics applies to both instead
-// of living as two independently-maintained copies.
+// extend (an Rc clone), O(depth) lookup (most-recent-binding-wins). Used
+// ONLY by typecheck's Ctx (payload = Type) -- the runtime Env moved to
+// frame::Env (per-scope immutable frames, statically resolved lookups); see
+// env.rs and resolve.rs.
 #[derive(Clone)]
 pub struct PList<T>(Rc<PNode<T>>);
 
