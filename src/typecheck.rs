@@ -2473,7 +2473,18 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             Expr::LetRec(bindings, body) => {
                 let mut val_ctx = cur_ctx.clone();
                 for (name, ann, _) in bindings.iter() {
-                    val_ctx = extend(&val_ctx, name, ann.clone().unwrap_or_else(|| infer.fresh_var(name)));
+                    val_ctx = match ann {
+                        // Generalized, not plain extend: a fully-given
+                        // annotation makes checking mode against it
+                        // sound even for a recursive self/sibling
+                        // reference (Mycroft's polymorphic-recursion
+                        // result; design spec 2026-09-20 sec 2) --
+                        // gated on an explicit annotation, not new
+                        // inference, so this is deliberately narrower
+                        // than general HM polymorphic recursion.
+                        Some(ty) => extend_generalized(&val_ctx, name, ty.clone(), infer),
+                        None => extend(&val_ctx, name, infer.fresh_var(name)),
+                    };
                 }
                 let mut elaborated = Vec::with_capacity(bindings.len());
                 for (name, ann, val) in bindings.iter() {

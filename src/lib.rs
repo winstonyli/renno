@@ -5810,4 +5810,66 @@ mod tests {
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("type mismatch"), "expected a type-mismatch error, got: {}", err.0);
     }
+
+    #[test]
+    fn letrec_annotated_self_reference_recurses_at_a_decremented_index() {
+        // The Motivation example's own root-cause repro, isolated from Gap
+        // 1: today this fails typecheck with "infinite index expression: n
+        // occurs in n - 1" because `len`'s self-reference is bound
+        // monomorphically (plain `extend`) before its body -- containing
+        // the recursive call `len(t)` where `t: Vec(n - 1)` -- is
+        // elaborated. Returns a plain Int, not a Vec, so it exercises Gap
+        // 2 without depending on Gap 1's construction fix at all.
+        let src = r#"
+            let rec len: (Vec(n) -> Int) = fun v ->
+                match v
+                | [] -> 0
+                | h :: t -> 1 + len(t)
+            in
+            let v0: Vec(3) = [1, 2, 3] in
+            len(v0)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 3);
+    }
+
+    #[test]
+    fn letrec_mutual_annotated_recursion_composes_across_the_binding_group() {
+        // The composition case the design spec's own Testing Strategy
+        // flags as "not reasoned through to full certainty during design"
+        // -- two Vec(n)-indexed bindings, each recursing into the OTHER at
+        // a decremented index, exercising the per-binding extend_generalized
+        // loop's iterative composition rather than a single self-reference.
+        let src = r#"
+            let rec evens: (Vec(n) -> Vec(n)) = fun v ->
+                match v
+                | [] -> []
+                | h :: t -> h :: odds(t)
+            and odds: (Vec(n) -> Vec(n)) = fun v ->
+                match v
+                | [] -> []
+                | h :: t -> h :: evens(t)
+            in
+            let v0: Vec(4) = [1, 2, 3, 4] in
+            evens(v0)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[1, 2, 3, 4]");
+    }
+
+    #[test]
+    fn letrec_unannotated_self_reference_stays_monomorphic() {
+        // Confirms the unannotated path is byte-for-byte unchanged: still
+        // plain `extend`, still today's exact behavior.
+        let src = r#"
+            let rec fact = fun n ->
+                if n == 0 then 1 else n * fact(n - 1)
+            in fact(5)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 120);
+    }
 }
