@@ -1,6 +1,7 @@
 pub mod cont;
 pub mod env;
 pub mod expr;
+pub mod frame;
 pub mod index_expr;
 pub mod lexer;
 pub mod machine;
