@@ -5833,7 +5833,18 @@ mod tests {
         "#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("type mismatch"), "expected a type-mismatch error, got: {}", err.0);
+        // Tightened (final-review Finding 5): the tail's own Check-mode
+        // arm decrements the annotation's index symbolically (`3 - 1`,
+        // never simplified to `2`) and compares it against the tail
+        // literal's own real, synthesized length (3) -- checking both
+        // stable, predictable values involved, mirroring
+        // list_lit_checked_against_indexed_rejects_wrong_length's own
+        // style, instead of the universal "type mismatch" substring.
+        assert!(
+            err.0.contains("3 - 1") && err.0.contains("found [Int](3)"),
+            "expected an index-mismatch error showing the tail's expected length (3 - 1) vs its real length (3), got: {}",
+            err.0
+        );
     }
 
     #[test]
@@ -5857,6 +5868,39 @@ mod tests {
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 3);
+    }
+
+    #[test]
+    fn letrec_annotated_self_reference_generalizes_across_two_different_call_sites() {
+        // Final-review Finding 6: every existing recursive-function test
+        // in this branch calls its function exactly once, so none of them
+        // distinguishes "the index variable is genuinely generalized/
+        // polymorphic across calls" (Gap 2's own fix, via
+        // extend_generalized/lookup's per-use instantiation) from "it
+        // happened to get monomorphically bound at one specific length."
+        // Reuses `len`'s own shape from
+        // letrec_annotated_self_reference_recurses_at_a_decremented_index
+        // above, called at two DIFFERENT lengths in the same program --
+        // if `n` were monomorphically bound (Gap 2 unfixed, or a
+        // regression of its fix), the second call would fail to
+        // type-check against whatever length the first call bound `n`
+        // to.
+        let src = r#"
+            let rec len: (Vec(n) -> Int) = fun v ->
+                match v
+                | [] -> 0
+                | h :: t -> 1 + len(t)
+            in
+            let v3: Vec(3) = [1, 2, 3] in
+            let v5: Vec(5) = [1, 2, 3, 4, 5] in
+            (len(v3), len(v5))
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        match machine::run(&arena, elaborated, Env::prelude(), &spans) {
+            Value::List(items) => assert_eq!((items[0].as_int(), items[1].as_int()), (3, 5)),
+            other => panic!("expected a tuple, got {other}"),
+        }
     }
 
     #[test]
@@ -5937,7 +5981,19 @@ mod tests {
         "#;
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
-        assert!(err.0.contains("type mismatch"), "expected a type-mismatch error, got: {}", err.0);
+        // Tightened (final-review Finding 5): the [] base-case arm's own
+        // hypothesis pins its own index to 0 (Case A pattern refinement),
+        // then unify_index_expr rejects that literal-0 index against the
+        // function's own already-established `n` decremented once (index
+        // 1 for the top-level call at length 3, one match-arm level in)
+        // -- a stable, predictable "index 0 does not unify with index 1"
+        // message. Checking both index literals involved, not just the
+        // universal "type mismatch" substring.
+        assert!(
+            err.0.contains("index 0") && err.0.contains("index 1"),
+            "expected an index-mismatch error showing 0 vs 1, got: {}",
+            err.0
+        );
     }
 
     #[test]
@@ -5975,7 +6031,17 @@ mod tests {
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
         let err = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap_err();
-        assert!(err.0.contains("type mismatch"), "expected a plain type mismatch (3-tuple isn't step-shaped), got: {}", err.0);
+        // Tightened (final-review Finding 5): a 3-tuple isn't step-shaped
+        // (step_alt is a 2-tuple), so this falls through to the ordinary
+        // generic fallback -- a stable, predictable "expected List(1),
+        // found (Int, Int, Bool)" message. Checking both the expected
+        // indexed type and the actual synthesized tuple type, not just
+        // the universal "type mismatch" substring.
+        assert!(
+            err.0.contains("List(1)") && err.0.contains("(Int, Int, Bool)"),
+            "expected a plain type mismatch (3-tuple isn't step-shaped) naming List(1) and (Int, Int, Bool), got: {}",
+            err.0
+        );
     }
 
     #[test]
@@ -6025,5 +6091,30 @@ mod tests {
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
         let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 1);
+    }
+
+    #[test]
+    fn case_b_base_case_hook_excludes_dyn_valued_base_alternative() {
+        // Final-review Finding 1: the base-case hook's Dyn/Var guard only
+        // excluded Type::Dyn/Type::Var on the `actual_ty` side, not on
+        // `base_alt`. `consistent` treats Dyn as universally consistent
+        // with anything, so a qualifying named union whose BASE
+        // alternative happens to be Dyn (like this `T`) made the hook
+        // wrongly treat ANY actual_ty -- including `w`'s real
+        // Indexed(Named(T), 2) -- as satisfying the base case, force-
+        // asserting its index to 0 (a genuine conflict with the real
+        // index 2) and failing typecheck with a spurious error. With the
+        // guard made symmetric (excluding Dyn/Var on `base_alt` too),
+        // this falls through to the ordinary trailing unify_fits check
+        // instead, which correctly confirms `w`'s type is still T(2).
+        let src = r#"
+            type T = Dyn | (Int, T) in
+            let v: T(2) = (1, (2, 5)) in
+            let w: T(2) = v in
+            0
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 0);
     }
 }

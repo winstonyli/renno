@@ -1624,14 +1624,32 @@ fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: 
 // runs under. `Synth` is today's only mode (infer a type bottom-up, no
 // expected type available). `Check(expected)` is new: the caller already
 // knows what type this expression must have (typically a declared
-// annotation flowing down through a Let/Lambda chain) -- `If` and `Match`
-// use this to check each branch/arm against `expected` directly instead of
-// inferring each one and reconciling them against EACH OTHER afterward
-// (today's only option, via unify_trial). Every other expression shape
-// still just synthesizes regardless of mode; `check_against`'s own
-// coerce-then-unify_fits fallback (mirroring Expr::App's existing
-// argument-check pattern) is what makes Check mode sound for those shapes
-// too, without each of them needing its own Check-mode arm.
+// annotation flowing down through a Let/Lambda chain).
+//
+// The mode-consulting arms in `elaborate_node`/`elaborate_mode` today:
+// `Expr::Tuple`, `Expr::ListLit`, `BinOp::Cons`, `Expr::If`, `Expr::Match`.
+// `If` and `Match` check each branch/arm against `expected` directly
+// instead of inferring each one and reconciling them against EACH OTHER
+// afterward (today's only option for everything else, via unify_trial).
+// `Expr::ListLit`/`BinOp::Cons` (Case A) and `Expr::Tuple` (Case B) check
+// against an `Indexed`-typed `expected` to construct a value with a
+// statically-known index, rather than synthesizing a plain, un-indexed
+// shape (see the design spec 2026-09-20, sections 1 and 4). Every OTHER
+// expression shape still just synthesizes regardless of mode;
+// `check_against`'s own coerce-then-unify_fits fallback (mirroring
+// Expr::App's existing argument-check pattern) is what makes Check mode
+// sound for those shapes too, without each of them needing its own
+// Check-mode arm.
+//
+// Invariant for future maintainers: any FUTURE Check-mode arm added here
+// over an `Indexed(Named(_))` expected type must also be added to
+// `case_b_base_candidate`'s own exclusion list (this file) -- that
+// function's own tail-dispatch hook has a Mode::Synth-only fallback path
+// for its own "not a recognized special shape" case, and a new Check-mode
+// arm left out of its exclusion list is silently bypassed by that
+// fallback exactly the way `Expr::If`/`Expr::Match` themselves were
+// before Task 6's own review caught it (see `case_b_base_candidate`'s own
+// doc comment for the traced regression).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Mode<'a> {
     Synth,
@@ -1932,6 +1950,12 @@ fn self_ref_pattern<'a>(pat: &'a Pattern, step_alt: &Type, id: &str) -> Option<&
 // pattern-matching side, Phase 4) but returns a POSITION into the
 // Tuple's items instead of a &Pattern, since a Tuple literal's items
 // at a construction site are ExprRefs, not Patterns to recurse into.
+// Deliberately does NOT also mirror self_ref_pattern's separate
+// top-level `Type::Named(n) if n == id` case (for a degenerate `type X
+// = Y | X` shape, the self-reference IS the whole alternative) -- not
+// an oversight, just unreachable from this function's only call site,
+// which has already matched `step_alt` as a `Type::Tuple` (the
+// step-shaped-literal check) before ever calling this.
 fn self_ref_position(step_alt: &Type, id: &str) -> Option<usize> {
     match step_alt {
         Type::Tuple(items) => items.iter().position(|item_ty| matches!(item_ty, Type::Named(n) if n == id)),
@@ -2671,7 +2695,53 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // genuine case (a real, concrete base-alternative value
                 // like a `false` literal) working exactly as the brief
                 // intended.
-                if !matches!(actual_ty, Type::Dyn | Type::Var(_)) && consistent(&actual_ty, &base_alt) {
+                //
+                // Final-review Finding 1: `consistent` is symmetric in
+                // what counts as "universally consistent" -- Dyn/Var is
+                // permissive on EITHER side, not just `actual_ty`'s. A
+                // qualifying named union whose BASE alternative happens to
+                // be Dyn/Var (e.g. `type T = Dyn | (Int, T)`) makes
+                // `consistent(actual_ty, base_alt)` trivially true for ANY
+                // `actual_ty`, including a genuinely step-shaped one (a
+                // `w: T(2) = v` reference to an already-Indexed(Named(T),
+                // 2) value) -- force-asserting index 0 against an index
+                // that's already known to be 2, a genuine conflict.
+                //
+                // The review's own proposed fix was the literal mirror of
+                // the existing actual_ty guard -- also exclude Dyn/Var on
+                // `base_alt`. Verified BROKEN by empirical reproduction:
+                // it also rejects `let x: T(0) = 5 in x`, the ordinary,
+                // legitimate base case for exactly this kind of type (Dyn
+                // base_alt matching a plain Int with no pre-existing index
+                // at all) -- there `consistent`'s Dyn-side permissiveness
+                // is exactly correct, not a false signal, since nothing
+                // else in this codebase can ever prove a plain Int equals
+                // an Indexed(Named(id), _) type otherwise (consistent()
+                // has no Indexed-vs-non-Indexed arm at all -- see
+                // types::consistent). Excluding Dyn/Var base_alt
+                // unconditionally throws that legitimate case out with the
+                // bug.
+                //
+                // The actual discriminator isn't "is base_alt Dyn/Var" --
+                // it's "does actual_ty ALREADY carry its own, independently
+                // established index" (i.e. `actual_ty` itself resolves to
+                // Type::Indexed). Only then does force-asserting index 0
+                // risk overriding real, already-known index information;
+                // a plain concrete actual_ty (Int, Bool, Tuple, Fun, ...)
+                // has no pre-existing index to conflict with, so treating
+                // it as the base case is always sound. This also subsumes
+                // the original actual_ty Dyn/Var exclusion's own case
+                // (Type::Indexed is excluded regardless of what base_alt
+                // is), so it replaces that exclusion rather than adding to
+                // it. Confirmed by direct repro: `w: T(2) = v` (actual_ty
+                // = Indexed(Named(T), 2)) now falls through to the
+                // trailing unify_fits, which already has full, correct
+                // Indexed-vs-Indexed handling via unify() -- while `let x:
+                // T(0) = 5 in x` and the deeper `let v: T(2) = (1, (2, 5))`
+                // (whose innermost `5` is checked against a still-symbolic
+                // `T(2 - 1 - 1)`) both keep working, since Int is never
+                // Type::Indexed.
+                if !matches!(actual_ty, Type::Dyn | Type::Var(_) | Type::Indexed(..)) && consistent(&actual_ty, &base_alt) {
                     unify_index_expr(&idx, &IndexExpr::Lit(0), infer, spans[cur_expr])?;
                     (expected.clone(), row, expr2)
                 } else {
