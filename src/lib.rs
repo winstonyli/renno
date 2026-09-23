@@ -5788,4 +5788,26 @@ mod tests {
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("(2)") && err.0.contains("(3)"), "expected an index-mismatch error showing 2 vs 3, got: {}", err.0);
     }
+
+    #[test]
+    fn cons_checked_against_indexed_checks_tail_at_decremented_length() {
+        let src = r#"
+            let result: Vec(3) = 0 :: [1, 2] in
+            result
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[0, 1, 2]");
+    }
+
+    #[test]
+    fn cons_checked_against_indexed_rejects_wrong_tail_length() {
+        let src = r#"
+            let result: Vec(3) = 0 :: [1, 2, 3] in
+            result
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("type mismatch"), "expected a type-mismatch error, got: {}", err.0);
+    }
 }

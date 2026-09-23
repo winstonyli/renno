@@ -2887,6 +2887,26 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         }
 
         Expr::BinOp(op, l, r) => {
+            // Case A construction (design spec 2026-09-20 sec 1, Cons half):
+            // checked against an Indexed(List(_), _) expected type, `::`
+            // checks its tail against a length-decremented Vec and its head
+            // against the element type, instead of the unconditional Synth
+            // elaboration below (which would throw away `expected` entirely --
+            // same reason ListLit needed its own Mode-aware branch, Task 1).
+            if op == BinOp::Cons {
+                if let Mode::Check(expected) = mode {
+                    if let Type::Indexed(wrapped, idx) = infer.resolve_deep(expected) {
+                        if let Type::List(elem_ty) = wrapped.as_ref() {
+                            let elem_ty = (**elem_ty).clone();
+                            let tail_expected = Type::Indexed(wrapped.clone(), Rc::new(IndexExpr::Sub(idx.clone(), Rc::new(IndexExpr::Lit(1)))));
+                            let (l_row, l2) = check_against(arena, l, &elem_ty, ctx, spans, infer)?;
+                            let (r_row, r2) = check_against(arena, r, &tail_expected, ctx, spans, infer)?;
+                            let row = EffectRow::union(&l_row, &r_row);
+                            return Ok((expected.clone(), row, arena.push(Expr::BinOp(op, l2, r2))));
+                        }
+                    }
+                }
+            }
             let (l_ty, l_row, l2) = elaborate(arena, l, ctx, spans, infer)?;
             let (r_ty, r_row, r2) = elaborate(arena, r, ctx, spans, infer)?;
             let row = EffectRow::union(&l_row, &r_row);
