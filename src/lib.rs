@@ -5872,4 +5872,46 @@ mod tests {
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 120);
     }
+
+    #[test]
+    fn same_length_recursive_vec_function_end_to_end() {
+        // The design spec's own Motivation example, run in full: a
+        // recursive function that both CONSUMES and PRODUCES a
+        // length-indexed Vec(n), needing Gap 1 (Cons/ListLit mode-aware
+        // construction, Tasks 1-2) AND Gap 2 (LetRec generalized
+        // self-reference, Task 3) together.
+        let src = r#"
+            let rec same_length: (Vec(n) -> Vec(n)) = fun v ->
+                match v
+                | [] -> []
+                | h :: t -> h :: same_length(t)
+            in
+            let v0: Vec(3) = [1, 2, 3] in
+            same_length(v0)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).to_string(), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn same_length_recursive_vec_function_rejects_a_genuinely_wrong_length() {
+        // A hand-written arm that returns the wrong length -- the [] base
+        // case should produce Vec(0), not the required Vec(n) at n=0's own
+        // own call depth here it's a direct top-level mismatch: the
+        // function's OWN declared return type is Vec(n), but this arm
+        // returns a 1-element list no matter what v's length is.
+        let src = r#"
+            let rec bad: (Vec(n) -> Vec(n)) = fun v ->
+                match v
+                | [] -> [0]
+                | h :: t -> h :: bad(t)
+            in
+            let v0: Vec(3) = [1, 2, 3] in
+            bad(v0)
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+        assert!(err.0.contains("type mismatch"), "expected a type-mismatch error, got: {}", err.0);
+    }
 }
