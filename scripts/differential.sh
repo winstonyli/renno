@@ -3,6 +3,16 @@
 # every example and corpus program -- stdout, stderr and exit status must match.
 # Usage: bash scripts/differential.sh [baseline-binary]
 set -u
+# Pin backtraces off regardless of the caller's own environment: with
+# RUST_BACKTRACE set (1 or full), Rust's default panic hook prints an
+# actual stack trace after the panic line, and its frames (addresses,
+# rustc's own std/core source paths) differ between the two binaries even
+# when they behave identically -- confirmed live: `RUST_BACKTRACE=1 bash
+# scripts/differential.sh` reports DIFFERENCES FOUND purely from this,
+# with no real behavior difference. RUST_LIB_BACKTRACE (its
+# higher-precedence override) is pinned the same way.
+export RUST_BACKTRACE=0
+export RUST_LIB_BACKTRACE=0
 BASE="${1:-target/baseline/renno-4a58bb3.exe}"
 NEW="target/release/renno.exe"
 [ -x "$BASE" ] || { echo "missing baseline binary: $BASE"; exit 2; }
