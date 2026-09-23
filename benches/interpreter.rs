@@ -82,6 +82,27 @@ fn record_construction_source(n: i64) -> String {
     )
 }
 
+// `let rec sum = fun l -> match l | [] -> 0 | h::t -> h + sum(t) in
+// sum(range(0, n))` -- isolates Pattern::Cons's own deconstruction cost
+// (machine.rs's `items[1..].to_vec()`, a full tail clone per step) from
+// everything else: the list itself is built once, natively, by `range`
+// (O(n)), so only the recursive traversal is on the clock. If Cons's
+// tail-clone is a real cost, time should grow roughly with n^2, not n --
+// no benchmark existed for pure list-pattern recursion before now.
+fn list_cons_recursion_source(n: i64) -> String {
+    format!("let rec sum = fun l -> match l | [] -> 0 | h :: t -> h + sum(t) in sum(range(0)({n}))")
+}
+
+// `sort(fun a -> fun b -> a <= b)(reverse(range(0, n)))` -- worst-case
+// input (fully reverse-sorted) to maximize comparator calls. Exercises
+// dispatch_builtin's own Sort arm, which its doc comment (value.rs) says
+// calls the renno-level comparator up to twice per comparison, gated
+// behind "only if sort ever shows up in a profile" -- no benchmark
+// existed to produce that evidence before now.
+fn sort_source(n: i64) -> String {
+    format!("sort(fun a -> fun b -> a <= b)(reverse(range(0)({n})))")
+}
+
 fn full_pipeline(c: &mut Criterion) {
     let src = std::fs::read_to_string("examples/multi_shot.rn").expect("run from the repo root");
     c.bench_function("full_pipeline/multi_shot.rn", |b| {
@@ -155,6 +176,28 @@ fn record_construction(c: &mut Criterion) {
     group.finish();
 }
 
+fn list_cons_recursion(c: &mut Criterion) {
+    let mut group = c.benchmark_group("list_cons_recursion");
+    for n in [100i64, 500, 1000, 2000] {
+        let src = list_cons_recursion_source(n);
+        group.bench_with_input(BenchmarkId::from_parameter(n), &src, |b, src| {
+            b.iter(|| run_source(black_box(src)).unwrap())
+        });
+    }
+    group.finish();
+}
+
+fn sort(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sort");
+    for n in [100i64, 500, 1000] {
+        let src = sort_source(n);
+        group.bench_with_input(BenchmarkId::from_parameter(n), &src, |b, src| {
+            b.iter(|| run_source(black_box(src)).unwrap())
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     full_pipeline,
@@ -163,6 +206,8 @@ criterion_group!(
     deep_reinstall,
     recursive_match,
     tuple_construction,
-    record_construction
+    record_construction,
+    list_cons_recursion,
+    sort
 );
 criterion_main!(benches);
