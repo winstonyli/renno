@@ -12,6 +12,15 @@ pub mod types;
 pub mod util;
 pub mod value;
 
+// SPIKE, not yet a settled decision -- profiling a heavy recursive workload
+// (samply, 2026-09-23) found ~63% of self-time inside ntdll's own heap
+// manager (RtlAllocateHeap/RtlFreeHeap), not in any renno logic -- every
+// Frame::cons/PList::extend/closure Env capture is a small Rc::new, and the
+// interpreter is allocation-bound, not logic-bound. mimalloc specializes in
+// exactly this workload shape (many small, short-lived allocations).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use env::Env;
 use value::{Outcome, Value};
 
