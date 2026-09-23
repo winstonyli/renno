@@ -6,6 +6,7 @@ pub mod lexer;
 pub mod machine;
 pub mod parser;
 pub mod plist;
+pub mod resolve;
 pub mod span;
 pub mod typecheck;
 pub mod types;
