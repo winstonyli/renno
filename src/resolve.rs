@@ -12,10 +12,16 @@ pub enum VarRef {
     Local { hops: u32, slot: u32 },
     // Index into env::PRELUDE.
     Prelude(u32),
+    // In no scope and not in the prelude. Typecheck does not reject unbound
+    // names (gradual typing), so this is NOT a resolve-time error: the machine
+    // panics `unbound variable: {name}` lazily if it ever evaluates such a
+    // Var (same message, same laziness as before the resolver existed; the
+    // span is preserved via machine::current_span).
+    Unbound,
 }
 
 // Side table keyed by the SAME ExprRef as the Arena (the SpanMap idiom):
-// only Expr::Var nodes get an entry.
+// only Expr::Var nodes get an entry (an unbound name gets VarRef::Unbound).
 pub struct Resolved {
     vars: SecondaryMap<ExprRef, Option<VarRef>>,
 }
@@ -60,6 +66,7 @@ enum Work {
 // long programs off the native stack, and a recursive walk here would bring
 // the overflow back. The work stack is LIFO, so each node pushes its
 // children in REVERSE of the order they must be processed in.
+// Never fails on a name: an unresolvable one becomes VarRef::Unbound.
 pub fn resolve(arena: &Arena, root: ExprRef) -> Resolved {
     let mut vars: SecondaryMap<ExprRef, Option<VarRef>> = SecondaryMap::new();
     let mut scopes: Vec<Vec<String>> = Vec::new();
@@ -86,7 +93,8 @@ fn lookup(scopes: &[Vec<String>], name: &str) -> VarRef {
     }
     match PRELUDE.iter().position(|(n, _)| *n == name) {
         Some(i) => VarRef::Prelude(i as u32),
-        None => panic!("unbound variable: {name}"),
+        // Not an error here: see VarRef::Unbound.
+        None => VarRef::Unbound,
     }
 }
 
@@ -296,17 +304,42 @@ mod tests {
 
     // Documents the spec's confirmed decision: a group with any non-Lambda
     // binding is NOT recursive (same as today's runtime all_closures==false
-    // path), so `f` is not in scope inside its own body.
+    // path), so `f` is not in scope inside its own body. Scoping AND timing
+    // match today: `f` is unbound there, and that only fails lazily, if the
+    // body is ever evaluated.
     #[test]
-    #[should_panic(expected = "unbound variable: f")]
     fn let_rec_mixed_group_is_not_recursive() {
-        refs_of("let rec f = fun x -> f(x) and y = 3 in y", "f");
+        assert_eq!(
+            refs_of("let rec f = fun x -> f(x) and y = 3 in y", "f"),
+            vec![VarRef::Unbound]
+        );
     }
 
     #[test]
-    #[should_panic(expected = "unbound variable: zzz")]
-    fn unbound_variable_panics_at_resolve_time() {
-        refs_of("zzz", "zzz");
+    fn unbound_variable_resolves_to_unbound() {
+        assert_eq!(refs_of("zzz", "zzz"), vec![VarRef::Unbound]);
+    }
+
+    #[test]
+    fn pattern_vars_record_fields_in_stored_order() {
+        let (arena, _s, root) = crate::parser::parse("match {a: 1, b: 2} | {a: p, b: q} -> q").unwrap();
+        let Expr::Match(_, arms) = &arena[root] else { panic!("expected Match") };
+        assert_eq!(pattern_vars(&arms[0].0), vec!["p", "q"]);
+    }
+
+    // `_` is an ordinary Pattern::Var, so it occupies a slot (faithful).
+    #[test]
+    fn wildcard_pattern_occupies_a_slot() {
+        assert_eq!(refs_of("match [1, 2] | [_, y] -> y", "y"), vec![local(0, 1)]);
+    }
+
+    // Fallback group: values evaluate in the OUTER scope (`z` is the lambda
+    // param, one frame), and only the body sees `x`.
+    #[test]
+    fn let_rec_fallback_values_resolve_in_outer_scope() {
+        let src = "fun z -> let rec x = z in x";
+        assert_eq!(refs_of(src, "z"), vec![local(0, 0)]);
+        assert_eq!(refs_of(src, "x"), vec![local(0, 0)]);
     }
 
     // Built by hand (no parser recursion) and resolved on the DEFAULT test

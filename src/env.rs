@@ -7,8 +7,10 @@ pub type Env = PList<Value>;
 
 // Single source of truth for the builtin prelude: Env::prelude() folds it
 // into a chain today, and resolve::resolve looks names up in it (as
-// VarRef::Prelude(index)). ORDER MATTERS only in that it is the order the
-// bind chain is built in (first entry = deepest); names are unique.
+// VarRef::Prelude(index)). ORDER MATTERS in two ways: it is the order the
+// bind chain is built in (first entry = deepest), and it fixes the
+// VarRef::Prelude(i) indices (harmless: both consumers read this one table).
+// Names are unique.
 pub static PRELUDE: &[(&str, Builtin)] = &[
     // `deep`/`shallow` bound as ordinary values -- functions that take a
     // handler value and return a new one with the reinstall bit flipped.
