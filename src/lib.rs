@@ -6000,4 +6000,30 @@ mod tests {
             other => panic!("expected a tuple, got {other}"),
         }
     }
+
+    #[test]
+    fn recursive_function_over_case_b_eligible_named_type_end_to_end() {
+        // Mirrors same_length_recursive_vec_function_end_to_end (Task 4),
+        // but for a user-defined Case B type instead of the built-in Vec:
+        // a recursive function that both consumes and produces a
+        // length-indexed List(n), needing Task 5 (syntax), Task 6
+        // (construction) and Task 3 (LetRec) all together.
+        let src = r#"
+            type List = (Int, List) | Bool in
+            let rec same_length: (List(n) -> List(n)) = fun v ->
+                match v
+                | (h, t) -> (h, same_length(t))
+                | false -> false
+                | true -> false
+            in
+            let v0: List(2) = (1, (2, false)) in
+            match same_length(v0)
+            | (h, t) -> h
+            | false -> 0
+            | true -> 0
+        "#;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 1);
+    }
 }
