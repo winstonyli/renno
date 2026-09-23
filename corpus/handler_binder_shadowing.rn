@@ -1,0 +1,8 @@
+// The handler's own payload/resume binders (`p`, `resume`) shadow outer
+// variables of the same name -- the arm body must see ITS OWN p/resume,
+// not the outer ones.
+let p = 1 in
+let resume = 2 in
+handle
+  perform choose(p + resume)
+with handler choose(p, resume) -> resume(p * 10)

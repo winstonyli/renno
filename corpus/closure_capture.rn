@@ -1,0 +1,6 @@
+// Adder factory: `fun a -> fun b -> a + b`, partially applied once to
+// capture `a`, then the resulting closure applied twice with different
+// `b`s.
+let add = fun a -> fun b -> a + b in
+let add5 = add(5) in
+add5(1) + add5(2)

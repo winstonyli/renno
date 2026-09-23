@@ -1,0 +1,6 @@
+// Three-member `let rec ... and ... and ...` cycle: a(9) -> b(8) -> c(7)
+// -> ... -> a(0) = 1.
+let rec a = fun n -> if n == 0 then 1 else b(n - 1)
+and b = fun n -> if n == 0 then 2 else c(n - 1)
+and c = fun n -> if n == 0 then 3 else a(n - 1)
+in a(9)

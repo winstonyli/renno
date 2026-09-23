@@ -1,0 +1,5 @@
+// `_` is an ordinary Pattern::Var (see resolve.rs's own doc comment),
+// so it occupies a real slot and can be referenced as an expression --
+// whatever the baseline binary does here, the new build must do
+// identically.
+match 3 | _ -> _

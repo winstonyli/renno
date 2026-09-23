@@ -1,0 +1,8 @@
+// map/fold/filter/sort chained together, each closure capturing a
+// local (`base`).
+let base = 10 in
+let xs = [3, 1, 4, 1, 5, 9, 2, 6] in
+let mapped = map(fun x -> x + base)(xs) in
+let filtered = filter(fun x -> x > base)(mapped) in
+let sorted = sort(fun a -> fun b -> a <= b)(filtered) in
+fold(fun acc -> fun x -> acc + x)(0)(sorted)

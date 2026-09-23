@@ -1,0 +1,4 @@
+// A recursive function passed to `map` as an ordinary value, not called
+// directly from the trampoline loop.
+let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in
+map(fact)([0, 1, 2, 3, 4])

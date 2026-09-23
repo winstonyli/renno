@@ -1,0 +1,7 @@
+// Deep handler: the same handler catches two SEQUENTIAL performs of
+// "choose" (not multi-shot), each resumed once.
+handle
+  let x = perform choose(1) in
+  let y = perform choose(2) in
+  x + y
+with deep(handler choose(p, resume) -> resume(p * 10))

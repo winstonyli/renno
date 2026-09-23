@@ -1,0 +1,6 @@
+// Nested `let`s reusing one name: the inner `x` shadows the outer one
+// inside its own scope, and the outer `x` is visible again once that
+// inner scope ends.
+let x = 1 in
+let y = (let x = 2 in x + 100) in
+x + y

@@ -1,0 +1,5 @@
+// `first` calls `second`, its sibling declared LATER in the group; the
+// `let rec` body itself then calls both members.
+let rec first = fun n -> if n == 0 then 0 else second(n - 1) + 1
+and second = fun n -> if n == 0 then 0 else first(n - 1) + 1
+in first(4) + second(3)

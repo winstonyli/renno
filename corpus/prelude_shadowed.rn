@@ -1,0 +1,2 @@
+// A local binding shadows a prelude builtin -- Local wins over Prelude.
+let len = fun x -> 42 in len([1, 2, 3])

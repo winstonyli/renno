@@ -1,0 +1,11 @@
+// A match arm's binders (`a`, `b`) captured by a lambda that is
+// returned from the arm and outlives the match itself. `p` is annotated
+// as a concrete Tuple type -- left as Dyn (the unannotated default),
+// missing_case can't see it's a Tuple at all and never recognizes
+// `(a, b)` as exhaustive.
+let make_adder = fun p: (Int, Int) ->
+  match p
+  | (a, b) -> fun x -> a + b + x
+in
+let add = make_adder((3, 4)) in
+add(10)

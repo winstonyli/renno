@@ -1,0 +1,8 @@
+// Record patterns: an exact-fields match (`{x, y}`) and a width-tolerant
+// one (`{x}` against a record that also has y and z), both with field
+// binders.
+let p1 = {x: 1, y: 2} in
+let p2 = {x: 3, y: 4, z: 5} in
+let g1 = match p1 | {x, y} -> x + y in
+let g2 = match p2 | {x} -> x in
+g1 + g2

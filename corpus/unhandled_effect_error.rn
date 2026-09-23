@@ -1,0 +1,2 @@
+let f: (Dyn -> Dyn) = fun y -> perform choose(y) in
+f(5)

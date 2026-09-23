@@ -1,0 +1,3 @@
+// A group with one non-lambda member (`y`) is not a direct recursive
+// group at all -- falls back, same as let_rec_non_function.rn.
+let rec f = fun x -> x and y = 3 in y

@@ -1,0 +1,12 @@
+// `h :: t`, `[a, b]`, nested `(x, y) :: rest`, and empty-list `[]`
+// patterns, each matched independently.
+let case_empty = match [] | [] -> 0 | h :: t -> h in
+// missing_case's List-exhaustiveness check only ever looks at whether
+// `h :: t`'s HEAD is a bare Var, never at whether that head pattern is
+// itself fully-covering for its own type -- a Tuple-shaped head like
+// `(x, y)` is treated the same as a literal head (covers SOME
+// non-empty lists, not all), so a trailing wildcard is required here.
+let case_cons_tuple = match [(1, 2), (3, 4)] | [] -> 0 | (x, y) :: rest -> x + y + len(rest) | _ -> -1 in
+let case_fixed = match [5, 6] | [a, b] -> a + b | _ -> -1 in
+let case_cons = match [10, 20, 30] | h :: t -> h | [] -> 0 in
+case_empty + case_cons_tuple + case_fixed + case_cons

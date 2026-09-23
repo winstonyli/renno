@@ -1,0 +1,5 @@
+// A single perform resumed twice (multi-shot); the two results are
+// combined by the handler's own arm body.
+handle
+  perform choose(5)
+with handler choose(p, resume) -> resume(p) + resume(p * 2)

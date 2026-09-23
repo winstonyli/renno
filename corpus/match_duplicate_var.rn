@@ -1,0 +1,7 @@
+// `[x, x]`: the same name bound twice in one pattern -- the last
+// binding wins (resolve.rs: duplicate_pattern_var_last_slot_wins). A
+// fixed-length list pattern is never exhaustive by itself (missing_case
+// only recognizes a Var, or `[]`+`h :: t` together, for List) -- the
+// wildcard fallback is required for this to typecheck at all, and is
+// never actually taken (the scrutinee has exactly 2 elements).
+match [1, 2] | [x, x] -> x | _ -> -1

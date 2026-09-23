@@ -1,0 +1,9 @@
+// A `match` no arm covers. Under the current typechecker this is
+// actually caught statically ("non-exhaustive match"), not at runtime
+// (see src/lib.rs's own comment on match_with_no_matching_arm_panics --
+// a statically-exhaustive match can no longer fail at runtime with "no
+// pattern matched"); kept as-is per Task 4's own instructions since the
+// underlying feature (an arm set that doesn't cover its scrutinee) is
+// genuinely impossible to reach at runtime through a typechecked
+// program. Both binaries must still agree on the (typecheck) error.
+match 5 | 1 -> 1

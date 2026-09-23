@@ -1,0 +1,5 @@
+// Shallow handler (the default): catches exactly one occurrence of the
+// effect, resumed once.
+handle
+  perform choose(3)
+with handler choose(p, resume) -> resume(p + 1)

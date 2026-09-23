@@ -1,0 +1,1 @@
+let rec sum = fun l -> match l | [] -> 0 | h :: t -> h + sum(t) in sum(range(0)(300))

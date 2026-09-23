@@ -1,0 +1,10 @@
+// `_` in several positions: a bare wildcard arm, inside a fixed-length
+// list pattern, before `::`, and as a discarded `let` binding.
+let a = match 5 | _ -> 99 in
+// A fixed-length list pattern is never exhaustive by itself (see
+// match_duplicate_var.rn's own comment) -- the wildcard fallback here
+// is required to typecheck, never actually taken.
+let b = match [1, 2] | [_, y] -> y | _ -> -1 in
+let c = match [1, 2, 3] | h :: _ -> h | [] -> 0 in
+let d = let _ = 1 in 2 in
+a + b + c + d

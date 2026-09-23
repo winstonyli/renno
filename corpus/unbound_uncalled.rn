@@ -1,0 +1,3 @@
+// `m` is unbound inside `f`'s body, but `f` is never called -- the
+// lazily-panicking Unbound lookup never fires.
+let f = fun n -> n + m in 3

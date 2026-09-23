@@ -1,0 +1,4 @@
+// Record construction, `.field` access, and a nested record.
+let inner = {a: 1, b: 2} in
+let outer = {inner: inner, c: 3} in
+outer.inner.a + outer.inner.b + outer.c
