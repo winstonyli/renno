@@ -2,6 +2,7 @@ use cranelift_entity::SecondaryMap;
 
 use crate::env::PRELUDE;
 use crate::expr::{Arena, Expr, ExprRef, Pattern};
+use crate::types::Type;
 
 // Where a variable lives at runtime, decided statically. See the spec's
 // scope table (docs/superpowers/specs/2026-09-23-env-frames-and-resolver-
@@ -106,6 +107,16 @@ fn scoped(work: &mut Vec<Work>, names: Vec<String>, child: ExprRef) {
     work.push(Work::Push(names));
 }
 
+// The ONE definition of "this `let rec` is a recursive function group"
+// (spec §2): every binding value is syntactically a direct Lambda. The
+// resolver assigns the group layout ([names…, param] per function body,
+// [names…] for the body) iff this holds, and machine.rs's Expr::LetRec arm
+// builds the RecClosure group iff this holds -- sharing this function is
+// what keeps the two from drifting apart.
+pub fn is_direct_group(arena: &Arena, bindings: &[(String, Option<Type>, ExprRef)]) -> bool {
+    bindings.iter().all(|(_, _, v)| matches!(arena[*v], Expr::Lambda(..)))
+}
+
 fn visit(
     arena: &Arena,
     id: ExprRef,
@@ -150,7 +161,7 @@ fn visit(
             let names: Vec<String> = bindings.iter().map(|(n, _, _)| n.clone()).collect();
             // Reverse processing order: the body's frame [names…] comes last…
             scoped(work, names.clone(), *body);
-            let group = bindings.iter().all(|(_, _, v)| matches!(arena[*v], Expr::Lambda(..)));
+            let group = is_direct_group(arena, bindings);
             for (_, _, v) in bindings.iter().rev() {
                 if group {
                     // Direct-Lambda group: each function body runs in one
@@ -209,6 +220,25 @@ mod tests {
     use super::*;
     use crate::env::PRELUDE;
     use crate::expr::{Arena, Expr};
+
+    fn let_rec_bindings(src: &str) -> (Arena, Vec<(String, Option<crate::types::Type>, crate::expr::ExprRef)>) {
+        let (arena, _s, root) = crate::parser::parse(src).unwrap();
+        let Expr::LetRec(bindings, _) = &arena[root] else { panic!("expected LetRec") };
+        let bindings = bindings.as_ref().clone();
+        (arena, bindings)
+    }
+
+    #[test]
+    fn is_direct_group_true_only_when_every_value_is_a_lambda() {
+        let (a, b) = let_rec_bindings("let rec f = fun x -> f(x) in f");
+        assert!(is_direct_group(&a, &b));
+        let (a, b) = let_rec_bindings("let rec f = fun x -> x and g = fun y -> y in f");
+        assert!(is_direct_group(&a, &b));
+        let (a, b) = let_rec_bindings("let rec f = fun x -> x and y = 3 in f");
+        assert!(!is_direct_group(&a, &b));
+        let (a, b) = let_rec_bindings("let rec x = 5 in x");
+        assert!(!is_direct_group(&a, &b));
+    }
 
     // Every Var node named `name` that the resolver assigned a VarRef to,
     // sorted (order of nodes in the arena is a parser detail).
