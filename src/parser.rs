@@ -314,7 +314,7 @@ impl<'a> Parser<'a> {
 
     // Walks `e`'s whole expression tree looking for an Expr::Perform node
     // -- the static half of "guards may never perform" (see match's own
-    // Token::Match arm, and [[renno_future_pattern_guards]]). Conservative
+    // Token::Match arm). Conservative
     // on purpose, not exhaustively precise: this flags a `perform` even
     // inside an uncalled Lambda literal the guard would never actually
     // invoke, since telling "present in the text" from "actually reached
@@ -1474,8 +1474,7 @@ impl<'a> Parser<'a> {
                     let pat = self.pattern()?;
                     // Optional `if cond` guard -- reuses the existing `if`
                     // token rather than a new keyword (Rust/Scala/Python's
-                    // choice, not OCaml/Erlang/Swift's `when`/`where`; see
-                    // [[renno_future_pattern_guards]]), so this costs zero
+                    // choice, not OCaml/Erlang/Swift's `when`/`where`), so this costs zero
                     // new lexer tokens. No ambiguity: pattern grammar never
                     // otherwise produces `if` right before `Arrow`.
                     let guard = if matches!(self.peek(), Some(Token::If)) {
@@ -1488,8 +1487,7 @@ impl<'a> Parser<'a> {
                         // renno's `resume` is genuinely multi-shot, so a
                         // guard's handler resuming more than once would
                         // replay arm selection (and the arm body) itself
-                        // from one `match`. See [[renno_future_pattern_
-                        // guards]] for the full reasoning.
+                        // from one `match`. See contains_perform's own doc comment above.
                         if Self::contains_perform(&self.arena, g) {
                             return Err(self.err_at(
                                 self.span_before(),

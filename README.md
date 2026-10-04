@@ -6,6 +6,10 @@ A small scripting language with algebraic effect handlers and gradual typing, im
 let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in fact(10)
 ```
 
+## Scope
+
+renno is a language-design and implementation study, not a production language. It is an interpreter only (no compiler or bytecode format), runs single-file programs or a REPL, and has no module system, package manager, FFI, or standard library beyond a small built-in prelude. The language and its error messages may change without notice.
+
 ## Highlights
 
 - **Algebraic effects**: `perform`/`handle`, first-class handler values, deep and shallow semantics, and genuine multi-shot resumption (a captured continuation can be resumed zero, one, or many times).
@@ -21,6 +25,10 @@ let rec fact = fun n -> if n == 0 then 1 else n * fact(n - 1) in fact(10)
 - **Union types and type aliases**: `type Name = TypeExpr in ...` names any type expression, and `A | B` unions two or more into one — a self-contained "one of these" with no registry lookup, usable in any annotation (`fun x: Int | Str -> ...`). A `Dyn` value crossing a Union-typed boundary is accepted if it shallowly matches *any* alternative; `match` exhaustiveness over a Union-typed scrutinee is proven when every alternative (not necessarily by the same arm) is covered by some pattern — `type Pair = (Int,) | (Int, Int) in ... | (n,) -> n | (n, m) -> n + m` is exhaustive this way, even though neither arm alone covers the whole union.
 - **Diagnostics**: every parse error, type error, and runtime panic reports a `line, column` location with a source snippet and a caret, not just a bare message.
 - **Multi-line REPL**: `let`/`match` blocks spanning multiple lines can be typed directly at the prompt.
+
+## Requirements
+
+Rust 1.95 or newer (the highest minimum version among the dependencies, via `cranelift-entity`), edition 2024. Tested on Windows with stable and nightly toolchains.
 
 ## Quick start
 
@@ -256,3 +264,11 @@ More complete examples for every feature above live in [`examples/`](examples/).
 - Width subtyping is invisible only to pattern matching, not to everything — a wider record accepted where a narrower type is annotated keeps every field it always had (no value is ever narrowed at a boundary), so those "extra" fields still show up if the value is printed or crosses to `Outcome` (same kind of leak the `opaque` brand tag above already has, just for a Record's own extra fields instead of a Token's hidden id), and `==` on two records still compares everything either side actually carries, not just what some annotation happened to name — a value satisfying a type is a different question from two values being equal.
 - `Type::Token` (`opaque`'s own static type) has no surface spelling, and deliberately won't get one: the only way to write it would be to recognize one specific syntactic pattern (e.g. `let NAME = opaque in ...`) in a new parser-side alias table — exactly the kind of bespoke, narrowly-special-cased machinery this codebase has consistently avoided in favor of general mechanisms (tuples, unions, type aliases) that don't need to know about `opaque` at all. So a hand-rolled `opaque`-tagged sum (`let None = (opaque,) in let Some = fun x -> (opaque, x) in ...`) fully works — construction, matching via ordinary tuple patterns, `==` on the tokens, `Dyn`-boundary shape checks — but never gets a `type` alias naming it, and so never gets static exhaustiveness checking. Same "prove what's cheap, stay silent otherwise" treatment an Int-literal match with no wildcard already gets, not a special exception.
 - A `Dyn`-to-`Union` boundary check picks the matching alternative via a shallow shape test (build_shape_predicate), then runs THAT alternative's own full `build_boundary_check` — so a `Fun`-typed alternative gets the same real per-call contract (`wrap_fun_contract`) a bare (non-union) `Fun` annotation would, not just an "is this callable" test. A statically Union-typed value still can't be CALLED directly (`fun h: (Int -> Int) | Str -> h(5)` is rejected — `App`'s typecheck only knows how to call a `Fun`- or `Dyn`-typed callee); only reachable once the value has been passed through something that erases it to `Dyn` first (an unannotated parameter, `map`'s own native `apply`, ...).
+
+## AI-assisted development
+
+Much of renno was written with AI assistance (Claude Code). Every commit is authored and committed under the repository owner's name; commits made with Claude's help carry a `Co-Authored-By: Claude` trailer. At the time of writing that is 194 of the 216 commits (about 90%). Treat the git history as the record.
+
+## License
+
+MIT; see [LICENSE](LICENSE).

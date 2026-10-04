@@ -1374,8 +1374,7 @@ mod tests {
     #[test]
     fn a_still_open_enclosing_type_variable_is_not_wrongly_re_generalized() {
         // The exact bug class the passthrough feature's own final review
-        // found and fixed (see docs/superpowers/specs/2026-09-19-
-        // passthrough-polymorphism-design.md) and the concurrent
+        // found and fixed (in its design spec's review) and the concurrent
         // row-variable fix found again for EffectRow::Var: a nested
         // let-alias inside a still-open function body must NOT
         // re-generalize the outer, still-open type variable it merely

@@ -5,8 +5,7 @@ use crate::expr::{Arena, Expr, ExprRef, Pattern};
 use crate::types::Type;
 
 // Where a variable lives at runtime, decided statically. See the spec's
-// scope table (docs/superpowers/specs/2026-09-23-env-frames-and-resolver-
-// design.md, §2): `hops` counts runtime frames outward from the innermost
+// scope table (the env-frames design spec, §2): `hops` counts runtime frames outward from the innermost
 // one, `slot` indexes within that frame.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VarRef {

@@ -207,8 +207,8 @@ pub enum Expr {
     // true, otherwise matching falls through to the next arm as if this
     // one's pattern hadn't matched at all (see machine.rs's Frame::
     // MatchGuard). A guard may never `perform` -- enforced statically by
-    // parser::contains_perform, not by this type -- see [[renno_future_
-    // pattern_guards]] for why (multi-shot resume replaying match-arm
+    // parser::contains_perform, not by this type -- see the guard
+    // check in parser.rs for why (multi-shot resume replaying match-arm
     // selection itself).
     Match(ExprRef, Rc<Vec<(Pattern, Option<ExprRef>, ExprRef)>>),
 }

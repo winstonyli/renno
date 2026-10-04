@@ -112,8 +112,7 @@ pub enum Builtin {
     Print,
     // Dyn -> Str: the same rendering Print writes to stdout, captured as
     // a Str instead -- `"x = " ++ to_str(x)` is renno's answer to string
-    // interpolation (no `"...${e}..."` syntax; see [[renno_future_string_
-    // interpolation]]), so this is the one piece those needed, not a
+    // interpolation (no `"...${e}..."` syntax), so this is the one piece those needed, not a
     // separate feature of its own.
     ToStr,
     // (a -> Bool, [a]) -> [a]. Map's own structural sibling -- same
