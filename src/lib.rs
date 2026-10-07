@@ -6256,4 +6256,15 @@ mod tests {
         assert!(run_source(&format!("{t}let p = (1, (2, 5)) in let w: T(1) = p in 0")).is_ok());
         assert!(run_source(&format!("{t}let p = (true, 5) in let w: T(1) = p in 0")).is_err());
     }
+
+    #[test]
+    fn literal_argument_checks_against_an_indexed_parameter() {
+        let len = "let rec len: (Vec(n) -> Int) = fun v ->\n match v | [] -> 0 | h :: t -> 1 + len(t) in\n";
+        let run = |call: &str| run_source(&format!("{len}{call}"));
+        assert_eq!(run("len([1, 2, 3])").unwrap().as_int(), 3);
+        assert_eq!(run("len([len([1, 2]), 5])").unwrap().as_int(), 2);
+        let fixed = "let f = fun v: Vec(2) -> 0 in\n";
+        assert!(run_source(&format!("{fixed}f([1, 2])")).is_ok());
+        assert!(run_source(&format!("{fixed}f([1, 2, 3])")).is_err());
+    }
 }

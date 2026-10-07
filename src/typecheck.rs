@@ -3076,7 +3076,22 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
 
         Expr::App(f, a) => {
             let (f_ty, f_row, f2) = elaborate(arena, f, ctx, spans, infer)?;
-            let (a_ty, a_row, a2) = elaborate(arena, a, ctx, spans, infer)?;
+            let f_ty = infer.resolve(&f_ty);
+            // A callee whose parameter is statically an Indexed type
+            // (`Vec(n)`, `T(n)`) gets its argument CHECKED against it, so a
+            // list/tuple literal argument can satisfy the index -- Synth
+            // alone gives a plain un-indexed List/Tuple that never can.
+            // Deliberately limited to Indexed parameters: Check mode would
+            // otherwise drop the argument's own synthesized type, which
+            // bind_row_vars below needs to bind effect-row variables.
+            let (a_ty, a_row, a2) = match &f_ty {
+                Type::Fun(param_ty, ..) if matches!(infer.resolve_deep(param_ty), Type::Indexed(..)) => {
+                    let param_resolved = infer.resolve_deep(param_ty);
+                    let (row, a2) = check_against(arena, a, &param_resolved, ctx, spans, infer)?;
+                    (param_resolved, row, a2)
+                }
+                _ => elaborate(arena, a, ctx, spans, infer)?,
+            };
             // Resolve before dispatching: f_ty is read straight out of
             // Ctx (via lookup), which -- since Task 7's ctx-wide
             // generalization -- can hand back a raw Type::Var that
@@ -3090,7 +3105,6 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // is_fun check when the callee resolves to Dyn. Same
             // principle as Task 3's resolve_deep in Pattern::Var and
             // Task 4's param_ty_resolved just below.
-            let f_ty = infer.resolve(&f_ty);
             let (call_row, ret_ty, app2) = match &f_ty {
                 Type::Fun(param_ty, call_row, ret_ty) => {
                     // Resolve BEFORE handing to coerce, not just before/
