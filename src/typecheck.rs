@@ -2001,7 +2001,7 @@ fn self_ref_position(step_alt: &Type, id: &str) -> Option<usize> {
 // its body against `Indexed(Named(id), n - 1)` failed. Excluding
 // If/Match here, exactly like Tuple's own step-shape exclusion, lets
 // elaborate_node's normal dispatch handle them and fixes it.
-fn case_b_base_candidate(arena: &Arena, cur_expr: ExprRef, expected: &Type, infer: &InferCtx) -> Option<(Type, Rc<IndexExpr>)> {
+fn case_b_base_candidate(arena: &Arena, cur_expr: ExprRef, expected: &Type, infer: &InferCtx) -> Option<(String, Type, Type, Rc<IndexExpr>)> {
     let Type::Indexed(wrapped, idx) = infer.resolve_deep(expected) else { return None };
     let Type::Named(id) = wrapped.as_ref() else { return None };
     let (base_alt, step_alt) = qualifying_named_alternatives(id, &infer.named_types)?;
@@ -2016,7 +2016,47 @@ fn case_b_base_candidate(arena: &Arena, cur_expr: ExprRef, expected: &Type, infe
         }
         _ => {}
     }
-    Some((base_alt, idx))
+    Some((id.clone(), base_alt, step_alt, idx))
+}
+
+// A closed-form value for an index expression with no free variables,
+// else None (an unbound variable, or arithmetic overflow).
+fn const_index(e: &IndexExpr) -> Option<i64> {
+    match e {
+        IndexExpr::Var(_) => None,
+        IndexExpr::Lit(n) => Some(*n),
+        IndexExpr::Add(a, b) => const_index(a)?.checked_add(const_index(b)?),
+        IndexExpr::Sub(a, b) => const_index(a)?.checked_sub(const_index(b)?),
+        IndexExpr::Mul(a, b) => const_index(a)?.checked_mul(const_index(b)?),
+    }
+}
+
+// Type-level mirror of Expr::Tuple's Case B step arm, for a value whose
+// synthesized type is already a plain `Type::Tuple` (e.g. read back from
+// an unannotated `let`) rather than a literal: is `actual` a legitimate
+// `Named(id)(idx)` step value? Only decided when `idx` is a known
+// positive constant -- a symbolic or zero index keeps the base-case
+// treatment, since a Dyn base alternative would also accept the tuple
+// there. Non-recursive positions must be consistent with the step
+// alternative's; the recursive position is checked against `idx - 1`,
+// recursing while it is itself a tuple and ending at a base value (or
+// Dyn/Var, which carries no information to contradict).
+fn is_step_shaped_tuple(actual: &Type, base_alt: &Type, step_alt: &Type, id: &str, idx: &IndexExpr, infer: &InferCtx) -> bool {
+    let (Type::Tuple(items), Type::Tuple(step_items)) = (actual, step_alt) else { return false };
+    let Some(k) = const_index(&infer.resolve_index_deep(idx)).filter(|k| *k > 0) else { return false };
+    let Some(rec_pos) = self_ref_position(step_alt, id) else { return false };
+    if items.len() != step_items.len() {
+        return false;
+    }
+    if !(0..items.len()).all(|i| i == rec_pos || consistent(&items[i], &step_items[i])) {
+        return false;
+    }
+    let tail = infer.resolve_deep(&items[rec_pos]);
+    match &tail {
+        Type::Dyn | Type::Var(_) => true,
+        Type::Tuple(_) if k > 1 => is_step_shaped_tuple(&tail, base_alt, step_alt, id, &IndexExpr::Lit(k - 1), infer),
+        _ => k == 1 && !matches!(tail, Type::Indexed(..)) && consistent(&tail, base_alt),
+    }
 }
 
 // Shared "nothing real to correlate against" fallback: bind each of a
@@ -2682,7 +2722,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     // rejecting a value that's neither shape.
     let (mut result_ty, mut result_row, mut result_expr) = match cur_mode {
         Mode::Check(expected) => match case_b_base_candidate(arena, cur_expr, expected, infer) {
-            Some((base_alt, idx)) => {
+            Some((id, base_alt, step_alt, idx)) => {
                 let (actual_ty, row, expr2) = elaborate(arena, cur_expr, &cur_ctx, spans, infer)?;
                 // DEVIATION from the task-6 brief's literal text: the
                 // brief's own condition was bare `consistent(&actual_ty,
@@ -2768,7 +2808,10 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // Dyn/Var) still unifies index 0 correctly.
                 let actual_is_indexed = matches!(actual_ty, Type::Indexed(..));
                 let base_is_dyn_or_var = matches!(base_alt, Type::Dyn | Type::Var(_));
-                if !matches!(actual_ty, Type::Dyn | Type::Var(_))
+                if is_step_shaped_tuple(&actual_ty, &base_alt, &step_alt, &id, &idx, infer) {
+                    // Already-synthesized step-shaped Tuple (see the helper).
+                    (expected.clone(), row, expr2)
+                } else if !matches!(actual_ty, Type::Dyn | Type::Var(_))
                     && !(actual_is_indexed && base_is_dyn_or_var)
                     && consistent(&actual_ty, &base_alt)
                 {

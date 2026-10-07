@@ -6244,4 +6244,16 @@ mod tests {
         let err = run_source("type Pair = (Int, Int) in let x: Pair(3) = (1, 2) in x").unwrap_err();
         assert!(err.contains("(Int, Int) is not an indexable type"), "unexpected message: {err}");
     }
+
+    #[test]
+    fn step_shaped_tuple_through_a_let_keeps_its_index() {
+        let t = "type T = Dyn | (Int, T) in\n";
+        assert!(run_source(&format!("{t}let p = (1, 5) in let w: T(1) = p in 0")).is_ok());
+        assert!(run_source(&format!("{t}let p = (1, (2, 5)) in let w: T(2) = p in 0")).is_ok());
+        assert!(run_source(&format!("{t}let p = (1, 5) in let w: T(0) = p in 0")).is_ok());
+        assert!(run_source(&format!("{t}let p = (1, 5) in let w: T(2) = p in 0")).is_err());
+        // Dyn base alternative: the inner (2, 5) is a valid T(0).
+        assert!(run_source(&format!("{t}let p = (1, (2, 5)) in let w: T(1) = p in 0")).is_ok());
+        assert!(run_source(&format!("{t}let p = (true, 5) in let w: T(1) = p in 0")).is_err());
+    }
 }
