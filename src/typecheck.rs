@@ -1153,6 +1153,18 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, nam
                 return Ok(e);
             }
         }
+        // Indexing syntax parses on any alias (parser.rs, Case B), so a
+        // non-eligible one only fails here -- name that, not a bare mismatch.
+        if let Type::Indexed(wrapped, _) = to {
+            let indexable = match &**wrapped {
+                Type::List(_) | Type::Var(_) | Type::Dyn => true,
+                Type::Named(id) => qualifying_named_alternatives(id, named_types).is_some(),
+                _ => false,
+            };
+            if !indexable {
+                return Err(TypeError(format!("{wrapped} is not an indexable type"), span));
+            }
+        }
         return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span));
     }
     if !matches!(from, Type::Dyn | Type::Var(_)) || *to == Type::Dyn || matches!(to, Type::Var(_)) {

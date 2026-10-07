@@ -6238,4 +6238,10 @@ mod tests {
         let err = run_source(src).unwrap_err();
         assert!(err.contains("unbound variable: f"), "unexpected message: {err}");
     }
+
+    #[test]
+    fn indexing_a_non_indexable_alias_reports_it_is_not_indexable() {
+        let err = run_source("type Pair = (Int, Int) in let x: Pair(3) = (1, 2) in x").unwrap_err();
+        assert!(err.contains("(Int, Int) is not an indexable type"), "unexpected message: {err}");
+    }
 }
