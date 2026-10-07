@@ -56,6 +56,13 @@ Run the benchmarks:
 cargo bench
 ```
 
+Run the differential check (compares a baseline binary against the current release build over every `examples/` and `corpus/` program). It needs a baseline `renno.exe` that isn't in the repo — build one from an earlier commit and pass its path, or it defaults to `target/baseline/renno-4a58bb3.exe`:
+
+```bash
+cargo build --release
+bash scripts/differential.sh path/to/baseline/renno.exe
+```
+
 ## Language tour
 
 ### Values and arithmetic
