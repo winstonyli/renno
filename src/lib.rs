@@ -6285,4 +6285,22 @@ mod tests {
         assert!(ok(&format!("{f}f(([1, 2], 3))")));
         assert!(!ok(&format!("{f}f(([1, 2, 3], 3))")));
     }
+
+    // Same conflicts as the two `*_annotation_is_still_rejected` tests
+    // above, but the Tuple/List is built by an unannotated `let` first, so
+    // literal Check-mode never sees it: only unify_fits's own Tuple/List
+    // arms can catch the shared-`n` conflict.
+    #[test]
+    fn a_vec_conflict_in_a_non_literal_tuple_or_list_is_caught_by_unify_fits() {
+        let pre = "let ca: Dyn = [1, 2, 3] in let cb: Dyn = [1, 2] in\n\
+                   let wa: Vec(3) = ca in let wb: Vec(2) = cb in\n";
+        let tuple = format!("{pre}let ta = (wa, 1) in let tb = (wb, 2) in\n\
+                             let pa: (Vec(n), Int) = ta in let pb: (Vec(n), Int) = tb in 1");
+        let list = format!("{pre}let xa = [wa] in let xb = [wb] in\n\
+                            let la: [Vec(n)] = xa in let lb: [Vec(n)] = xb in 1");
+        for src in [tuple, list] {
+            let err = run_source(&src).unwrap_err();
+            assert!(err.contains("index 3 does not unify with index 2"), "unexpected message: {err}");
+        }
+    }
 }
