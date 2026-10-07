@@ -4504,7 +4504,9 @@ mod tests {
             1
         "#;
         let err = run_source(src).unwrap_err();
-        assert!(err.contains("index 3 does not unify with index 2"), "unexpected message: {err}");
+        // The literal is now checked against the already-bound index, so the
+        // conflict surfaces as a mismatch between the two Vec lengths.
+        assert!(err.contains("expected [Dyn](3), found [Dyn](2)"), "unexpected message: {err}");
     }
 
     // Same gap, List-nested rather than Tuple-nested -- unify_fits had no
@@ -4523,7 +4525,9 @@ mod tests {
             1
         "#;
         let err = run_source(src).unwrap_err();
-        assert!(err.contains("index 3 does not unify with index 2"), "unexpected message: {err}");
+        // The literal is now checked against the already-bound index, so the
+        // conflict surfaces as a mismatch between the two Vec lengths.
+        assert!(err.contains("expected [Dyn](3), found [Dyn](2)"), "unexpected message: {err}");
     }
 
     #[test]
@@ -6266,5 +6270,19 @@ mod tests {
         let fixed = "let f = fun v: Vec(2) -> 0 in\n";
         assert!(run_source(&format!("{fixed}f([1, 2])")).is_ok());
         assert!(run_source(&format!("{fixed}f([1, 2, 3])")).is_err());
+    }
+
+    #[test]
+    fn literal_checks_nested_indexed_element_types_in_tuples_and_lists() {
+        let ok = |s: &str| run_source(s).is_ok();
+        // via annotated let
+        assert!(ok("let q: (Vec(2), Int) = ([1, 2], 3) in 0"));
+        assert!(!ok("let q: (Vec(2), Int) = ([1, 2, 3], 3) in 0"));
+        assert!(ok("let q: [Vec(2)] = [[1, 2], [3, 4]] in 0"));
+        assert!(!ok("let q: [Vec(2)] = [[1, 2], [3]] in 0"));
+        // directly as a call argument
+        let f = "let f = fun p: (Vec(2), Int) -> 0 in\n";
+        assert!(ok(&format!("{f}f(([1, 2], 3))")));
+        assert!(!ok(&format!("{f}f(([1, 2, 3], 3))")));
     }
 }

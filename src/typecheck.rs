@@ -2019,6 +2019,22 @@ fn case_b_base_candidate(arena: &Arena, cur_expr: ExprRef, expected: &Type, infe
     Some((id.clone(), base_alt, step_alt, idx))
 }
 
+// Does `ty` mention an Indexed type anywhere? Gates pushing an expected
+// element type down into a Tuple/List literal's items: only Indexed
+// element types need it (a plain literal can never satisfy one), and
+// checking every item would insert runtime casts for Dyn items that the
+// whole-literal coerce deliberately leaves alone.
+fn contains_indexed(ty: &Type) -> bool {
+    match ty {
+        Type::Indexed(..) => true,
+        Type::List(t) => contains_indexed(t),
+        Type::Tuple(ts) | Type::Union(ts) => ts.iter().any(contains_indexed),
+        Type::Record(fs) => fs.iter().any(|(_, t)| contains_indexed(t)),
+        Type::Fun(p, _, r) => contains_indexed(p) || contains_indexed(r),
+        _ => false,
+    }
+}
+
 // A closed-form value for an index expression with no free variables,
 // else None (an unbound variable, or arithmetic overflow).
 fn const_index(e: &IndexExpr) -> Option<i64> {
@@ -2964,8 +2980,21 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let mut row = EffectRow::pure();
             let mut tys = Vec::with_capacity(items.len());
             let mut refs = Vec::with_capacity(items.len());
-            for item in items {
-                let (item_ty, item_row, item2) = elaborate(arena, item, ctx, spans, infer)?;
+            let expected_items = match mode {
+                Mode::Check(expected) => match infer.resolve_deep(expected) {
+                    Type::Tuple(ts) if ts.len() == items.len() => Some(ts),
+                    _ => None,
+                },
+                Mode::Synth => None,
+            };
+            for (i, item) in items.into_iter().enumerate() {
+                let (item_ty, item_row, item2) = match expected_items.as_ref().map(|ts| &ts[i]).filter(|t| contains_indexed(t)) {
+                    Some(want) => {
+                        let (r, e) = check_against(arena, item, want, ctx, spans, infer)?;
+                        (want.clone(), r, e)
+                    }
+                    None => elaborate(arena, item, ctx, spans, infer)?,
+                };
                 row = EffectRow::union(&row, &item_row);
                 tys.push(item_ty);
                 refs.push(item2);
@@ -3033,8 +3062,21 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let mut row = EffectRow::pure();
             let mut elem_ty: Option<Type> = None;
             let mut refs = Vec::with_capacity(items.len());
+            let want_elem = match mode {
+                Mode::Check(expected) => match infer.resolve_deep(expected) {
+                    Type::List(t) if contains_indexed(&t) => Some((*t).clone()),
+                    _ => None,
+                },
+                Mode::Synth => None,
+            };
             for item in items {
-                let (item_ty, item_row, item2) = elaborate(arena, item, ctx, spans, infer)?;
+                let (item_ty, item_row, item2) = match &want_elem {
+                    Some(want) => {
+                        let (r, e) = check_against(arena, item, want, ctx, spans, infer)?;
+                        (want.clone(), r, e)
+                    }
+                    None => elaborate(arena, item, ctx, spans, infer)?,
+                };
                 row = EffectRow::union(&row, &item_row);
                 refs.push(item2);
                 elem_ty = Some(match elem_ty {
@@ -3077,15 +3119,19 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         Expr::App(f, a) => {
             let (f_ty, f_row, f2) = elaborate(arena, f, ctx, spans, infer)?;
             let f_ty = infer.resolve(&f_ty);
-            // A callee whose parameter is statically an Indexed type
-            // (`Vec(n)`, `T(n)`) gets its argument CHECKED against it, so a
+            // A callee whose parameter type mentions an Indexed type
+            // (`Vec(n)`, `T(n)`, bare or nested in a tuple/list) gets its argument CHECKED against it, so a
             // list/tuple literal argument can satisfy the index -- Synth
             // alone gives a plain un-indexed List/Tuple that never can.
-            // Deliberately limited to Indexed parameters: Check mode would
-            // otherwise drop the argument's own synthesized type, which
-            // bind_row_vars below needs to bind effect-row variables.
+            // Deliberately limited to such parameters, and to ones with no
+            // free row variables: Check mode would otherwise drop the
+            // argument's own synthesized type, which bind_row_vars below
+            // needs to bind effect-row variables.
             let (a_ty, a_row, a2) = match &f_ty {
-                Type::Fun(param_ty, ..) if matches!(infer.resolve_deep(param_ty), Type::Indexed(..)) => {
+                Type::Fun(param_ty, ..) if {
+                    let p = infer.resolve_deep(param_ty);
+                    contains_indexed(&p) && free_row_vars(&p).is_empty()
+                } => {
                     let param_resolved = infer.resolve_deep(param_ty);
                     let (row, a2) = check_against(arena, a, &param_resolved, ctx, spans, infer)?;
                     (param_resolved, row, a2)
