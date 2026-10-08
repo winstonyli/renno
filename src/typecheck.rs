@@ -1282,7 +1282,9 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
 
 // `t` with every Indexed whose index mentions a variable `has_value` rejects
 // reduced to the type it wraps, so build_boundary_check never needs a witness
-// it cannot get.
+// it cannot get. Deliberate extension: a non-bare index (Vec(n+1)) keeps its
+// length compare when every variable in it is witnessed in scope; otherwise
+// the check degrades to is_list only (see build_cast).
 fn erase_open_indexed(t: &Type, has_value: &dyn Fn(&str) -> bool) -> Type {
     let go = |t: &Type| erase_open_indexed(t, has_value);
     match t {

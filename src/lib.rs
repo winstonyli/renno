@@ -6910,9 +6910,21 @@ mod tests {
 
     #[test]
     fn a_returned_function_is_upcast_through_dyn() {
-        let mk = "let mk = fun a: Int -> fun b: Int -> a + b in let d: Dyn = mk in ";
-        assert!(run_source(&format!("{mk}d(1)(true)")).is_err());
-        assert_eq!(run_source(&format!("{mk}d(1)(2)")).unwrap().as_int(), 3);
+        let mk = "let mk = fun a: Int -> fun b: Int -> 7 in let d: Dyn = mk in ";
+        let err = run_source(&format!("{mk}d(1)(true)")).expect_err("bad returned-function argument");
+        assert!(err.contains("expected Int, found Bool"), "{err}");
+        assert_eq!(run_source(&format!("{mk}d(1)(2)")).unwrap().as_int(), 7);
+        assert!(run_source(&format!("{mk}d(true)(2)")).is_err());
+        let mk3 = "let mk = fun a: Int -> fun b: Int -> fun c: Int -> 7 in let d: Dyn = mk in ";
+        assert!(run_source(&format!("{mk3}d(1)(2)(true)")).is_err());
+        assert_eq!(run_source(&format!("{mk3}d(1)(2)(3)")).unwrap().as_int(), 7);
+    }
+
+    #[test]
+    fn a_witnessed_non_bare_index_in_a_returned_function_keeps_its_length_check() {
+        let h = "let h = fun a: Vec(n) -> fun b: Vec(n+1) -> len(b) in let x: Dyn = h in ";
+        assert_eq!(run_source(&format!("{h}x([1])([1, 2])")).unwrap().as_int(), 2);
+        assert!(run_source(&format!("{h}x([1])([1, 2, 3])")).is_err());
     }
 
     #[test]
@@ -6922,7 +6934,8 @@ mod tests {
     }
 
     #[test]
-    fn a_deep_tail_loop_through_a_dyn_wrapper_with_an_upcast_completes() {
+    // Only the entry call crosses the wrapper; the recursion inside go is direct.
+    fn a_deep_tail_loop_entered_through_a_dyn_wrapper_completes() {
         let src = "let rec go: (Int -> Int -> Int) = fun i: Int -> fun acc: Int -> if i == 0 then acc else go(i - 1)(acc + 1) in let d: Dyn = go in d(100000)(0)";
         assert_eq!(run_source(src).unwrap().as_int(), 100000);
     }
