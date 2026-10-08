@@ -6782,4 +6782,19 @@ mod tests {
             assert!(err.contains("is fixed by the signature and cannot equal 0"), "{src}: unexpected message: {err}");
         }
     }
+
+    #[test]
+    fn a_cons_arm_tail_length_variable_stays_rigid_after_the_arm() {
+        // q aliased to the arm's m inside the arm: pinning q afterwards pins m.
+        let g = "let g = fun a: Vec(k) -> fun b: Vec(k) -> len(a) - len(b) in";
+        let programs = [
+            (format!("let x: Dyn = [1,2,3] in let y: Vec(n) = x in let x2: Dyn = [] in let z: Vec(q) = x2 in {g} let r: Int = (match y | [] -> 100 | h :: t -> g(t)(z)) in let w: Vec(0) = z in r"), "cannot equal 0"),
+            (format!("let x: Dyn = [1,2,3] in let y: Vec(n) = x in let x2: Dyn = [9] in let z: Vec(q) = x2 in {g} let r: Int = (match y | [] -> 100 | h :: t -> g(t)(z)) in let w: Vec(1) = z in r"), "cannot equal 1"),
+            (format!("{g} let f = fun y: Vec(n) -> fun z: Vec(q) -> (let r: Int = (match y | [] -> 100 | h :: t -> g(t)(z)) in let w: Vec(0) = z in r) in f([1,2,3])([])"), "cannot equal 0"),
+        ];
+        for (src, want) in programs {
+            let err = run_source(&src).unwrap_err();
+            assert!(err.contains("is fixed by the signature and") && err.contains(want), "{src}: unexpected message: {err}");
+        }
+    }
 }

@@ -1551,7 +1551,6 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
                 && !ob.repeatable
                 && !ob.witness_vars().contains(&name.as_str())
                 && mentions.get(name) == Some(&1)
-                && !infer.index_subst.contains_key(name)
                 && !infer.index_subst.values().any(|v| free_index_vars(v).contains(name)));
         if unconstrained {
             arena[ob.len_eq] = Expr::Bool(true);
@@ -3995,8 +3994,9 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     }
                 }
             }
-            // The fresh cons-arm length variable, rigid for the arm so its body cannot pin it (the pin would outlive the arm); removed on restore.
-            let mut arm_rigid_m: Option<String> = None;
+            // The fresh cons-arm length variable m is made rigid and stays so: it is
+            // a unique name, and pins of it can alias through other variables
+            // after the arm ends.
             let mut row = scrut_row;
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
@@ -4041,9 +4041,6 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // only the hypothesis's own key, leaving everything else
                 // an arm proves intact.
                 restore_index_key(infer, &index_key, &prior_index_value);
-                if let Some(m) = arm_rigid_m.take() {
-                    infer.rigid_index.remove(&m);
-                }
                 let mut arm_ctx = bind_pattern_vars(ctx, pat, &scrut_ty, infer, spans[expr], &HashSet::new())?;
                 // Hypothesis injection (spec section 5): base case implies
                 // the scrutinee's own index is 0; step case mints a fresh
@@ -4079,7 +4076,6 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                                     let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
                                     infer.index_subst.insert(n_name.clone(), hypothesis);
                                     infer.rigid_index.insert(m.clone());
-                                    arm_rigid_m = Some(m.clone());
                                     let refined_tail_ty = Type::Indexed(Rc::new(Type::List(elem_ty.clone())), Rc::new(IndexExpr::Var(m)));
                                     arm_ctx = extend(&arm_ctx, tail_name, refined_tail_ty);
                                 }
@@ -4116,7 +4112,6 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                                     let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
                                     infer.index_subst.insert(n_name.clone(), hypothesis);
                                     infer.rigid_index.insert(m.clone());
-                                    arm_rigid_m = Some(m.clone());
                                     let refined_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var(m)));
                                     arm_ctx = extend(&arm_ctx, self_ref_name, refined_ty);
                                 }
@@ -4190,9 +4185,6 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // the per-arm restore's, just triggered once at the end
             // instead of every iteration).
             restore_index_key(infer, &index_key, &prior_index_value);
-            if let Some(m) = arm_rigid_m.take() {
-                infer.rigid_index.remove(&m);
-            }
             // A guarded arm's pattern can't be relied on to cover
             // anything for exhaustiveness -- its guard might reject --
             // so only unguarded arms' patterns count here (mirrors
