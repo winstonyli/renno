@@ -153,7 +153,7 @@ fn visit(
                 work.push(Work::Visit(*v));
             }
         }
-        Expr::FieldAccess(target, _) => work.push(Work::Visit(*target)),
+        Expr::FieldAccess(target, _) | Expr::Check(target, _) => work.push(Work::Visit(*target)),
         Expr::Lambda(param, _, body) => scoped(work, vec![param.clone()], *body),
         Expr::App(f, a) => {
             work.push(Work::Visit(*a));

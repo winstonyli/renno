@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::{Env, PRELUDE};
-use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
+use crate::expr::{Arena, BinOp, CheckMode, Expr, ExprRef, Pattern, SpanMap, Test};
 use crate::frame::Bindings;
 use crate::resolve::{is_direct_group, resolve, Resolved, VarRef};
 use crate::span::Span;
@@ -102,6 +102,10 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     CURRENT_SPAN.with(|c| c.set(Some(*span)));
                 }
                 match &arena[expr] {
+                Expr::Check(operand, spec) => {
+                    cont = Cont::cons(Frame::Check { spec: spec.clone() }, cont);
+                    control = Control::Eval(*operand, env);
+                }
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
                 Expr::Float(x) => control = Control::Apply(Value::Float(*x)),
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
@@ -437,6 +441,19 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                 }
                             }
                         }
+                        Frame::Check { spec } => {
+                            let spec = spec.clone();
+                            let holds = test_holds(&spec.test, &value);
+                            cont = rest;
+                            control = Control::Apply(match spec.mode {
+                                CheckMode::Probe => Value::Bool(holds),
+                                CheckMode::Assert if holds => value,
+                                CheckMode::Assert => {
+                                    set_current_span(spec.span);
+                                    panic!("type error: expected {}, found {}", spec.to, value.type_name())
+                                }
+                            });
+                        }
                         Frame::PerformPayload { effect } => {
                             let effect = effect.clone();
                             cont = rest;
@@ -459,6 +476,29 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                 control = perform(&mut cont, &effect, payload);
             }
         }
+    }
+}
+
+// The one definition of every shallow Dyn-boundary test (Expr::Check) and of
+// the is_int/is_float/... prelude predicates, which share it.
+fn test_holds(test: &Test, v: &Value) -> bool {
+    match test {
+        Test::Any => true,
+        Test::Never => false,
+        Test::Int => matches!(v, Value::Int(_)),
+        Test::Float => matches!(v, Value::Float(_)),
+        Test::Bool => matches!(v, Value::Bool(_)),
+        Test::Str => matches!(v, Value::Str(_)),
+        Test::List => matches!(v, Value::List(_)),
+        // A representation, not a signature: the higher-order contract
+        // (typecheck::wrap_fun_contract) re-checks each call separately.
+        Test::Fun => {
+            matches!(v, Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..))
+        }
+        Test::Token(id) => matches!(v, Value::Token(t) if t == id),
+        Test::Tuple(arity) => matches!(v, Value::List(items) if items.len() == *arity),
+        Test::Record(names) => matches!(v, Value::Record(fields) if names.iter().all(|n| find_field(fields, n).is_some())),
+        Test::Or(alternatives) => alternatives.iter().any(|t| test_holds(t, v)),
     }
 }
 
@@ -690,11 +730,11 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 _ => panic!("get expects a list and an int"),
             }
         }
-        Builtin::IsInt => Value::Bool(matches!(args.pop(), Some(Value::Int(_)))),
-        Builtin::IsFloat => Value::Bool(matches!(args.pop(), Some(Value::Float(_)))),
-        Builtin::IsBool => Value::Bool(matches!(args.pop(), Some(Value::Bool(_)))),
-        Builtin::IsStr => Value::Bool(matches!(args.pop(), Some(Value::Str(_)))),
-        Builtin::IsList => Value::Bool(matches!(args.pop(), Some(Value::List(_)))),
+        Builtin::IsInt => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Int, &v))),
+        Builtin::IsFloat => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Float, &v))),
+        Builtin::IsBool => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Bool, &v))),
+        Builtin::IsStr => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Str, &v))),
+        Builtin::IsList => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::List, &v))),
         Builtin::IsRecord => Value::Bool(matches!(args.pop(), Some(Value::Record(_)))),
         // (record, name) -- args.pop() order matches Get's own (list, i)
         // convention: last-pushed arg (name) pops first.
@@ -726,15 +766,7 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 _ => panic!("get_field expects a record and a string"),
             }
         }
-        // Same shallow "is it callable at all" story Value::matches_type's
-        // own Fun arm used to answer -- confirms a representation, not a
-        // specific signature (typecheck::coerce's higher-order contract,
-        // wrap_fun_contract, re-checks each call's actual argument/result
-        // types separately).
-        Builtin::IsFun => Value::Bool(matches!(
-            args.pop(),
-            Some(Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..))
-        )),
+        Builtin::IsFun => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Fun, &v))),
         Builtin::TypeName => match args.pop() {
             Some(v) => Value::Str(Rc::from(v.type_name())),
             None => panic!("type_name expects one argument"),
@@ -1052,5 +1084,36 @@ fn perform(cont: &mut Cont, effect: &str, payload: Value) -> Control {
                 node = rest.clone();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(n: usize) -> Value {
+        Value::List(Rc::new(vec![Value::Int(0); n]))
+    }
+
+    #[test]
+    fn test_holds_covers_every_shape() {
+        let record = Value::Record(Rc::new(vec![("x".to_string(), Value::Int(1)), ("y".to_string(), Value::Int(2))]));
+        let closure = Value::Builtin(Builtin::Len);
+        assert!(test_holds(&Test::Any, &Value::Bool(true)) && !test_holds(&Test::Never, &Value::Bool(true)));
+        assert!(test_holds(&Test::Int, &Value::Int(1)) && !test_holds(&Test::Int, &Value::Float(1.0)));
+        assert!(test_holds(&Test::Float, &Value::Float(1.0)) && !test_holds(&Test::Float, &Value::Int(1)));
+        assert!(test_holds(&Test::Bool, &Value::Bool(false)) && !test_holds(&Test::Bool, &Value::Int(0)));
+        assert!(test_holds(&Test::Str, &Value::Str(Rc::from("a"))) && !test_holds(&Test::Str, &Value::Int(0)));
+        assert!(test_holds(&Test::List, &list(0)) && !test_holds(&Test::List, &record));
+        assert!(test_holds(&Test::Fun, &closure) && !test_holds(&Test::Fun, &Value::Int(0)));
+        assert!(test_holds(&Test::Token(7), &Value::Token(7)) && !test_holds(&Test::Token(7), &Value::Token(8)));
+        assert!(!test_holds(&Test::Token(7), &Value::Int(7)));
+        assert!(test_holds(&Test::Tuple(2), &list(2)) && !test_holds(&Test::Tuple(2), &list(3)) && !test_holds(&Test::Tuple(2), &record));
+        let fields = |names: &[&str]| Test::Record(names.iter().map(|n| n.to_string()).collect());
+        assert!(test_holds(&fields(&["x"]), &record) && test_holds(&fields(&["x", "y"]), &record));
+        assert!(!test_holds(&fields(&["z"]), &record) && !test_holds(&fields(&["x"]), &list(1)));
+        let int_or_token = Test::Or(vec![Test::Int, Test::Token(7)]);
+        assert!(test_holds(&int_or_token, &Value::Token(7)) && test_holds(&int_or_token, &Value::Int(1)) && !test_holds(&int_or_token, &Value::Bool(true)));
+        assert!(!test_holds(&Test::Or(vec![]), &Value::Int(1)));
     }
 }

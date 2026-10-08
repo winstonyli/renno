@@ -101,8 +101,57 @@ pub enum BinOp {
     Cons,
 }
 
+// The shallow runtime test an `Expr::Check` applies to a value (machine::
+// test_holds). Shape only, never deeper: arity for Tuple, field presence for
+// Record (width-tolerant), the callability tag for Fun.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Test {
+    // Dyn/Var: everything passes. Never: nothing does (a failing branch, or a
+    // Named ancestor already being unfolded).
+    Any,
+    Never,
+    Int,
+    Float,
+    Bool,
+    Str,
+    List,
+    Fun,
+    // The exact Value::Token with this id.
+    Token(u64),
+    // A list of exactly this length.
+    Tuple(usize),
+    // A record with at least these fields.
+    Record(Vec<String>),
+    // Any alternative passes (a union, first match wins).
+    Or(Vec<Test>),
+}
+
+// What Expr::Check does with the test's outcome.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CheckMode {
+    // Return the value, or panic `type error: expected {to}, found {type}`.
+    Assert,
+    // Return the Bool outcome (a union picking its alternative).
+    Probe,
+}
+
+#[derive(Debug)]
+pub struct CheckSpec {
+    pub test: Test,
+    pub mode: CheckMode,
+    // The type's display text, for the Assert message.
+    pub to: String,
+    // The cast site a failure blames (the node itself has no span in the
+    // parser's SpanMap); None keeps whatever span ran last.
+    pub span: Option<Span>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
+    // `e` tested natively against `spec` -- evaluates `e` once, no effects,
+    // no env frame. Typecheck-synthesized only (a Dyn-boundary check);
+    // never written by the parser.
+    Check(ExprRef, Rc<CheckSpec>),
     Int(i64),
     // A second numeric literal kind, distinct from Int -- see types::
     // Type::Float's own doc comment for how far the Int/Float interop

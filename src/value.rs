@@ -59,32 +59,24 @@ pub enum Builtin {
     // this field" (unlike "index N of this list") is a genuinely common
     // question to ask about a value whose exact shape isn't statically
     // known -- width subtyping means a Dyn-sourced record's exact field
-    // set is routinely broader than what any one annotation names. What
-    // typecheck::build_boundary_check's Record arm desugars a Dyn-to-
-    // Record boundary check into: is_record(v) && has_field(v, "x") &&
-    // ... , one clause per required field name.
+    // set is routinely broader than what any one annotation names. (A
+    // Dyn-to-Record boundary check is a native Expr::Check with Test::Record,
+    // which machine::test_holds answers the same way.)
     HasField,
     // (Dyn, Str) -> Dyn -- extracts a named field's value. What `.field`
     // access desugars into (typecheck::elaborate_node's own
     // Expr::FieldAccess arm) rather than a dedicated runtime opcode --
-    // same "no new machine.rs code" story build_predicate_call's other
-    // callers already get, since this is just an ordinary two-argument
-    // call like HasField. Panics, like Get, rather than returning an
+    // same "no new machine.rs code" story, since this is just an ordinary
+    // two-argument call like HasField. Panics, like Get, rather than returning an
     // Option: renno has no Option/Result in the prelude, and every other
     // Dyn-sourced shape mismatch already panics at the point of use.
     GetField,
-    // Dyn -> Bool, one per primitive tag. typecheck::coerce desugars a
-    // Dyn-to-primitive boundary Check into `if is_X(e) then e else
-    // fail(...)` using these, instead of a dedicated Check AST node/Frame
-    // -- see coerce's own doc comment. IsFun covers every callable
-    // representation (Closure/RecClosure/Continuation/Builtin/
-    // PartialBuiltin), the same shallow "is it callable at all" question
-    // Value::matches_type's own Fun arm used to answer.
+    // Dyn -> Bool, one per primitive tag, for user programs. A Dyn-to-
+    // primitive boundary check is a native Expr::Check instead; both share
+    // machine::test_holds. IsFun covers every callable representation
+    // (Closure/RecClosure/Continuation/Builtin/PartialBuiltin).
     IsInt,
-    // Dyn -> Bool. Float's own tag test, same story as IsInt -- used both
-    // directly (a `Float`-annotated Dyn boundary) and as one half of the
-    // numeric Union check typecheck::coerce_numeric builds for Add/Sub/
-    // Mul/Div/Mod/Lt's own Dyn operands.
+    // Dyn -> Bool. Float's own tag test, same story as IsInt.
     IsFloat,
     IsBool,
     IsStr,
@@ -95,10 +87,8 @@ pub enum Builtin {
     // a distinct kind from List (name-keyed, not positional) rather than
     // reusing IsList.
     IsRecord,
-    // Dyn -> Str: the same string Value::type_name() computes, exposed so
-    // a desugared boundary-check failure can build its own "found {type}"
-    // message at runtime (the actual runtime value's type isn't known
-    // until then).
+    // Dyn -> Str: the same string Value::type_name() computes (the "found
+    // {type}" half of a boundary-check failure message).
     TypeName,
     // Dyn -> Dyn: writes the argument's own Display impl to stdout (same
     // rendering the REPL/CLI already gives a program's final result --

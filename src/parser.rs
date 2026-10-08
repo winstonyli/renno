@@ -328,7 +328,7 @@ impl<'a> Parser<'a> {
             Expr::Perform(_, _) => true,
             Expr::Tuple(items) | Expr::ListLit(items) => items.iter().any(|i| Self::contains_perform(arena, *i)),
             Expr::Record(fields) => fields.iter().any(|(_, v)| Self::contains_perform(arena, *v)),
-            Expr::FieldAccess(target, _) => Self::contains_perform(arena, *target),
+            Expr::FieldAccess(target, _) | Expr::Check(target, _) => Self::contains_perform(arena, *target),
             Expr::Lambda(_, _, body) => Self::contains_perform(arena, *body),
             Expr::App(f, a) => Self::contains_perform(arena, *f) || Self::contains_perform(arena, *a),
             Expr::Let(_, _, val, body) => Self::contains_perform(arena, *val) || Self::contains_perform(arena, *body),

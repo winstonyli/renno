@@ -17,9 +17,9 @@ pub static PRELUDE: &[(&str, Builtin)] = &[
     ("fold", Builtin::Fold),
     ("fail", Builtin::Fail),
     ("get", Builtin::Get),
-    // Runtime half of typecheck::coerce's boundary-check
-    // desugaring (see its own doc comment) -- ordinary prelude
-    // builtins, not hidden, the same way `fail` already isn't.
+    // Ordinary prelude predicates, not hidden, the same way `fail` isn't.
+    // Dyn-boundary checks no longer call them (typecheck emits a native
+    // Expr::Check; machine::test_holds is the shared definition).
     ("is_int", Builtin::IsInt),
     ("is_float", Builtin::IsFloat),
     ("is_bool", Builtin::IsBool),

@@ -95,49 +95,37 @@ mod tests {
         machine::run(&arena, root, Env::prelude(), &spans)
     }
 
-    // Walks the elaborated tree looking for a runtime boundary check.
-    // typecheck::coerce no longer builds a dedicated Check AST node (see
-    // build_boundary_check's own doc comment) -- it desugars
-    // into `let __check_tmp = ... in if ... then ... else fail(...)`, so
-    // detecting one now means detecting THAT Let's own fixed binder name
-    // instead of a distinct node kind. Needed because arena-indexed
-    // Expr's derived Debug only prints the immediate node (children are
-    // plain ExprRef indices now, not Rc<Expr>, so Debug no longer
-    // recurses through them the way it used to).
+    // Walks the elaborated tree looking for a runtime boundary check: a
+    // native Expr::Check, or a Vec(n) index check (still desugared into
+    // `let __check_tmp = ... in if ... then ... else ...`, detected by that
+    // Let's fixed binder name). Needed because arena-indexed Expr's derived
+    // Debug only prints the immediate node (children are plain ExprRef
+    // indices, so Debug does not recurse through them).
     fn contains_check(arena: &expr::Arena, root: expr::ExprRef) -> bool {
+        tree_any(arena, root, &|n| match n {
+            expr::Expr::Check(..) => true,
+            expr::Expr::Let(var, ..) => var.starts_with("__check_tmp#"),
+            _ => false,
+        })
+    }
+
+    // Does any node of the (elaborated) tree under `root` satisfy `pred`?
+    // The one tree walker the shape-asserting tests share.
+    fn tree_any(arena: &expr::Arena, root: expr::ExprRef, pred: &dyn Fn(&expr::Expr) -> bool) -> bool {
         use expr::Expr;
-        match &arena[root] {
-            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
-            Expr::ListLit(items) | Expr::Tuple(items) => items.iter().any(|i| contains_check(arena, *i)),
-            Expr::Lambda(_, _, body) => contains_check(arena, *body),
-            Expr::App(f, a) => contains_check(arena, *f) || contains_check(arena, *a),
-            Expr::Let(var, _, val, body) => {
-                var.starts_with("__check_tmp#") || contains_check(arena, *val) || contains_check(arena, *body)
+        let go = |r: &expr::ExprRef| tree_any(arena, *r, pred);
+        pred(&arena[root])
+            || match &arena[root] {
+                Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
+                Expr::Check(e, _) | Expr::FieldAccess(e, _) | Expr::Perform(_, e) => go(e),
+                Expr::ListLit(items) | Expr::Tuple(items) => items.iter().any(go),
+                Expr::Lambda(_, _, body) | Expr::MakeHandler { body, .. } => go(body),
+                Expr::App(a, b) | Expr::BinOp(_, a, b) | Expr::Let(_, _, a, b) | Expr::Handle { body: a, handler: b } => go(a) || go(b),
+                Expr::LetRec(bindings, body) => bindings.iter().any(|(_, _, v)| go(v)) || go(body),
+                Expr::If(c, t, e) => go(c) || go(t) || go(e),
+                Expr::Match(s, arms) => go(s) || arms.iter().any(|(_, g, b)| g.as_ref().is_some_and(go) || go(b)),
+                Expr::Record(fields) => fields.iter().any(|(_, v)| go(v)),
             }
-            Expr::LetRec(bindings, body) => {
-                bindings.iter().any(|(_, _, val)| contains_check(arena, *val)) || contains_check(arena, *body)
-            }
-            Expr::BinOp(_, l, r) => contains_check(arena, *l) || contains_check(arena, *r),
-            Expr::If(c, t, e) => contains_check(arena, *c) || contains_check(arena, *t) || contains_check(arena, *e),
-            Expr::Perform(_, payload) => contains_check(arena, *payload),
-            Expr::Handle { body, handler } => contains_check(arena, *body) || contains_check(arena, *handler),
-            Expr::MakeHandler { body, .. } => contains_check(arena, *body),
-            Expr::Match(scrutinee, arms) => {
-                contains_check(arena, *scrutinee)
-                    || arms.iter().any(|(_, guard, body)| {
-                        guard.is_some_and(|g| contains_check(arena, g)) || contains_check(arena, *body)
-                    })
-            }
-            // Stale as of records getting a real runtime kind: Expr::Record
-            // DOES survive elaboration now (see its own doc comment), so
-            // this walks its field values like any other compound node.
-            Expr::Record(fields) => fields.iter().any(|(_, v)| contains_check(arena, *v)),
-            // Never reaches here -- this walks an ELABORATED tree, and
-            // Expr::FieldAccess never survives elaboration (rewritten
-            // into an ordinary get_field(...) call -- see its own doc
-            // comment).
-            Expr::FieldAccess(..) => unreachable!("Expr::FieldAccess never survives elaboration"),
-        }
     }
 
     // handle { let x = perform choose(0) in x + 100 } with
@@ -4959,7 +4947,7 @@ mod tests {
         let err = run_source(src).unwrap_err();
         // Type::Indexed's own Display renders as "[Dyn](3)", not "Vec(3)"
         // (see types.rs's own Display impl) -- this is the same runtime
-        // message format build_checked's fail() call always produces.
+        // message format every failing Expr::Check produces.
         assert!(err.contains("expected [Dyn](3)"), "expected a genuine Vec(3) length mismatch at runtime, got: {err}");
     }
 
@@ -6837,24 +6825,11 @@ mod tests {
     // --- Fun-to-Dyn / Fun-to-Fun wrapping (spec 2026-10-08), closure form ---
 
     fn has_let_named(arena: &expr::Arena, root: expr::ExprRef, name: &str) -> bool {
-        use expr::Expr;
-        let go = |r: &expr::ExprRef| has_let_named(arena, *r, name);
-        match &arena[root] {
-            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
-            Expr::ListLit(items) | Expr::Tuple(items) => items.iter().any(go),
-            Expr::Lambda(param, _, body) => param.starts_with(name) || go(body),
-            Expr::App(f, a) => go(f) || go(a),
-            Expr::Let(var, _, val, body) => var.starts_with(name) || go(val) || go(body),
-            Expr::LetRec(bindings, body) => bindings.iter().any(|(_, _, v)| go(v)) || go(body),
-            Expr::BinOp(_, l, r) => go(l) || go(r),
-            Expr::If(c, t, e) => go(c) || go(t) || go(e),
-            Expr::Perform(_, p) => go(p),
-            Expr::Handle { body, handler } => go(body) || go(handler),
-            Expr::MakeHandler { body, .. } => go(body),
-            Expr::Match(s, arms) => go(s) || arms.iter().any(|(_, g, b)| g.as_ref().is_some_and(go) || go(b)),
-            Expr::Record(fields) => fields.iter().any(|(_, v)| go(v)),
-            Expr::FieldAccess(..) => unreachable!(),
-        }
+        tree_any(arena, root, &|n| match n {
+            expr::Expr::Lambda(param, ..) => param.starts_with(name),
+            expr::Expr::Let(var, ..) => var.starts_with(name),
+            _ => false,
+        })
     }
 
     fn elaborated_has_wrapper(src: &str) -> bool {
@@ -6951,6 +6926,7 @@ mod tests {
         let mut go = |r: &expr::ExprRef| let_rec_groups_direct(arena, *r, out);
         match &arena[root] {
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => {}
+            Expr::Check(operand, _) => go(operand),
             Expr::ListLit(items) | Expr::Tuple(items) => items.iter().for_each(go),
             Expr::Lambda(_, _, body) => go(body),
             Expr::App(f, a) => {
@@ -7042,13 +7018,14 @@ mod tests {
     }
 
     // The error location of a rejected literal-form call: the first line is
-    // "line L, column C: ..." (spec 8). Recorded from an actual run:
-    // `let d: Dyn = fun a: Int -> a + 1 in d(true)` -> "line 1, column 39:
-    // type error: expected Int, found Bool", the span of the argument `true`.
+    // "line L, column C: ..." (spec 8). `let d: Dyn = fun a: Int -> a + 1 in
+    // d(true)` -> "line 1, column 14: type error: expected Int, found Bool",
+    // the span of the cast site (the literal crossing into Dyn); it used to
+    // be column 39, the argument `true`, whatever ran last.
     #[test]
     fn a_rejected_literal_call_reports_a_location() {
         let err = run_source("let d: Dyn = fun a: Int -> a + 1 in d(true)").expect_err("bad argument");
-        assert!(err.starts_with("line 1, column 39: "), "{err}");
+        assert!(err.starts_with("line 1, column 14: "), "{err}");
         assert!(err.contains("expected Int, found Bool"), "{err}");
     }
 
@@ -7119,9 +7096,10 @@ mod tests {
     #[test]
     fn a_var_returning_call_into_a_dyn_callback_is_rejected_today_known_limitation() {
         let src = "let id = fun k -> k in (fun k: (Dyn -> Dyn) -> k(true))(id(fun x: Int -> x + 1))";
-        // Current behaviour: the bad call IS rejected (at the `true` in `k(true)`); pinned so a change shows.
+        // Current behaviour: the bad call IS rejected, blaming the cast site (the
+        // argument `id(..)`, column 57; it used to blame the `true` in `k(true)`, column 50); pinned so a change shows.
         let err = run_source(src).expect_err("rejected today");
-        assert!(err.starts_with("line 1, column 50: type error: expected Int, found Bool"), "{err}");
+        assert!(err.starts_with("line 1, column 57: type error: expected Int, found Bool"), "{err}");
     }
 
     #[test]
@@ -7218,6 +7196,166 @@ mod tests {
         ] {
             assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
         }
+    }
+
+    // --- Native Expr::Check (spec 2026-10-08-cast-cost-design, phase 1) ---
+
+    fn elaborated_tree(src: &str) -> (expr::Arena, expr::ExprRef) {
+        let (mut arena, spans, root, named) = parser::parse_with_named_types(src).unwrap();
+        let out = typecheck::check_with_named_types(&mut arena, root, &spans, named).unwrap();
+        (arena, out)
+    }
+
+    // An Assert Check with exactly this test is somewhere in the tree.
+    fn has_assert_check(src: &str, test: expr::Test) -> bool {
+        let (arena, root) = elaborated_tree(src);
+        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(_, s) if s.test == test && s.mode == expr::CheckMode::Assert))
+    }
+
+    // A synthesized call to one of the prelude predicates a check used to
+    // desugar into (`#is_int`, `#type_name`, `#has_field`, ...).
+    fn calls_a_check_predicate(src: &str) -> bool {
+        let (arena, root) = elaborated_tree(src);
+        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Var(v) if v.starts_with("#is_") || v == "#type_name" || v == "#has_field"))
+    }
+
+    type ShapeCase = (&'static str, Vec<&'static str>, Vec<(&'static str, &'static str)>, Option<expr::Test>);
+
+    // (annotation, accepted Dyn values, rejected Dyn values with the expected
+    // message fragment, the native test of its Assert Check -- None when the
+    // crossing stays desugared). Every shape the old builders produced.
+    fn native_check_shapes() -> Vec<ShapeCase> {
+        use expr::Test;
+        let x = || vec!["x".to_string()];
+        vec![
+            ("Int", vec!["3"], vec![("true", "type error: expected Int, found Bool")], Some(Test::Int)),
+            ("Float", vec!["1.5"], vec![("\"a\"", "type error: expected Float, found Str")], Some(Test::Float)),
+            ("Bool", vec!["true"], vec![("3", "type error: expected Bool, found Int")], Some(Test::Bool)),
+            ("Str", vec!["\"a\""], vec![("3", "type error: expected Str, found Int")], Some(Test::Str)),
+            ("[Int]", vec!["[1]", "[]"], vec![("3", "type error: expected [Int], found Int")], Some(Test::List)),
+            ("(Int -> Int)", vec!["fun x: Int -> x"], vec![("3", "type error: expected (Dyn -> Dyn), found Int")], Some(Test::Fun)),
+            (
+                "(Int, Int)",
+                vec!["[1, 2]"],
+                vec![("[1, 2, 3]", "type error: expected (Int, Int), found List"), ("3", "type error: expected (Int, Int), found Int")],
+                Some(Test::Tuple(2)),
+            ),
+            (
+                "{x: Int}",
+                vec!["{x: 1}", "{x: 1, y: 2}"],
+                vec![("{y: 2}", "type error: expected {x: Int}, found Record"), ("5", "type error: expected {x: Int}, found Int")],
+                Some(Test::Record(x())),
+            ),
+            ("Int | Bool", vec!["3", "true"], vec![("\"a\"", "type error: expected Int | Bool, found Str")], Some(Test::Or(vec![Test::Int, Test::Bool]))),
+            (
+                "Int | (Int, Int) | {x: Int}",
+                vec!["3", "[1, 2]", "{x: 1}"],
+                vec![("[1]", "type error: expected Int | (Int, Int) | {x: Int}, found List"), ("{y: 1}", "found Record")],
+                Some(Test::Or(vec![Test::Int, Test::Tuple(2), Test::Record(x())])),
+            ),
+            ("Vec(2)", vec!["[1, 2]"], vec![("[1]", "expected [Dyn](2), found List"), ("3", "found Int")], None),
+            ("Int | Vec(2)", vec!["3", "[1, 2]"], vec![("[1]", "found List"), ("true", "found Bool")], None),
+            ("Int | (Int -> Int)", vec!["3", "fun x: Int -> x"], vec![("\"a\"", "type error: expected Int | (Int -> Int), found Str")], None),
+        ]
+    }
+
+    // A bare Fun crossing is a per-call contract: it is only exercised by calling.
+    fn crossing(ty: &str, v: &str) -> String {
+        let used = if ty == "(Int -> Int)" { "y(1)" } else { "1" };
+        format!("let d: Dyn = {v} in let y: {ty} = d in {used}")
+    }
+
+    #[test]
+    fn every_dyn_boundary_shape_accepts_and_rejects_as_before() {
+        for (ty, accepted, rejected, _) in native_check_shapes() {
+            for v in accepted {
+                let src = crossing(ty, v);
+                assert_eq!(run_source(&src).unwrap().as_int(), 1, "{src}");
+            }
+            for (v, want) in rejected {
+                let src = crossing(ty, v);
+                let err = run_source(&src).expect_err(&src);
+                assert!(err.contains(want), "{src}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_shallow_dyn_boundary_shape_is_one_native_check() {
+        for (ty, _, _, native) in native_check_shapes() {
+            let src = crossing(ty, "3");
+            if let Some(test) = native {
+                assert!(has_assert_check(&src, test), "{src}: no native Check");
+                let (arena, root) = elaborated_tree(&src);
+                assert!(!has_let_named(&arena, root, "__check_tmp#"), "{src}: still desugared");
+            }
+            assert!(!calls_a_check_predicate(&src), "{src}: still calls a prelude predicate");
+        }
+    }
+
+    #[test]
+    fn dyn_and_unannotated_targets_emit_no_check() {
+        for src in ["let d: Dyn = 3 in let y: Dyn = d in y", "let f = fun x -> x in f(3)"] {
+            let (arena, root) = elaborated_tree(src);
+            assert!(!tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(..))), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_numeric_operand_of_unknown_type_is_one_native_int_or_float_check() {
+        let src = "let f = fun x -> x + 1 in f(2)";
+        assert!(has_assert_check(src, expr::Test::Or(vec![expr::Test::Int, expr::Test::Float])));
+        let (arena, root) = elaborated_tree(src);
+        assert!(!has_let_named(&arena, root, "__check_tmp#"));
+        assert_eq!(run_source(src).unwrap().as_int(), 3);
+        let err = run_source("let f = fun x -> x + 1 in f(true)").unwrap_err();
+        assert!(err.contains("type error: expected Int | Float, found Bool"), "{err}");
+    }
+
+    #[test]
+    fn an_annotated_callback_check_is_native_and_allocation_free() {
+        let src = "map(fun x: Int -> x + 1)([1, 2])";
+        assert!(has_assert_check(src, expr::Test::Int));
+        let (arena, root) = elaborated_tree(src);
+        assert!(!has_let_named(&arena, root, "__check_tmp#"));
+        assert!(!calls_a_check_predicate(src));
+        assert_clean_rejection("map(fun x: Int -> x + 1)([true])", BAD_INT);
+    }
+
+    #[test]
+    fn a_closure_form_cast_check_is_native() {
+        let src = "let f = fun x: Int -> x + 1 in let d: Dyn = f in d(1)";
+        assert!(has_assert_check(src, expr::Test::Int));
+        assert!(!calls_a_check_predicate(src));
+        assert_clean_rejection("let f = fun x: Int -> x + 1 in let d: Dyn = f in d(true)", BAD_INT);
+    }
+
+    #[test]
+    fn a_vec_n_index_check_stays_desugared_but_tests_natively() {
+        let src = "let d: Dyn = [1, 2] in let y: Vec(2) = d in 1";
+        let (arena, root) = elaborated_tree(src);
+        assert!(has_let_named(&arena, root, "__check_tmp#"));
+        assert!(tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(_, s) if s.test == expr::Test::List && s.mode == expr::CheckMode::Probe)));
+        assert!(!calls_a_check_predicate(src));
+    }
+
+    #[test]
+    fn a_native_check_inside_a_resumed_continuation_runs_on_every_resume() {
+        let ok = "handle (let y: Int = perform choose(0) in y + 100) with handler choose(p, resume) -> resume(1) + resume(2)";
+        assert_eq!(run_source(ok).unwrap().as_int(), 203);
+        let bad = "handle (let y: Int = perform choose(0) in y + 100) with handler choose(p, resume) -> resume(1) + resume(true)";
+        assert_clean_rejection(bad, BAD_INT);
+    }
+
+    #[test]
+    fn a_failing_native_check_blames_the_cast_site() {
+        // The Dyn-to-Int crossing is the annotated binding's value `d`
+        // (line 2, column 14), not the later expression that runs last.
+        let err = run_source("let d: Dyn = true in\nlet y: Int = d in\ny + 1").unwrap_err();
+        assert!(err.starts_with("line 2, column 14: type error: expected Int, found Bool"), "{err}");
+        // A numeric operand blames the operand.
+        let err = run_source("let f = fun x -> 1 + x in\nf(true)").unwrap_err();
+        assert!(err.starts_with("line 1, column 22: type error: expected Int | Float, found Bool"), "{err}");
     }
 
     // --- Join-to-Dyn arm casts (spec 2026-10-08-join-to-dyn-casts) ---
