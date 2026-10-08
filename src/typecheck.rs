@@ -145,8 +145,9 @@ pub(crate) struct InferCtx {
     // a Dyn callee, a Perform payload) while the variable is still unbound
     // (spec 2026-10-08-var-passthrough-casts). The Fun-callee App arm casts a
     // typed function argument to Dyn when the callee's parameter is such a
-    // variable. Monotone like `subst` (no rollback: a stale flag costs at most
-    // one extra, still-sound cast); propagated by `lookup` and `unify`.
+    // variable. Grows like `subst` and is snapshotted/restored with it by
+    // unify_trial (a failed trial must not leak flags); propagated by
+    // `lookup` and `unify`.
     dyn_sunk: HashSet<String>,
 }
 
@@ -664,10 +665,14 @@ pub(crate) fn unify_trial(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span
     // comparison would silently see a binding this trial never actually
     // committed to.
     let index_snapshot = infer.index_subst.clone();
+    // The Dyn-sink flags travel with variable aliasing in unify(), so a
+    // failed trial must drop the flags it spread as well.
+    let sunk_snapshot = infer.dyn_sunk.clone();
     let result = unify(t1, t2, infer, span);
     if result.is_err() {
         infer.subst = snapshot;
         infer.index_subst = index_snapshot;
+        infer.dyn_sunk = sunk_snapshot;
     }
     result
 }
@@ -1592,8 +1597,11 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
         Type::Tuple(_) => build_shape_check(arena, e, to, env, visiting),
         Type::Record(_) => build_shape_check(arena, e, to, env, visiting),
         Type::Union(_) => build_union_check(arena, e, to, env, visiting),
-        Type::Dyn => unreachable!("coerce only calls this once *to != Type::Dyn is already established"),
-        Type::Var(_) => e,
+        // Dyn accepts everything, so a check against it is the identity. Not
+        // unreachable: wrap_fun_contract checks a call's result against the
+        // Fun's return type, which is Dyn for `Dyn -> Dyn` (and nested
+        // builders reach it through tuple/union alternatives).
+        Type::Dyn | Type::Var(_) => e,
         // Same is_list-then-len composition as Type::Tuple's own arm
         // above (build_shape_predicate's Tuple case), just checking the
         // length AGAINST the index expression instead of a fixed arity

@@ -7559,6 +7559,47 @@ mod tests {
     }
 
     #[test]
+    fn a_dyn_returning_function_parameter_check_is_the_identity_not_an_ice() {
+        // DOWN on a `Dyn -> Dyn` parameter builds a return check against Dyn,
+        // which is no check at all (was `unreachable!` in build_boundary_check).
+        for src in [
+            "let ap = fun g -> map(g)([fun x -> x + 1]) in ap(fun f: (Dyn -> Dyn) -> f(1))",
+            "let ap = fun g -> map(g)([fun x -> x + 1]) in ap(fun f: (Dyn ->{e} Dyn) -> f(1))",
+            "map(fun f: (Dyn ->{e} Dyn) -> f(1))([fun x -> x + 1])",
+            "let ap: Dyn = fun f: (Dyn -> Dyn) -> f(1) in ap(fun x -> x + 1)",
+        ] {
+            let r = std::panic::catch_unwind(|| run_source(src));
+            assert!(matches!(&r, Ok(Ok(_))), "{src}: {r:?}");
+        }
+        let src = "let ap = fun g -> map(g)([fun x -> x + 1]) in ap(fun f: (Dyn -> Dyn) -> f(1))";
+        assert_eq!(run_source(src).unwrap(), Outcome::List(vec![Outcome::Int(2)]));
+        // Two typed functions of different types joined by `if`.
+        let join = "let g = fun a: Int -> a in let h = fun s: Str -> s in (if true then g else h)(1)";
+        let r = std::panic::catch_unwind(|| run_source(join));
+        assert!(matches!(&r, Ok(Ok(_))), "{join}: {r:?}");
+    }
+
+    #[test]
+    fn a_failed_trial_unify_does_not_leak_a_dyn_sink_flag() {
+        // `h` never reaches a Dyn sink: the `(g, 1)` / `(h, true)` join fails
+        // its trial unify after binding g's and h's variables together, and
+        // that alias must not carry g's flag over to h. h stays unwrapped.
+        let h = "fun f: (Dyn -> Dyn) -> f(1)";
+        for join in ["if true then (g, 1) else (h, true)", "match [(g, 1), (h, true)] | [p, q] -> p | _ -> (g, 1)"] {
+            let src = format!(
+                "let k = fun g -> fun h -> let r = map(g)([1]) in let j = ({join}) in h in \
+                 (k(fun x -> x)({h}))(fun x -> x)"
+            );
+            assert_eq!(run_source(&src).unwrap().as_int(), 1, "{src}");
+            assert!(!elaborated_has_cast(&src), "{src}");
+        }
+        let list = "let k = fun g -> fun h -> let r = map(g)([1]) in let j = [(g, 1), (h, true)] in h in \
+                    (k(fun x -> x)(fun f: (Dyn -> Dyn) -> f(1)))(fun x -> x)";
+        assert_eq!(run_source(list).unwrap().as_int(), 1, "{list}");
+        assert!(!elaborated_has_cast(list), "{list}");
+    }
+
+    #[test]
     fn a_perform_as_a_join_arm_is_handled_and_the_resumed_function_is_still_checked() {
         let prog = |call: &str| format!(
             "handle (let g = if 1 < 2 then (perform pick(0)) else (fun s: Str -> s) in g({call})) \
