@@ -6539,21 +6539,25 @@ mod tests {
     }
 
     #[test]
-    fn dyn_argument_into_a_vec_n_polymorphic_function_is_a_clean_error_today() {
-        // Pins current behaviour (spec 2026-10-07, open follow-up): the
-        // call site's instantiated n has no runtime binder, so the crossing
-        // fails cleanly instead of panicking or skipping the check.
+    fn a_dyn_argument_into_a_vec_n_polymorphic_function_needs_only_a_list_when_its_length_is_unconstrained() {
+        // The call site's instantiated n has no runtime binder and nothing
+        // ever binds it (spec 2026-10-07-dyn-crossing-deferred-length-checks),
+        // so the crossing checks is_list only. It used to fail cleanly.
         let src = "let f = fun v: Vec(n) -> v in let x: Dyn = [1, 2] in len(f(x))";
+        assert_eq!(run_source(src).unwrap().as_int(), 2);
+        // A non-list still fails the crossing cleanly.
+        let src = "let f = fun v: Vec(n) -> v in let x: Dyn = 5 in len(f(x))";
         let err = run_source(src).unwrap_err();
-        assert!(err.contains("has no runtime value to check a length against"), "unexpected message: {err}");
+        assert!(err.contains("type error: expected [Dyn]("), "unexpected message: {err}");
         assert!(!err.contains("unbound variable"), "unexpected message: {err}");
     }
 
     #[test]
     fn dyn_to_vec_n_boundary_with_no_runtime_value_for_n_is_a_clean_error() {
-        // n is an existential with no runtime binder: nothing to compare the
-        // length against, so the check fails cleanly instead of panicking.
-        let src = "let x: Dyn = [1, 2, 3] in let y: Vec(n) = x in len(y)";
+        // Two crossings share the existential n, which has no runtime binder:
+        // the types claim equal lengths with nothing to compare against, so
+        // the check fails cleanly instead of panicking or passing.
+        let src = "let x: Dyn = [1, 2, 3] in let y: Vec(n) = x in let z: Vec(n) = x in len(y)";
         let err = run_source(src).unwrap_err();
         assert!(err.contains("index variable n has no runtime value"), "unexpected message: {err}");
         // ...but an n already known statically is compared directly.
@@ -6670,5 +6674,34 @@ mod tests {
                    let g = fun u: Vec(k) -> u in let x: Dyn = [1] in let z: Vec(n) = g(x) in 0 in f([1, 2])";
         let err = run_source(src).unwrap_err();
         assert!(err.contains("has no runtime value"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_dyn_crossing_into_an_unconstrained_vec_n_only_checks_that_it_is_a_list() {
+        // n is never bound and no other crossing mentions it: any list passes.
+        let accepted = [
+            ("let x: Dyn = [1, 2, 3] in let y: Vec(n) = x in len(y)", 3),
+            ("let x: Dyn = [] in let y: Vec(n) = x in len(y)", 0),
+        ];
+        for (src, want) in accepted {
+            assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
+        }
+        // Still a clean runtime error, never skipped:
+        let rejected = [
+            // not a list at all
+            ("let x: Dyn = 5 in let y: Vec(n) = x in 0", "type error: expected [Dyn](n), found"),
+            // two crossings sharing n
+            ("let x: Dyn = [1, 2] in let y: Vec(n) = x in let z: Vec(n) = x in 0", "index variable n has no runtime value"),
+            // a compound index over an unbound variable (no equation solving)
+            ("let f = fun v: Vec(n + 1) -> v in let x: Dyn = [1, 2] in len(f(x))", "has no runtime value"),
+            // a union alternative is out of scope: unchanged
+            ("let x: Dyn = [1] in let y: Vec(n) | Int = x in 0", "has no runtime value"),
+        ];
+        for (src, want) in rejected {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains(want), "{src}: unexpected message: {err}");
+        }
+        // The union's other alternative still matches a non-list.
+        assert_eq!(run_source("let x: Dyn = 5 in let y: Vec(n) | Int = x in 0").unwrap().as_int(), 0);
     }
 }

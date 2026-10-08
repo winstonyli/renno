@@ -1520,9 +1520,29 @@ fn record_obligation(len_eq: ExprRef, index: &IndexExpr, env: &CheckEnv) {
 // final bindings, each variable read from a witness in scope at the
 // crossing, otherwise the clean "no runtime value" failure. Runs before
 // anything evaluates the tree.
+//
+// An index that is still a bare unbound variable no other obligation
+// mentions constrains nothing, so the check is `is_list` alone (the node
+// becomes `true`). Two crossings sharing one such variable would claim equal
+// lengths with nothing to compare against, so they keep the clean failure.
 fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
-    for ob in infer.obligations.take() {
+    let obligations = infer.obligations.take();
+    let mut mentions: HashMap<String, usize> = HashMap::new();
+    for ob in &obligations {
+        for var in free_index_vars(&ob.current_index(infer)) {
+            *mentions.entry(var).or_insert(0) += 1;
+        }
+    }
+    for ob in obligations {
         let index = ob.current_index(infer);
+        let unconstrained = match &index {
+            IndexExpr::Var(name) => !ob.witness_vars().contains(&name.as_str()) && mentions[name] == 1,
+            _ => false,
+        };
+        if unconstrained {
+            arena[ob.len_eq] = Expr::Bool(true);
+            continue;
+        }
         let len_call = match &arena[ob.len_eq] {
             Expr::BinOp(BinOp::Eq, len_call, _) => *len_call,
             _ => unreachable!("an obligation's len_eq is the BinOp built by build_indexed_shape_cond"),
