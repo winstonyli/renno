@@ -6940,7 +6940,6 @@ mod tests {
         assert_eq!(run_source(src).unwrap().as_int(), 100000);
     }
 
-
     // Every LetRec in an elaborated tree is still a direct Lambda group
     // (resolve::is_direct_group); otherwise the recursive name becomes unbound.
     fn let_rec_groups_direct(arena: &expr::Arena, root: expr::ExprRef, out: &mut Vec<bool>) {
@@ -7008,6 +7007,20 @@ mod tests {
         assert_eq!(run_source(&format!("{d}d(1)(2)")).unwrap().as_int(), 3);
     }
 
+    // The DOWN check calls builtins (is_int, fail, type_name); a parameter
+    // named like one must not capture them.
+    #[test]
+    fn a_literal_parameter_named_like_a_builtin_does_not_capture_the_check() {
+        assert_eq!(run_source("let d: Dyn = fun is_int: Int -> is_int + 1 in d(2)").unwrap().as_int(), 3);
+        for name in ["fail", "type_name", "is_int", "is_list"] {
+            let src = format!("let d: Dyn = fun {name}: Int -> {name} + 1 in d(true)");
+            let err = run_source(&src).expect_err(&src);
+            assert!(err.contains("type error: expected Int, found Bool"), "{src}: {err}");
+        }
+        let rec = "let rec is_int: Dyn = fun is_int: Int -> if is_int < 1 then 0 else 1 in is_int(3)";
+        assert_eq!(elaborated_let_rec_groups(rec), vec![true]);
+    }
+
     #[test]
     fn a_literal_is_rebuilt_in_place_not_wrapped_in_a_closure() {
         // Literal form: no `let __cf = ... in fun __ca` outer closure.
@@ -7036,7 +7049,7 @@ mod tests {
     }
 
     #[test]
-    fn a_literal_vec_n_lambda_at_dyn_only_checks_is_list_and_is_a_pinned_limitation() {
+    fn a_literal_vec_n_lambda_at_dyn_only_checks_is_list_and_is_a_pinned_known_limitation() {
         let d = "let d: Dyn = fun a: Vec(n) -> fun b: Vec(n) -> len(b) in ";
         // PINNED parked limitation (spec 7): the literal form never compares
         // lengths, so mismatched lengths are accepted.
@@ -7106,6 +7119,7 @@ mod tests {
         let err = run_source(src).expect_err("rejected today");
         assert!(err.starts_with("line 1, column 50: type error: expected Int, found Bool"), "{err}");
     }
+
     #[test]
     fn unannotated_code_emits_no_function_wrapper() {
         for src in [

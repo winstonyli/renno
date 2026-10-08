@@ -1350,18 +1350,22 @@ fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env
     };
     let witnessed = |v: &str| env.local.iter().any(|w| w.var == v) || env.infer.index_witness.iter().any(|w| w.var == v);
     let up_body = if needs_upcast(b, &b_target) { literal_up(arena, body, b, &b_target, env, depth + 1) } else { body };
-    let body = if needs_down(a, &a_target) {
-        let p_ref = arena.push(Expr::Var(param.clone()));
-        let checked = build_boundary_check(arena, p_ref, &erase_open_indexed(a, &witnessed), env, &HashSet::new());
-        arena.push(Expr::Let(param.clone(), None, checked, up_body))
-    } else {
-        up_body
-    };
-    arena.push(Expr::Lambda(param, Some(a_target), body))
+    if !needs_down(a, &a_target) {
+        return arena.push(Expr::Lambda(param, Some(a_target), up_body));
+    }
+    // The incoming value arrives under a fresh name and is checked outside the
+    // user's parameter scope, so a parameter named like a builtin the check
+    // calls (is_int, fail, type_name, ...) cannot capture it.
+    let ca = if depth == 0 { "__ca".to_string() } else { format!("__ca{}", depth + 1) };
+    let ca_ref = arena.push(Expr::Var(ca.clone()));
+    let checked = build_boundary_check(arena, ca_ref, &erase_open_indexed(a, &witnessed), env, &HashSet::new());
+    let body = arena.push(Expr::Let(param, None, checked, up_body));
+    arena.push(Expr::Lambda(ca, Some(a_target), body))
 }
 
 // UP for a literal's body: a Lambda body is rebuilt in turn (through a witness
-// binder, `let hidden = <var> in ...`); any other body is wrapped in the
+// binder `let hidden = <var> in ...`; the arm matches any `let y = a in ...`
+// too, which is harmless); any other body is wrapped in the
 // closure form.
 fn literal_up(arena: &mut Arena, body: ExprRef, b: &Type, b_target: &Type, env: &CheckEnv, depth: usize) -> ExprRef {
     match arena[body].clone() {
