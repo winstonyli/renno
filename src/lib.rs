@@ -4412,9 +4412,11 @@ mod tests {
         // reaches `Vec(n)` only from an already-concrete `Vec(3)` (`w`),
         // never straight from Dyn, keeping it a pure static-inference check
         // of coerce()/unify_fits, the actual subject of this task.
-        // (2026-10-07: that gap no longer panics. The check reads n from a
-        // witness or its static binding, else fails cleanly; see
-        // dyn_to_vec_n_boundary_with_no_runtime_value_for_n_is_a_clean_error.)
+        // (2026-10-07: that gap is closed. The check's index is resolved when
+        // typechecking finishes: a later binding gives a real length check, an
+        // unconstrained n checks is_list only, anything else fails cleanly; see
+        // a_dyn_crossing_into_an_unconstrained_vec_n_only_checks_that_it_is_a_list
+        // and dyn_to_vec_n_boundary_with_no_runtime_value_for_n_is_a_clean_error.)
         let src = r#"
             let x: Dyn = [1, 2, 3] in
             let w: Vec(3) = x in
