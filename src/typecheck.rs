@@ -109,6 +109,11 @@ pub(crate) struct InferCtx {
     // checked (spec 2026-10-07). Hypotheses injected by Match write
     // index_subst directly, so they are unaffected.
     pub(crate) rigid_index: HashSet<String>,
+    // Annotation index-variable names renamed while an annotated binding's
+    // value is checked (open_signature): written name -> fresh name. Applied
+    // to every annotation read inside that value (scoped_annotation), so a
+    // body annotation reusing the name denotes the signature's variable.
+    index_rename: HashMap<String, String>,
     // Every genuinely self-referential type alias this program's own
     // parse registered (parser::Parser's own `named_types`, handed in
     // once at construction) -- consulted on demand by
@@ -122,7 +127,7 @@ pub(crate) struct InferCtx {
 
 impl InferCtx {
     pub(crate) fn new(named_types: HashMap<String, Type>) -> InferCtx {
-        InferCtx { subst: HashMap::new(), index_subst: HashMap::new(), rigid_index: HashSet::new(), named_types }
+        InferCtx { subst: HashMap::new(), index_subst: HashMap::new(), rigid_index: HashSet::new(), index_rename: HashMap::new(), named_types }
     }
 
     // Mints a fresh Type::Var -- every unannotated binding site (Lambda
@@ -854,20 +859,30 @@ fn free_index_vars(e: &IndexExpr) -> BTreeSet<String> {
 // index variable can only ever appear inside a Type::Indexed's own
 // IndexExpr, never anywhere else in a Type.
 pub(crate) fn free_index_vars_resolved(ty: &Type, infer: &InferCtx) -> BTreeSet<String> {
+    collect_index_vars(ty, &|e| infer.resolve_index_deep(e))
+}
+
+// The index-variable names `ty` mentions as written, NOT resolved through
+// index_subst (open_signature needs to see the already-bound ones).
+fn index_vars_as_written(ty: &Type) -> BTreeSet<String> {
+    collect_index_vars(ty, &|e| e.clone())
+}
+
+fn collect_index_vars(ty: &Type, resolve: &dyn Fn(&IndexExpr) -> IndexExpr) -> BTreeSet<String> {
     match ty {
         Type::Indexed(wrapped, index) => {
-            let mut vars = free_index_vars_resolved(wrapped, infer);
-            vars.extend(free_index_vars(&infer.resolve_index_deep(index)));
+            let mut vars = collect_index_vars(wrapped, resolve);
+            vars.extend(free_index_vars(&resolve(index)));
             vars
         }
         Type::Fun(param, _row, ret) => {
-            let mut vars = free_index_vars_resolved(param, infer);
-            vars.extend(free_index_vars_resolved(ret, infer));
+            let mut vars = collect_index_vars(param, resolve);
+            vars.extend(collect_index_vars(ret, resolve));
             vars
         }
-        Type::List(elem) => free_index_vars_resolved(elem, infer),
-        Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(|t| free_index_vars_resolved(t, infer)).collect(),
-        Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_index_vars_resolved(t, infer)).collect(),
+        Type::List(elem) => collect_index_vars(elem, resolve),
+        Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(|t| collect_index_vars(t, resolve)).collect(),
+        Type::Record(fields) => fields.iter().flat_map(|(_, t)| collect_index_vars(t, resolve)).collect(),
         _ => BTreeSet::new(),
     }
 }
@@ -2636,8 +2651,9 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // entry point: `let f: A -> Vec(n) = fn(x) = <body>`
                     // now checks <body> against Vec(n) directly.
                     Some(t) => {
-                        let (val_row, val4) = check_against_rigid(arena, val, &t, &cur_ctx, spans, infer)?;
-                        (t.clone(), val_row, val4)
+                        let (t, renames) = open_signature(&t, infer);
+                        let (val_row, val4) = check_against_rigid(arena, val, &t, &renames, &cur_ctx, spans, infer)?;
+                        (t, val_row, val4)
                     }
                     None => {
                         let (val_ty, val_row, val2) = elaborate(arena, val, &cur_ctx, spans, infer)?;
@@ -2663,7 +2679,12 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // which one happens to come first in the `and` chain.
             Expr::LetRec(bindings, body) => {
                 let mut val_ctx = cur_ctx.clone();
-                for (name, ann, _) in bindings.iter() {
+                // Each annotation opened once (open_signature), so the
+                // pre-binding below and the value check share its renames.
+                let opened: Vec<Option<(Type, Renames)>> =
+                    bindings.iter().map(|(_, ann, _)| ann.as_ref().map(|t| open_signature(t, infer))).collect();
+                for ((name, _, _), ann) in bindings.iter().zip(&opened) {
+                    let ann = ann.as_ref().map(|(t, _)| t);
                     val_ctx = match ann {
                         // Generalized, not plain extend: a fully-given
                         // annotation makes checking mode against it
@@ -2678,15 +2699,15 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     };
                 }
                 let mut elaborated = Vec::with_capacity(bindings.len());
-                for (name, ann, val) in bindings.iter() {
+                for ((name, _, val), ann) in bindings.iter().zip(opened) {
                     // Same check_against restructuring as Expr::Let just
                     // above -- see its own comment. `cur_mode` is likewise
                     // untouched: each binding's annotation is its own
                     // self-contained expected type.
                     let (bound_ty, val_row, val3) = match ann {
-                        Some(t) => {
-                            let (val_row, val4) = check_against_rigid(arena, *val, t, &val_ctx, spans, infer)?;
-                            (t.clone(), val_row, val4)
+                        Some((t, renames)) => {
+                            let (val_row, val4) = check_against_rigid(arena, *val, &t, &renames, &val_ctx, spans, infer)?;
+                            (t, val_row, val4)
                         }
                         None => {
                             let (val_ty, val_row, val2) = elaborate(arena, *val, &val_ctx, spans, infer)?;
@@ -2702,6 +2723,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 cur_expr = body;
             }
             Expr::Lambda(param, ann, body) => {
+                let ann = ann.map(|t| scoped_annotation(&t, infer));
                 // The one place `cur_mode` actually changes: if the
                 // caller already knows this Lambda must have type
                 // Fun(param_ty, _, ret_ty) -- e.g. it's the value of a
@@ -2954,14 +2976,73 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
 // compose. Non-function annotations (`let x: Vec(n) = [1, 2]`) keep their
 // flexible, binding-style variables: there `n` is an existential to be
 // inferred from the value, not a signature parameter. See spec 2026-10-07.
-fn check_against_rigid(arena: &mut Arena, val: ExprRef, ann: &Type, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<(EffectRow, ExprRef), TypeError> {
+// `renames` (from open_signature) are in force for the value only, then
+// restored, the same way the rigid set is.
+fn check_against_rigid(
+    arena: &mut Arena,
+    val: ExprRef,
+    ann: &Type,
+    renames: &[(String, String)],
+    ctx: &Ctx,
+    spans: &SpanMap,
+    infer: &mut InferCtx,
+) -> Result<(EffectRow, ExprRef), TypeError> {
     let signature_vars = if matches!(ann, Type::Fun(..)) { free_index_vars_resolved(ann, infer) } else { BTreeSet::new() };
     let added: Vec<String> = signature_vars.into_iter().filter(|v| infer.rigid_index.insert(v.clone())).collect();
+    let prior: Vec<(String, Option<String>)> =
+        renames.iter().map(|(from, to)| (from.clone(), infer.index_rename.insert(from.clone(), to.clone()))).collect();
     let result = check_against(arena, val, ann, ctx, spans, infer);
+    for (from, old) in prior.into_iter().rev() {
+        match old {
+            Some(old) => infer.index_rename.insert(from, old),
+            None => infer.index_rename.remove(&from),
+        };
+    }
     for v in &added {
         infer.rigid_index.remove(v);
     }
     result
+}
+
+// An annotation as read inside an annotated binding's value: names that an
+// enclosing open_signature renamed denote the renamed variable.
+fn scoped_annotation(ann: &Type, infer: &InferCtx) -> Type {
+    if infer.index_rename.is_empty() {
+        return ann.clone();
+    }
+    let map: HashMap<String, IndexExpr> =
+        infer.index_rename.iter().map(|(from, to)| (from.clone(), IndexExpr::Var(to.clone()))).collect();
+    subst_type(ann, &HashMap::new(), &HashMap::new(), &map)
+}
+
+// A function signature's index variables are its own parameters. Index
+// variable names are program-global strings, and a non-function annotation
+// (`let a: Vec(n) = [1, 2]`) binds its `n` existentially for the rest of the
+// program, so a later signature reusing the name would otherwise inherit
+// `n = 2` instead of quantifying. Rename such names (bound in index_subst,
+// and not an enclosing signature's own rigid variable, which a nested
+// signature deliberately shares) to fresh ones. Returns the renamed
+// annotation and the renames to scope over the value (check_against_rigid).
+type Renames = Vec<(String, String)>;
+
+fn open_signature(ann: &Type, infer: &InferCtx) -> (Type, Renames) {
+    let ann = scoped_annotation(ann, infer);
+    if !matches!(ann, Type::Fun(..)) {
+        return (ann, Vec::new());
+    }
+    let renames: Renames = index_vars_as_written(&ann)
+        .into_iter()
+        .filter(|v| infer.index_subst.contains_key(v) && !infer.rigid_index.contains(v))
+        .map(|v| {
+            let fresh = fresh_index_name(&v);
+            (v, fresh)
+        })
+        .collect();
+    if renames.is_empty() {
+        return (ann, renames);
+    }
+    let map: HashMap<String, IndexExpr> = renames.iter().map(|(from, to)| (from.clone(), IndexExpr::Var(to.clone()))).collect();
+    (subst_type(&ann, &HashMap::new(), &HashMap::new(), &map), renames)
 }
 
 // The bidirectional-checking entry point (spec section 6): verify `expr`

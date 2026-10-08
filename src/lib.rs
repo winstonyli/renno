@@ -6451,4 +6451,32 @@ mod tests {
                    and odd: (Vec(n) -> Int) = fun v -> match v | [] -> 0 | h :: t -> even(t) in even([1, 2])";
         assert_eq!(run_source(src).unwrap().as_int(), 1);
     }
+
+    #[test]
+    fn signature_variable_shadows_an_earlier_existential_of_the_same_name() {
+        // `let a: Vec(n) = [1, 2]` binds the existential n := 2 for the rest of
+        // the program; a later function signature reusing the name `n` must
+        // still quantify its own variable, not inherit 2.
+        let accepted = [
+            ("let a: Vec(n) = [1, 2] in let f: (Vec(n) -> Vec(n)) = fun v -> v in f([1, 2, 3])", "[1, 2, 3]"),
+            ("let a: Vec(n) = [1, 2] in let rec f: (Vec(n) -> Vec(n)) = fun v -> v in f([1, 2, 3])", "[1, 2, 3]"),
+            // a body annotation reusing `n` denotes the signature's variable
+            ("let a: Vec(n) = [1, 2] in let f: (Vec(n) -> Vec(n)) = fun v -> let w: Vec(n) = v in w in f([1, 2, 3])", "[1, 2, 3]"),
+            ("let a: Vec(n) = [1, 2] in let f: (Vec(n) -> Vec(n)) = fun v: Vec(n) -> v in f([1, 2, 3])", "[1, 2, 3]"),
+        ];
+        for (src, want) in accepted {
+            assert_eq!(run_source(src).unwrap().to_string(), want, "{src}");
+        }
+        // ...and stays rigid: a body that only fits the old n = 2 is rejected.
+        let src = "let a: Vec(n) = [1, 2] in let f: (Vec(n) -> Vec(n)) = fun v -> [1, 2] in 0";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("fixed by the signature"), "unexpected message: {err}");
+        // The existential itself is untouched: a later non-function reuse still conflicts.
+        let src = "let a: Vec(n) = [1, 2] in let f: (Vec(n) -> Vec(n)) = fun v -> v in let b: Vec(n) = [1, 2, 3] in 0";
+        assert!(run_source(src).is_err(), "existential n = 2 must still conflict with length 3");
+        // Deliberate consequence: a signature cannot capture that existential.
+        // `Int -> Vec(n)` promises every length, so returning the length-2 `a` is rejected.
+        let src = "let a: Vec(n) = [1, 2] in let f: (Int -> Vec(n)) = fun k -> a in 0";
+        assert!(run_source(src).unwrap_err().contains("fixed by the signature"));
+    }
 }
