@@ -1354,10 +1354,11 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
         // for the matching "Phase 2 only" note on the index side).
         Type::Indexed(wrapped, index) => match wrapped.as_ref() {
             Type::List(_) => build_checked(arena, e, to, |arena, v| {
+                let (cond, len_eq) = build_indexed_shape_cond(arena, v, index, env);
                 if env.defer {
-                    record_obligation(index, env);
+                    record_obligation(len_eq, index, env);
                 }
-                build_indexed_shape_cond(arena, v, index, env)
+                cond
             }),
             _ => e,
         },
@@ -1438,8 +1439,10 @@ impl IndexWitness {
 // index with every binding known at the crossing substituted (runtime_index),
 // so a Match arm's hypothesis, restored after the arm, stays in force.
 // `witnesses` are the (variable, hidden alias) pairs in scope at the
-// crossing, outermost first.
+// crossing, outermost first. `len_eq` is the check's `len(value) == <index>`
+// node, which resolve_obligations patches in place.
 struct Obligation {
+    len_eq: ExprRef,
     index: IndexExpr,
     witnesses: Vec<(String, String)>,
 }
@@ -1495,16 +1498,44 @@ fn runtime_index(e: &IndexExpr, infer: &InferCtx, witness_vars: &[&str], by_alia
 
 // Records an obligation for a crossing outside a union when its index has a
 // variable index_var_to_expr cannot give a runtime value (the check built
-// for it holds that clean failure until resolved).
-fn record_obligation(index: &IndexExpr, env: &CheckEnv) {
+// for it holds that clean failure until resolved). Every witness in scope
+// is marked used: the resolved check may read any of them, and their alias
+// binders are emitted (or not) before typechecking finishes.
+fn record_obligation(len_eq: ExprRef, index: &IndexExpr, env: &CheckEnv) {
     let in_scope: Vec<&IndexWitness> = env.infer.index_witness.iter().chain(env.local.iter().copied()).collect();
     let vars: Vec<&str> = in_scope.iter().map(|w| w.var.as_str()).collect();
     let index = runtime_index(index, env.infer, &vars, false);
     if free_index_vars(&index).iter().all(|v| vars.contains(&v.as_str())) {
         return;
     }
+    for w in &in_scope {
+        w.used.set(true);
+    }
     let witnesses = in_scope.iter().map(|w| (w.var.clone(), w.hidden.clone())).collect();
-    env.infer.obligations.borrow_mut().push(Obligation { index, witnesses });
+    env.infer.obligations.borrow_mut().push(Obligation { len_eq, index, witnesses });
+}
+
+// Patches every obligation's `len(value) == <index>` node once inference has
+// finished, so bindings made after the crossing count: the index under the
+// final bindings, each variable read from a witness in scope at the
+// crossing, otherwise the clean "no runtime value" failure. Runs before
+// anything evaluates the tree.
+fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
+    for ob in infer.obligations.take() {
+        let index = ob.current_index(infer);
+        let len_call = match &arena[ob.len_eq] {
+            Expr::BinOp(BinOp::Eq, len_call, _) => *len_call,
+            _ => unreachable!("an obligation's len_eq is the BinOp built by build_indexed_shape_cond"),
+        };
+        let witnesses: Vec<IndexWitness> = ob
+            .witnesses
+            .iter()
+            .map(|(var, hidden)| IndexWitness { var: var.clone(), hidden: hidden.clone(), used: Cell::new(true) })
+            .collect();
+        let env = CheckEnv { infer, local: witnesses.iter().collect(), defer: false };
+        let index_ref = index_expr_to_expr(arena, &index, &env);
+        arena[ob.len_eq] = Expr::BinOp(BinOp::Eq, len_call, index_ref);
+    }
 }
 
 // What the runtime-check builders (build_boundary_check and friends) need:
@@ -1608,15 +1639,16 @@ fn index_var_to_expr(arena: &mut Arena, name: &str, env: &CheckEnv) -> ExprRef {
 // exactly once) while build_shape_predicate uses it directly as its own
 // bare predicate (no let-binding, callers may OR several of these
 // together) -- see each caller's own doc comment for why they need
-// different wrapping.
-fn build_indexed_shape_cond(arena: &mut Arena, value_ref: ExprRef, index: &IndexExpr, env: &CheckEnv) -> ExprRef {
+// different wrapping. Also returns the `len(value) == <index>` node, which
+// a deferred obligation patches in place (resolve_obligations).
+fn build_indexed_shape_cond(arena: &mut Arena, value_ref: ExprRef, index: &IndexExpr, env: &CheckEnv) -> (ExprRef, ExprRef) {
     let is_list = build_predicate_call(arena, "is_list", value_ref);
     let len_var = arena.push(Expr::Var("len".to_string()));
     let len_call = arena.push(Expr::App(len_var, value_ref));
     let index_expr = index_expr_to_expr(arena, index, env);
     let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, index_expr));
     let false_lit = arena.push(Expr::Bool(false));
-    arena.push(Expr::If(is_list, len_eq, false_lit))
+    (arena.push(Expr::If(is_list, len_eq, false_lit)), len_eq)
 }
 
 // `let __check_tmp = e in if <alt1-shape> then <alt1's OWN full check>
@@ -1747,7 +1779,7 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, env: 
         // before this phase can construct one yet -- so it still falls
         // back to shape-only delegation, unchanged.
         Type::Indexed(wrapped, index) => match wrapped.as_ref() {
-            Type::List(_) => build_indexed_shape_cond(arena, value_ref, index, env),
+            Type::List(_) => build_indexed_shape_cond(arena, value_ref, index, env).0,
             _ => build_shape_predicate(arena, value_ref, wrapped, env, visiting),
         },
     }
@@ -4180,6 +4212,7 @@ pub fn check(arena: &mut Arena, root: ExprRef, spans: &SpanMap) -> Result<ExprRe
 pub fn check_with_named_types(arena: &mut Arena, root: ExprRef, spans: &SpanMap, named_types: HashMap<String, Type>) -> Result<ExprRef, TypeError> {
     let mut infer = InferCtx::new(named_types);
     let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), spans, &mut infer)?;
+    resolve_obligations(arena, &infer);
     match row {
         EffectRow::Closed(unhandled) if !unhandled.is_empty() => {
             let names: Vec<_> = unhandled.into_iter().collect();

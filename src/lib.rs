@@ -6632,4 +6632,43 @@ mod tests {
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         assert!(typecheck::check(&mut arena, root, &spans).is_ok(), "{src}");
     }
+
+    #[test]
+    fn a_deferred_length_check_uses_the_bindings_known_when_typechecking_finishes() {
+        // Each crossing's index variable is still unbound when the crossing is
+        // elaborated; something later decides it. (matching, wrong length, len)
+        let cases = [
+            // the caller's annotation
+            ("let f = fun v: Vec(n) -> v in let x: Dyn = [1, 2, 3] in let y: Vec(3) = f(x) in len(y)",
+             "let f = fun v: Vec(n) -> v in let x: Dyn = [1, 2] in let y: Vec(3) = f(x) in len(y)", 3),
+            // through a monomorphic wrapper: the check runs inside mk
+            ("let f = fun v: Vec(n) -> v in let x: Dyn = [1, 2, 3] in let mk = fun u -> f(x) in let a: Vec(3) = mk(0) in len(a)",
+             "let f = fun v: Vec(n) -> v in let x: Dyn = [1, 2] in let mk = fun u -> f(x) in let a: Vec(3) = mk(0) in len(a)", 3),
+            // a sibling annotation after the crossing binds the existential n
+            ("let x: Dyn = [7, 8] in let y: Vec(n) = x in let z: Vec(n) = [7, 8] in len(y)",
+             "let x: Dyn = [7] in let y: Vec(n) = x in let z: Vec(n) = [7, 8] in len(y)", 2),
+            // an enclosing signature's result type
+            ("let g: (Int -> Vec(2)) = fun i -> let f = fun v: Vec(k) -> v in let r: Dyn = [1, 2] in f(r) in len(g(0))",
+             "let g: (Int -> Vec(2)) = fun i -> let f = fun v: Vec(k) -> v in let r: Dyn = [1] in f(r) in len(g(0))", 2),
+            // the crossing's variable ends up equal to a Vec(n) parameter's length
+            ("let f = fun v: Vec(n) -> let g = fun u: Vec(k) -> u in let x: Dyn = [1, 2] in let z: Vec(n) = g(x) in z in len(f([5, 6]))",
+             "let f = fun v: Vec(n) -> let g = fun u: Vec(k) -> u in let x: Dyn = [1, 2] in let z: Vec(n) = g(x) in z in len(f([5, 6, 7]))", 2),
+        ];
+        for (good, bad, want) in cases {
+            assert_eq!(run_source(good).unwrap().as_int(), want, "{good}");
+            let err = run_source(bad).unwrap_err();
+            assert!(err.contains("type error: expected [Dyn]("), "{bad}: unexpected message: {err}");
+        }
+    }
+
+    #[test]
+    fn a_deferred_check_over_a_variable_with_no_runtime_value_stays_a_clean_error() {
+        // In the cons arm n = m + 1, and the crossing's k ends up equal to
+        // m + 1. The arm's m has no runtime value (only n, the parameter's
+        // length, has a witness), so the check fails cleanly, never skipped.
+        let src = "let rec f: (Vec(n) -> Int) = fun v -> match v | [] -> 0 | h :: t -> \
+                   let g = fun u: Vec(k) -> u in let x: Dyn = [1] in let z: Vec(n) = g(x) in 0 in f([1, 2])";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("has no runtime value"), "unexpected message: {err}");
+    }
 }
