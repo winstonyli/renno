@@ -7182,14 +7182,6 @@ mod tests {
     }
 
     #[test]
-    fn a_vec_n_function_reached_through_an_untyped_parameter_is_unchecked_on_entry_known_limitation() {
-        // The untouched-on-entry property still holds through the parked Var-param hole.
-        let src = "let f = fun v: Vec(n) -> if true then 0 else (let r: Dyn = [1] in let q: Vec(n) = r in 0) in \
-                   let ap = fun g -> map(g)([5]) in ap(f)";
-        assert_eq!(run_source(src).unwrap(), Outcome::List(vec![Outcome::Int(0)]));
-    }
-
-    #[test]
     fn a_monomorphic_vec_n_witness_checks_list_shape_only_in_the_closure_form_known_limitation() {
         // `n` is bound by an earlier Dyn-to-Vec(n) check; the wrapper gets a
         // per-call witness, so DOWN checks only that the argument is a list.
@@ -7402,6 +7394,168 @@ mod tests {
         let bad = "handle (let g = if 1 < 2 then (fun x: Int -> perform choose(x)) else (fun s: Str -> 0) in g(true)) \
                    with handler choose(p, resume) -> resume(1) + resume(2)";
         assert_clean_rejection(bad, BAD_INT);
+    }
+
+    // --- Var-typed passthrough to Dyn sinks (spec 2026-10-08-var-passthrough-casts) ---
+
+    #[test]
+    fn a_typed_function_passed_through_an_untyped_parameter_to_a_dyn_sink_is_cast() {
+        let f = "fun x: Int -> x + 1";
+        let two = "fun a: Int -> fun b: Int -> a + b";
+        for src in [
+            format!("let ap = fun g -> map(g)([true]) in ap({f})"),
+            format!("let ap = fun g -> filter(g)([true]) in ap(fun x: Int -> x < 2)"),
+            format!("let ap = fun g -> fold(g)(0)([true]) in ap({two})"),
+            // Hops: each untyped layer is generalised and instantiated afresh.
+            format!("let ap = fun g -> let ap2 = fun h -> map(h)([true]) in ap2(g) in ap({f})"),
+            format!("let ap = fun g -> let ap2 = fun h -> let ap3 = fun k -> map(k)([true]) in ap3(h) in ap2(g) in ap({f})"),
+            // Directly applied lambda (monomorphic parameter).
+            format!("(fun g -> map(g)([true]))({f})"),
+            // Perform payload.
+            format!("let ap = fun g -> perform op(g) in handle ap({f}) with handler op(p, resume) -> resume(p(true))"),
+            // Closure-form argument.
+            format!("let f = {f} in let ap = fun g -> map(g)([true]) in ap(f)"),
+            // Curried: the UP recursion casts the returned function too.
+            "let ap = fun g -> map(g)([true]) in ap(fun a: Int -> fun b: Int -> a + b)".to_string(),
+            "let ap = fun g -> let r = perform op(g) in r in \
+             handle ap(fun a: Int -> fun b: Int -> a + b) with handler op(p, resume) -> resume(p(1)(true))".to_string(),
+        ] {
+            assert_clean_rejection(&src, BAD_INT);
+        }
+    }
+
+    #[test]
+    fn correct_calls_through_an_untyped_dyn_sink_parameter_are_unchanged() {
+        let list = |xs: &[i64]| Outcome::List(xs.iter().map(|n| Outcome::Int(*n)).collect());
+        assert_eq!(run_source("let ap = fun g -> map(g)([1]) in ap(fun x: Int -> x + 1)").unwrap(), list(&[2]));
+        assert_eq!(run_source("let ap = fun g -> map(g)([1]) in ap(fun x -> x + 1)").unwrap(), list(&[2]));
+        assert_eq!(run_source("let ap = fun g -> fold(g)(0)([1, 2]) in ap(fun a: Int -> fun b: Int -> a + b)").unwrap().as_int(), 3);
+        assert_eq!(
+            run_source("let ap = fun g -> let ap2 = fun h -> map(h)([1]) in ap2(g) in ap(fun x: Int -> x + 1)").unwrap(),
+            list(&[2])
+        );
+        assert_eq!(run_source("(fun g -> map(g)([1]))(fun x: Int -> x + 1)").unwrap(), list(&[2]));
+        assert_eq!(
+            run_source("let ap = fun g -> perform op(g) in handle ap(fun a: Int -> a + 1) with handler op(p, resume) -> resume(p(1))")
+                .unwrap()
+                .as_int(),
+            2
+        );
+        // A non-function argument and independent instantiations (the flag
+        // lives on the scheme variable, not on an instance).
+        assert_eq!(run_source("let ap = fun g -> map(g)([1]) in ap(fun x: Int -> x + 1)").unwrap(), list(&[2]));
+        // The second instantiation is checked on its own (previously this
+        // silently accepted a Str function applied to an Int).
+        let two_calls = "let ap = fun g -> map(g)([1]) in let a = ap(fun x: Int -> x + 1) in ap(fun s: Str -> s)";
+        assert_clean_rejection(two_calls, "type error: expected Str, found Int");
+        let ok_then_bad = "let ap = fun g -> map(g)([true]) in let a = ap(fun x -> x) in ap(fun x: Int -> x + 1)";
+        assert_clean_rejection(ok_then_bad, BAD_INT);
+        let bad_then_ok = "let ap = fun g -> map(g)([true]) in let a = ap(fun x: Int -> x + 1) in a";
+        assert_clean_rejection(bad_then_ok, BAD_INT);
+        // A curried function called correctly.
+        let curried = "let ap = fun g -> fold(g)(0)([1, 2]) in ap(fun a: Int -> fun b: Int -> a + b)";
+        assert_eq!(run_source(curried).unwrap().as_int(), 3);
+    }
+
+    #[test]
+    fn a_non_function_reaching_an_untyped_dyn_sink_parameter_is_unchanged() {
+        assert_eq!(run_source("let ap = fun g -> let r = perform op(g) in r in handle ap(5) with handler op(p, resume) -> resume(p)").unwrap().as_int(), 5);
+        assert_eq!(run_source("let ap = fun g -> len(g) in ap([1, 2])").unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_multi_shot_handler_over_a_cast_dyn_sink_still_resumes_twice() {
+        let ok = "let ap = fun g -> perform op(g) in \
+                  handle ap(fun a: Int -> a + 1) with handler op(p, resume) -> resume(p(1)) + resume(p(2))";
+        assert_eq!(run_source(ok).unwrap().as_int(), 5);
+        let bad = "let ap = fun g -> perform op(g) in \
+                   handle ap(fun a: Int -> a + 1) with handler op(p, resume) -> resume(p(1)) + resume(p(true))";
+        assert_clean_rejection(bad, BAD_INT);
+    }
+
+    #[test]
+    fn unannotated_callbacks_through_an_untyped_dyn_sink_parameter_emit_no_wrapper() {
+        for src in [
+            "let ap = fun g -> map(g)([1]) in ap(fun x -> x + 1)",
+            "let ap = fun g -> map(g)([1]) in ap(fun x -> x)",
+            "let ap = fun g -> let ap2 = fun h -> map(h)([1]) in ap2(g) in ap(fun x -> x)",
+            "let ap = fun g -> perform op(g) in handle ap(fun x -> x) with handler op(p, resume) -> resume(p)",
+            "(fun g -> map(g)([1]))(fun x -> x)",
+            // Sink flagged, but nothing typed reaches it.
+            "let ap = fun g -> map(g)([1]) in ap(map)",
+            // A polymorphic use with no sink at all.
+            "let apply = fun g -> g(1) in apply(fun x: Int -> x)",
+        ] {
+            assert!(!elaborated_has_wrapper(src) && !elaborated_has_cast(src), "{src}");
+        }
+        // The typed counterparts do carry the wrapper.
+        for src in [
+            "let ap = fun g -> map(g)([1]) in ap(fun x: Int -> x + 1)",
+            "(fun g -> map(g)([1]))(fun x: Int -> x + 1)",
+            "let ap = fun g -> perform op(g) in handle ap(fun x: Int -> x) with handler op(p, resume) -> resume(p)",
+        ] {
+            // Literal lambdas are rebuilt in place (`__ca`), no `__cf` closure.
+            assert!(elaborated_has_cast(src), "{src}");
+        }
+    }
+
+    #[test]
+    fn marking_a_dyn_sink_variable_loses_no_polymorphic_precision() {
+        // Option (c) (bind the Var to Dyn) would turn these into Dyn results.
+        let src = "let f = fun xs -> let n = len(xs) in xs in let ys: [Int] = f([1, 2]) in ys";
+        assert_eq!(run_source(src).unwrap(), Outcome::List(vec![Outcome::Int(1), Outcome::Int(2)]));
+        assert!(!elaborated_has_wrapper(src) && !elaborated_has_cast(src));
+        // The argument comes back with its own type: `g` stays a function.
+        let id2 = "let id2 = fun g -> let r = map(g)([1]) in g in (id2(fun x: Int -> x + 1))(5)";
+        assert_eq!(run_source(id2).unwrap().as_int(), 6);
+        let id2_bad = "let id2 = fun g -> let r = map(g)([1]) in g in (id2(fun x: Int -> x + 1))(true)";
+        let err = run_source(id2_bad).expect_err("static");
+        assert!(err.contains("type mismatch"), "{err}");
+    }
+
+    #[test]
+    fn a_var_bound_to_a_function_before_the_sink_keeps_its_behaviour() {
+        // `g(1)` first fixes g : Int -> Int, so the ordinary cast fires.
+        let call_first = "let ap = fun g -> let r = g(1) in map(g)([true]) in ap(fun x: Int -> x + 1)";
+        assert_clean_rejection(call_first, BAD_INT);
+        // Variables unified with Dyn or passed to typed callees already worked.
+        for src in [
+            "let ap = fun g -> let d: Dyn = g in d(true) in ap(fun x: Int -> x + 1)",
+            "let call = fun h: Dyn -> h(true) in let ap = fun g -> call(g) in ap(fun x: Int -> x + 1)",
+            "let call = fun h: Dyn -> h(true) in let ap = fun g -> let ap2 = fun k -> call(k) in ap2(g) in ap(fun x: Int -> x + 1)",
+            "let ap = fun g -> let d: Dyn = g in map(d)([true]) in ap(fun x: Int -> x + 1)",
+        ] {
+            assert_clean_rejection(src, BAD_INT);
+        }
+        let ret = "let ap = fun g -> g in let h: Dyn = ap(fun a: Int -> a + 1) in h(true)";
+        assert_clean_rejection(ret, BAD_INT);
+    }
+
+    #[test]
+    fn sink_first_then_call_is_still_unchecked_known_limitation() {
+        // The Var is bound to a Fun only after the sink was elaborated; the
+        // flag dies with the binding (spec 2026-10-08-var-passthrough-casts
+        // section 7, item 1). Pinned: flips if a deferred sink patch lands.
+        let src = "let ap = fun g -> let r = map(g)([true]) in g(1) in ap(fun x: Int -> x + 1)";
+        let r = std::panic::catch_unwind(|| run_source(src));
+        let clean = matches!(&r, Ok(Err(e)) if e.contains(BAD_INT));
+        assert!(!clean, "now rejected cleanly; remove the known_limitation pin");
+    }
+
+    #[test]
+    fn a_vec_n_function_through_an_untyped_dyn_sink_parameter_is_checked_for_list_shape() {
+        // `map(g)` applies g to each ELEMENT. The wrapper's DOWN is `is_list`
+        // only (the witness is the wrapper's own, no length check), so a list
+        // element still returns [0]...
+        let f = "let f = fun v: Vec(n) -> if true then 0 else (let r: Dyn = [1] in let q: Vec(n) = r in 0) in";
+        let ok = format!("{f} let ap = fun g -> map(g)([[5]]) in ap(f)");
+        assert_eq!(run_source(&ok).unwrap(), Outcome::List(vec![Outcome::Int(0)]));
+        // ...and a non-list element, which the old pin of this test let in
+        // unchecked (`map(g)([5])` returned [0]), is now rejected cleanly.
+        for el in ["5", "true"] {
+            let bad = format!("{f} let ap = fun g -> map(g)([{el}]) in ap(f)");
+            assert_clean_rejection(&bad, "type error: expected [Dyn], found");
+        }
     }
 
     #[test]

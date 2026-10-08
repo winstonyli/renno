@@ -1,0 +1,5 @@
+// Runtime contract error: `ap` is unannotated, so its parameter is a type
+// variable that reaches the Dyn callee `map`; the typed function keeps its
+// own parameter check and rejects the Bool.
+let ap = fun g -> map(g)([true]) in
+ap(fun x: Int -> x + 1)

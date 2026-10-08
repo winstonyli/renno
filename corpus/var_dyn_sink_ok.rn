@@ -1,0 +1,11 @@
+// A typed function handed to an unannotated parameter that feeds a Dyn sink
+// (a prelude HOF, a Perform payload, an extra untyped hop) still works when
+// called correctly, and an unannotated callback pays nothing.
+let ap = fun g -> map(g)([1, 2]) in
+let ap2 = fun g -> let hop = fun h -> map(h)([10]) in hop(g) in
+let via_effect = fun g -> perform op(g) in
+let a = ap(fun x: Int -> x + 1) in
+let b = ap2(fun x: Int -> x * 2) in
+let c = handle via_effect(fun x: Int -> x - 1) with handler op(p, resume) -> resume(p(5)) in
+let d = ap(fun x -> x + 100) in
+len(a) + len(b) + c + len(d)

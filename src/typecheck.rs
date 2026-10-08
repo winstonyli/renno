@@ -141,6 +141,13 @@ pub(crate) struct InferCtx {
     // registry is a static, parse-time-complete fact about the
     // program, unlike `subst`.
     named_types: HashMap<String, Type>,
+    // Names of type variables whose value reaches a Dyn sink (the argument of
+    // a Dyn callee, a Perform payload) while the variable is still unbound
+    // (spec 2026-10-08-var-passthrough-casts). The Fun-callee App arm casts a
+    // typed function argument to Dyn when the callee's parameter is such a
+    // variable. Monotone like `subst` (no rollback: a stale flag costs at most
+    // one extra, still-sound cast); propagated by `lookup` and `unify`.
+    dyn_sunk: HashSet<String>,
 }
 
 impl InferCtx {
@@ -154,7 +161,19 @@ impl InferCtx {
             obligations: RefCell::new(Vec::new()),
             repeatable_depth: 0,
             named_types,
+            dyn_sunk: HashSet::new(),
         }
+    }
+
+    // Flags `ty` as reaching a Dyn sink if it is (still) a bare type variable.
+    fn note_dyn_sink(&mut self, ty: &Type) {
+        if let Type::Var(v) = self.resolve(ty) {
+            self.dyn_sunk.insert(v);
+        }
+    }
+
+    fn is_dyn_sunk(&self, ty: &Type) -> bool {
+        !self.dyn_sunk.is_empty() && matches!(self.resolve(ty), Type::Var(v) if self.dyn_sunk.contains(&v))
     }
 
     #[cfg(test)]
@@ -417,6 +436,14 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
             if occurs_in(name, other, infer) {
                 return Err(TypeError(format!("infinite type: {name} occurs in {other}"), span));
             }
+            // Two variables being equated share one flag (a hop's instance
+            // aliasing the caller's variable carries the sink back to it).
+            if let Type::Var(o) = other
+                && (infer.dyn_sunk.contains(name) || infer.dyn_sunk.contains(o))
+            {
+                infer.dyn_sunk.insert(name.clone());
+                infer.dyn_sunk.insert(o.clone());
+            }
             infer.subst.insert(name.clone(), other.clone());
             Ok(())
         }
@@ -674,6 +701,15 @@ pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
                 .collect();
             let type_subst: HashMap<String, Type> =
                 scheme.type_vars.iter().map(|v| (v.clone(), infer.fresh_var(v))).collect();
+            // An instance of a quantified variable that reaches a Dyn sink
+            // reaches it too.
+            if !infer.dyn_sunk.is_empty() {
+                for (v, fresh) in &type_subst {
+                    if infer.dyn_sunk.contains(v) {
+                        infer.note_dyn_sink(fresh);
+                    }
+                }
+            }
             let index_subst: HashMap<String, IndexExpr> =
                 scheme.index_vars.iter().map(|v| (v.clone(), IndexExpr::Var(fresh_index_name(v)))).collect();
             subst_type(&scheme.ty, &row_subst, &type_subst, &index_subst)
@@ -3848,6 +3884,9 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // changes what coerce sees when something upstream
                     // has ALREADY resolved it.
                     let param_ty_resolved = infer.resolve_deep(param_ty);
+                    // Read the flag now: unify_fits below binds the variable
+                    // to the argument's type and with it the evidence.
+                    let sunk = infer.is_dyn_sunk(&param_ty_resolved);
                     let a3 = coerce_check(arena, a2, &a_ty, &param_ty_resolved, spans[a], &CheckEnv::new(infer))?;
                     let mut row_subst = HashMap::new();
                     // Deliberately the RAW param_ty here, not
@@ -3867,7 +3906,10 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // param_ty_resolved is stale after unify_fits (it still
                     // shows the Var an unannotated `apply(f)` just bound), so
                     // the cast re-resolves both sides.
-                    let a3 = coerce_cast(arena, a3, &a_ty, param_ty, &CheckEnv::new(infer));
+                    // A parameter variable that feeds a Dyn sink in the callee's
+                    // body is cast like a Dyn parameter.
+                    let cast_to = if sunk { &Type::Dyn } else { param_ty };
+                    let a3 = coerce_cast(arena, a3, &a_ty, cast_to, &CheckEnv::new(infer));
                     // resolve_deep alone only ever consults infer.subst
                     // (ordinary Type::Var bindings) -- it knows nothing
                     // about row_subst, built separately just above.
@@ -3910,6 +3952,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // The argument crosses into an unknown function, so it is
                     // cast to Dyn like any other Dyn position (a typed
                     // function argument gets its wrapper).
+                    infer.note_dyn_sink(&a_ty);
                     let a3 = coerce_cast(arena, a2, &a_ty, &Type::Dyn, &CheckEnv::new(infer));
                     (EffectRow::Dyn, Type::Dyn, arena.push(Expr::App(f3, a3)))
                 }
@@ -4136,6 +4179,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         Expr::Perform(effect, payload) => {
             let (payload_ty, payload_row, payload2) = elaborate(arena, payload, ctx, spans, infer)?;
             // The handler receives the payload as Dyn.
+            infer.note_dyn_sink(&payload_ty);
             let payload2 = coerce_cast(arena, payload2, &payload_ty, &Type::Dyn, &CheckEnv::new(infer));
             let row = EffectRow::union(&payload_row, &EffectRow::single(&effect));
             Ok((Type::Dyn, row, arena.push(Expr::Perform(effect, payload2))))
