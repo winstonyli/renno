@@ -6303,4 +6303,77 @@ mod tests {
             assert!(err.contains("index 3 does not unify with index 2"), "unexpected message: {err}");
         }
     }
+
+    // --- rigid index variables (spec 2026-10-07) ---
+
+    fn rigid_infer(names: &[&str]) -> crate::typecheck::InferCtx {
+        let mut infer = crate::typecheck::InferCtx::new(std::collections::HashMap::new());
+        for n in names {
+            infer.rigid_index.insert((*n).to_string());
+        }
+        infer
+    }
+
+    fn var(n: &str) -> crate::index_expr::IndexExpr {
+        crate::index_expr::IndexExpr::Var(n.to_string())
+    }
+
+    #[test]
+    fn rigid_index_variable_refuses_to_bind_to_a_literal() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::unify_index_expr;
+        let span = crate::span::Span { start: 0, end: 0 };
+        let mut infer = rigid_infer(&["n"]);
+        let err = unify_index_expr(&var("n"), &IndexExpr::Lit(3), &mut infer, span).unwrap_err();
+        assert!(err.0.contains("index variable n is fixed by the signature"), "unexpected: {}", err.0);
+        // Same with the sides swapped, and n stays unbound.
+        assert!(unify_index_expr(&IndexExpr::Lit(3), &var("n"), &mut infer, span).is_err());
+        assert_eq!(infer.resolve_index(&var("n")), var("n"));
+    }
+
+    #[test]
+    fn flexible_index_variable_yields_to_a_rigid_one_in_either_order() {
+        use crate::typecheck::unify_index_expr;
+        let span = crate::span::Span { start: 0, end: 0 };
+        let mut infer = rigid_infer(&["n"]);
+        unify_index_expr(&var("n"), &var("m"), &mut infer, span).unwrap();
+        assert_eq!(infer.resolve_index(&var("m")), var("n"));
+        let mut infer = rigid_infer(&["n"]);
+        unify_index_expr(&var("k"), &var("n"), &mut infer, span).unwrap();
+        assert_eq!(infer.resolve_index(&var("k")), var("n"));
+        assert_eq!(infer.resolve_index(&var("n")), var("n"));
+    }
+
+    #[test]
+    fn two_distinct_rigid_variables_do_not_unify_but_a_rigid_equals_itself_modulo_sop() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::unify_index_expr;
+        use std::rc::Rc;
+        let span = crate::span::Span { start: 0, end: 0 };
+        let mut infer = rigid_infer(&["n", "m"]);
+        assert!(unify_index_expr(&var("n"), &var("m"), &mut infer, span).is_err());
+        // n against n + 0 is SOP-equal, so it is accepted without binding.
+        let n_plus_0 = IndexExpr::Add(Rc::new(var("n")), Rc::new(IndexExpr::Lit(0)));
+        unify_index_expr(&var("n"), &n_plus_0, &mut infer, span).unwrap();
+        assert_eq!(infer.resolve_index(&var("n")), var("n"));
+    }
+
+    #[test]
+    fn rigid_equality_is_always_decided_never_unknown() {
+        // Pins spec "Potential future step": SOP equality over index
+        // polynomials proves or refutes, so the Unknown outcome is
+        // unreachable. If a program ever needs it, this test should be the
+        // first thing revisited.
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::unify_index_expr;
+        use std::rc::Rc;
+        let span = crate::span::Span { start: 0, end: 0 };
+        let mul = |a: IndexExpr, b: IndexExpr| IndexExpr::Mul(Rc::new(a), Rc::new(b));
+        let add = |a: IndexExpr, b: IndexExpr| IndexExpr::Add(Rc::new(a), Rc::new(b));
+        let mut infer = rigid_infer(&["n", "m"]);
+        // n*m vs m*n: equal. n*m vs n+m: refuted. Neither is "unknown".
+        let nm = mul(var("n"), var("m"));
+        assert!(unify_index_expr(&nm, &mul(var("m"), var("n")), &mut infer, span).is_ok());
+        assert!(unify_index_expr(&nm, &add(var("n"), var("m")), &mut infer, span).is_err());
+    }
 }

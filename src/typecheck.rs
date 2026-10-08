@@ -104,6 +104,11 @@ pub(crate) struct InferCtx {
     // function's own type-var name collide with an unrelated Vec's
     // own index-var name.
     pub(crate) index_subst: HashMap<String, IndexExpr>,
+    // Index variables that unify_index_expr must NOT bind: the free index
+    // variables of an annotated binding's signature while its value is
+    // checked (spec 2026-10-07). Hypotheses injected by Match write
+    // index_subst directly, so they are unaffected.
+    pub(crate) rigid_index: HashSet<String>,
     // Every genuinely self-referential type alias this program's own
     // parse registered (parser::Parser's own `named_types`, handed in
     // once at construction) -- consulted on demand by
@@ -117,7 +122,7 @@ pub(crate) struct InferCtx {
 
 impl InferCtx {
     pub(crate) fn new(named_types: HashMap<String, Type>) -> InferCtx {
-        InferCtx { subst: HashMap::new(), index_subst: HashMap::new(), named_types }
+        InferCtx { subst: HashMap::new(), index_subst: HashMap::new(), rigid_index: HashSet::new(), named_types }
     }
 
     // Mints a fresh Type::Var -- every unannotated binding site (Lambda
@@ -249,6 +254,26 @@ fn occurs_in_index(name: &str, e: &IndexExpr, infer: &InferCtx) -> bool {
     }
 }
 
+// Outcome of asking whether a rigid index variable's equation holds.
+// SOP normalization over index polynomials either proves two sides equal
+// or refutes them, so `Unknown` is unreachable today; it exists as the
+// marked place for the future gradual runtime check (spec 2026-10-07,
+// "Potential future step").
+enum RigidEq {
+    Equal,
+    Unequal,
+    #[allow(dead_code)]
+    Unknown,
+}
+
+fn classify_rigid_eq(a: &IndexExpr, b: &IndexExpr) -> RigidEq {
+    if crate::index_expr::index_exprs_equal(a, b) {
+        RigidEq::Equal
+    } else {
+        RigidEq::Unequal
+    }
+}
+
 // A real, but DELIBERATELY NARROW unifier for IndexExpr -- see the
 // design spec's own §4 and this plan's Global Constraints for why:
 // this binds a BARE unbound variable to whatever it's compared
@@ -276,7 +301,25 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
     let b = infer.resolve_index_deep(b);
     match (&a, &b) {
         (IndexExpr::Var(n1), IndexExpr::Var(n2)) if n1 == n2 => Ok(()),
+        // A flexible variable yields to a rigid one: bind the flexible side,
+        // never the rigid one. (The or-pattern arm below would otherwise
+        // pick the left variable as the one to bind.)
+        (IndexExpr::Var(rigid), IndexExpr::Var(flex)) if infer.rigid_index.contains(rigid) && !infer.rigid_index.contains(flex) => {
+            infer.index_subst.insert(flex.clone(), IndexExpr::Var(rigid.clone()));
+            Ok(())
+        }
         (IndexExpr::Var(name), other) | (other, IndexExpr::Var(name)) => {
+            // A rigid variable (still unbound: both sides are already
+            // resolved) may only be equated, never bound.
+            if infer.rigid_index.contains(name) {
+                return match classify_rigid_eq(&a, &b) {
+                    RigidEq::Equal => Ok(()),
+                    RigidEq::Unequal | RigidEq::Unknown => Err(TypeError(
+                        format!("index variable {name} is fixed by the signature and cannot equal {other}"),
+                        span,
+                    )),
+                };
+            }
             if occurs_in_index(name, other, infer) {
                 // A structural occurrence isn't always a genuine
                 // infinite-expression violation: `n` against `n + 0` (or
