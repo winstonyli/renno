@@ -117,8 +117,8 @@ pub(crate) struct InferCtx {
     index_rename: HashMap<String, String>,
     // Runtime values for index variables, innermost last: while a Lambda
     // whose parameter is Vec(n) is elaborated, `n` is that parameter's
-    // length. A Dyn-to-Vec(n) boundary check inside reads it from a hidden
-    // binder (`hidden = len(param)`), which the Lambda inserts at its entry
+    // length. A Dyn-to-Vec(n) boundary check inside reads `len(hidden)` of a
+    // hidden alias (`hidden = param`), which the Lambda inserts at its entry
     // only if some check used it. See index_var_to_expr. Pushed and popped
     // by elaborate_mode's Lambda frames; an elaboration error abandons the
     // whole check, so an Err path never needs to pop.
@@ -1381,10 +1381,12 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
     }
 }
 
-// A runtime value for an index variable: `hidden` is an Int variable bound
-// by synthesized code to a list's length (a Lambda's parameter, or a
-// contract's argument). `used` records whether any check read it, so the
-// binder is only emitted when needed (zero overhead otherwise).
+// A runtime value for an index variable: `hidden` is a variable bound by
+// synthesized code to the list itself (a Lambda's parameter, or a
+// contract's argument); a check reads `len(hidden)` at the check site, so
+// the entry path evaluates nothing (an untyped caller passing a non-list
+// is unaffected unless a check actually runs). `used` records whether any
+// check read it, so the binder is only emitted when needed.
 struct IndexWitness {
     var: String,
     hidden: String,
@@ -1393,23 +1395,22 @@ struct IndexWitness {
 
 impl IndexWitness {
     fn new(var: String, param: &str) -> IndexWitness {
-        IndexWitness { var, hidden: fresh_index_name(&format!("len_{param}")), used: Cell::new(false) }
+        IndexWitness { var, hidden: fresh_index_name(&format!("list_{param}")), used: Cell::new(false) }
     }
 
-    // `let hidden = len(list_var) in body`
+    // `let hidden = list_var in body`: an alias, immune to later shadowing
+    // of the parameter's name.
     fn bind(&self, arena: &mut Arena, list_var: &str, body: ExprRef) -> ExprRef {
         let list_ref = arena.push(Expr::Var(list_var.to_string()));
-        let len_call = build_predicate_call(arena, "len", list_ref);
-        arena.push(Expr::Let(self.hidden.clone(), None, len_call, body))
+        arena.push(Expr::Let(self.hidden.clone(), None, list_ref, body))
     }
 }
 
 // What the runtime-check builders (build_boundary_check and friends) need:
-// the type registry, plus the scope an index variable is evaluated in. The
-// typing ctx and InferCtx are the ones in force where the check is spliced;
-// `local` holds witnesses bound inside synthesized code (wrap_fun_contract).
+// the type registry and index state (InferCtx, as of where the check is
+// spliced); `local` holds witnesses bound inside synthesized code
+// (wrap_fun_contract).
 struct CheckEnv<'a> {
-    ctx: &'a Ctx,
     infer: &'a InferCtx,
     local: Vec<&'a IndexWitness>,
 }
@@ -1427,8 +1428,8 @@ fn list_length_var(ty: &Type, infer: &InferCtx) -> Option<String> {
 }
 
 impl<'a> CheckEnv<'a> {
-    fn new(ctx: &'a Ctx, infer: &'a InferCtx) -> CheckEnv<'a> {
-        CheckEnv { ctx, infer, local: Vec::new() }
+    fn new(infer: &'a InferCtx) -> CheckEnv<'a> {
+        CheckEnv { infer, local: Vec::new() }
     }
 }
 
@@ -1458,24 +1459,21 @@ fn index_expr_to_expr(arena: &mut Arena, e: &IndexExpr, env: &CheckEnv) -> ExprR
 }
 
 // An index variable's runtime value, first match wins:
-// 1. a term variable of the same name in scope (the dependent-parameter
-//    convention, `fun n: Int -> fun v: Vec(n) -> ...`) -- unchanged from
-//    before witnesses existed, so every check that already ran keeps its
-//    meaning;
-// 2. a witness: the length of the innermost list parameter (or contract
+// 1. a witness: `len` of the innermost list parameter (or contract
 //    argument) typed Vec(name);
-// 3. its static binding in index_subst, translated in turn;
-// 4. otherwise nothing at runtime holds it (an existential from a plain
+// 2. its static binding in index_subst, translated in turn;
+// 3. otherwise nothing at runtime holds it (an existential from a plain
 //    `let x: Vec(n) = <Dyn>`, or a call-site instantiation): the check fails
 //    with a clean type error rather than reading an unbound variable.
+// A same-named TERM variable (`fun n: Int -> fun v: Vec(n)`) is never used:
+// the typechecker does not link a term `n` to the index `n`, so reading it
+// would let a wrong-length value through (or reject a right one).
 fn index_var_to_expr(arena: &mut Arena, name: &str, env: &CheckEnv) -> ExprRef {
-    if env.ctx.get(name).is_some() {
-        return arena.push(Expr::Var(name.to_string()));
-    }
     let witness = env.local.iter().rev().copied().chain(env.infer.index_witness.iter().rev()).find(|w| w.var == name);
     if let Some(w) = witness {
         w.used.set(true);
-        return arena.push(Expr::Var(w.hidden.clone()));
+        let list_ref = arena.push(Expr::Var(w.hidden.clone()));
+        return build_predicate_call(arena, "len", list_ref);
     }
     if let Some(bound) = env.infer.index_subst.get(name) {
         return index_expr_to_expr(arena, bound, env);
@@ -1786,7 +1784,7 @@ fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: 
         Some(w) => {
             let mut local = env.local.clone();
             local.push(w);
-            build_boundary_check(arena, call, &ret_ty, &CheckEnv { ctx: env.ctx, infer: env.infer, local }, visiting)
+            build_boundary_check(arena, call, &ret_ty, &CheckEnv { infer: env.infer, local }, visiting)
         }
         None => build_boundary_check(arena, call, &ret_ty, env, visiting),
     };
@@ -3019,7 +3017,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         Mode::Synth => elaborate_node(arena, cur_expr, &cur_ctx, spans, infer, cur_mode)?,
     };
     if let Mode::Check(expected) = cur_mode {
-        result_expr = coerce(arena, result_expr, &result_ty, expected, spans[cur_expr], &CheckEnv::new(&cur_ctx, infer))?;
+        result_expr = coerce(arena, result_expr, &result_ty, expected, spans[cur_expr], &CheckEnv::new(infer))?;
         unify_fits(expected, &result_ty, infer, spans[cur_expr])?;
         result_ty = expected.clone();
     }
@@ -3071,7 +3069,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     // see this file's own regression history for why skipping this step
     // silently accepted `let f: Int = fun x -> x in ...`).
     if let Mode::Check(expected) = mode {
-        let checked = coerce(arena, result_expr, &result_ty, expected, spans[expr], &CheckEnv::new(ctx, infer))?;
+        let checked = coerce(arena, result_expr, &result_ty, expected, spans[expr], &CheckEnv::new(infer))?;
         unify_fits(expected, &result_ty, infer, spans[expr])?;
         result_ty = expected.clone();
         result_expr = checked;
@@ -3308,7 +3306,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             };
             let checked_target = if matches!(target_ty, Type::Dyn | Type::Var(_)) {
                 let required = Type::Record(Rc::new(vec![(name.clone(), Type::Dyn)]));
-                build_shape_check(arena, target2, &required, &CheckEnv::new(ctx, infer), &HashSet::new())
+                build_shape_check(arena, target2, &required, &CheckEnv::new(infer), &HashSet::new())
             } else {
                 target2
             };
@@ -3433,7 +3431,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // changes what coerce sees when something upstream
                     // has ALREADY resolved it.
                     let param_ty_resolved = infer.resolve_deep(param_ty);
-                    let a3 = coerce(arena, a2, &a_ty, &param_ty_resolved, spans[a], &CheckEnv::new(ctx, infer))?;
+                    let a3 = coerce(arena, a2, &a_ty, &param_ty_resolved, spans[a], &CheckEnv::new(infer))?;
                     let mut row_subst = HashMap::new();
                     // Deliberately the RAW param_ty here, not
                     // param_ty_resolved -- row variables only ever
@@ -3526,8 +3524,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // own doc comment for why this stays a local special case
                 // rather than a general Int<->Float consistent() rule.
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Lt => {
-                    let l3 = coerce_numeric(arena, l2, &l_ty, spans[l], &CheckEnv::new(ctx, infer))?;
-                    let r3 = coerce_numeric(arena, r2, &r_ty, spans[r], &CheckEnv::new(ctx, infer))?;
+                    let l3 = coerce_numeric(arena, l2, &l_ty, spans[l], &CheckEnv::new(infer))?;
+                    let r3 = coerce_numeric(arena, r2, &r_ty, spans[r], &CheckEnv::new(infer))?;
                     // Both concretely Int: stays Int, exactly like before
                     // Float existed (Div/Mod's truncating semantics are
                     // untouched). Either side concretely Float: the OTHER
@@ -3566,12 +3564,12 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         ));
                     }
                     let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
-                        coerce(arena, l2, &l_ty, &r_ty, spans[l], &CheckEnv::new(ctx, infer))?
+                        coerce(arena, l2, &l_ty, &r_ty, spans[l], &CheckEnv::new(infer))?
                     } else {
                         l2
                     };
                     let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
-                        coerce(arena, r2, &r_ty, &l_ty, spans[r], &CheckEnv::new(ctx, infer))?
+                        coerce(arena, r2, &r_ty, &l_ty, spans[r], &CheckEnv::new(infer))?
                     } else {
                         r2
                     };
@@ -3615,12 +3613,12 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         }
                     };
                     let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
-                        coerce(arena, l2, &l_ty, &r_ty, spans[l], &CheckEnv::new(ctx, infer))?
+                        coerce(arena, l2, &l_ty, &r_ty, spans[l], &CheckEnv::new(infer))?
                     } else {
                         l2
                     };
                     let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
-                        coerce(arena, r2, &r_ty, &l_ty, spans[r], &CheckEnv::new(ctx, infer))?
+                        coerce(arena, r2, &r_ty, &l_ty, spans[r], &CheckEnv::new(infer))?
                     } else {
                         r2
                     };
@@ -3664,7 +3662,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
 
         Expr::If(c, t, e) => {
             let (c_ty, c_row, c2) = elaborate(arena, c, ctx, spans, infer)?;
-            let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans[c], &CheckEnv::new(ctx, infer))?;
+            let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans[c], &CheckEnv::new(infer))?;
             let (result_ty, t_row, e_row, t2, e2) = match mode {
                 // Today's exact behavior, unchanged: infer both branches
                 // independently, try unify first (resolves open type
@@ -3961,7 +3959,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 let guard2 = match guard {
                     Some(g) => {
                         let (guard_ty, guard_row, g2) = elaborate(arena, *g, &arm_ctx, spans, infer)?;
-                        let g3 = coerce(arena, g2, &guard_ty, &Type::Bool, spans[*g], &CheckEnv::new(&arm_ctx, infer))?;
+                        let g3 = coerce(arena, g2, &guard_ty, &Type::Bool, spans[*g], &CheckEnv::new(infer))?;
                         row = EffectRow::union(&row, &guard_row);
                         Some(g3)
                     }

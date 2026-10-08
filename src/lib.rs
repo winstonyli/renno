@@ -6518,6 +6518,38 @@ mod tests {
     }
 
     #[test]
+    fn dyn_to_vec_n_boundary_ignores_a_term_variable_that_shares_the_index_name() {
+        // The typechecker never links a term `n` to the index `n`, so the
+        // check must use the parameter's length, not the term's value.
+        let src = "let rec f: (Vec(n) -> Int -> Vec(n)) = fun v -> fun n -> let r: Dyn = [1, 2, 3] in let q: Vec(n) = r in q in let a: Vec(2) = f([1, 2])(3) in a";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("type error: expected [Dyn](n"), "unexpected message: {err}");
+        let src = "let make = fun n: Int -> fun v: Vec(n) -> let r: Dyn = v in let q: Vec(n) = r in q in \
+                   let x: Dyn = [1, 2, 3] in let va: Vec(3) = x in len(make(5)(va))";
+        assert_eq!(run_source(src).unwrap().as_int(), 3);
+    }
+
+    #[test]
+    fn a_vec_n_lambda_whose_check_never_runs_does_not_touch_its_argument_on_entry() {
+        // The witness binder must not evaluate anything on entry: an untyped
+        // caller passing a non-list used to get 0, and still must.
+        let src = "let f = fun v: Vec(n) -> if true then 0 else (let r: Dyn = [1] in let q: Vec(n) = r in 0) in \
+                   let d: Dyn = f in d(5)";
+        assert_eq!(run_source(src).unwrap().as_int(), 0);
+    }
+
+    #[test]
+    fn dyn_argument_into_a_vec_n_polymorphic_function_is_a_clean_error_today() {
+        // Pins current behaviour (spec 2026-10-07, open follow-up): the
+        // call site's instantiated n has no runtime binder, so the crossing
+        // fails cleanly instead of panicking or skipping the check.
+        let src = "let f = fun v: Vec(n) -> v in let x: Dyn = [1, 2] in len(f(x))";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("has no runtime value to check a length against"), "unexpected message: {err}");
+        assert!(!err.contains("unbound variable"), "unexpected message: {err}");
+    }
+
+    #[test]
     fn dyn_to_vec_n_boundary_with_no_runtime_value_for_n_is_a_clean_error() {
         // n is an existential with no runtime binder: nothing to compare the
         // length against, so the check fails cleanly instead of panicking.
