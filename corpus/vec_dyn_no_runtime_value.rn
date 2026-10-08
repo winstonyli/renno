@@ -1,0 +1,5 @@
+// Clean runtime error: two crossings share n, which has no runtime value.
+let x: Dyn = [1, 2, 3] in
+let y: Vec(n) = x in
+let z: Vec(n) = x in
+len(y)

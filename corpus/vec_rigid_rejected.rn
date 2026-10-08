@@ -1,0 +1,2 @@
+// Static error: the signature fixes n, so a length-3 literal is rejected.
+let f: (Vec(n) -> Vec(n)) = fun v -> [1, 2, 3] in 0

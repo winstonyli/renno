@@ -1,0 +1,9 @@
+// cons grows the length by one; app adds lengths.
+let push: (Vec(n) -> Vec(n + 1)) = fun v -> 0 :: v in
+let rec app: (Vec(m) -> Vec(n) -> Vec(m + n)) = fun a -> fun b ->
+  match a
+  | [] -> b
+  | h :: t -> h :: app(t)(b)
+in
+let r: Vec(5) = app(push([1, 2]))([7, 8]) in
+r

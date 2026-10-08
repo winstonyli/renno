@@ -1,0 +1,5 @@
+// One Vec(n) function used at two different lengths.
+let id = fun v: Vec(n) -> v in
+let a: Vec(2) = id([1, 2]) in
+let b: Vec(4) = id([1, 2, 3, 4]) in
+(len(a), len(b))

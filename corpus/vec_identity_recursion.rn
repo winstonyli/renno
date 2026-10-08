@@ -1,0 +1,6 @@
+// Vec(n) -> Vec(n) recursion over a list: rebuilds the list element by element.
+let rec copy: (Vec(n) -> Vec(n)) = fun v ->
+  match v
+  | [] -> []
+  | h :: t -> (h + 1) :: copy(t)
+in copy([1, 2, 3])

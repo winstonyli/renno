@@ -1,0 +1,4 @@
+// A Dyn argument into a Vec(n)-polymorphic function; n is never constrained, so only is_list is checked.
+let f = fun v: Vec(n) -> v in
+let x: Dyn = [1, 2] in
+len(f(x))

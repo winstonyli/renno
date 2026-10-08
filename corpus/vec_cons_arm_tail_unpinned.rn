@@ -1,0 +1,2 @@
+// Static error: the cons arm tail length is a rigid variable (q minus one), so it cannot be pinned to Vec(0).
+let f = fun z: Vec(q) -> (let w: Vec(0) = (match z | h :: t -> t | _ -> []) in len(w)) in f([1, 2, 3])
