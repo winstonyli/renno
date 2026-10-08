@@ -6567,8 +6567,9 @@ mod tests {
     fn a_vec_n_lambda_whose_check_never_runs_is_checked_on_entry_when_called_through_dyn() {
         // Fun-to-Dyn wrapping (spec 2026-10-08) runs DOWN at the wrapper's
         // entry, so an untyped non-list is now rejected there even though the
-        // body's own check never runs. The old property (untouched on entry)
-        // can no longer hold.
+        // body's own check never runs. The untouched-on-entry property still
+        // holds where no wrapper is built (reached through an untyped
+        // parameter, see the `..._untyped_parameter_..._known_limitation` test).
         let src = "let f = fun v: Vec(n) -> if true then 0 else (let r: Dyn = [1] in let q: Vec(n) = r in 0) in \
                    let d: Dyn = f in d(5)";
         let err = run_source(src).unwrap_err();
@@ -6843,7 +6844,7 @@ mod tests {
             Expr::ListLit(items) | Expr::Tuple(items) => items.iter().any(go),
             Expr::Lambda(_, _, body) => go(body),
             Expr::App(f, a) => go(f) || go(a),
-            Expr::Let(var, _, val, body) => var == name || go(val) || go(body),
+            Expr::Let(var, _, val, body) => var.starts_with(name) || go(val) || go(body),
             Expr::LetRec(bindings, body) => bindings.iter().any(|(_, _, v)| go(v)) || go(body),
             Expr::BinOp(_, l, r) => go(l) || go(r),
             Expr::If(c, t, e) => go(c) || go(t) || go(e),
@@ -6859,7 +6860,7 @@ mod tests {
     fn elaborated_has_wrapper(src: &str) -> bool {
         let (mut arena, spans, root, named) = parser::parse_with_named_types(src).unwrap();
         let out = typecheck::check_with_named_types(&mut arena, root, &spans, named).unwrap();
-        has_let_named(&arena, out, "__cf")
+        has_let_named(&arena, out, "__cf#")
     }
 
     #[test]
@@ -7089,7 +7090,7 @@ mod tests {
         let src = "handle (let f = perform choose(0) in f(10)) with handler choose(p, resume) -> resume(fun a: Int -> a + 1) + resume(fun a: Int -> a * 2)";
         assert_eq!(run_source(src).unwrap().as_int(), 31);
         let bad = "handle (let f = perform choose(0) in f(true)) with handler choose(p, resume) -> resume(fun a: Int -> a + 1) + resume(fun a: Int -> a * 2)";
-        assert!(run_source(bad).is_err());
+        assert!(run_source(bad).unwrap_err().contains("type error: expected Int, found Bool"));
         let lit = "let rec f: Dyn = fun n: Int -> if n < 1 then 0 else f(n - 1) in handle (perform choose(0)) + f(2) with handler choose(p, resume) -> resume(1) + resume(2)";
         assert_eq!(elaborated_let_rec_groups(lit), vec![true]);
         assert_eq!(run_source(lit).unwrap().as_int(), 3);
@@ -7132,5 +7133,70 @@ mod tests {
             assert!(!elaborated_has_wrapper(src), "{src}");
         }
         assert!(elaborated_has_wrapper("let f = fun a: Int -> a + 1 in let d: Dyn = f in d(2)"));
+    }
+
+    #[test]
+    fn synthesized_builtin_calls_are_not_captured_by_user_bindings() {
+        for (src, want) in [
+            ("let is_int = 0 in len(map(fun x: Int -> x + 1)([1, 2]))", 2),
+            ("let g = fun is_int: Bool -> len(map(fun x: Int -> x + 1)([1, 2])) in g(true)", 2),
+            ("let is_list = 0 in len(map(fun v: [Int] -> len(v))([[1], [2]]))", 2),
+            ("let has_field = 0 in len(map(fun r: {x: Int} -> 1)([{x: 1}]))", 1),
+            ("let is_record = 0 in len(map(fun r: {x: Int} -> 1)([{x: 1}]))", 1),
+            ("let len = 0 in let f = fun a: Vec(n) -> fun b: Vec(n) -> 7 in let d: Dyn = f in d([1])([2])", 7),
+            ("let is_fun = 0 in let d: Dyn = fun x: Int -> x in d(1)", 1),
+            ("let is_bool = 0 in let d: Dyn = fun x: Bool -> 1 in d(true)", 1),
+            ("let is_float = 0 in let d: Dyn = fun x: Float -> 1 in d(1.5)", 1),
+            ("let type_name = 0 in let d: Dyn = fun x: Int -> x in d(1)", 1),
+        ] {
+            assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
+        }
+        let s = "let is_str = 0 in let d: Dyn = fun s: Str -> s in d(\"a\")";
+        assert_eq!(run_source(s).unwrap(), Outcome::Str("a".to_string()));
+        for src in [
+            "let fail = fun x -> 0 in let f = fun a: Int -> a + 1 in let d: Dyn = f in d(true)",
+            "let is_int = fun x -> true in let x: Dyn = true in let y: Int = x in y",
+            "let type_name = fun x -> \"\" in let fail = 0 in let x: Dyn = true in let y: Int = x in y",
+        ] {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains("type error: expected Int, found Bool"), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn synthesized_cast_binders_are_not_captured_by_user_variables() {
+        for (src, want) in [
+            ("let __ca = 10 in let d: Dyn = fun a: Int -> a + __ca in d(1)", 11),
+            ("let __ca = 10 in len(map(fun a: Int -> a + __ca)([1]))", 1),
+            ("let __ca = 10 in map(fun a: Int -> a + __ca)([1])", -1),
+            ("let __ca2 = 100 in let d: Dyn = fun a: Int -> fun b: Int -> a + b + __ca2 in d(1)(2)", 103),
+            ("let d: Dyn = fun __ca2: Int -> fun b: Int -> __ca2 + b in d(1)(2)", 3),
+            ("let __cf = 5 in let f = fun a: Int -> a + __cf in let g = fun x -> x in let d: Dyn = f in d(1)", 6),
+        ] {
+            if want == -1 {
+                assert_eq!(run_source(src).unwrap(), Outcome::List(vec![Outcome::Int(11)]), "{src}");
+            } else {
+                assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_vec_n_function_reached_through_an_untyped_parameter_is_unchecked_on_entry_known_limitation() {
+        // The untouched-on-entry property still holds through the parked Var-param hole.
+        let src = "let f = fun v: Vec(n) -> if true then 0 else (let r: Dyn = [1] in let q: Vec(n) = r in 0) in \
+                   let ap = fun g -> map(g)([5]) in ap(f)";
+        assert_eq!(run_source(src).unwrap(), Outcome::List(vec![Outcome::Int(0)]));
+    }
+
+    #[test]
+    fn a_monomorphic_vec_n_witness_checks_list_shape_only_in_the_closure_form_known_limitation() {
+        // `n` is bound by an earlier Dyn-to-Vec(n) check; the wrapper gets a
+        // per-call witness, so DOWN checks only that the argument is a list.
+        // The direct call f([1]) is rejected.
+        let src = "let x: Dyn = [1, 2] in let y: Vec(n) = x in let f = fun w: Vec(n) -> len(w) in let d: Dyn = f in d([1])";
+        assert_eq!(run_source(src).unwrap().as_int(), 1);
+        let direct = "let x: Dyn = [1, 2] in let y: Vec(n) = x in let f = fun w: Vec(n) -> len(w) in f([1])";
+        assert!(run_source(direct).is_err());
     }
 }

@@ -83,7 +83,16 @@ pub fn resolve(arena: &Arena, root: ExprRef) -> Resolved {
     Resolved { vars }
 }
 
+// A name spelled `#builtin` (never lexable) is a synthesized reference to a
+// prelude builtin: it ignores the lexical scope, so no user binding can capture
+// it (typecheck::prelude_var builds these).
 fn lookup(scopes: &[Vec<String>], name: &str) -> VarRef {
+    if let Some(builtin) = name.strip_prefix('#') {
+        return match PRELUDE.iter().position(|(n, _)| *n == builtin) {
+            Some(i) => VarRef::Prelude(i as u32),
+            None => VarRef::Unbound,
+        };
+    }
     for (hops, frame) in scopes.iter().rev().enumerate() {
         // Last slot wins: preserves today's shadowing for a duplicate
         // binder in one frame, e.g. the pattern `(x, x)`.

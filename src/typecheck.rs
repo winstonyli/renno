@@ -1300,8 +1300,9 @@ fn erase_open_indexed(t: &Type, has_value: &dyn Fn(&str) -> bool) -> Type {
 }
 
 // Structural equality that ignores effect rows (no runtime row representation).
-// Intentionally Fun/structure-only with an == fallback; it is the only thing
-// keeping annotated `let rec` bindings bare Lambdas (see coerce_cast).
+// Intentionally Fun/structure-only with an == fallback. coerce_cast uses it as
+// a cheap identity guard so an equal-up-to-rows cast skips a redundant DOWN
+// (needs_wrapper already answers false for equal concrete types).
 fn same_ignoring_rows(a: &Type, b: &Type) -> bool {
     match (a, b) {
         (Type::Fun(p, _, r), Type::Fun(p2, _, r2)) => same_ignoring_rows(p, p2) && same_ignoring_rows(r, r2),
@@ -1316,47 +1317,68 @@ fn same_ignoring_rows(a: &Type, b: &Type) -> bool {
 // Wraps a Fun-typed `e` so that, seen as `to` (Dyn or a Fun), its argument is
 // re-checked against the parameter type it was really declared with and a
 // returned function is wrapped in turn. Closure form:
-// `let __cf = e in fun __ca: A' -> UP(__cf(DOWN(__ca)))`, fresh Var nodes each
-// time. The body runs once per call (repeatable) and records no obligations.
+// `let __cf#k = e in fun __ca#k: A' -> UP(__cf#k(DOWN(__ca#k)))`, fresh Var
+// nodes and fresh unlexable binder names each time (cast_binder). The body runs once per call (repeatable) and records no obligations.
 // Returns `e` unchanged when no wrapper is needed.
 fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let from = env.infer.resolve_deep(from);
     let to = env.infer.resolve_deep(to);
-    // A cast from a type to itself is the identity (it also keeps an annotated
-    // `let rec` binding a bare Lambda, which is_direct_group requires).
+    // A cast from a type to itself is the identity. (A literal cast keeps the
+    // Lambda a Lambda, so an annotated `let rec` binding stays a direct group
+    // either way; this guard just avoids a redundant DOWN.)
     if same_ignoring_rows(&from, &to) || !needs_wrapper(&from, &to) {
         return e;
     }
     if matches!(arena[e], Expr::Lambda(..)) {
-        return build_literal_cast(arena, e, &from, &to, env, 0);
+        return build_literal_cast(arena, e, &from, &to, env);
     }
-    build_cast(arena, e, &from, &to, env, 0)
+    build_cast(arena, e, &from, &to, env)
+}
+
+// Binder names a cast introduces (`__cf`, `__ca`): fresh and unlexable
+// (`__ca#7`), so neither a user variable nor a nested cast's own binder can
+// capture or shadow them. Shared by build_cast and build_literal_cast.
+fn cast_binder(base: &str) -> String {
+    fresh_index_name(base)
+}
+
+// The (parameter, result) types a cast aims at: those of a Fun target, Dyn for
+// both when the target is Dyn.
+fn cast_targets(to: &Type) -> (Type, Type) {
+    match to {
+        Type::Fun(a2, _, b2) => ((**a2).clone(), (**b2).clone()),
+        _ => (Type::Dyn, Type::Dyn),
+    }
+}
+
+// Is index variable `v` already bound by a witness in scope (a local one, or
+// one the inference recorded)?
+fn index_witnessed<'a>(env: &'a CheckEnv<'a>) -> impl Fn(&str) -> bool + 'a {
+    move |v| env.local.iter().any(|w| w.var == v) || env.infer.index_witness.iter().any(|w| w.var == v)
 }
 
 // The literal form of build_cast for a Lambda `e` (spec 2026-10-08 sec 5):
-// the Lambda is rebuilt in place, `fun p: A' -> let p = DOWN(p) in UP(body)`,
+// the Lambda is rebuilt in place,
+// `fun __ca#k: A' -> let p = DOWN(__ca#k) in UP(body)`,
 // so an annotated `let rec` binding stays a direct Lambda (is_direct_group)
 // and no closure is allocated. A witness binder (`let hidden = p in ...`) at
 // the top of the body is kept, and UP recurses into a Lambda body. Here a
 // parameter's index variables are never witnessed: DOWN is is_list only for
 // them, unless the variable is already witnessed by an enclosing scope
 // (parked, spec sec 7).
-fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv, depth: usize) -> ExprRef {
+fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let Expr::Lambda(param, _, body) = arena[e].clone() else { unreachable!("build_literal_cast takes a Lambda") };
     let Type::Fun(a, _, b) = from else { unreachable!("build_literal_cast takes a Fun source") };
-    let (a_target, b_target) = match to {
-        Type::Fun(a2, _, b2) => ((**a2).clone(), (**b2).clone()),
-        _ => (Type::Dyn, Type::Dyn),
-    };
-    let witnessed = |v: &str| env.local.iter().any(|w| w.var == v) || env.infer.index_witness.iter().any(|w| w.var == v);
-    let up_body = if needs_upcast(b, &b_target) { literal_up(arena, body, b, &b_target, env, depth + 1) } else { body };
+    let (a_target, b_target) = cast_targets(to);
+    let witnessed = index_witnessed(env);
+    let up_body = if needs_upcast(b, &b_target) { literal_up(arena, body, b, &b_target, env) } else { body };
     if !needs_down(a, &a_target) {
         return arena.push(Expr::Lambda(param, Some(a_target), up_body));
     }
     // The incoming value arrives under a fresh name and is checked outside the
     // user's parameter scope, so a parameter named like a builtin the check
     // calls (is_int, fail, type_name, ...) cannot capture it.
-    let ca = if depth == 0 { "__ca".to_string() } else { format!("__ca{}", depth + 1) };
+    let ca = cast_binder("__ca");
     let ca_ref = arena.push(Expr::Var(ca.clone()));
     let checked = build_boundary_check(arena, ca_ref, &erase_open_indexed(a, &witnessed), env, &HashSet::new());
     let body = arena.push(Expr::Let(param, None, checked, up_body));
@@ -1367,34 +1389,35 @@ fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env
 // binder `let hidden = <var> in ...`; the arm matches any `let y = a in ...`
 // too, which is harmless); any other body is wrapped in the
 // closure form.
-fn literal_up(arena: &mut Arena, body: ExprRef, b: &Type, b_target: &Type, env: &CheckEnv, depth: usize) -> ExprRef {
+fn literal_up(arena: &mut Arena, body: ExprRef, b: &Type, b_target: &Type, env: &CheckEnv) -> ExprRef {
     match arena[body].clone() {
-        Expr::Lambda(..) => build_literal_cast(arena, body, b, b_target, env, depth),
+        Expr::Lambda(..) => build_literal_cast(arena, body, b, b_target, env),
         Expr::Let(hidden, None, val, inner) if matches!(arena[val], Expr::Var(_)) => {
-            let inner = literal_up(arena, inner, b, b_target, env, depth);
+            let inner = literal_up(arena, inner, b, b_target, env);
             arena.push(Expr::Let(hidden, None, val, inner))
         }
-        _ => build_cast(arena, body, b, b_target, env, depth),
+        _ => build_cast(arena, body, b, b_target, env),
     }
 }
 
 // The closure form of coerce_cast for a Fun `from` (needs_wrapper holds).
-// `depth` numbers the binder names so a returned function's wrapper, nested
+// Every binder is fresh (cast_binder), so a returned function's wrapper, nested
 // inside this one's lambda, never shadows it. A Vec(n) parameter whose `n` has
-// no witness in scope binds one from `__ca` (DOWN then needs only is_list: the
-// length half would be `len(__ca) == n`, a tautology); a variable already
+// no witness in scope binds one from `__ca#k` (DOWN then needs only is_list:
+// the length half would be `len(__ca#k) == n`, a tautology); a variable already
 // witnessed in scope is never rebound, so a nested wrapper compares against
 // the outer value. Any other open index degrades to is_list.
-fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv, depth: usize) -> ExprRef {
+// Known limitation (spec 2026-10-08 sec 7): a monomorphic `n` that no witness
+// in scope covers (e.g. `n` fixed by an earlier Dyn-to-Vec(n) check, then
+// `let f = fun w: Vec(n) -> .. in let d: Dyn = f in d([1])`) gets a fresh
+// per-call witness, so DOWN checks list shape only, while the direct call
+// `f([1])` is rejected. Pinned by a test.
+fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let Type::Fun(a, _, b) = from else { unreachable!("build_cast takes a Fun source") };
-    let (a_target, b_target) = match to {
-        Type::Fun(a2, _, b2) => ((**a2).clone(), (**b2).clone()),
-        _ => (Type::Dyn, Type::Dyn),
-    };
-    let suffix = if depth == 0 { String::new() } else { (depth + 1).to_string() };
-    let cf = format!("__cf{suffix}");
-    let ca = format!("__ca{suffix}");
-    let witnessed = |v: &str| env.local.iter().any(|w| w.var == v) || env.infer.index_witness.iter().any(|w| w.var == v);
+    let (a_target, b_target) = cast_targets(to);
+    let cf = cast_binder("__cf");
+    let ca = cast_binder("__ca");
+    let witnessed = index_witnessed(env);
     let witness = list_length_var(a, env.infer).filter(|v| !witnessed(v)).map(|var| IndexWitness::new(var, &ca));
     let mut local = env.local.clone();
     local.extend(witness.as_ref());
@@ -1407,7 +1430,7 @@ fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Check
     };
     let cf_ref = arena.push(Expr::Var(cf.clone()));
     let call = arena.push(Expr::App(cf_ref, arg));
-    let result = if needs_upcast(b, &b_target) { build_cast(arena, call, b, &b_target, &body_env, depth + 1) } else { call };
+    let result = if needs_upcast(b, &b_target) { build_cast(arena, call, b, &b_target, &body_env) } else { call };
     let body = match &witness {
         Some(w) if w.used.get() => w.bind(arena, &ca, result),
         _ => result,
@@ -1836,7 +1859,7 @@ fn index_var_to_expr(arena: &mut Arena, name: &str, env: &CheckEnv) -> ExprRef {
         let len_ref = arena.push(Expr::Var(w.hidden.clone()));
         let len_call = build_predicate_call(arena, "len", len_ref);
         let msg = arena.push(Expr::Str(format!("type error: index variable {name}'s witness is not a list")));
-        let fail_var = arena.push(Expr::Var("fail".to_string()));
+        let fail_var = prelude_var(arena, "fail");
         let fail_call = arena.push(Expr::App(fail_var, msg));
         return arena.push(Expr::If(is_list, len_call, fail_call));
     }
@@ -1844,7 +1867,7 @@ fn index_var_to_expr(arena: &mut Arena, name: &str, env: &CheckEnv) -> ExprRef {
         return index_expr_to_expr(arena, bound, env);
     }
     let msg = arena.push(Expr::Str(format!("type error: index variable {name} has no runtime value to check a length against")));
-    let fail_var = arena.push(Expr::Var("fail".to_string()));
+    let fail_var = prelude_var(arena, "fail");
     arena.push(Expr::App(fail_var, msg))
 }
 
@@ -1865,7 +1888,7 @@ fn index_var_to_expr(arena: &mut Arena, name: &str, env: &CheckEnv) -> ExprRef {
 // a deferred obligation patches in place (resolve_obligations).
 fn build_indexed_shape_cond(arena: &mut Arena, value_ref: ExprRef, index: &IndexExpr, env: &CheckEnv) -> (ExprRef, ExprRef) {
     let is_list = build_predicate_call(arena, "is_list", value_ref);
-    let len_var = arena.push(Expr::Var("len".to_string()));
+    let len_var = prelude_var(arena, "len");
     let len_call = arena.push(Expr::App(len_var, value_ref));
     let index_expr = index_expr_to_expr(arena, index, env);
     let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, index_expr));
@@ -1926,7 +1949,7 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, env: 
         }
         Type::Tuple(items) => {
             let is_list = build_predicate_call(arena, "is_list", value_ref);
-            let len_var = arena.push(Expr::Var("len".to_string()));
+            let len_var = prelude_var(arena, "len");
             let len_call = arena.push(Expr::App(len_var, value_ref));
             let arity_lit = arena.push(Expr::Int(items.len() as i64));
             let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, arity_lit));
@@ -2042,8 +2065,17 @@ fn fold_predicate<T>(
     result
 }
 
+// A synthesized reference to the prelude builtin `name`. Spelled `#name`,
+// which no source text can bind or lex, and which `resolve` maps straight to
+// the prelude table: a user binding named like the builtin (`let is_int = ..`,
+// a parameter `len`) cannot capture a check's own calls. EVERY builtin a
+// synthesized check calls goes through here.
+fn prelude_var(arena: &mut Arena, name: &str) -> ExprRef {
+    arena.push(Expr::Var(format!("#{name}")))
+}
+
 fn build_predicate_call(arena: &mut Arena, name: &str, value_ref: ExprRef) -> ExprRef {
-    let v = arena.push(Expr::Var(name.to_string()));
+    let v = prelude_var(arena, name);
     arena.push(Expr::App(v, value_ref))
 }
 
@@ -2051,7 +2083,7 @@ fn build_predicate_call(arena: &mut Arena, name: &str, value_ref: ExprRef) -> Ex
 // build_predicate_call, shared by Record's own has_field-based shape
 // check above and `.field` access's get_field desugaring below.
 fn build_str_call(arena: &mut Arena, builtin: &str, value_ref: ExprRef, str_arg: &str) -> ExprRef {
-    let f = arena.push(Expr::Var(builtin.to_string()));
+    let f = prelude_var(arena, builtin);
     let applied = arena.push(Expr::App(f, value_ref));
     let arg_lit = arena.push(Expr::Str(str_arg.to_string()));
     arena.push(Expr::App(applied, arg_lit))
@@ -2101,11 +2133,8 @@ fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, v
     build_checked(arena, e, to, |arena, v| build_shape_predicate(arena, v, to, env, visiting))
 }
 
-// `predicate` becomes an ordinary `Expr::Var(predicate)` node, resolved
-// the same as any other name -- to whichever prelude builtin that name
-// currently names (`is_int`/`is_bool`/`is_str`/`is_list`/`is_fun`), the
-// same way `fail`/`type_name` already are -- see their own doc comments on
-// the (pre-existing, accepted) shadowing risk that implies.
+// `predicate` (`is_int`/`is_bool`/`is_str`/`is_list`/`is_fun`/...) is
+// referenced through prelude_var, so user bindings cannot shadow it.
 fn build_shallow_check(arena: &mut Arena, e: ExprRef, to: &Type, predicate: &str) -> ExprRef {
     build_checked(arena, e, to, |arena, v| build_predicate_call(arena, predicate, v))
 }
@@ -2116,10 +2145,10 @@ fn build_shallow_check(arena: &mut Arena, e: ExprRef, to: &Type, predicate: &str
 // place.
 fn build_fail_call(arena: &mut Arena, to: &Type, value_ref: ExprRef) -> ExprRef {
     let prefix = arena.push(Expr::Str(format!("type error: expected {to}, found ")));
-    let type_name_var = arena.push(Expr::Var("type_name".to_string()));
+    let type_name_var = prelude_var(arena, "type_name");
     let type_name_call = arena.push(Expr::App(type_name_var, value_ref));
     let msg = arena.push(Expr::BinOp(BinOp::Concat, prefix, type_name_call));
-    let fail_var = arena.push(Expr::Var("fail".to_string()));
+    let fail_var = prelude_var(arena, "fail");
     arena.push(Expr::App(fail_var, msg))
 }
 
