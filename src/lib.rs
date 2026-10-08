@@ -6723,4 +6723,16 @@ mod tests {
         let src = "let f = fun v: Vec(n) -> v in let x: Dyn = [1, 2, 3] in len(f(x))";
         assert_eq!(run_source(src).unwrap().as_int(), 3);
     }
+
+    #[test]
+    fn a_dyn_function_contract_wrapper_keeps_the_clean_error_for_an_unbound_n() {
+        // wrap_fun_contract's wrapper runs on every call, so its return check
+        // is inside a function body: k(1) and k(2) share the one unbound n.
+        let src = "let h: Dyn = fun i -> if i < 2 then [1,2] else [1,2,3] in \
+                   let k: (Int -> Vec(n)) = h in \
+                   let g = fun a: Vec(m) -> fun b: Vec(m) -> len(b) in \
+                   g(k(1))(k(2))";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("has no runtime value"), "unexpected message: {err}");
+    }
 }

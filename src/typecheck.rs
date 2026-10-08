@@ -1519,7 +1519,7 @@ fn record_obligation(len_eq: ExprRef, index: &IndexExpr, env: &CheckEnv) {
         w.used.set(true);
     }
     let witnesses = in_scope.iter().map(|w| (w.var.clone(), w.hidden.clone())).collect();
-    env.infer.obligations.borrow_mut().push(Obligation { len_eq, index, witnesses, repeatable: env.infer.repeatable_depth > 0 || !env.local.is_empty() });
+    env.infer.obligations.borrow_mut().push(Obligation { len_eq, index, witnesses, repeatable: env.infer.repeatable_depth > 0 || env.repeatable });
 }
 
 // Patches every obligation's `len(value) == <index>` node once inference has
@@ -1529,9 +1529,10 @@ fn record_obligation(len_eq: ExprRef, index: &IndexExpr, env: &CheckEnv) {
 // anything evaluates the tree.
 //
 // An index that is still a bare unbound variable no other obligation
-// mentions, and that sits in no function body, constrains nothing, so the check is `is_list` alone (the node
-// becomes `true`). Two crossings sharing one such variable would claim equal
-// lengths with nothing to compare against, so they keep the clean failure.
+// mentions, and that sits in no function body, constrains nothing, so the
+// check is `is_list` alone (the node becomes `true`). Two crossings sharing
+// one such variable would claim equal lengths with nothing to compare
+// against, so they keep the clean failure.
 fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
     let obligations = infer.obligations.take();
     let mut mentions: HashMap<String, usize> = HashMap::new();
@@ -1557,7 +1558,7 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
             .iter()
             .map(|(var, hidden)| IndexWitness { var: var.clone(), hidden: hidden.clone(), used: Cell::new(true) })
             .collect();
-        let env = CheckEnv { infer, local: witnesses.iter().collect(), defer: false };
+        let env = CheckEnv { infer, local: witnesses.iter().collect(), defer: false, repeatable: false };
         let index_ref = index_expr_to_expr(arena, &index, &env);
         arena[ob.len_eq] = Expr::BinOp(BinOp::Eq, len_call, index_ref);
     }
@@ -1573,6 +1574,9 @@ struct CheckEnv<'a> {
     infer: &'a InferCtx,
     local: Vec<&'a IndexWitness>,
     defer: bool,
+    // Building inside a synthesized function body (wrap_fun_contract's
+    // wrapper), which runs on every call of the wrapped function.
+    repeatable: bool,
 }
 
 // `n` when `ty` is Vec(n) with `n` (resolved) still a bare variable: the
@@ -1589,7 +1593,7 @@ fn list_length_var(ty: &Type, infer: &InferCtx) -> Option<String> {
 
 impl<'a> CheckEnv<'a> {
     fn new(infer: &'a InferCtx) -> CheckEnv<'a> {
-        CheckEnv { infer, local: Vec::new(), defer: true }
+        CheckEnv { infer, local: Vec::new(), defer: true, repeatable: false }
     }
 }
 
@@ -1695,7 +1699,7 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, v
         Type::Union(alts) => alts.clone(),
         _ => unreachable!("build_union_check is only ever called with a Union target"),
     };
-    let env = &CheckEnv { infer: env.infer, local: env.local.clone(), defer: false };
+    let env = &CheckEnv { infer: env.infer, local: env.local.clone(), defer: false, repeatable: env.repeatable };
     let tmp = "__check_tmp".to_string();
     let tmp_ref = arena.push(Expr::Var(tmp.clone()));
     let mut result = build_fail_call(arena, to, tmp_ref);
@@ -1954,9 +1958,12 @@ fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: 
         Some(w) => {
             let mut local = env.local.clone();
             local.push(w);
-            build_boundary_check(arena, call, &ret_ty, &CheckEnv { infer: env.infer, local, defer: env.defer }, visiting)
+            build_boundary_check(arena, call, &ret_ty, &CheckEnv { infer: env.infer, local, defer: env.defer, repeatable: true }, visiting)
         }
-        None => build_boundary_check(arena, call, &ret_ty, env, visiting),
+        None => {
+            let env = CheckEnv { infer: env.infer, local: env.local.clone(), defer: env.defer, repeatable: true };
+            build_boundary_check(arena, call, &ret_ty, &env, visiting)
+        }
     };
     let checked_call = match &witness {
         Some(w) if w.used.get() => w.bind(arena, &arg_var, checked_call),
