@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -114,6 +115,14 @@ pub(crate) struct InferCtx {
     // to every annotation read inside that value (scoped_annotation), so a
     // body annotation reusing the name denotes the signature's variable.
     index_rename: HashMap<String, String>,
+    // Runtime values for index variables, innermost last: while a Lambda
+    // whose parameter is Vec(n) is elaborated, `n` is that parameter's
+    // length. A Dyn-to-Vec(n) boundary check inside reads it from a hidden
+    // binder (`hidden = len(param)`), which the Lambda inserts at its entry
+    // only if some check used it. See index_var_to_expr. Pushed and popped
+    // by elaborate_mode's Lambda frames; an elaboration error abandons the
+    // whole check, so an Err path never needs to pop.
+    index_witness: Vec<IndexWitness>,
     // Every genuinely self-referential type alias this program's own
     // parse registered (parser::Parser's own `named_types`, handed in
     // once at construction) -- consulted on demand by
@@ -127,7 +136,14 @@ pub(crate) struct InferCtx {
 
 impl InferCtx {
     pub(crate) fn new(named_types: HashMap<String, Type>) -> InferCtx {
-        InferCtx { subst: HashMap::new(), index_subst: HashMap::new(), rigid_index: HashSet::new(), index_rename: HashMap::new(), named_types }
+        InferCtx {
+            subst: HashMap::new(),
+            index_subst: HashMap::new(),
+            rigid_index: HashSet::new(),
+            index_rename: HashMap::new(),
+            index_witness: Vec::new(),
+            named_types,
+        }
     }
 
     // Mints a fresh Type::Var -- every unannotated binding site (Lambda
@@ -1138,7 +1154,8 @@ fn replace_named_with_dyn(ty: &Type, id: &str) -> Type {
 // BY IT, not by the original, was a latent bug (worked by coincidence
 // whenever the mismatched value happened to be a leaf that elaborate_node
 // returns unchanged).
-fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, named_types: &HashMap<String, Type>) -> Result<ExprRef, TypeError> {
+fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env: &CheckEnv) -> Result<ExprRef, TypeError> {
+    let named_types = &env.infer.named_types;
     if !consistent(from, to) {
         if fits(to, from) {
             return Ok(e);
@@ -1228,7 +1245,7 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, nam
     if !matches!(from, Type::Dyn | Type::Var(_)) || *to == Type::Dyn || matches!(to, Type::Var(_)) {
         return Ok(e);
     }
-    Ok(build_boundary_check(arena, e, to, named_types, &HashSet::new()))
+    Ok(build_boundary_check(arena, e, to, env, &HashSet::new()))
 }
 
 // Like `coerce`, but the target is "Int or Float" rather than one fixed
@@ -1243,10 +1260,10 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, nam
 // with an ad-hoc Union([Int, Float]) is safe reuse despite that: it only
 // asks "does this runtime value look like one of these shapes," which
 // carries no implication for consistent() or any other static check.
-fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, named_types: &HashMap<String, Type>) -> Result<ExprRef, TypeError> {
+fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &CheckEnv) -> Result<ExprRef, TypeError> {
     match ty {
         Type::Int | Type::Float => Ok(e),
-        Type::Dyn | Type::Var(_) => Ok(build_boundary_check(arena, e, &Type::Union(Rc::new(vec![Type::Int, Type::Float])), named_types, &HashSet::new())),
+        Type::Dyn | Type::Var(_) => Ok(build_boundary_check(arena, e, &Type::Union(Rc::new(vec![Type::Int, Type::Float])), env, &HashSet::new())),
         other => Err(TypeError(format!("type mismatch: expected Int or Float, found {other}"), span)),
     }
 }
@@ -1282,18 +1299,18 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, named_ty
 // the Named leaf) would otherwise unfold to the exact same Union([Int,
 // Named(id)]) forever -- genuine infinite recursion in THIS function's own
 // call stack during elaboration, not a runtime concern.
-fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &HashMap<String, Type>, visiting: &HashSet<String>) -> ExprRef {
+fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
     match to {
         Type::Int => build_shallow_check(arena, e, to, "is_int"),
         Type::Float => build_shallow_check(arena, e, to, "is_float"),
         Type::Bool => build_shallow_check(arena, e, to, "is_bool"),
         Type::Str => build_shallow_check(arena, e, to, "is_str"),
         Type::List(_) => build_shallow_check(arena, e, to, "is_list"),
-        Type::Fun(param_ty, _row, ret_ty) => wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone(), named_types, visiting),
+        Type::Fun(param_ty, _row, ret_ty) => wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone(), env, visiting),
         Type::Token(id) => build_token_check(arena, e, to, *id),
-        Type::Tuple(_) => build_shape_check(arena, e, to, named_types, visiting),
-        Type::Record(_) => build_shape_check(arena, e, to, named_types, visiting),
-        Type::Union(_) => build_union_check(arena, e, to, named_types, visiting),
+        Type::Tuple(_) => build_shape_check(arena, e, to, env, visiting),
+        Type::Record(_) => build_shape_check(arena, e, to, env, visiting),
+        Type::Union(_) => build_union_check(arena, e, to, env, visiting),
         Type::Dyn => unreachable!("coerce only calls this once *to != Type::Dyn is already established"),
         Type::Var(_) => e,
         // Same is_list-then-len composition as Type::Tuple's own arm
@@ -1315,7 +1332,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &
         // construct one yet (see index_expr_to_expr's own doc comment
         // for the matching "Phase 2 only" note on the index side).
         Type::Indexed(wrapped, index) => match wrapped.as_ref() {
-            Type::List(_) => build_checked(arena, e, to, |arena, v| build_indexed_shape_cond(arena, v, index)),
+            Type::List(_) => build_checked(arena, e, to, |arena, v| build_indexed_shape_cond(arena, v, index, env)),
             _ => e,
         },
         // One level only, matching every other shape check in this
@@ -1355,41 +1372,117 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &
             if visiting.contains(id) {
                 return e;
             }
-            let Some(raw) = named_types.get(id) else { return e };
+            let Some(raw) = env.infer.named_types.get(id) else { return e };
             let mut visiting = visiting.clone();
             visiting.insert(id.clone());
             let unfolded = raw.clone();
-            build_boundary_check(arena, e, &unfolded, named_types, &visiting)
+            build_boundary_check(arena, e, &unfolded, env, &visiting)
         }
     }
 }
 
-// Translates a (currently always closed -- no dependent parameters
-// exist until Phase 2) IndexExpr into an ordinary Expr the machine can
-// evaluate, for splicing into a synthesized runtime check. A bare
-// Var here has no binder yet in this phase; Phase 2 makes this
-// meaningful by ensuring any Var appearing in a REACHABLE Vec(n)
-// position is always a real, in-scope function parameter by then.
-fn index_expr_to_expr(arena: &mut Arena, e: &IndexExpr) -> ExprRef {
+// A runtime value for an index variable: `hidden` is an Int variable bound
+// by synthesized code to a list's length (a Lambda's parameter, or a
+// contract's argument). `used` records whether any check read it, so the
+// binder is only emitted when needed (zero overhead otherwise).
+struct IndexWitness {
+    var: String,
+    hidden: String,
+    used: Cell<bool>,
+}
+
+impl IndexWitness {
+    fn new(var: String, param: &str) -> IndexWitness {
+        IndexWitness { var, hidden: fresh_index_name(&format!("len_{param}")), used: Cell::new(false) }
+    }
+
+    // `let hidden = len(list_var) in body`
+    fn bind(&self, arena: &mut Arena, list_var: &str, body: ExprRef) -> ExprRef {
+        let list_ref = arena.push(Expr::Var(list_var.to_string()));
+        let len_call = build_predicate_call(arena, "len", list_ref);
+        arena.push(Expr::Let(self.hidden.clone(), None, len_call, body))
+    }
+}
+
+// What the runtime-check builders (build_boundary_check and friends) need:
+// the type registry, plus the scope an index variable is evaluated in. The
+// typing ctx and InferCtx are the ones in force where the check is spliced;
+// `local` holds witnesses bound inside synthesized code (wrap_fun_contract).
+struct CheckEnv<'a> {
+    ctx: &'a Ctx,
+    infer: &'a InferCtx,
+    local: Vec<&'a IndexWitness>,
+}
+
+// `n` when `ty` is Vec(n) with `n` (resolved) still a bare variable: the
+// variable a list of this type witnesses the value of.
+fn list_length_var(ty: &Type, infer: &InferCtx) -> Option<String> {
+    match ty {
+        Type::Indexed(wrapped, index) if matches!(wrapped.as_ref(), Type::List(_)) => match infer.resolve_index_deep(index) {
+            IndexExpr::Var(name) => Some(name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+impl<'a> CheckEnv<'a> {
+    fn new(ctx: &'a Ctx, infer: &'a InferCtx) -> CheckEnv<'a> {
+        CheckEnv { ctx, infer, local: Vec::new() }
+    }
+}
+
+// Translates an IndexExpr into an ordinary Expr the machine can evaluate,
+// for splicing into a synthesized runtime check. See index_var_to_expr for
+// where each variable's runtime value comes from.
+fn index_expr_to_expr(arena: &mut Arena, e: &IndexExpr, env: &CheckEnv) -> ExprRef {
     match e {
-        IndexExpr::Var(name) => arena.push(Expr::Var(name.clone())),
+        IndexExpr::Var(name) => index_var_to_expr(arena, name, env),
         IndexExpr::Lit(n) => arena.push(Expr::Int(*n)),
         IndexExpr::Add(a, b) => {
-            let a2 = index_expr_to_expr(arena, a);
-            let b2 = index_expr_to_expr(arena, b);
+            let a2 = index_expr_to_expr(arena, a, env);
+            let b2 = index_expr_to_expr(arena, b, env);
             arena.push(Expr::BinOp(BinOp::Add, a2, b2))
         }
         IndexExpr::Sub(a, b) => {
-            let a2 = index_expr_to_expr(arena, a);
-            let b2 = index_expr_to_expr(arena, b);
+            let a2 = index_expr_to_expr(arena, a, env);
+            let b2 = index_expr_to_expr(arena, b, env);
             arena.push(Expr::BinOp(BinOp::Sub, a2, b2))
         }
         IndexExpr::Mul(a, b) => {
-            let a2 = index_expr_to_expr(arena, a);
-            let b2 = index_expr_to_expr(arena, b);
+            let a2 = index_expr_to_expr(arena, a, env);
+            let b2 = index_expr_to_expr(arena, b, env);
             arena.push(Expr::BinOp(BinOp::Mul, a2, b2))
         }
     }
+}
+
+// An index variable's runtime value, first match wins:
+// 1. a term variable of the same name in scope (the dependent-parameter
+//    convention, `fun n: Int -> fun v: Vec(n) -> ...`) -- unchanged from
+//    before witnesses existed, so every check that already ran keeps its
+//    meaning;
+// 2. a witness: the length of the innermost list parameter (or contract
+//    argument) typed Vec(name);
+// 3. its static binding in index_subst, translated in turn;
+// 4. otherwise nothing at runtime holds it (an existential from a plain
+//    `let x: Vec(n) = <Dyn>`, or a call-site instantiation): the check fails
+//    with a clean type error rather than reading an unbound variable.
+fn index_var_to_expr(arena: &mut Arena, name: &str, env: &CheckEnv) -> ExprRef {
+    if env.ctx.get(name).is_some() {
+        return arena.push(Expr::Var(name.to_string()));
+    }
+    let witness = env.local.iter().rev().copied().chain(env.infer.index_witness.iter().rev()).find(|w| w.var == name);
+    if let Some(w) = witness {
+        w.used.set(true);
+        return arena.push(Expr::Var(w.hidden.clone()));
+    }
+    if let Some(bound) = env.infer.index_subst.get(name) {
+        return index_expr_to_expr(arena, bound, env);
+    }
+    let msg = arena.push(Expr::Str(format!("type error: index variable {name} has no runtime value to check a length against")));
+    let fail_var = arena.push(Expr::Var("fail".to_string()));
+    arena.push(Expr::App(fail_var, msg))
 }
 
 // The raw boolean condition shared by build_boundary_check's and
@@ -1406,11 +1499,11 @@ fn index_expr_to_expr(arena: &mut Arena, e: &IndexExpr) -> ExprRef {
 // bare predicate (no let-binding, callers may OR several of these
 // together) -- see each caller's own doc comment for why they need
 // different wrapping.
-fn build_indexed_shape_cond(arena: &mut Arena, value_ref: ExprRef, index: &IndexExpr) -> ExprRef {
+fn build_indexed_shape_cond(arena: &mut Arena, value_ref: ExprRef, index: &IndexExpr, env: &CheckEnv) -> ExprRef {
     let is_list = build_predicate_call(arena, "is_list", value_ref);
     let len_var = arena.push(Expr::Var("len".to_string()));
     let len_call = arena.push(Expr::App(len_var, value_ref));
-    let index_expr = index_expr_to_expr(arena, index);
+    let index_expr = index_expr_to_expr(arena, index, env);
     let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, index_expr));
     let false_lit = arena.push(Expr::Bool(false));
     arena.push(Expr::If(is_list, len_eq, false_lit))
@@ -1430,7 +1523,7 @@ fn build_indexed_shape_cond(arena: &mut Arena, value_ref: ExprRef, index: &Index
 // one -- so the shape predicate decides WHICH alternative's full check to
 // run, and that full check (redundantly, but harmlessly) re-confirms the
 // same shape on its way to the real work.
-fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &HashMap<String, Type>, visiting: &HashSet<String>) -> ExprRef {
+fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
     let alts: Rc<Vec<Type>> = match to {
         Type::Union(alts) => alts.clone(),
         _ => unreachable!("build_union_check is only ever called with a Union target"),
@@ -1439,8 +1532,8 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &Has
     let tmp_ref = arena.push(Expr::Var(tmp.clone()));
     let mut result = build_fail_call(arena, to, tmp_ref);
     for alt in alts.iter().rev() {
-        let pred = build_shape_predicate(arena, tmp_ref, alt, named_types, visiting);
-        let checked = build_boundary_check(arena, tmp_ref, alt, named_types, visiting);
+        let pred = build_shape_predicate(arena, tmp_ref, alt, env, visiting);
+        let checked = build_boundary_check(arena, tmp_ref, alt, env, visiting);
         result = arena.push(Expr::If(pred, checked, result));
     }
     arena.push(Expr::Let(tmp, None, e, result))
@@ -1452,7 +1545,7 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &Has
 // together before deciding anything. Mirrors build_boundary_check's own
 // arms exactly (same shallow-check precedent each one sets), just
 // stopping short of wrapping the result in Let/If/fail.
-fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, named_types: &HashMap<String, Type>, visiting: &HashSet<String>) -> ExprRef {
+fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
     match ty {
         Type::Dyn => arena.push(Expr::Bool(true)),
         Type::Var(_) => arena.push(Expr::Bool(true)),
@@ -1497,7 +1590,7 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, named
             arena.push(Expr::If(is_record, has_all, false_lit))
         }
         Type::Union(alts) => {
-            fold_predicate(arena, alts, FoldOp::Or, |arena, alt| build_shape_predicate(arena, value_ref, alt, named_types, visiting))
+            fold_predicate(arena, alts, FoldOp::Or, |arena, alt| build_shape_predicate(arena, value_ref, alt, env, visiting))
         }
         // Same one-level-only unfold as build_boundary_check's own new
         // arm just above. A missing registry entry IS reachable (not an
@@ -1522,11 +1615,11 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, named
             if visiting.contains(id) {
                 return arena.push(Expr::Bool(false));
             }
-            let Some(raw) = named_types.get(id) else { return arena.push(Expr::Bool(true)) };
+            let Some(raw) = env.infer.named_types.get(id) else { return arena.push(Expr::Bool(true)) };
             let mut visiting = visiting.clone();
             visiting.insert(id.clone());
             let unfolded = raw.clone();
-            build_shape_predicate(arena, value_ref, &unfolded, named_types, &visiting)
+            build_shape_predicate(arena, value_ref, &unfolded, env, &visiting)
         }
         // Unlike Named's own one-level unfold just above (pure delegation
         // to what it unfolds to), an Indexed value's LENGTH is real,
@@ -1543,8 +1636,8 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, named
         // before this phase can construct one yet -- so it still falls
         // back to shape-only delegation, unchanged.
         Type::Indexed(wrapped, index) => match wrapped.as_ref() {
-            Type::List(_) => build_indexed_shape_cond(arena, value_ref, index),
-            _ => build_shape_predicate(arena, value_ref, wrapped, named_types, visiting),
+            Type::List(_) => build_indexed_shape_cond(arena, value_ref, index, env),
+            _ => build_shape_predicate(arena, value_ref, wrapped, env, visiting),
         },
     }
 }
@@ -1639,8 +1732,8 @@ fn build_token_check(arena: &mut Arena, e: ExprRef, to: &Type, id: u64) -> ExprR
 // own job, not re-derived here, so this one function serves both
 // Type::Tuple and Type::Record with nothing Tuple/Record-specific of its
 // own.
-fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type, named_types: &HashMap<String, Type>, visiting: &HashSet<String>) -> ExprRef {
-    build_checked(arena, e, to, |arena, v| build_shape_predicate(arena, v, to, named_types, visiting))
+fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
+    build_checked(arena, e, to, |arena, v| build_shape_predicate(arena, v, to, env, visiting))
 }
 
 // `predicate` becomes an ordinary `Expr::Var(predicate)` node, resolved
@@ -1679,14 +1772,28 @@ fn build_fail_call(arena: &mut Arena, to: &Type, value_ref: ExprRef) -> ExprRef 
 // span bookkeeping here: these nodes are synthesized, not sourced from
 // the program text, and typecheck never looks up a span for them (see
 // TypeError's doc comment).
-fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: Rc<Type>, named_types: &HashMap<String, Type>, visiting: &HashSet<String>) -> ExprRef {
+// A Vec(n) parameter makes `n` the argument's length for the return check
+// (a local witness, bound inside the wrapper only if that check reads it).
+fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: Rc<Type>, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
     let fn_var = "__contract_fn".to_string();
     let arg_var = "__contract_arg".to_string();
     let fn_var_ref = arena.push(Expr::Var(fn_var.clone()));
     let arg_var_ref = arena.push(Expr::Var(arg_var.clone()));
     let checked_fn = build_shallow_check(arena, fn_var_ref, &any_fun(), "is_fun");
     let call = arena.push(Expr::App(checked_fn, arg_var_ref));
-    let checked_call = build_boundary_check(arena, call, &ret_ty, named_types, visiting);
+    let witness = list_length_var(&param_ty, env.infer).map(|var| IndexWitness::new(var, &arg_var));
+    let checked_call = match &witness {
+        Some(w) => {
+            let mut local = env.local.clone();
+            local.push(w);
+            build_boundary_check(arena, call, &ret_ty, &CheckEnv { ctx: env.ctx, infer: env.infer, local }, visiting)
+        }
+        None => build_boundary_check(arena, call, &ret_ty, env, visiting),
+    };
+    let checked_call = match &witness {
+        Some(w) if w.used.get() => w.bind(arena, &arg_var, checked_call),
+        _ => checked_call,
+    };
     let lambda = arena.push(Expr::Lambda(arg_var, Some((*param_ty).clone()), checked_call));
     arena.push(Expr::Let(fn_var, None, e, lambda))
 }
@@ -1737,7 +1844,9 @@ enum PendingElab {
     // inferred/annotated type, row, and elaborated value), folding back
     // into a single Expr::LetRec.
     LetRec { bindings: Vec<(String, Type, EffectRow, ExprRef)> },
-    Fun { param: String, param_ty: Type },
+    // `witness`: this Lambda pushed an infer.index_witness entry (its
+    // parameter is Vec(n)), popped when the frame unwinds.
+    Fun { param: String, param_ty: Type, witness: bool },
 }
 
 // Recognizes the handler-expression shapes this codebase actually
@@ -2764,7 +2873,10 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     _ => (ann.unwrap_or_else(|| infer.fresh_var(&param)), Mode::Synth),
                 };
                 cur_ctx = extend(&cur_ctx, &param, param_ty.clone());
-                pending.push(PendingElab::Fun { param, param_ty });
+                let witness = list_length_var(&param_ty, infer).map(|var| IndexWitness::new(var, &param));
+                let has_witness = witness.is_some();
+                infer.index_witness.extend(witness);
+                pending.push(PendingElab::Fun { param, param_ty, witness: has_witness });
                 cur_mode = next_mode;
                 cur_expr = body;
             }
@@ -2907,7 +3019,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         Mode::Synth => elaborate_node(arena, cur_expr, &cur_ctx, spans, infer, cur_mode)?,
     };
     if let Mode::Check(expected) = cur_mode {
-        result_expr = coerce(arena, result_expr, &result_ty, expected, spans[cur_expr], &infer.named_types)?;
+        result_expr = coerce(arena, result_expr, &result_ty, expected, spans[cur_expr], &CheckEnv::new(&cur_ctx, infer))?;
         unify_fits(expected, &result_ty, infer, spans[cur_expr])?;
         result_ty = expected.clone();
     }
@@ -2931,12 +3043,18 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     bindings.into_iter().map(|(name, ty, _, val)| (name, Some(ty), val)).collect();
                 result_expr = arena.push(Expr::LetRec(Rc::new(group), result_expr));
             }
-            PendingElab::Fun { param, param_ty } => {
+            PendingElab::Fun { param, param_ty, witness } => {
                 // Matches the original Lambda arm: the body's row is
                 // embedded in the Fun type, not propagated -- evaluating
                 // the Lambda expression itself is always pure.
                 result_ty = Type::Fun(Rc::new(param_ty.clone()), result_row, Rc::new(result_ty));
                 result_row = EffectRow::pure();
+                if witness {
+                    let w = infer.index_witness.pop().expect("a Fun frame's witness is the innermost one");
+                    if w.used.get() {
+                        result_expr = w.bind(arena, &param, result_expr);
+                    }
+                }
                 result_expr = arena.push(Expr::Lambda(param, Some(param_ty), result_expr));
             }
         }
@@ -2953,7 +3071,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     // see this file's own regression history for why skipping this step
     // silently accepted `let f: Int = fun x -> x in ...`).
     if let Mode::Check(expected) = mode {
-        let checked = coerce(arena, result_expr, &result_ty, expected, spans[expr], &infer.named_types)?;
+        let checked = coerce(arena, result_expr, &result_ty, expected, spans[expr], &CheckEnv::new(ctx, infer))?;
         unify_fits(expected, &result_ty, infer, spans[expr])?;
         result_ty = expected.clone();
         result_expr = checked;
@@ -3190,7 +3308,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             };
             let checked_target = if matches!(target_ty, Type::Dyn | Type::Var(_)) {
                 let required = Type::Record(Rc::new(vec![(name.clone(), Type::Dyn)]));
-                build_shape_check(arena, target2, &required, &infer.named_types, &HashSet::new())
+                build_shape_check(arena, target2, &required, &CheckEnv::new(ctx, infer), &HashSet::new())
             } else {
                 target2
             };
@@ -3315,7 +3433,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // changes what coerce sees when something upstream
                     // has ALREADY resolved it.
                     let param_ty_resolved = infer.resolve_deep(param_ty);
-                    let a3 = coerce(arena, a2, &a_ty, &param_ty_resolved, spans[a], &infer.named_types)?;
+                    let a3 = coerce(arena, a2, &a_ty, &param_ty_resolved, spans[a], &CheckEnv::new(ctx, infer))?;
                     let mut row_subst = HashMap::new();
                     // Deliberately the RAW param_ty here, not
                     // param_ty_resolved -- row variables only ever
@@ -3408,8 +3526,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // own doc comment for why this stays a local special case
                 // rather than a general Int<->Float consistent() rule.
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Lt => {
-                    let l3 = coerce_numeric(arena, l2, &l_ty, spans[l], &infer.named_types)?;
-                    let r3 = coerce_numeric(arena, r2, &r_ty, spans[r], &infer.named_types)?;
+                    let l3 = coerce_numeric(arena, l2, &l_ty, spans[l], &CheckEnv::new(ctx, infer))?;
+                    let r3 = coerce_numeric(arena, r2, &r_ty, spans[r], &CheckEnv::new(ctx, infer))?;
                     // Both concretely Int: stays Int, exactly like before
                     // Float existed (Div/Mod's truncating semantics are
                     // untouched). Either side concretely Float: the OTHER
@@ -3448,12 +3566,12 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         ));
                     }
                     let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
-                        coerce(arena, l2, &l_ty, &r_ty, spans[l], &infer.named_types)?
+                        coerce(arena, l2, &l_ty, &r_ty, spans[l], &CheckEnv::new(ctx, infer))?
                     } else {
                         l2
                     };
                     let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
-                        coerce(arena, r2, &r_ty, &l_ty, spans[r], &infer.named_types)?
+                        coerce(arena, r2, &r_ty, &l_ty, spans[r], &CheckEnv::new(ctx, infer))?
                     } else {
                         r2
                     };
@@ -3497,12 +3615,12 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         }
                     };
                     let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
-                        coerce(arena, l2, &l_ty, &r_ty, spans[l], &infer.named_types)?
+                        coerce(arena, l2, &l_ty, &r_ty, spans[l], &CheckEnv::new(ctx, infer))?
                     } else {
                         l2
                     };
                     let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
-                        coerce(arena, r2, &r_ty, &l_ty, spans[r], &infer.named_types)?
+                        coerce(arena, r2, &r_ty, &l_ty, spans[r], &CheckEnv::new(ctx, infer))?
                     } else {
                         r2
                     };
@@ -3546,7 +3664,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
 
         Expr::If(c, t, e) => {
             let (c_ty, c_row, c2) = elaborate(arena, c, ctx, spans, infer)?;
-            let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans[c], &infer.named_types)?;
+            let c3 = coerce(arena, c2, &c_ty, &Type::Bool, spans[c], &CheckEnv::new(ctx, infer))?;
             let (result_ty, t_row, e_row, t2, e2) = match mode {
                 // Today's exact behavior, unchanged: infer both branches
                 // independently, try unify first (resolves open type
@@ -3843,7 +3961,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 let guard2 = match guard {
                     Some(g) => {
                         let (guard_ty, guard_row, g2) = elaborate(arena, *g, &arm_ctx, spans, infer)?;
-                        let g3 = coerce(arena, g2, &guard_ty, &Type::Bool, spans[*g], &infer.named_types)?;
+                        let g3 = coerce(arena, g2, &guard_ty, &Type::Bool, spans[*g], &CheckEnv::new(&arm_ctx, infer))?;
                         row = EffectRow::union(&row, &guard_row);
                         Some(g3)
                     }

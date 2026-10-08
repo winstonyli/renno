@@ -4412,6 +4412,9 @@ mod tests {
         // reaches `Vec(n)` only from an already-concrete `Vec(3)` (`w`),
         // never straight from Dyn, keeping it a pure static-inference check
         // of coerce()/unify_fits, the actual subject of this task.
+        // (2026-10-07: that gap no longer panics. The check reads n from a
+        // witness or its static binding, else fails cleanly; see
+        // dyn_to_vec_n_boundary_with_no_runtime_value_for_n_is_a_clean_error.)
         let src = r#"
             let x: Dyn = [1, 2, 3] in
             let w: Vec(3) = x in
@@ -6478,5 +6481,51 @@ mod tests {
         // `Int -> Vec(n)` promises every length, so returning the length-2 `a` is rejected.
         let src = "let a: Vec(n) = [1, 2] in let f: (Int -> Vec(n)) = fun k -> a in 0";
         assert!(run_source(src).unwrap_err().contains("fixed by the signature"));
+    }
+
+    // A Dyn value crossing into Vec(n) is checked at runtime against n's
+    // value. Inside a function whose parameter is Vec(n), that value is the
+    // parameter's length. These used to panic with "unbound variable: n".
+    #[test]
+    fn dyn_to_vec_n_boundary_checks_against_the_parameters_length_when_called() {
+        let mismatched = [
+            // rigid signature, Dyn escape hatch rebinding n
+            "let rec f: (Vec(n) -> Vec(n)) = fun v -> let r: Dyn = [1, 2, 3] in let q: Vec(n) = r in q in let a: Vec(2) = f([1, 2]) in a",
+            // the dyn_escape test's own program, now actually called
+            "let rec f: (Vec(n) -> Vec(n)) = fun v -> let r: Dyn = [1, 2, 3] in r in f([1, 2])",
+            // flexible, inline parameter annotation
+            "let f = fun v: Vec(n) -> let r: Dyn = [1, 2, 3] in let q: Vec(n) = r in q in f([1, 2])",
+            // higher-order contract: the wrapped function's result is checked against its argument's length
+            "let g: Dyn = fun x -> [1] in let h: (Vec(n) -> Vec(n)) = g in h([1, 2])",
+        ];
+        for src in mismatched {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains("type error: expected [Dyn](n"), "{src}: unexpected message: {err}");
+        }
+        let matching = [
+            ("let rec f: (Vec(n) -> Vec(n)) = fun v -> let r: Dyn = [1, 2, 3] in let q: Vec(n) = r in q in let a: Vec(3) = f([1, 2, 3]) in a", "[1, 2, 3]"),
+            ("let rec f: (Vec(n) -> Vec(n)) = fun v -> let r: Dyn = [1, 2, 3] in r in f([4, 5, 6])", "[1, 2, 3]"),
+            ("let f = fun v: Vec(n) -> let r: Dyn = [1, 2, 3] in let q: Vec(n) = r in q in f([1, 2, 3])", "[1, 2, 3]"),
+            ("let g: Dyn = fun x -> x in let h: (Vec(n) -> Vec(n)) = g in h([1, 2])", "[1, 2]"),
+            // inside the cons arm n is still the parameter's length (n = m + 1)
+            ("let rec f: (Vec(n) -> Vec(n)) = fun v -> match v | [] -> [] | h :: t -> let r: Dyn = v in let q: Vec(n) = r in q in f([1, 2])", "[1, 2]"),
+            // a shadowed parameter name does not change what n means
+            ("let rec f: (Vec(n) -> Vec(n)) = fun v -> let v = 0 in let r: Dyn = [1, 2] in let q: Vec(n) = r in q in f([7, 8])", "[1, 2]"),
+        ];
+        for (src, want) in matching {
+            assert_eq!(run_source(src).unwrap().to_string(), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn dyn_to_vec_n_boundary_with_no_runtime_value_for_n_is_a_clean_error() {
+        // n is an existential with no runtime binder: nothing to compare the
+        // length against, so the check fails cleanly instead of panicking.
+        let src = "let x: Dyn = [1, 2, 3] in let y: Vec(n) = x in len(y)";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("index variable n has no runtime value"), "unexpected message: {err}");
+        // ...but an n already known statically is compared directly.
+        let src = "let a: Vec(n) = [1, 2] in let x: Dyn = [1, 2] in let y: Vec(n) = x in len(y)";
+        assert_eq!(run_source(src).unwrap().as_int(), 2);
     }
 }
