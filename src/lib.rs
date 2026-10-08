@@ -7403,4 +7403,24 @@ mod tests {
                    with handler choose(p, resume) -> resume(1) + resume(2)";
         assert_clean_rejection(bad, BAD_INT);
     }
+
+    #[test]
+    fn a_perform_as_a_join_arm_is_handled_and_the_resumed_function_is_still_checked() {
+        let prog = |call: &str| format!(
+            "handle (let g = if 1 < 2 then (perform pick(0)) else (fun s: Str -> s) in g({call})) \
+             with handler pick(p, resume) -> resume(fun x: Int -> x + 1)"
+        );
+        assert_eq!(run_source(&prog("1")).unwrap().as_int(), 2);
+        assert_clean_rejection(&prog("true"), BAD_INT);
+    }
+
+    #[test]
+    fn a_let_rec_function_arm_joined_to_a_str_function_is_cast() {
+        let prog = |call: &str| format!(
+            "let rec f = fun n: Int -> if n < 1 then 0 else f(n - 1) in \
+             let g = if 1 < 2 then f else (fun s: Str -> s) in g({call})"
+        );
+        assert_eq!(run_source(&prog("3")).unwrap().as_int(), 0);
+        assert_clean_rejection(&prog("true"), BAD_INT);
+    }
 }
