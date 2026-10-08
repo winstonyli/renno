@@ -6885,7 +6885,46 @@ mod tests {
 
     #[test]
     fn re_crossed_function_rejects_a_bad_argument_statically() {
-        assert!(run_source("let f = fun a: Int -> a + 1 in let d: Dyn = f in let g: (Int -> Int) = d in g(true)").is_err());
+        let err = run_source("let f = fun a: Int -> a + 1 in let d: Dyn = f in let g: (Int -> Int) = d in g(true)").expect_err("static mismatch");
+        assert!(err.contains("type mismatch"), "{err}");
+    }
+
+    #[test]
+    fn a_dyn_crossed_curried_vec_n_function_compares_lengths_across_calls() {
+        let curried = "let d = fun a: Vec(n) -> fun b: Vec(n) -> len(b) in let x: Dyn = d in ";
+        assert!(run_source(&format!("{curried}x([1])([1, 2])")).is_err());
+        assert_eq!(run_source(&format!("{curried}x([1, 2])([3, 4])")).unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_dyn_crossed_vec_n_function_does_not_fail_spuriously() {
+        assert_eq!(run_source("let f = fun v: Vec(n) -> len(v) in let d: Dyn = f in d([1, 2, 3])").unwrap().as_int(), 3);
+        assert_eq!(run_source("let f = fun v: Vec(n+1) -> len(v) in let d: Dyn = f in d([1, 2])").unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_contravariant_callback_is_checked_through_the_upcast_recursion() {
+        let err = run_source("let ap = fun k: ((Int -> Int) -> Int) -> k(fun x: Int -> x) in let d: Dyn = ap in d(fun cb -> cb(true))").expect_err("bad callback result");
+        assert!(err.contains("expected Int, found Bool"), "{err}");
+    }
+
+    #[test]
+    fn a_returned_function_is_upcast_through_dyn() {
+        let mk = "let mk = fun a: Int -> fun b: Int -> a + b in let d: Dyn = mk in ";
+        assert!(run_source(&format!("{mk}d(1)(true)")).is_err());
+        assert_eq!(run_source(&format!("{mk}d(1)(2)")).unwrap().as_int(), 3);
+    }
+
+    #[test]
+    fn a_named_return_through_dyn_terminates_without_upcast() {
+        // Only an annotated binding gives a source Fun a recursive Named return that typechecks today.
+        assert_eq!(run_source("type F = Int | (Int, F) in let mk: (Int -> F) = fun a: Int -> a in let d: Dyn = mk in d(1)").unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn a_deep_tail_loop_through_a_dyn_wrapper_with_an_upcast_completes() {
+        let src = "let rec go: (Int -> Int -> Int) = fun i: Int -> fun acc: Int -> if i == 0 then acc else go(i - 1)(acc + 1) in let d: Dyn = go in d(100000)(0)";
+        assert_eq!(run_source(src).unwrap().as_int(), 100000);
     }
 
     #[test]

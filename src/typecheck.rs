@@ -1280,22 +1280,26 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
     Ok(build_boundary_check(arena, e, to, env, &HashSet::new()))
 }
 
-// `t` with every Indexed whose index still has a free variable reduced to the
-// type it wraps, so build_boundary_check never needs a witness for it.
-fn erase_open_indexed(t: &Type) -> Type {
+// `t` with every Indexed whose index mentions a variable `has_value` rejects
+// reduced to the type it wraps, so build_boundary_check never needs a witness
+// it cannot get.
+fn erase_open_indexed(t: &Type, has_value: &dyn Fn(&str) -> bool) -> Type {
+    let go = |t: &Type| erase_open_indexed(t, has_value);
     match t {
-        Type::Indexed(w, i) if free_index_vars(i).is_empty() => Type::Indexed(Rc::new(erase_open_indexed(w)), i.clone()),
-        Type::Indexed(w, _) => erase_open_indexed(w),
-        Type::List(e) => Type::List(Rc::new(erase_open_indexed(e))),
-        Type::Tuple(ts) => Type::Tuple(Rc::new(ts.iter().map(erase_open_indexed).collect())),
-        Type::Union(ts) => Type::Union(Rc::new(ts.iter().map(erase_open_indexed).collect())),
-        Type::Record(fs) => Type::Record(Rc::new(fs.iter().map(|(n, t)| (n.clone(), erase_open_indexed(t))).collect())),
-        Type::Fun(p, r, b) => Type::Fun(Rc::new(erase_open_indexed(p)), r.clone(), Rc::new(erase_open_indexed(b))),
+        Type::Indexed(w, i) if free_index_vars(i).iter().all(|v| has_value(v)) => Type::Indexed(Rc::new(go(w)), i.clone()),
+        Type::Indexed(w, _) => go(w),
+        Type::List(e) => Type::List(Rc::new(go(e))),
+        Type::Tuple(ts) => Type::Tuple(Rc::new(ts.iter().map(go).collect())),
+        Type::Union(ts) => Type::Union(Rc::new(ts.iter().map(go).collect())),
+        Type::Record(fs) => Type::Record(Rc::new(fs.iter().map(|(n, t)| (n.clone(), go(t))).collect())),
+        Type::Fun(p, r, b) => Type::Fun(Rc::new(go(p)), r.clone(), Rc::new(go(b))),
         other => other.clone(),
     }
 }
 
 // Structural equality that ignores effect rows (no runtime row representation).
+// Intentionally Fun/structure-only with an == fallback; it is the only thing
+// keeping annotated `let rec` bindings bare Lambdas (see coerce_cast).
 fn same_ignoring_rows(a: &Type, b: &Type) -> bool {
     match (a, b) {
         (Type::Fun(p, _, r), Type::Fun(p2, _, r2)) => same_ignoring_rows(p, p2) && same_ignoring_rows(r, r2),
@@ -1308,11 +1312,11 @@ fn same_ignoring_rows(a: &Type, b: &Type) -> bool {
 }
 
 // Wraps a Fun-typed `e` so that, seen as `to` (Dyn or a Fun), its argument is
-// re-checked against the parameter type it was really declared with. Closure
-// form: `let __cf = e in fun __ca: A' -> __cf(DOWN(__ca))`, fresh Var nodes
-// each time. The body runs once per call (repeatable) and records no
-// obligations. A parameter's open index variables are erased (Task 3 adds
-// witnesses). Returns `e` unchanged when no wrapper is needed.
+// re-checked against the parameter type it was really declared with and a
+// returned function is wrapped in turn. Closure form:
+// `let __cf = e in fun __ca: A' -> UP(__cf(DOWN(__ca)))`, fresh Var nodes each
+// time. The body runs once per call (repeatable) and records no obligations.
+// Returns `e` unchanged when no wrapper is needed.
 fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let from = env.infer.resolve_deep(from);
     let to = env.infer.resolve_deep(to);
@@ -1321,26 +1325,46 @@ fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Chec
     if same_ignoring_rows(&from, &to) || !needs_wrapper(&from, &to) {
         return e;
     }
-    let Type::Fun(a, _, _) = &from else { return e };
-    let a_target = match &to {
-        Type::Fun(a2, ..) => (**a2).clone(),
-        _ => Type::Dyn,
+    build_cast(arena, e, &from, &to, env, 0)
+}
+
+// The closure form of coerce_cast for a Fun `from` (needs_wrapper holds).
+// `depth` numbers the binder names so a returned function's wrapper, nested
+// inside this one's lambda, never shadows it. A Vec(n) parameter whose `n` has
+// no witness in scope binds one from `__ca` (DOWN then needs only is_list: the
+// length half would be `len(__ca) == n`, a tautology); a variable already
+// witnessed in scope is never rebound, so a nested wrapper compares against
+// the outer value. Any other open index degrades to is_list.
+fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv, depth: usize) -> ExprRef {
+    let Type::Fun(a, _, b) = from else { unreachable!("build_cast takes a Fun source") };
+    let (a_target, b_target) = match to {
+        Type::Fun(a2, _, b2) => ((**a2).clone(), (**b2).clone()),
+        _ => (Type::Dyn, Type::Dyn),
     };
-    let cf = "__cf".to_string();
-    let ca = "__ca".to_string();
+    let suffix = if depth == 0 { String::new() } else { (depth + 1).to_string() };
+    let cf = format!("__cf{suffix}");
+    let ca = format!("__ca{suffix}");
+    let witnessed = |v: &str| env.local.iter().any(|w| w.var == v) || env.infer.index_witness.iter().any(|w| w.var == v);
+    let witness = list_length_var(a, env.infer).filter(|v| !witnessed(v)).map(|var| IndexWitness::new(var, &ca));
+    let mut local = env.local.clone();
+    local.extend(witness.as_ref());
+    let body_env = CheckEnv { infer: env.infer, local, defer: false, repeatable: true };
     let ca_ref = arena.push(Expr::Var(ca.clone()));
     let arg = if needs_down(a, &a_target) {
-        let body_env = CheckEnv { infer: env.infer, local: env.local.clone(), defer: false, repeatable: true };
-        build_boundary_check(arena, ca_ref, &erase_open_indexed(a), &body_env, &HashSet::new())
+        build_boundary_check(arena, ca_ref, &erase_open_indexed(a, &witnessed), &body_env, &HashSet::new())
     } else {
         ca_ref
     };
     let cf_ref = arena.push(Expr::Var(cf.clone()));
     let call = arena.push(Expr::App(cf_ref, arg));
-    let lambda = arena.push(Expr::Lambda(ca, Some(a_target), call));
+    let result = if needs_upcast(b, &b_target) { build_cast(arena, call, b, &b_target, &body_env, depth + 1) } else { call };
+    let body = match &witness {
+        Some(w) if w.used.get() => w.bind(arena, &ca, result),
+        _ => result,
+    };
+    let lambda = arena.push(Expr::Lambda(ca, Some(a_target), body));
     arena.push(Expr::Let(cf, None, e, lambda))
 }
-
 // True iff `t` has no Dyn, Var, Union or free index variable at any depth:
 // a type a strict (non-gradual) `fits` check can be trusted on. A Union
 // counts as loose because `fits(Int, Int | Bool)` holds. Named and Token
