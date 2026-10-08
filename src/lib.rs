@@ -6426,6 +6426,18 @@ mod tests {
     }
 
     #[test]
+    fn rigid_cons_arm_fresh_variable_cannot_be_pinned_to_reach_the_signature_variable() {
+        // The cons arm's hypothesis n := m + 1 uses a fresh m; pinning m in the
+        // body must not let a length-5 result through a Vec(n) -> Vec(n) signature.
+        for src in [
+            "let rec f: (Vec(n) -> Vec(n)) = fun v -> match v | [] -> [] | h :: t -> let w: Vec(4) = t in [1, 2, 3, 4, 5] in f([1, 2])",
+            "let rec f: (Vec(n) -> Vec(n)) = fun v -> match v | [] -> [] | h :: t -> let w: Vec(4) = f(t) in [1, 2, 3, 4, 5] in f([1, 2])",
+        ] {
+            assert!(run_source(src).is_err(), "should be rejected: {src}");
+        }
+    }
+
+    #[test]
     fn rigid_variables_are_released_after_the_binding() {
         // After f is checked, a later, unrelated annotation reusing the name
         // `n` must be free to bind it again.
