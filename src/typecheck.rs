@@ -1273,6 +1273,50 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env
     Ok(build_boundary_check(arena, e, to, env, &HashSet::new()))
 }
 
+// True iff `t` has no Dyn, Var, Union or free index variable at any depth:
+// a type a strict (non-gradual) `fits` check can be trusted on. A Union
+// counts as loose because `fits(Int, Int | Bool)` holds. Named and Token
+// are tolerated (nominal leaves). All take resolve_deep'd types.
+pub(crate) fn loose_free(t: &Type) -> bool {
+    match t {
+        Type::Dyn | Type::Var(_) | Type::Union(_) => false,
+        Type::List(elem) => loose_free(elem),
+        Type::Fun(p, _, r) => loose_free(p) && loose_free(r),
+        Type::Tuple(items) => items.iter().all(loose_free),
+        Type::Record(fields) => fields.iter().all(|(_, t)| loose_free(t)),
+        Type::Indexed(wrapped, _) => loose_free(wrapped) && index_vars_as_written(t).is_empty(),
+        _ => true,
+    }
+}
+
+// `a_src` statically fits `a_target` and nothing about the target is loose.
+// Argument order mirrors fits' param contravariance: fits(act_param, req_param).
+pub(crate) fn strict_fits(a_target: &Type, a_src: &Type) -> bool {
+    fits(a_src, a_target) && loose_free(a_target)
+}
+
+// Must a value of type `a_src` be re-checked at runtime to be used as `a_target`?
+pub(crate) fn needs_down(a_src: &Type, a_target: &Type) -> bool {
+    !matches!(a_src, Type::Dyn | Type::Var(_)) && !strict_fits(a_target, a_src)
+}
+
+// Does a return value of type `b` need a wrapper to be seen as `b_target`?
+// Recurses only into a bare Fun return; never Named, Union, Tuple, Record, List.
+fn needs_upcast(b: &Type, b_target: &Type) -> bool {
+    matches!(b, Type::Fun(..)) && needs_wrapper(b, b_target)
+}
+
+// Does casting `from` (a Fun) to `to` (Dyn, read as Fun(Dyn, _, Dyn), or a
+// Fun) need a wrapper around the function value?
+pub(crate) fn needs_wrapper(from: &Type, to: &Type) -> bool {
+    let Type::Fun(a, _, b) = from else { return false };
+    match to {
+        Type::Dyn => needs_down(a, &Type::Dyn) || needs_upcast(b, &Type::Dyn),
+        Type::Fun(a2, _, b2) => needs_down(a, a2) || needs_upcast(b, b2),
+        _ => false,
+    }
+}
+
 // Like `coerce`, but the target is "Int or Float" rather than one fixed
 // type -- Add/Sub/Mul/Div/Mod/Lt's own operand check. Kept separate from
 // the general coerce()/consistent() machinery ON PURPOSE: Int and Float

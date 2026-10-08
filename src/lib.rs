@@ -4254,6 +4254,38 @@ mod tests {
     }
 
     #[test]
+    fn needs_down_decides_when_a_source_value_must_be_re_checked_against_a_target() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::needs_down;
+        use std::rc::Rc;
+        use types::Type;
+        let list = |t: Type| Type::List(Rc::new(t));
+        let rec = |names: &[&str]| Type::Record(Rc::new(names.iter().map(|n| (n.to_string(), Type::Int)).collect()));
+        let vec_of = |i: IndexExpr| Type::Indexed(Rc::new(list(Type::Int)), Rc::new(i));
+        assert!(!needs_down(&Type::Dyn, &Type::Int));
+        assert!(!needs_down(&Type::Var("a".to_string()), &Type::Int));
+        assert!(!needs_down(&Type::Int, &Type::Int));
+        assert!(needs_down(&Type::Int, &Type::Dyn));
+        assert!(needs_down(&Type::Int, &Type::Union(Rc::new(vec![Type::Int, Type::Bool]))));
+        assert!(needs_down(&list(Type::Int), &list(Type::Dyn)));
+        assert!(needs_down(&rec(&["x", "y"]), &rec(&["x"])));
+        assert!(needs_down(&vec_of(IndexExpr::Lit(3)), &vec_of(IndexExpr::Var("m".to_string()))));
+        assert!(!needs_down(&vec_of(IndexExpr::Lit(3)), &vec_of(IndexExpr::Lit(3))));
+    }
+
+    #[test]
+    fn needs_wrapper_decides_when_a_function_cast_needs_a_wrapper() {
+        use crate::typecheck::needs_wrapper;
+        use std::rc::Rc;
+        use types::{EffectRow, Type};
+        let fun = |a: Type, b: Type| Type::Fun(Rc::new(a), EffectRow::Dyn, Rc::new(b));
+        assert!(needs_wrapper(&fun(Type::Int, Type::Int), &Type::Dyn));
+        assert!(!needs_wrapper(&fun(Type::Dyn, Type::Dyn), &Type::Dyn));
+        assert!(needs_wrapper(&fun(Type::Dyn, fun(Type::Int, Type::Int)), &Type::Dyn));
+        assert!(!needs_wrapper(&fun(Type::Dyn, Type::Named("T#1".to_string())), &Type::Dyn));
+    }
+
+    #[test]
     fn free_index_vars_resolved_finds_a_bare_index_variable() {
         use crate::index_expr::IndexExpr;
         use crate::typecheck::{free_index_vars_resolved, InferCtx};
