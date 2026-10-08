@@ -6940,6 +6940,172 @@ mod tests {
         assert_eq!(run_source(src).unwrap().as_int(), 100000);
     }
 
+
+    // Every LetRec in an elaborated tree is still a direct Lambda group
+    // (resolve::is_direct_group); otherwise the recursive name becomes unbound.
+    fn let_rec_groups_direct(arena: &expr::Arena, root: expr::ExprRef, out: &mut Vec<bool>) {
+        use expr::Expr;
+        let mut go = |r: &expr::ExprRef| let_rec_groups_direct(arena, *r, out);
+        match &arena[root] {
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => {}
+            Expr::ListLit(items) | Expr::Tuple(items) => items.iter().for_each(go),
+            Expr::Lambda(_, _, body) => go(body),
+            Expr::App(f, a) => {
+                go(f);
+                go(a);
+            }
+            Expr::Let(_, _, val, body) => {
+                go(val);
+                go(body);
+            }
+            Expr::LetRec(bindings, body) => {
+                let direct = resolve::is_direct_group(arena, bindings);
+                bindings.iter().for_each(|(_, _, v)| go(v));
+                go(body);
+                out.push(direct);
+            }
+            Expr::BinOp(_, l, r) => {
+                go(l);
+                go(r);
+            }
+            Expr::If(c, t, e) => {
+                go(c);
+                go(t);
+                go(e);
+            }
+            Expr::Perform(_, p) => go(p),
+            Expr::Handle { body, handler } => {
+                go(body);
+                go(handler);
+            }
+            Expr::MakeHandler { body, .. } => go(body),
+            Expr::Match(s, arms) => {
+                go(s);
+                for (_, g, b) in arms.iter() {
+                    g.iter().for_each(&mut go);
+                    go(b);
+                }
+            }
+            Expr::Record(fields) => fields.iter().for_each(|(_, v)| go(v)),
+            Expr::FieldAccess(..) => unreachable!(),
+        }
+    }
+
+    fn elaborated_let_rec_groups(src: &str) -> Vec<bool> {
+        let (mut arena, spans, root, named) = parser::parse_with_named_types(src).unwrap();
+        let out = typecheck::check_with_named_types(&mut arena, root, &spans, named).unwrap();
+        let mut groups = Vec::new();
+        let_rec_groups_direct(&arena, out, &mut groups);
+        groups
+    }
+
+    #[test]
+    fn a_curried_literal_at_a_dyn_position_checks_each_stage() {
+        let d = "let d: Dyn = fun a: Int -> fun b: Int -> a + b in ";
+        let err = run_source(&format!("{d}d(1)(true)")).expect_err("bad second argument");
+        assert!(err.contains("type error") && err.contains("expected Int, found Bool"), "{err}");
+        assert!(run_source(&format!("{d}d(true)(2)")).is_err());
+        assert_eq!(run_source(&format!("{d}d(1)(2)")).unwrap().as_int(), 3);
+    }
+
+    #[test]
+    fn a_literal_is_rebuilt_in_place_not_wrapped_in_a_closure() {
+        // Literal form: no `let __cf = ... in fun __ca` outer closure.
+        assert!(!elaborated_has_wrapper("let d: Dyn = fun a: Int -> fun b: Int -> a + b in d(1)(2)"));
+        assert!(elaborated_has_wrapper("let f = fun a: Int -> a + 1 in let d: Dyn = f in d(2)"));
+    }
+
+    #[test]
+    fn an_annotated_let_rec_literal_at_dyn_stays_a_direct_recursive_group() {
+        let src = "let rec f: Dyn = fun n: Int -> if n < 1 then 0 else f(n - 1) in ";
+        assert_eq!(elaborated_let_rec_groups(&format!("{src}f(3)")), vec![true]);
+        assert_eq!(run_source(&format!("{src}f(3)")).unwrap().as_int(), 0);
+        let err = run_source(&format!("{src}f(true)")).expect_err("bad argument");
+        assert!(err.contains("type error") && err.contains("expected Int, found Bool"), "{err}");
+    }
+
+    // The error location of a rejected literal-form call: the first line is
+    // "line L, column C: ..." (spec 8). Recorded from an actual run:
+    // `let d: Dyn = fun a: Int -> a + 1 in d(true)` -> "line 1, column 39:
+    // type error: expected Int, found Bool", the span of the argument `true`.
+    #[test]
+    fn a_rejected_literal_call_reports_a_location() {
+        let err = run_source("let d: Dyn = fun a: Int -> a + 1 in d(true)").expect_err("bad argument");
+        assert!(err.starts_with("line 1, column 39: "), "{err}");
+        assert!(err.contains("expected Int, found Bool"), "{err}");
+    }
+
+    #[test]
+    fn a_literal_vec_n_lambda_at_dyn_only_checks_is_list_and_is_a_pinned_limitation() {
+        let d = "let d: Dyn = fun a: Vec(n) -> fun b: Vec(n) -> len(b) in ";
+        // PINNED parked limitation (spec 7): the literal form never compares
+        // lengths, so mismatched lengths are accepted.
+        assert_eq!(run_source(&format!("{d}d([1])([1, 2])")).unwrap().as_int(), 2);
+        assert!(run_source(&format!("{d}d(5)")).is_err());
+        assert!(run_source(&format!("{d}d([1])(5)")).is_err());
+    }
+
+    #[test]
+    fn a_loose_vec_literal_through_a_dyn_hop_is_rejected_when_the_index_is_fixed() {
+        let err = run_source("let k: Dyn = fun x: Vec(3) -> 1 in k([1])").expect_err("wrong length");
+        assert!(err.contains("type error"), "{err}");
+        assert_eq!(run_source("let k: Dyn = fun x: Vec(3) -> 1 in k([1, 2, 3])").unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn a_dyn_callee_argument_is_cast_to_dyn() {
+        let err = run_source("let f = fun a: Int -> a + 1 in map(f)([true])").expect_err("bad element");
+        assert!(err.contains("type error") && !err.contains("expected a number"), "{err}");
+        assert_eq!(run_source("let f = fun a: Int -> a + 1 in len(map(f)([1, 2]))").unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_perform_payload_function_is_cast_to_dyn() {
+        let src = "handle perform op(fun a: Int -> a + 1) with handler op(p, resume) -> resume(p(true))";
+        let err = run_source(src).expect_err("bad application");
+        assert!(err.contains("type error") && !err.contains("expected a number"), "{err}");
+        let ok = "handle perform op(fun a: Int -> a + 1) with handler op(p, resume) -> resume(p(1))";
+        assert_eq!(run_source(ok).unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_wrapped_function_resumed_twice_is_checked_each_time() {
+        let src = "handle (let f = perform choose(0) in f(10)) with handler choose(p, resume) -> resume(fun a: Int -> a + 1) + resume(fun a: Int -> a * 2)";
+        assert_eq!(run_source(src).unwrap().as_int(), 31);
+        let bad = "handle (let f = perform choose(0) in f(true)) with handler choose(p, resume) -> resume(fun a: Int -> a + 1) + resume(fun a: Int -> a * 2)";
+        assert!(run_source(bad).is_err());
+        let lit = "let rec f: Dyn = fun n: Int -> if n < 1 then 0 else f(n - 1) in handle (perform choose(0)) + f(2) with handler choose(p, resume) -> resume(1) + resume(2)";
+        assert_eq!(elaborated_let_rec_groups(lit), vec![true]);
+        assert_eq!(run_source(lit).unwrap().as_int(), 3);
+    }
+
+    #[test]
+    fn a_literal_loop_that_re_enters_its_wrapper_every_iteration_completes() {
+        let src = "let rec f: Dyn = fun n: Int -> if n < 1 then 0 else f(n - 1) in f(100000)";
+        assert_eq!(run_source(src).unwrap().as_int(), 0);
+    }
+
+    #[test]
+    fn a_union_target_is_not_wrapped_is_a_known_limitation() {
+        let src = "let h: ((Dyn -> Dyn) | Bool) = fun x: Int -> x in (fun k: (Dyn -> Dyn) -> k(true))(h)";
+        // Union targets are not descended: the cast is skipped and the argument is unchecked (spec 7).
+        assert_eq!(run_source(src).unwrap(), Outcome::Bool(true));
+    }
+
+    #[test]
+    fn a_named_target_is_not_wrapped_is_a_known_limitation() {
+        let src = "type F = Dyn -> F in let g: F = fun x: Int -> fun y: Int -> y in let d: Dyn = g in d(true)";
+        // Named targets are not descended: `d(true)` returns the inner function instead of rejecting `true` (spec 7).
+        assert!(matches!(run_source(src).unwrap(), Outcome::Function));
+    }
+
+    #[test]
+    fn a_var_returning_call_into_a_dyn_callback_is_rejected_today_known_limitation() {
+        let src = "let id = fun k -> k in (fun k: (Dyn -> Dyn) -> k(true))(id(fun x: Int -> x + 1))";
+        // Current behaviour: the bad call IS rejected (at the `true` in `k(true)`); pinned so a change shows.
+        let err = run_source(src).expect_err("rejected today");
+        assert!(err.starts_with("line 1, column 50: type error: expected Int, found Bool"), "{err}");
+    }
     #[test]
     fn unannotated_code_emits_no_function_wrapper() {
         for src in [

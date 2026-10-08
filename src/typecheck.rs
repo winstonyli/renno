@@ -1327,7 +1327,51 @@ fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Chec
     if same_ignoring_rows(&from, &to) || !needs_wrapper(&from, &to) {
         return e;
     }
+    if matches!(arena[e], Expr::Lambda(..)) {
+        return build_literal_cast(arena, e, &from, &to, env, 0);
+    }
     build_cast(arena, e, &from, &to, env, 0)
+}
+
+// The literal form of build_cast for a Lambda `e` (spec 2026-10-08 sec 5):
+// the Lambda is rebuilt in place, `fun p: A' -> let p = DOWN(p) in UP(body)`,
+// so an annotated `let rec` binding stays a direct Lambda (is_direct_group)
+// and no closure is allocated. A witness binder (`let hidden = p in ...`) at
+// the top of the body is kept, and UP recurses into a Lambda body. Here a
+// parameter's index variables are never witnessed: DOWN is is_list only for
+// them, unless the variable is already witnessed by an enclosing scope
+// (parked, spec sec 7).
+fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv, depth: usize) -> ExprRef {
+    let Expr::Lambda(param, _, body) = arena[e].clone() else { unreachable!("build_literal_cast takes a Lambda") };
+    let Type::Fun(a, _, b) = from else { unreachable!("build_literal_cast takes a Fun source") };
+    let (a_target, b_target) = match to {
+        Type::Fun(a2, _, b2) => ((**a2).clone(), (**b2).clone()),
+        _ => (Type::Dyn, Type::Dyn),
+    };
+    let witnessed = |v: &str| env.local.iter().any(|w| w.var == v) || env.infer.index_witness.iter().any(|w| w.var == v);
+    let up_body = if needs_upcast(b, &b_target) { literal_up(arena, body, b, &b_target, env, depth + 1) } else { body };
+    let body = if needs_down(a, &a_target) {
+        let p_ref = arena.push(Expr::Var(param.clone()));
+        let checked = build_boundary_check(arena, p_ref, &erase_open_indexed(a, &witnessed), env, &HashSet::new());
+        arena.push(Expr::Let(param.clone(), None, checked, up_body))
+    } else {
+        up_body
+    };
+    arena.push(Expr::Lambda(param, Some(a_target), body))
+}
+
+// UP for a literal's body: a Lambda body is rebuilt in turn (through a witness
+// binder, `let hidden = <var> in ...`); any other body is wrapped in the
+// closure form.
+fn literal_up(arena: &mut Arena, body: ExprRef, b: &Type, b_target: &Type, env: &CheckEnv, depth: usize) -> ExprRef {
+    match arena[body].clone() {
+        Expr::Lambda(..) => build_literal_cast(arena, body, b, b_target, env, depth),
+        Expr::Let(hidden, None, val, inner) if matches!(arena[val], Expr::Var(_)) => {
+            let inner = literal_up(arena, inner, b, b_target, env, depth);
+            arena.push(Expr::Let(hidden, None, val, inner))
+        }
+        _ => build_cast(arena, body, b, b_target, env, depth),
+    }
 }
 
 // The closure form of coerce_cast for a Fun `from` (needs_wrapper holds).
@@ -3814,7 +3858,11 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // machine.rs. Can't know what it might perform, so the
                     // call contributes an unknown (Dyn) row.
                     let f3 = build_shallow_check(arena, f2, &any_fun(), "is_fun");
-                    (EffectRow::Dyn, Type::Dyn, arena.push(Expr::App(f3, a2)))
+                    // The argument crosses into an unknown function, so it is
+                    // cast to Dyn like any other Dyn position (a typed
+                    // function argument gets its wrapper).
+                    let a3 = coerce_cast(arena, a2, &a_ty, &Type::Dyn, &CheckEnv::new(infer));
+                    (EffectRow::Dyn, Type::Dyn, arena.push(Expr::App(f3, a3)))
                 }
                 other => return Err(TypeError(format!("cannot call a value of type {other}"), spans[f])),
             };
@@ -4034,7 +4082,9 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         // The effect this specific operation performs, plus whatever the
         // payload expression itself might perform.
         Expr::Perform(effect, payload) => {
-            let (_, payload_row, payload2) = elaborate(arena, payload, ctx, spans, infer)?;
+            let (payload_ty, payload_row, payload2) = elaborate(arena, payload, ctx, spans, infer)?;
+            // The handler receives the payload as Dyn.
+            let payload2 = coerce_cast(arena, payload2, &payload_ty, &Type::Dyn, &CheckEnv::new(infer));
             let row = EffectRow::union(&payload_row, &EffectRow::single(&effect));
             Ok((Type::Dyn, row, arena.push(Expr::Perform(effect, payload2))))
         }
