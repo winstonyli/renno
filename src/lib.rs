@@ -6704,4 +6704,23 @@ mod tests {
         // The union's other alternative still matches a non-list.
         assert_eq!(run_source("let x: Dyn = 5 in let y: Vec(n) | Int = x in 0").unwrap().as_int(), 0);
     }
+
+    #[test]
+    fn a_dyn_crossing_inside_a_function_body_keeps_the_clean_error_for_an_unbound_n() {
+        // One crossing site, run twice: both results share the one unbound n,
+        // so g would trust unequal-length lists. Never accepted.
+        let lambda = "let mk = fun d: Dyn -> (let y: Vec(n) = d in y) in \
+                      let g = fun a: Vec(k) -> fun b: Vec(k) -> len(b) in \
+                      let x1: Dyn = [1, 2] in let x2: Dyn = [1, 2, 3] in g(mk(x1))(mk(x2))";
+        let rec_body = "let rec mk = fun d: Dyn -> (let y: Vec(n) = d in y) in \
+                        let g = fun a: Vec(k) -> fun b: Vec(k) -> len(b) in \
+                        let x1: Dyn = [1, 2] in let x2: Dyn = [1, 2, 3] in g(mk(x1))(mk(x2))";
+        for src in [lambda, rec_body] {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains("has no runtime value"), "{src}: unexpected message: {err}");
+        }
+        // A top-level call site is not inside the callee's body: is_list only.
+        let src = "let f = fun v: Vec(n) -> v in let x: Dyn = [1, 2, 3] in len(f(x))";
+        assert_eq!(run_source(src).unwrap().as_int(), 3);
+    }
 }

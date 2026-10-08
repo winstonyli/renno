@@ -129,6 +129,9 @@ pub(crate) struct InferCtx {
     // A RefCell because the check builders only see a shared &InferCtx
     // (CheckEnv), the same reason IndexWitness.used is a Cell.
     obligations: RefCell<Vec<Obligation>>,
+    // How many function bodies (Lambda, handler clause) enclose the point
+    // being elaborated: code inside one can run any number of times.
+    repeatable_depth: usize,
     // Every genuinely self-referential type alias this program's own
     // parse registered (parser::Parser's own `named_types`, handed in
     // once at construction) -- consulted on demand by
@@ -149,6 +152,7 @@ impl InferCtx {
             index_rename: HashMap::new(),
             index_witness: Vec::new(),
             obligations: RefCell::new(Vec::new()),
+            repeatable_depth: 0,
             named_types,
         }
     }
@@ -1445,6 +1449,9 @@ struct Obligation {
     len_eq: ExprRef,
     index: IndexExpr,
     witnesses: Vec<(String, String)>,
+    // The crossing sits inside a function body, so one site can produce many
+    // values sharing its index variable.
+    repeatable: bool,
 }
 
 impl Obligation {
@@ -1512,7 +1519,7 @@ fn record_obligation(len_eq: ExprRef, index: &IndexExpr, env: &CheckEnv) {
         w.used.set(true);
     }
     let witnesses = in_scope.iter().map(|w| (w.var.clone(), w.hidden.clone())).collect();
-    env.infer.obligations.borrow_mut().push(Obligation { len_eq, index, witnesses });
+    env.infer.obligations.borrow_mut().push(Obligation { len_eq, index, witnesses, repeatable: env.infer.repeatable_depth > 0 || !env.local.is_empty() });
 }
 
 // Patches every obligation's `len(value) == <index>` node once inference has
@@ -1522,7 +1529,7 @@ fn record_obligation(len_eq: ExprRef, index: &IndexExpr, env: &CheckEnv) {
 // anything evaluates the tree.
 //
 // An index that is still a bare unbound variable no other obligation
-// mentions constrains nothing, so the check is `is_list` alone (the node
+// mentions, and that sits in no function body, constrains nothing, so the check is `is_list` alone (the node
 // becomes `true`). Two crossings sharing one such variable would claim equal
 // lengths with nothing to compare against, so they keep the clean failure.
 fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
@@ -1535,10 +1542,8 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
     }
     for ob in obligations {
         let index = ob.current_index(infer);
-        let unconstrained = match &index {
-            IndexExpr::Var(name) => !ob.witness_vars().contains(&name.as_str()) && mentions[name] == 1,
-            _ => false,
-        };
+        let unconstrained = matches!(&index, IndexExpr::Var(name)
+            if !ob.repeatable && !ob.witness_vars().contains(&name.as_str()) && mentions.get(name) == Some(&1));
         if unconstrained {
             arena[ob.len_eq] = Expr::Bool(true);
             continue;
@@ -3039,6 +3044,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 let witness = list_length_var(&param_ty, infer).map(|var| IndexWitness::new(var, &param));
                 let has_witness = witness.is_some();
                 infer.index_witness.extend(witness);
+                infer.repeatable_depth += 1;
                 pending.push(PendingElab::Fun { param, param_ty, witness: has_witness });
                 cur_mode = next_mode;
                 cur_expr = body;
@@ -3207,6 +3213,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 result_expr = arena.push(Expr::LetRec(Rc::new(group), result_expr));
             }
             PendingElab::Fun { param, param_ty, witness } => {
+                infer.repeatable_depth -= 1;
                 // Matches the original Lambda arm: the body's row is
                 // embedded in the Fun type, not propagated -- evaluating
                 // the Lambda expression itself is always pure.
@@ -4201,7 +4208,10 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         // see the doc comment on `elaborate_mode`.
         Expr::MakeHandler { effect, payload_var, resume_var, body } => {
             let inner_ctx = extend(&extend(ctx, &payload_var, Type::Dyn), &resume_var, Type::Dyn);
-            let (_, _, body2) = elaborate(arena, body, &inner_ctx, spans, infer)?;
+            infer.repeatable_depth += 1;
+            let body_result = elaborate(arena, body, &inner_ctx, spans, infer);
+            infer.repeatable_depth -= 1;
+            let (_, _, body2) = body_result?;
             Ok((
                 Type::Dyn,
                 EffectRow::pure(),
