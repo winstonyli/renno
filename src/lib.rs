@@ -6758,4 +6758,26 @@ mod tests {
                   let r: Int = (match y | [] -> 100 | h :: t -> (let x2: Dyn = [1] in let z: Vec(q) = x2 in len(z) - len(t))) in r";
         assert_eq!(run_source(a8).unwrap().as_int(), -1);
     }
+
+    #[test]
+    fn a_cons_arm_body_cannot_pin_the_tail_length_variable() {
+        // The arm's fresh m stands for len(tail) on every run of the arm, so
+        // pinning it to 0 (which used to outlive the arm) is a static error.
+        // v2 has no Dyn at all and was unsound before.
+        let h = "let d1: Dyn = [1,2,3] in let z: Vec(q) = d1 in";
+        let g = "let g = fun a: Vec(k) -> fun b: Vec(k) -> len(a) - len(b) in";
+        let programs = [
+            format!("{h} let w: Vec(0) = (match z | h :: t -> t | _ -> []) in len(w)"),
+            format!("{g} {h} let r: Int = (match z | h :: t -> g(t)([]) | _ -> 0) in r"),
+            format!("{g} {h} let r: Int = (match z | h :: t -> (let s: Vec(0) = t in g(z)([5])) | _ -> 0) in r"),
+            "let x: Dyn=[1,2,3] in let y: Vec(n) = x in let x2: Dyn=[1] in \
+             let r: Int = (match y | [] -> 100 | h :: t -> (let z: Vec(q) = x2 in let s: Vec(0) = t in len(z))) in r + len(y)"
+                .to_string(),
+            "let f = fun z: Vec(q) -> (let w: Vec(0) = (match z | h :: t -> t | _ -> []) in len(w)) in f([1,2,3])".to_string(),
+        ];
+        for src in programs {
+            let err = run_source(&src).unwrap_err();
+            assert!(err.contains("is fixed by the signature and cannot equal 0"), "{src}: unexpected message: {err}");
+        }
+    }
 }

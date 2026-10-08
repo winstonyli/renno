@@ -3995,7 +3995,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     }
                 }
             }
-            // Fresh cons-arm variable made rigid because its scrutinee variable is; removed on restore.
+            // The fresh cons-arm length variable, rigid for the arm so its body cannot pin it (the pin would outlive the arm); removed on restore.
             let mut arm_rigid_m: Option<String> = None;
             let mut row = scrut_row;
             let mut result_ty: Option<Type> = None;
@@ -4078,10 +4078,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                                     let m = fresh_index_name("m");
                                     let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
                                     infer.index_subst.insert(n_name.clone(), hypothesis);
-                                    if infer.rigid_index.contains(n_name) {
-                                        infer.rigid_index.insert(m.clone());
-                                        arm_rigid_m = Some(m.clone());
-                                    }
+                                    infer.rigid_index.insert(m.clone());
+                                    arm_rigid_m = Some(m.clone());
                                     let refined_tail_ty = Type::Indexed(Rc::new(Type::List(elem_ty.clone())), Rc::new(IndexExpr::Var(m)));
                                     arm_ctx = extend(&arm_ctx, tail_name, refined_tail_ty);
                                 }
@@ -4117,10 +4115,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                                     let m = fresh_index_name("m");
                                     let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
                                     infer.index_subst.insert(n_name.clone(), hypothesis);
-                                    if infer.rigid_index.contains(n_name) {
-                                        infer.rigid_index.insert(m.clone());
-                                        arm_rigid_m = Some(m.clone());
-                                    }
+                                    infer.rigid_index.insert(m.clone());
+                                    arm_rigid_m = Some(m.clone());
                                     let refined_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var(m)));
                                     arm_ctx = extend(&arm_ctx, self_ref_name, refined_ty);
                                 }
