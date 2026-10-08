@@ -6560,4 +6560,17 @@ mod tests {
         let src = "let a: Vec(n) = [1, 2] in let x: Dyn = [1, 2] in let y: Vec(n) = x in len(y)";
         assert_eq!(run_source(src).unwrap().as_int(), 2);
     }
+
+    #[test]
+    fn vec_n_witness_check_on_a_non_list_argument_is_a_clean_error_not_a_panic() {
+        // An untyped caller passes a non-list for `v: Vec(n)`; the check
+        // site reads the witness length and used to panic inside `len`.
+        let src = "let f = fun v: Vec(n) -> (let r: Dyn = [1,2,3] in let q: Vec(n) = r in 0) in let d: Dyn = f in d(5)";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("type error: index variable n"), "unexpected message: {err}");
+        assert!(!err.contains("len expects"), "unexpected message: {err}");
+        // A real list witness still works.
+        let src = "let f = fun v: Vec(n) -> (let r: Dyn = [1,2,3] in let q: Vec(n) = r in 0) in let d: Dyn = f in d([4,5,6])";
+        assert_eq!(run_source(src).unwrap().as_int(), 0);
+    }
 }

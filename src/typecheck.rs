@@ -1472,8 +1472,16 @@ fn index_var_to_expr(arena: &mut Arena, name: &str, env: &CheckEnv) -> ExprRef {
     let witness = env.local.iter().rev().copied().chain(env.infer.index_witness.iter().rev()).find(|w| w.var == name);
     if let Some(w) = witness {
         w.used.set(true);
+        // An untyped caller may have passed a non-list for the witness
+        // parameter; `len` would panic on it, so test is_list first.
         let list_ref = arena.push(Expr::Var(w.hidden.clone()));
-        return build_predicate_call(arena, "len", list_ref);
+        let is_list = build_predicate_call(arena, "is_list", list_ref);
+        let len_ref = arena.push(Expr::Var(w.hidden.clone()));
+        let len_call = build_predicate_call(arena, "len", len_ref);
+        let msg = arena.push(Expr::Str(format!("type error: index variable {name}'s witness is not a list")));
+        let fail_var = arena.push(Expr::Var("fail".to_string()));
+        let fail_call = arena.push(Expr::App(fail_var, msg));
+        return arena.push(Expr::If(is_list, len_call, fail_call));
     }
     if let Some(bound) = env.infer.index_subst.get(name) {
         return index_expr_to_expr(arena, bound, env);
