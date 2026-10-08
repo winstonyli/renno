@@ -1,0 +1,6 @@
+// A typed function called through Dyn with a correct argument works, as does
+// a literal `let rec f: Dyn` recursion (the literal form keeps recursing).
+let f = fun x: Int -> x + 1 in
+let d: Dyn = f in
+let rec g: Dyn = fun n -> if n == 0 then 0 else g(n - 1) in
+d(41) + g(3)

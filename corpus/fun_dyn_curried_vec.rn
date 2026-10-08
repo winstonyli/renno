@@ -1,0 +1,4 @@
+// A curried Vec(n) function through Dyn: two arguments of the same length are accepted.
+let f = fun a: Vec(n) -> fun b: Vec(n) -> len(b) in
+let d: Dyn = f in
+d([1, 2])([3, 4])

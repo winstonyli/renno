@@ -6564,12 +6564,15 @@ mod tests {
     }
 
     #[test]
-    fn a_vec_n_lambda_whose_check_never_runs_does_not_touch_its_argument_on_entry() {
-        // The witness binder must not evaluate anything on entry: an untyped
-        // caller passing a non-list used to get 0, and still must.
+    fn a_vec_n_lambda_whose_check_never_runs_is_checked_on_entry_when_called_through_dyn() {
+        // Fun-to-Dyn wrapping (spec 2026-10-08) runs DOWN at the wrapper's
+        // entry, so an untyped non-list is now rejected there even though the
+        // body's own check never runs. The old property (untouched on entry)
+        // can no longer hold.
         let src = "let f = fun v: Vec(n) -> if true then 0 else (let r: Dyn = [1] in let q: Vec(n) = r in 0) in \
                    let d: Dyn = f in d(5)";
-        assert_eq!(run_source(src).unwrap().as_int(), 0);
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("type error"), "unexpected message: {err}");
     }
 
     #[test]
@@ -6605,7 +6608,7 @@ mod tests {
         // site reads the witness length and used to panic inside `len`.
         let src = "let f = fun v: Vec(n) -> (let r: Dyn = [1,2,3] in let q: Vec(n) = r in 0) in let d: Dyn = f in d(5)";
         let err = run_source(src).unwrap_err();
-        assert!(err.contains("type error: index variable n"), "unexpected message: {err}");
+        assert!(err.contains("type error: expected [Dyn], found Int"), "unexpected message: {err}");
         assert!(!err.contains("len expects"), "unexpected message: {err}");
         // A real list witness still works.
         let src = "let f = fun v: Vec(n) -> (let r: Dyn = [1,2,3] in let q: Vec(n) = r in 0) in let d: Dyn = f in d([4,5,6])";

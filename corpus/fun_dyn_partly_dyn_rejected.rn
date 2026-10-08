@@ -1,0 +1,5 @@
+// Runtime contract error: a partly-Dyn function type (Dyn -> Int) is still
+// wrapped at the Fun-to-Dyn conversion, so the Int-typed result is checked.
+let f: (Dyn -> Int) = fun x -> x in
+let d: Dyn = f in
+d(true)

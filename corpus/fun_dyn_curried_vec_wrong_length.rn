@@ -1,0 +1,4 @@
+// Runtime contract error: the second argument has a different length than the first.
+let f = fun a: Vec(n) -> fun b: Vec(n) -> len(b) in
+let d: Dyn = f in
+d([1])([1, 2])
