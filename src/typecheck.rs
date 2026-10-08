@@ -1428,8 +1428,8 @@ fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env
         return arena.push(Expr::Lambda(param, Some(a_target), up_body));
     }
     // The incoming value arrives under a fresh name and is checked outside the
-    // user's parameter scope, so a parameter named like a builtin the check
-    // calls (is_int, fail, type_name, ...) cannot capture it.
+    // user's parameter scope, so a parameter of the same name cannot capture
+    // the value.
     let ca = cast_binder("__ca");
     let ca_ref = arena.push(Expr::Var(ca.clone()));
     let checked = build_boundary_check(arena, ca_ref, &erase_open_indexed(a, &witnessed), env, &HashSet::new());
@@ -3810,7 +3810,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // Type::Var(_) arm below -- which has no coerce() at all --
             // instead of the Type::Fun arm's own subtyping-aware
             // handling, or would silently skip the Type::Dyn arm's own
-            // is_fun check when the callee resolves to Dyn. Same
+            // function check when the callee resolves to Dyn. Same
             // principle as Task 3's resolve_deep in Pattern::Var and
             // Task 4's param_ty_resolved just below.
             let (call_row, ret_ty, app2) = match &f_ty {
