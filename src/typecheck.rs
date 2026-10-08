@@ -1532,7 +1532,10 @@ fn record_obligation(len_eq: ExprRef, index: &IndexExpr, env: &CheckEnv) {
 // mentions, and that sits in no function body, constrains nothing, so the
 // check is `is_list` alone (the node becomes `true`). Two crossings sharing
 // one such variable would claim equal lengths with nothing to compare
-// against, so they keep the clean failure.
+// against, so they keep the clean failure. So does a variable unified with any
+// other index variable, in either direction (e.g. inside a match arm whose
+// hypothesis was since removed): it is not isolated, and the crossing's own
+// index must be unchanged by the bindings.
 fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
     let obligations = infer.obligations.take();
     let mut mentions: HashMap<String, usize> = HashMap::new();
@@ -1543,8 +1546,13 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
     }
     for ob in obligations {
         let index = ob.current_index(infer);
-        let unconstrained = matches!(&index, IndexExpr::Var(name)
-            if !ob.repeatable && !ob.witness_vars().contains(&name.as_str()) && mentions.get(name) == Some(&1));
+        let unconstrained = matches!((&index, &ob.index), (IndexExpr::Var(name), IndexExpr::Var(orig))
+            if name == orig
+                && !ob.repeatable
+                && !ob.witness_vars().contains(&name.as_str())
+                && mentions.get(name) == Some(&1)
+                && !infer.index_subst.contains_key(name)
+                && !infer.index_subst.values().any(|v| free_index_vars(v).contains(name)));
         if unconstrained {
             arena[ob.len_eq] = Expr::Bool(true);
             continue;

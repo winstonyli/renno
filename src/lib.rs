@@ -6735,4 +6735,27 @@ mod tests {
         let err = run_source(src).unwrap_err();
         assert!(err.contains("has no runtime value"), "unexpected message: {err}");
     }
+
+    #[test]
+    fn an_unbound_vec_n_unified_with_a_match_arm_length_keeps_the_clean_error() {
+        // Inside a cons arm the tail's length m is hypothesis-bound (n = m+1),
+        // but a unification of q with m survives the arm, so q is not isolated.
+        let a9 = "let x: Dyn = [1, 2, 3] in let y: Vec(n) = x in let x2: Dyn = [1] in let z: Vec(q) = x2 in \
+                  let r: Int = (match y | [] -> 100 | h :: t -> (let s: Vec(q) = t in len(z) - len(s))) in r";
+        let a10 = "let x2: Dyn = [1] in let z: Vec(q) = x2 in \
+                   let f = fun v: Vec(n) -> (let r: Int = (match v | [] -> 0 | h :: t -> (let s: Vec(q) = t in len(z) - len(s))) in r) in \
+                   f([1, 2, 3]) * 100 + f([1, 2, 3, 4, 5])";
+        // the other orientation: the arm's variable is aliased to q through g
+        let a4 = "let x: Dyn = [1, 2, 3] in let y: Vec(n) = x in let x2: Dyn = [1] in let z: Vec(q) = x2 in \
+                  let g = fun a: Vec(k) -> fun b: Vec(k) -> len(a) - len(b) in \
+                  let r: Int = (match y | [] -> 100 | h :: t -> g(t)(z)) in r";
+        for src in [a9, a10, a4] {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains("has no runtime value"), "{src}: unexpected message: {err}");
+        }
+        // A crossing inside an arm that is unified with nothing stays is_list-only.
+        let a8 = "let x: Dyn = [1, 2, 3] in let y: Vec(n) = x in \
+                  let r: Int = (match y | [] -> 100 | h :: t -> (let x2: Dyn = [1] in let z: Vec(q) = x2 in len(z) - len(t))) in r";
+        assert_eq!(run_source(a8).unwrap().as_int(), -1);
+    }
 }
