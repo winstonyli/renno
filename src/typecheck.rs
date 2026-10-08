@@ -1180,6 +1180,13 @@ fn replace_named_with_dyn(ty: &Type, id: &str) -> Type {
 // whenever the mismatched value happened to be a leaf that elaborate_node
 // returns unchanged).
 fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env: &CheckEnv) -> Result<ExprRef, TypeError> {
+    let checked = coerce_check(arena, e, from, to, span, env)?;
+    Ok(coerce_cast(arena, checked, from, to, env))
+}
+
+// The static consistency check plus the Dyn-to-concrete boundary check. A
+// Fun source is returned unchanged; coerce_cast wraps it separately.
+fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env: &CheckEnv) -> Result<ExprRef, TypeError> {
     let named_types = &env.infer.named_types;
     if !consistent(from, to) {
         if fits(to, from) {
@@ -1271,6 +1278,67 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env
         return Ok(e);
     }
     Ok(build_boundary_check(arena, e, to, env, &HashSet::new()))
+}
+
+// `t` with every Indexed whose index still has a free variable reduced to the
+// type it wraps, so build_boundary_check never needs a witness for it.
+fn erase_open_indexed(t: &Type) -> Type {
+    match t {
+        Type::Indexed(w, i) if free_index_vars(i).is_empty() => Type::Indexed(Rc::new(erase_open_indexed(w)), i.clone()),
+        Type::Indexed(w, _) => erase_open_indexed(w),
+        Type::List(e) => Type::List(Rc::new(erase_open_indexed(e))),
+        Type::Tuple(ts) => Type::Tuple(Rc::new(ts.iter().map(erase_open_indexed).collect())),
+        Type::Union(ts) => Type::Union(Rc::new(ts.iter().map(erase_open_indexed).collect())),
+        Type::Record(fs) => Type::Record(Rc::new(fs.iter().map(|(n, t)| (n.clone(), erase_open_indexed(t))).collect())),
+        Type::Fun(p, r, b) => Type::Fun(Rc::new(erase_open_indexed(p)), r.clone(), Rc::new(erase_open_indexed(b))),
+        other => other.clone(),
+    }
+}
+
+// Structural equality that ignores effect rows (no runtime row representation).
+fn same_ignoring_rows(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::Fun(p, _, r), Type::Fun(p2, _, r2)) => same_ignoring_rows(p, p2) && same_ignoring_rows(r, r2),
+        (Type::List(x), Type::List(y)) => same_ignoring_rows(x, y),
+        (Type::Tuple(xs), Type::Tuple(ys)) | (Type::Union(xs), Type::Union(ys)) => xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| same_ignoring_rows(x, y)),
+        (Type::Record(xs), Type::Record(ys)) => xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|((n, x), (m, y))| n == m && same_ignoring_rows(x, y)),
+        (Type::Indexed(w, i), Type::Indexed(w2, i2)) => i == i2 && same_ignoring_rows(w, w2),
+        _ => a == b,
+    }
+}
+
+// Wraps a Fun-typed `e` so that, seen as `to` (Dyn or a Fun), its argument is
+// re-checked against the parameter type it was really declared with. Closure
+// form: `let __cf = e in fun __ca: A' -> __cf(DOWN(__ca))`, fresh Var nodes
+// each time. The body runs once per call (repeatable) and records no
+// obligations. A parameter's open index variables are erased (Task 3 adds
+// witnesses). Returns `e` unchanged when no wrapper is needed.
+fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
+    let from = env.infer.resolve_deep(from);
+    let to = env.infer.resolve_deep(to);
+    // A cast from a type to itself is the identity (it also keeps an annotated
+    // `let rec` binding a bare Lambda, which is_direct_group requires).
+    if same_ignoring_rows(&from, &to) || !needs_wrapper(&from, &to) {
+        return e;
+    }
+    let Type::Fun(a, _, _) = &from else { return e };
+    let a_target = match &to {
+        Type::Fun(a2, ..) => (**a2).clone(),
+        _ => Type::Dyn,
+    };
+    let cf = "__cf".to_string();
+    let ca = "__ca".to_string();
+    let ca_ref = arena.push(Expr::Var(ca.clone()));
+    let arg = if needs_down(a, &a_target) {
+        let body_env = CheckEnv { infer: env.infer, local: env.local.clone(), defer: false, repeatable: true };
+        build_boundary_check(arena, ca_ref, &erase_open_indexed(a), &body_env, &HashSet::new())
+    } else {
+        ca_ref
+    };
+    let cf_ref = arena.push(Expr::Var(cf.clone()));
+    let call = arena.push(Expr::App(cf_ref, arg));
+    let lambda = arena.push(Expr::Lambda(ca, Some(a_target), call));
+    arena.push(Expr::Let(cf, None, e, lambda))
 }
 
 // True iff `t` has no Dyn, Var, Union or free index variable at any depth:
@@ -3661,7 +3729,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // changes what coerce sees when something upstream
                     // has ALREADY resolved it.
                     let param_ty_resolved = infer.resolve_deep(param_ty);
-                    let a3 = coerce(arena, a2, &a_ty, &param_ty_resolved, spans[a], &CheckEnv::new(infer))?;
+                    let a3 = coerce_check(arena, a2, &a_ty, &param_ty_resolved, spans[a], &CheckEnv::new(infer))?;
                     let mut row_subst = HashMap::new();
                     // Deliberately the RAW param_ty here, not
                     // param_ty_resolved -- row variables only ever
@@ -3677,6 +3745,10 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     bind_row_vars(param_ty, &a_ty, &mut row_subst);
                     let call_row2 = resolve_row(call_row, &row_subst);
                     unify_fits(param_ty, &a_ty, infer, spans[a])?;
+                    // param_ty_resolved is stale after unify_fits (it still
+                    // shows the Var an unannotated `apply(f)` just bound), so
+                    // the cast re-resolves both sides.
+                    let a3 = coerce_cast(arena, a3, &a_ty, param_ty, &CheckEnv::new(infer));
                     // resolve_deep alone only ever consults infer.subst
                     // (ordinary Type::Var bindings) -- it knows nothing
                     // about row_subst, built separately just above.

@@ -6829,4 +6829,73 @@ mod tests {
             assert!(err.contains("is fixed by the signature and") && err.contains(want), "{src}: unexpected message: {err}");
         }
     }
+
+    // --- Fun-to-Dyn / Fun-to-Fun wrapping (spec 2026-10-08), closure form ---
+
+    fn has_let_named(arena: &expr::Arena, root: expr::ExprRef, name: &str) -> bool {
+        use expr::Expr;
+        let go = |r: &expr::ExprRef| has_let_named(arena, *r, name);
+        match &arena[root] {
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
+            Expr::ListLit(items) | Expr::Tuple(items) => items.iter().any(go),
+            Expr::Lambda(_, _, body) => go(body),
+            Expr::App(f, a) => go(f) || go(a),
+            Expr::Let(var, _, val, body) => var == name || go(val) || go(body),
+            Expr::LetRec(bindings, body) => bindings.iter().any(|(_, _, v)| go(v)) || go(body),
+            Expr::BinOp(_, l, r) => go(l) || go(r),
+            Expr::If(c, t, e) => go(c) || go(t) || go(e),
+            Expr::Perform(_, p) => go(p),
+            Expr::Handle { body, handler } => go(body) || go(handler),
+            Expr::MakeHandler { body, .. } => go(body),
+            Expr::Match(s, arms) => go(s) || arms.iter().any(|(_, g, b)| g.as_ref().is_some_and(go) || go(b)),
+            Expr::Record(fields) => fields.iter().any(|(_, v)| go(v)),
+            Expr::FieldAccess(..) => unreachable!(),
+        }
+    }
+
+    fn elaborated_has_wrapper(src: &str) -> bool {
+        let (mut arena, spans, root, named) = parser::parse_with_named_types(src).unwrap();
+        let out = typecheck::check_with_named_types(&mut arena, root, &spans, named).unwrap();
+        has_let_named(&arena, out, "__cf")
+    }
+
+    #[test]
+    fn a_typed_function_converted_to_dyn_is_wrapped() {
+        for src in [
+            "let h = fun a: Vec(3) -> len(a) in let hd: Dyn = h in hd([1])",
+            "let f = fun a: Int -> a + 1 in let d: Dyn = f in d(true)",
+            "(fun k: (Dyn -> Dyn) -> k(true)) (fun a: Int -> a + 1)",
+            "let ap = fun k: ((Int|Bool) -> Int) -> k(true) in ap(fun x: Int -> x + 1)",
+            "let ap = fun k: (Dyn -> Int) -> k(true) in ap(fun x: (Int, Int) -> 1)",
+            "let ap = fun k: (Dyn -> Int) -> k(true) in ap(fun x: [Int] -> 1)",
+        ] {
+            let err = run_source(src).expect_err(src);
+            assert!(err.contains("type error"), "{src}: unexpected message: {err}");
+            assert!(!err.contains("expected a number"), "{src}: {err}");
+        }
+        for (src, want) in [
+            ("let f = fun a: Int -> a + 1 in let d: Dyn = f in d(2)", 3),
+            ("let ap = fun k: ((Int|Bool) -> Int) -> k(1) in ap(fun x: Int -> x + 1)", 2),
+            ("let f = fun a: Int -> a + 1 in let d: Dyn = f in let g: (Int -> Int) = d in g(2)", 3),
+            ("let f = fun x: Int -> x in let apply = fun g -> g(1) in apply(f)", 1),
+        ] {
+            assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn re_crossed_function_rejects_a_bad_argument_statically() {
+        assert!(run_source("let f = fun a: Int -> a + 1 in let d: Dyn = f in let g: (Int -> Int) = d in g(true)").is_err());
+    }
+
+    #[test]
+    fn unannotated_code_emits_no_function_wrapper() {
+        for src in [
+            "let f = fun x: Int -> x in let apply = fun g -> g(1) in apply(f)",
+            "map(fun x -> x + 1)([1,2])",
+        ] {
+            assert!(!elaborated_has_wrapper(src), "{src}");
+        }
+        assert!(elaborated_has_wrapper("let f = fun a: Int -> a + 1 in let d: Dyn = f in d(2)"));
+    }
 }
