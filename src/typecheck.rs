@@ -1335,6 +1335,17 @@ fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Chec
     build_cast(arena, e, &from, &to, env)
 }
 
+// Casts each Synth-joined arm from its own type to the FINAL joined type, so a
+// typed function that reaches a Dyn (or partly-Dyn Fun) join keeps its
+// parameter checks. Call once, after the whole join: a later arm can still
+// change the join, and an arm that unified with an already-Dyn join needs the
+// cast too. Infallible; non-function and equal-typed arms come back unchanged.
+fn cast_join_arms(arena: &mut Arena, arms: &mut [ExprRef], tys: &[Type], join: &Type, infer: &InferCtx) {
+    for (arm, ty) in arms.iter_mut().zip(tys) {
+        *arm = coerce_cast(arena, *arm, ty, join, &CheckEnv::new(infer));
+    }
+}
+
 // Binder names a cast introduces (`__cf`, `__ca`): fresh and unlexable
 // (`__ca#7`), so neither a user variable nor a nested cast's own binder can
 // capture or shadow them. Shared by build_cast and build_literal_cast.
@@ -3720,6 +3731,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let mut row = EffectRow::pure();
             let mut elem_ty: Option<Type> = None;
             let mut refs = Vec::with_capacity(items.len());
+            let mut item_tys = Vec::with_capacity(items.len());
             let want_elem = match mode {
                 Mode::Check(expected) => match infer.resolve_deep(expected) {
                     Type::List(t) if contains_indexed(&t) => Some((*t).clone()),
@@ -3737,6 +3749,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 };
                 row = EffectRow::union(&row, &item_row);
                 refs.push(item2);
+                item_tys.push(item_ty.clone());
                 elem_ty = Some(match elem_ty {
                     None => item_ty,
                     Some(t) => match unify_trial(&t, &item_ty, infer, spans[item]) {
@@ -3751,6 +3764,9 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // against instead of a Dyn that would otherwise immediately
             // flatten the whole result.
             let elem_ty = elem_ty.unwrap_or_else(|| infer.fresh_var("elem"));
+            if matches!(mode, Mode::Synth) {
+                cast_join_arms(arena, &mut refs, &item_tys, &elem_ty, infer);
+            }
             // Case A construction (design spec 2026-09-20 sec 1): checked
             // against an Indexed(List(_), _) expected type, synthesize the
             // PRECISE length-indexed type instead of a plain List --
@@ -4085,6 +4101,9 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         Ok(()) => infer.resolve_deep(&t_ty),
                         Err(_) => Type::Dyn,
                     };
+                    let mut arms = [t2, e2];
+                    cast_join_arms(arena, &mut arms, &[t_ty, e_ty], &result_ty, infer);
+                    let [t2, e2] = arms;
                     (result_ty, t_row, e_row, t2, e2)
                 }
                 // New: both branches are checked directly against the
@@ -4225,6 +4244,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let mut row = scrut_row;
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
+            let mut arm_tys = Vec::with_capacity(arms.len());
             for (pat, (_, guard, body)) in pats.iter().copied().zip(arms.iter()) {
                 if !pattern_could_match(pat, &scrut_ty, &infer.named_types, &HashSet::new()) {
                     return Err(TypeError(
@@ -4381,6 +4401,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 let (arm_row, body2) = match mode {
                     Mode::Synth => {
                         let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, spans, infer)?;
+                        arm_tys.push(arm_ty.clone());
                         result_ty = Some(match result_ty {
                             None => arm_ty,
                             Some(t) => match unify_trial(&t, &arm_ty, infer, spans[expr]) {
@@ -4428,6 +4449,13 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 Mode::Synth => result_ty.unwrap_or(Type::Dyn),
                 Mode::Check(expected) => expected.clone(),
             };
+            if matches!(mode, Mode::Synth) {
+                let mut bodies: Vec<ExprRef> = new_arms.iter().map(|(_, _, b)| *b).collect();
+                cast_join_arms(arena, &mut bodies, &arm_tys, &final_ty, infer);
+                for (arm, body) in new_arms.iter_mut().zip(bodies) {
+                    arm.2 = body;
+                }
+            }
             Ok((final_ty, row, arena.push(Expr::Match(scrutinee2, Rc::new(new_arms)))))
         }
 

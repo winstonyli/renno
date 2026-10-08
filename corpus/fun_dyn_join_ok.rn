@@ -1,0 +1,8 @@
+// Disagreeing typed functions joined by a list, `if` and `match` are each
+// callable with a correct argument; a partly-Dyn sibling keeps working too.
+let from_list = match [fun x: Int -> x + 1, fun s: Str -> s] | [p, q] -> p(1) + len(q("ab")) | _ -> 0 in
+let from_if = (if 1 < 2 then (fun x: Int -> x * 2) else (fun s: Str -> s))(4) in
+let from_match = (match 2 | 1 -> (fun x: Int -> x) | _ -> (fun s: Str -> s))("z") in
+let a: (Dyn -> Int) = fun x -> 7 in
+let sibling = (if 2 < 1 then a else (fun y: Int -> y + 1))(1) in
+from_list + from_if + len(from_match) + sibling

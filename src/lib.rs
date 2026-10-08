@@ -6842,7 +6842,7 @@ mod tests {
         match &arena[root] {
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
             Expr::ListLit(items) | Expr::Tuple(items) => items.iter().any(go),
-            Expr::Lambda(_, _, body) => go(body),
+            Expr::Lambda(param, _, body) => param.starts_with(name) || go(body),
             Expr::App(f, a) => go(f) || go(a),
             Expr::Let(var, _, val, body) => var.starts_with(name) || go(val) || go(body),
             Expr::LetRec(bindings, body) => bindings.iter().any(|(_, _, v)| go(v)) || go(body),
@@ -7226,5 +7226,181 @@ mod tests {
         ] {
             assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
         }
+    }
+
+    // --- Join-to-Dyn arm casts (spec 2026-10-08-join-to-dyn-casts) ---
+
+    fn elaborated_has_cast(src: &str) -> bool {
+        let (mut arena, spans, root, named) = parser::parse_with_named_types(src).unwrap();
+        let out = typecheck::check_with_named_types(&mut arena, root, &spans, named).unwrap();
+        has_let_named(&arena, out, "__ca#")
+    }
+
+    fn assert_clean_rejection(src: &str, want: &str) {
+        let err = run_source(src).expect_err(src);
+        assert!(err.contains(want), "{src}: {err}");
+        assert!(!err.contains("expected a number"), "{src}: {err}");
+    }
+
+    const BAD_INT: &str = "type error: expected Int, found Bool";
+
+    #[test]
+    fn a_list_of_disagreeing_typed_functions_is_cast_to_dyn() {
+        let f = "fun x: Int -> x + 1";
+        let g = "fun s: Str -> s";
+        assert_clean_rejection(&format!("match [{f}, {g}] | [p, q] -> p(true) | _ -> 0"), BAD_INT);
+        assert_clean_rejection(&format!("match [{f}, {g}, fun b: Bool -> 1] | [p, q, r] -> r(1) | _ -> 0"), "type error: expected Bool, found Int");
+        // A third element that unified with the already-Dyn join is cast too.
+        assert_clean_rejection(&format!("match [{f}, {g}, fun y: Int -> y] | [p, q, r] -> r(true) | _ -> 0"), BAD_INT);
+        // Returned functions are cast in turn.
+        let curried = "[fun x: Int -> fun y: Int -> y, fun s: Str -> s]";
+        assert_clean_rejection(&format!("match {curried} | [p, q] -> p(1)(true) | _ -> 0"), BAD_INT);
+        assert_eq!(run_source(&format!("match {curried} | [p, q] -> p(1)(2) | _ -> 0")).unwrap().as_int(), 2);
+        // Correct calls are unchanged.
+        assert_eq!(run_source(&format!("match [{f}, {g}] | [p, q] -> p(1) | _ -> 0")).unwrap().as_int(), 2);
+        assert_eq!(run_source(&format!("match [{f}, {g}] | [p, q] -> q(\"a\") | _ -> 0")).unwrap(), Outcome::Str("a".to_string()));
+    }
+
+    #[test]
+    fn disagreeing_typed_functions_joined_by_if_or_match_are_cast_to_dyn() {
+        let f = "(fun x: Int -> x + 1)";
+        let g = "(fun s: Str -> s)";
+        for src in [
+            format!("let g = if 1 < 2 then {f} else {g} in g(true)"),
+            format!("let g = if 2 < 1 then {f} else {g} in g(true)"),
+            format!("let g = match 1 | 1 -> {f} | _ -> {g} in g(true)"),
+            format!("let g = match 2 | 1 -> {f} | _ -> {g} in g(true)"),
+        ] {
+            let want = if src.contains("2 < 1") || src.contains("match 2") { "type error: expected Str, found Bool" } else { BAD_INT };
+            assert_clean_rejection(&src, want);
+        }
+        // Third arm unified with the already-Dyn join of the first two.
+        assert_clean_rejection(&format!("let g = match 3 | 1 -> {f} | 2 -> {g} | _ -> (fun b: Bool -> 1) in g(1)"), "type error: expected Bool, found Int");
+        assert_eq!(run_source(&format!("let g = if 1 < 2 then {f} else {g} in g(1)")).unwrap().as_int(), 2);
+        assert_eq!(run_source(&format!("let g = if 2 < 1 then {f} else {g} in g(\"a\")")).unwrap(), Outcome::Str("a".to_string()));
+        assert_eq!(run_source(&format!("let g = match 2 | 1 -> {f} | _ -> {g} in g(\"a\")")).unwrap(), Outcome::Str("a".to_string()));
+    }
+
+    #[test]
+    fn a_partly_dyn_sibling_in_a_join_is_cast_to_the_join_type() {
+        let a = "let a: (Dyn -> Int) = fun x -> 1 in";
+        let y = "(fun y: Int -> y)";
+        for src in [
+            format!("{a} let g = if 2 < 1 then a else {y} in g(true)"),
+            format!("{a} let g = match 2 | 1 -> a | _ -> {y} in g(true)"),
+            format!("{a} match [a, {y}] | [p, q] -> q(true) | _ -> 0"),
+            // A Dyn-typed sibling makes the join Dyn.
+            format!("let a: Dyn = 5 in let g = if 2 < 1 then a else {y} in g(true)"),
+            format!("let a: Dyn = 5 in match [a, {y}] | [p, q] -> q(true) | _ -> 0"),
+        ] {
+            assert_clean_rejection(&src, BAD_INT);
+        }
+        assert_eq!(run_source(&format!("{a} let g = if 2 < 1 then a else {y} in g(3)")).unwrap().as_int(), 3);
+        // Arm order decides the join (pinned): with the precise arm first the
+        // join is `Int -> Int` and the bad call stays a STATIC error.
+        let err = run_source(&format!("{a} let g = if 2 < 1 then {y} else a in g(true)")).expect_err("static");
+        assert!(err.contains("type mismatch"), "{err}");
+        let err = run_source(&format!("{a} match [{y}, a] | [p, q] -> p(true) | _ -> 0")).expect_err("static");
+        assert!(err.contains("type mismatch"), "{err}");
+    }
+
+    #[test]
+    fn joins_that_need_no_cast_emit_no_cast() {
+        for src in [
+            "if 1 < 2 then (fun x: Int -> x) else (fun y: Int -> y)",
+            "[fun x -> x, fun y -> y]",
+            "if 1 < 2 then (fun x -> x) else (fun y: Int -> y)",
+            "[fun x: Int -> x]",
+            "if 1 < 2 then 1 else 2",
+            "[1, 2, 3]",
+            "match 1 | 1 -> (fun x: Int -> x) | _ -> (fun y: Int -> y)",
+            "if 1 < 2 then 1 else \"a\"",
+            "[1, \"a\"]",
+            "if 1 < 2 then (fun x -> x) else (fun s -> s)",
+        ] {
+            assert!(!elaborated_has_cast(src), "{src}");
+        }
+        for src in [
+            "[fun x: Int -> x, fun s: Str -> s]",
+            "if 1 < 2 then (fun x: Int -> x) else (fun s: Str -> s)",
+            "match 1 | 1 -> (fun x: Int -> x) | _ -> (fun s: Str -> s)",
+        ] {
+            assert!(elaborated_has_cast(src), "{src}");
+        }
+    }
+
+    #[test]
+    fn unchanged_join_behaviour_is_preserved() {
+        for (src, want) in [
+            ("let g = if 1 < 2 then (fun x: Int -> x + 1) else (fun y: Int -> y) in g(1)", 2),
+            ("match [fun x: Int -> x + 1] | [p] -> p(1) | _ -> 0", 2),
+            ("let g = if 1 < 2 then (fun x -> x) else (fun y: Int -> y) in g(5)", 5),
+            ("let d: Dyn = if 1 < 2 then (fun x: Int -> x + 1) else (fun s: Str -> s) in d(1)", 2),
+        ] {
+            assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
+        }
+        // Same-typed arms and a single-element list keep their static errors.
+        for src in [
+            "let g = if 1 < 2 then (fun x: Int -> x) else (fun y: Int -> y) in g(true)",
+            "match [fun x: Int -> x] | [p] -> p(true) | _ -> 0",
+        ] {
+            let err = run_source(src).expect_err(src);
+            assert!(err.contains("type mismatch"), "{src}: {err}");
+        }
+        // Check mode against Dyn already coerces each arm.
+        assert_clean_rejection("let g: Dyn = if 1 < 2 then (fun x: Int -> x) else (fun s: Str -> s) in g(true)", BAD_INT);
+    }
+
+    #[test]
+    fn a_function_list_checked_against_a_dyn_list_is_unchecked_known_limitation() {
+        // Container casts are parked (fun-to-dyn spec 7): the list type
+        // `[Int -> Int]` coerces to `[Dyn]` with no wrapper, so the bad call
+        // is not rejected with a clean type error (pinned; flips with the fix).
+        for src in [
+            "let l: [Dyn] = [fun x: Int -> x + 1] in match l | [p] -> p(true) | _ -> 0",
+            "let l: [Dyn] = [fun x: Int -> x + 1, fun s: Str -> s] in match l | [p, q] -> p(true) | _ -> 0",
+        ] {
+            let r = std::panic::catch_unwind(|| run_source(src));
+            let clean = matches!(&r, Ok(Err(e)) if e.contains(BAD_INT));
+            assert!(!clean, "{src}: now rejected cleanly; remove the known_limitation pin");
+        }
+    }
+
+    #[test]
+    fn a_vec_n_function_in_a_join_compares_lengths_like_the_closure_form() {
+        // Probed empirically (spec 2026-10-08-join-to-dyn-casts, open item 4):
+        // inside `fun v: Vec(n)` the outer witness `n` is visible at the join
+        // site, so a wrong-length call through the join is rejected exactly as
+        // in the closure form (`let k = .. in let d: Dyn = k in d`), and the
+        // right length is not rejected spuriously.
+        let wrap = |body: &str, call: &str| format!("let f = fun v: Vec(n) -> {body} in {call}");
+        let closure = "(let k = fun a: Vec(n) -> len(a) in let d: Dyn = k in d)";
+        let if_join = "(if 1 < 2 then (fun a: Vec(n) -> len(a)) else (fun s: Str -> s))";
+        let list_join = "[fun a: Vec(n) -> len(a), fun s: Str -> s]";
+        for (body, call_ok, call_bad) in [
+            (closure, "f([1,2])([3,4])", "f([1,2])([3])"),
+            (if_join, "f([1,2])([3,4])", "f([1,2])([3])"),
+            (list_join, "match f([1,2]) | [p, q] -> p([3,4]) | _ -> 0", "match f([1,2]) | [p, q] -> p([3]) | _ -> 0"),
+        ] {
+            assert_eq!(run_source(&wrap(body, call_ok)).unwrap().as_int(), 2, "{body}");
+            assert_clean_rejection(&wrap(body, call_bad), "type error: expected [Dyn](n");
+        }
+        // A concrete length and a Vec(n) function value reaching the join.
+        let three = "let g = if 1 < 2 then (fun a: Vec(3) -> len(a)) else (fun s: Str -> s) in";
+        assert_eq!(run_source(&format!("{three} g([1,2,3])")).unwrap().as_int(), 3);
+        assert_clean_rejection(&format!("{three} g([1])"), "type error: expected [Dyn](3)");
+        let h = "let h = fun a: Vec(n) -> fun b: Vec(n) -> len(b) in let g = if 1 < 2 then h else (fun s: Str -> s) in";
+        assert_eq!(run_source(&format!("{h} g([1,2])([3,4])")).unwrap().as_int(), 2);
+        assert_clean_rejection(&format!("{h} g([1])([3,4])"), "type error: expected [Dyn](n");
+    }
+
+    #[test]
+    fn an_effect_performed_in_a_join_arm_still_resumes_through_the_cast() {
+        let ok = "handle (let g = if 1 < 2 then (fun x: Int -> perform choose(x)) else (fun s: Str -> 0) in g(1)) \
+                  with handler choose(p, resume) -> resume(1) + resume(2)";
+        assert_eq!(run_source(ok).unwrap().as_int(), 3);
+        let bad = "handle (let g = if 1 < 2 then (fun x: Int -> perform choose(x)) else (fun s: Str -> 0) in g(true)) \
+                   with handler choose(p, resume) -> resume(1) + resume(2)";
+        assert_clean_rejection(bad, BAD_INT);
     }
 }
