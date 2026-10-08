@@ -6573,4 +6573,63 @@ mod tests {
         let src = "let f = fun v: Vec(n) -> (let r: Dyn = [1,2,3] in let q: Vec(n) = r in 0) in let d: Dyn = f in d([4,5,6])";
         assert_eq!(run_source(src).unwrap().as_int(), 0);
     }
+
+    // --- Dyn crossings into an unbound Vec(n): deferred length checks (spec 2026-10-07) ---
+
+    fn obligations_after_checking(src: &str) -> usize {
+        use crate::typecheck::{check_against, Ctx, InferCtx};
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let mut infer = InferCtx::new(std::collections::HashMap::new());
+        check_against(&mut arena, root, &crate::types::Type::Int, &Ctx::empty(), &spans, &mut infer).unwrap();
+        infer.obligation_count()
+    }
+
+    #[test]
+    fn a_dyn_crossing_records_an_obligation_only_when_its_index_has_no_runtime_value() {
+        let deferred = [
+            "let x: Dyn = [1, 2, 3] in let y: Vec(n) = x in 0",
+            "let f = fun v: Vec(n) -> v in let x: Dyn = [1, 2] in let y = f(x) in 0",
+            "let f = fun v: Vec(n + 1) -> v in let x: Dyn = [1, 2] in let y = f(x) in 0",
+        ];
+        for src in deferred {
+            assert_eq!(obligations_after_checking(src), 1, "{src}");
+        }
+        let checked_at_the_crossing = [
+            // a literal index
+            "let x: Dyn = [1, 2] in let y: Vec(2) = x in 0",
+            // n already bound statically
+            "let a: Vec(n) = [1, 2] in let x: Dyn = [1, 2] in let y: Vec(n) = x in 0",
+            // n is the parameter's length (a witness)
+            "let f = fun v: Vec(n) -> let r: Dyn = [1] in let q: Vec(n) = r in 0 in 0",
+            // a union target is out of scope: unchanged, no obligation
+            "let x: Dyn = [1] in let y: Vec(n) | Int = x in 0",
+        ];
+        for src in checked_at_the_crossing {
+            assert_eq!(obligations_after_checking(src), 0, "{src}");
+        }
+    }
+
+    #[test]
+    fn a_variable_with_a_pending_obligation_is_not_generalized() {
+        // The caller's annotation decides n inside the function that contains
+        // the crossing, so one use pins it and a second use at another length
+        // is a static conflict. Generalizing would give each use a fresh n.
+        let conflicting = [
+            "let f = fun v: Vec(n) -> v in let x: Dyn = [1, 2, 3] in let mk = fun u -> f(x) in \
+             let a: Vec(3) = mk(0) in let b: Vec(4) = mk(0) in 0",
+            "let g: (Int -> Vec(k)) = fun i -> let r: Dyn = [1, 2] in r in \
+             let a: Vec(2) = g(1) in let b: Vec(3) = g(2) in 0",
+        ];
+        for src in conflicting {
+            let (mut arena, spans, root) = parser::parse(src).unwrap();
+            let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
+            assert!(err.0.contains("type mismatch"), "{src}: unexpected message: {}", err.0);
+        }
+        // A crossing whose variable ends up equal to a Vec(n) parameter's
+        // length is decided by that witness, so f stays polymorphic.
+        let src = "let f = fun v: Vec(n) -> let g = fun u: Vec(k) -> u in let x: Dyn = [1, 2] in let z: Vec(n) = g(x) in z in \
+                   let a = f([1, 2]) in let b = f([1, 2, 3]) in 0";
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        assert!(typecheck::check(&mut arena, root, &spans).is_ok(), "{src}");
+    }
 }

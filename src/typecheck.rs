@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -123,6 +123,12 @@ pub(crate) struct InferCtx {
     // by elaborate_mode's Lambda frames; an elaboration error abandons the
     // whole check, so an Err path never needs to pop.
     index_witness: Vec<IndexWitness>,
+    // Dyn-to-Vec(n) crossings whose length check needs an index variable
+    // that nothing at runtime holds at the crossing (no witness, no static
+    // binding yet): a later annotation may still bind it. See Obligation.
+    // A RefCell because the check builders only see a shared &InferCtx
+    // (CheckEnv), the same reason IndexWitness.used is a Cell.
+    obligations: RefCell<Vec<Obligation>>,
     // Every genuinely self-referential type alias this program's own
     // parse registered (parser::Parser's own `named_types`, handed in
     // once at construction) -- consulted on demand by
@@ -142,8 +148,14 @@ impl InferCtx {
             rigid_index: HashSet::new(),
             index_rename: HashMap::new(),
             index_witness: Vec::new(),
+            obligations: RefCell::new(Vec::new()),
             named_types,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn obligation_count(&self) -> usize {
+        self.obligations.borrow().len()
     }
 
     // Mints a fresh Type::Var -- every unannotated binding site (Lambda
@@ -961,8 +973,17 @@ fn generalizable_index_vars(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<Strin
     if candidates.is_empty() {
         return Vec::new();
     }
-    let still_open = free_index_vars_in_ctx(ctx, infer);
+    let mut still_open = free_index_vars_in_ctx(ctx, infer);
+    // A variable a pending obligation still needs is decided by whoever binds
+    // it later, inside the function containing the crossing. Generalizing it
+    // would give each use a fresh copy and leave the obligation unresolvable
+    // (spec 2026-10-07-dyn-crossing-deferred-length-checks, polymorphism rule).
+    still_open.extend(pending_obligation_vars(infer));
     candidates.difference(&still_open).cloned().collect()
+}
+
+fn pending_obligation_vars(infer: &InferCtx) -> BTreeSet<String> {
+    infer.obligations.borrow().iter().flat_map(|ob| ob.unresolved_vars(infer)).collect()
 }
 
 fn fresh_row_name(base: &str) -> String {
@@ -1332,7 +1353,12 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
         // construct one yet (see index_expr_to_expr's own doc comment
         // for the matching "Phase 2 only" note on the index side).
         Type::Indexed(wrapped, index) => match wrapped.as_ref() {
-            Type::List(_) => build_checked(arena, e, to, |arena, v| build_indexed_shape_cond(arena, v, index, env)),
+            Type::List(_) => build_checked(arena, e, to, |arena, v| {
+                if env.defer {
+                    record_obligation(index, env);
+                }
+                build_indexed_shape_cond(arena, v, index, env)
+            }),
             _ => e,
         },
         // One level only, matching every other shape check in this
@@ -1406,13 +1432,91 @@ impl IndexWitness {
     }
 }
 
+// A Dyn-to-Vec(n) length check whose index has a variable with no runtime
+// value at the crossing (no witness, no static binding there); spec
+// 2026-10-07-dyn-crossing-deferred-length-checks. `index` is the target
+// index with every binding known at the crossing substituted (runtime_index),
+// so a Match arm's hypothesis, restored after the arm, stays in force.
+// `witnesses` are the (variable, hidden alias) pairs in scope at the
+// crossing, outermost first.
+struct Obligation {
+    index: IndexExpr,
+    witnesses: Vec<(String, String)>,
+}
+
+impl Obligation {
+    fn witness_vars(&self) -> Vec<&str> {
+        self.witnesses.iter().map(|(var, _)| var.as_str()).collect()
+    }
+
+    // The index under the bindings known now, as the check would read it.
+    fn current_index(&self, infer: &InferCtx) -> IndexExpr {
+        runtime_index(&self.index, infer, &self.witness_vars(), true)
+    }
+
+    // The variables the check still has no runtime value for.
+    fn unresolved_vars(&self, infer: &InferCtx) -> BTreeSet<String> {
+        let witnessed = self.witness_vars();
+        free_index_vars(&self.current_index(infer)).into_iter().filter(|v| !witnessed.contains(&v.as_str())).collect()
+    }
+}
+
+// `e` as a runtime check reads it (index_var_to_expr's order): a variable
+// with a witness stays, a bound one is replaced by its binding, recursively,
+// an unbound one stays. With `by_alias`, an unbound variable that a witness's
+// own variable has since been unified with is renamed to that witness's
+// variable: the witness holds its value too.
+fn runtime_index(e: &IndexExpr, infer: &InferCtx, witness_vars: &[&str], by_alias: bool) -> IndexExpr {
+    let go = |x: &IndexExpr| Rc::new(runtime_index(x, infer, witness_vars, by_alias));
+    match e {
+        IndexExpr::Var(name) => {
+            if witness_vars.contains(&name.as_str()) {
+                return e.clone();
+            }
+            if let Some(bound) = infer.index_subst.get(name) {
+                return runtime_index(bound, infer, witness_vars, by_alias);
+            }
+            let alias = if by_alias {
+                witness_vars.iter().rev().find(|w| infer.resolve_index_deep(&IndexExpr::Var(w.to_string())) == *e)
+            } else {
+                None
+            };
+            match alias {
+                Some(w) => IndexExpr::Var(w.to_string()),
+                None => e.clone(),
+            }
+        }
+        IndexExpr::Lit(_) => e.clone(),
+        IndexExpr::Add(a, b) => IndexExpr::Add(go(a), go(b)),
+        IndexExpr::Sub(a, b) => IndexExpr::Sub(go(a), go(b)),
+        IndexExpr::Mul(a, b) => IndexExpr::Mul(go(a), go(b)),
+    }
+}
+
+// Records an obligation for a crossing outside a union when its index has a
+// variable index_var_to_expr cannot give a runtime value (the check built
+// for it holds that clean failure until resolved).
+fn record_obligation(index: &IndexExpr, env: &CheckEnv) {
+    let in_scope: Vec<&IndexWitness> = env.infer.index_witness.iter().chain(env.local.iter().copied()).collect();
+    let vars: Vec<&str> = in_scope.iter().map(|w| w.var.as_str()).collect();
+    let index = runtime_index(index, env.infer, &vars, false);
+    if free_index_vars(&index).iter().all(|v| vars.contains(&v.as_str())) {
+        return;
+    }
+    let witnesses = in_scope.iter().map(|w| (w.var.clone(), w.hidden.clone())).collect();
+    env.infer.obligations.borrow_mut().push(Obligation { index, witnesses });
+}
+
 // What the runtime-check builders (build_boundary_check and friends) need:
 // the type registry and index state (InferCtx, as of where the check is
 // spliced); `local` holds witnesses bound inside synthesized code
-// (wrap_fun_contract).
+// (wrap_fun_contract). `defer` is false inside a union target: a Vec(n)
+// alternative whose n has no runtime value keeps failing the whole check, so
+// it records no obligation.
 struct CheckEnv<'a> {
     infer: &'a InferCtx,
     local: Vec<&'a IndexWitness>,
+    defer: bool,
 }
 
 // `n` when `ty` is Vec(n) with `n` (resolved) still a bare variable: the
@@ -1429,7 +1533,7 @@ fn list_length_var(ty: &Type, infer: &InferCtx) -> Option<String> {
 
 impl<'a> CheckEnv<'a> {
     fn new(infer: &'a InferCtx) -> CheckEnv<'a> {
-        CheckEnv { infer, local: Vec::new() }
+        CheckEnv { infer, local: Vec::new(), defer: true }
     }
 }
 
@@ -1534,6 +1638,7 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, v
         Type::Union(alts) => alts.clone(),
         _ => unreachable!("build_union_check is only ever called with a Union target"),
     };
+    let env = &CheckEnv { infer: env.infer, local: env.local.clone(), defer: false };
     let tmp = "__check_tmp".to_string();
     let tmp_ref = arena.push(Expr::Var(tmp.clone()));
     let mut result = build_fail_call(arena, to, tmp_ref);
@@ -1792,7 +1897,7 @@ fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: 
         Some(w) => {
             let mut local = env.local.clone();
             local.push(w);
-            build_boundary_check(arena, call, &ret_ty, &CheckEnv { infer: env.infer, local }, visiting)
+            build_boundary_check(arena, call, &ret_ty, &CheckEnv { infer: env.infer, local, defer: env.defer }, visiting)
         }
         None => build_boundary_check(arena, call, &ret_ty, env, visiting),
     };
