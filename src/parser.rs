@@ -1307,7 +1307,7 @@ impl<'a> Parser<'a> {
     // needed for a refinement that can't be proven at parse time.
     fn wrap_runtime_check(&mut self, pred: ExprRef, body: ExprRef, span: Span) -> ExprRef {
         let msg = self.push_spanned(Expr::Str("refinement violated".to_string()), span);
-        let fail_var = self.push_spanned(Expr::Var("fail".to_string()), span);
+        let fail_var = self.push_spanned(Expr::Var("#fail".to_string()), span);
         let fail_call = self.push_spanned(Expr::App(fail_var, msg), span);
         self.push_spanned(Expr::If(pred, body, fail_call), span)
     }

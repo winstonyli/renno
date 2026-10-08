@@ -1916,7 +1916,7 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, v
         _ => unreachable!("build_union_check is only ever called with a Union target"),
     };
     let env = &CheckEnv { infer: env.infer, local: env.local.clone(), defer: false, repeatable: env.repeatable };
-    let tmp = "__check_tmp".to_string();
+    let tmp = fresh_index_name("__check_tmp");
     let tmp_ref = arena.push(Expr::Var(tmp.clone()));
     let mut result = build_fail_call(arena, to, tmp_ref);
     for alt in alts.iter().rev() {
@@ -2098,7 +2098,7 @@ fn build_str_call(arena: &mut Arena, builtin: &str, value_ref: ExprRef, str_arg:
 // build_shallow_check below -- each supplies its own `cond`, differing
 // only in what "looks like `to`" actually means for that kind of type.
 fn build_checked(arena: &mut Arena, e: ExprRef, to: &Type, cond: impl FnOnce(&mut Arena, ExprRef) -> ExprRef) -> ExprRef {
-    let tmp = "__check_tmp".to_string();
+    let tmp = fresh_index_name("__check_tmp");
     let tmp_ref = arena.push(Expr::Var(tmp.clone()));
     let pred = cond(arena, tmp_ref);
     let fail_call = build_fail_call(arena, to, tmp_ref);
@@ -2169,8 +2169,8 @@ fn build_fail_call(arena: &mut Arena, to: &Type, value_ref: ExprRef) -> ExprRef 
 // A Vec(n) parameter makes `n` the argument's length for the return check
 // (a local witness, bound inside the wrapper only if that check reads it).
 fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: Rc<Type>, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
-    let fn_var = "__contract_fn".to_string();
-    let arg_var = "__contract_arg".to_string();
+    let fn_var = fresh_index_name("__contract_fn");
+    let arg_var = fresh_index_name("__contract_arg");
     let fn_var_ref = arena.push(Expr::Var(fn_var.clone()));
     let arg_var_ref = arena.push(Expr::Var(arg_var.clone()));
     let checked_fn = build_shallow_check(arena, fn_var_ref, &any_fun(), "is_fun");

@@ -112,7 +112,7 @@ mod tests {
             Expr::Lambda(_, _, body) => contains_check(arena, *body),
             Expr::App(f, a) => contains_check(arena, *f) || contains_check(arena, *a),
             Expr::Let(var, _, val, body) => {
-                var == "__check_tmp" || contains_check(arena, *val) || contains_check(arena, *body)
+                var.starts_with("__check_tmp#") || contains_check(arena, *val) || contains_check(arena, *body)
             }
             Expr::LetRec(bindings, body) => {
                 bindings.iter().any(|(_, _, val)| contains_check(arena, *val)) || contains_check(arena, *body)
@@ -7198,5 +7198,33 @@ mod tests {
         assert_eq!(run_source(src).unwrap().as_int(), 1);
         let direct = "let x: Dyn = [1, 2] in let y: Vec(n) = x in let f = fun w: Vec(n) -> len(w) in f([1])";
         assert!(run_source(direct).is_err());
+    }
+
+    #[test]
+    fn refinement_runtime_check_is_not_captured_by_a_user_fail() {
+        for src in [
+            "let fail = fun x -> 0 in handle (let n: Int where 0 < n = perform choose(0) in n + 1) with handler choose(p, resume) -> resume(-5)",
+            "let g = fun fail: Int -> handle (let n: Int where 0 < n = perform choose(0) in n + 1) with handler choose(p, resume) -> resume(-5) in g(1)",
+            "let fail = fun x -> 0 in let f = fun n: Int where 0 < n -> n * 2 in f(-3)",
+        ] {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains("refinement violated"), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn synthesized_check_temporaries_are_not_captured_by_user_variables() {
+        for (src, want) in [
+            ("let __check_tmp = 10 in let d: Dyn = 3 in let y: Int = d in y + __check_tmp", 13),
+            ("let __check_tmp = 10 in let d: Dyn = 3 in let y: Int | Bool = d in __check_tmp", 10),
+            ("let __check_tmp = 10 in let d: Dyn = [1, 2] in let y: (Int, Int) = d in len(y) + __check_tmp", 12),
+            ("let __contract_fn = 10 in let d: Dyn = fun x: Int -> x in d(1) + __contract_fn", 11),
+            ("let __contract_arg = 10 in let d: Dyn = fun x: Int -> x in d(1) + __contract_arg", 11),
+            ("let __contract_arg = 10 in let __contract_fn = 20 in let f = fun a: Vec(n) -> 7 in let d: Dyn = f in d([1]) + __contract_arg + __contract_fn", 37),
+            ("let d: Dyn = fun __contract_arg: Int -> fun __contract_fn: Int -> __contract_arg + __contract_fn in d(1)(2)", 3),
+            ("let d: Dyn = fun __check_tmp: Int -> __check_tmp in d(4)", 4),
+        ] {
+            assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
+        }
     }
 }
