@@ -2636,7 +2636,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // entry point: `let f: A -> Vec(n) = fn(x) = <body>`
                     // now checks <body> against Vec(n) directly.
                     Some(t) => {
-                        let (val_row, val4) = check_against(arena, val, &t, &cur_ctx, spans, infer)?;
+                        let (val_row, val4) = check_against_rigid(arena, val, &t, &cur_ctx, spans, infer)?;
                         (t.clone(), val_row, val4)
                     }
                     None => {
@@ -2685,7 +2685,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // self-contained expected type.
                     let (bound_ty, val_row, val3) = match ann {
                         Some(t) => {
-                            let (val_row, val4) = check_against(arena, *val, t, &val_ctx, spans, infer)?;
+                            let (val_row, val4) = check_against_rigid(arena, *val, t, &val_ctx, spans, infer)?;
                             (t.clone(), val_row, val4)
                         }
                         None => {
@@ -2945,6 +2945,23 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
 // this file had a Mode enum -- every existing call site is untouched.
 fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     elaborate_mode(arena, expr, ctx, spans, infer, Mode::Synth)
+}
+
+// check_against for an annotated binding's value: a FUNCTION signature's
+// still-unbound index variables are rigid for the duration, so the body
+// cannot pin them (e.g. `n := 3`) by unification. Only variables THIS call
+// newly marked are released afterwards, so nested annotated bindings
+// compose. Non-function annotations (`let x: Vec(n) = [1, 2]`) keep their
+// flexible, binding-style variables: there `n` is an existential to be
+// inferred from the value, not a signature parameter. See spec 2026-10-07.
+fn check_against_rigid(arena: &mut Arena, val: ExprRef, ann: &Type, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<(EffectRow, ExprRef), TypeError> {
+    let signature_vars = if matches!(ann, Type::Fun(..)) { free_index_vars_resolved(ann, infer) } else { BTreeSet::new() };
+    let added: Vec<String> = signature_vars.into_iter().filter(|v| infer.rigid_index.insert(v.clone())).collect();
+    let result = check_against(arena, val, ann, ctx, spans, infer);
+    for v in &added {
+        infer.rigid_index.remove(v);
+    }
+    result
 }
 
 // The bidirectional-checking entry point (spec section 6): verify `expr`

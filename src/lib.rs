@@ -5362,7 +5362,7 @@ mod tests {
         // plays no role in the leak scenario itself, which only needs
         // `[]` to run before the compound-tail arm.
         let src = r#"
-            let f: (Vec(n) -> Int) = fun v ->
+            let f = fun v: Vec(n) ->
                 match v
                 | [] -> 0
                 | h :: h2 :: t2 ->
@@ -5434,7 +5434,7 @@ mod tests {
         // = snapshot[.clone()]`) flips this test from passing (is_err())
         // to failing (the program wrongly type-checks instead).
         let src = r#"
-            let f: (Vec(n) -> Vec(k) -> Int) = fun v -> fun w ->
+            let f = fun v: Vec(n) -> fun w: Vec(k) ->
                 let inner: Int =
                     match v
                     | [] -> let p1: Vec(2) = w in 0
@@ -6375,5 +6375,68 @@ mod tests {
         let nm = mul(var("n"), var("m"));
         assert!(unify_index_expr(&nm, &mul(var("m"), var("n")), &mut infer, span).is_ok());
         assert!(unify_index_expr(&nm, &add(var("n"), var("m")), &mut infer, span).is_err());
+    }
+
+    #[test]
+    fn rigid_signature_rejects_a_body_that_ignores_its_parameters_length() {
+        for src in [
+            "let rec f: (Vec(n) -> Vec(n)) = fun v -> [1, 2, 3] in 0",
+            "let f: (Vec(n) -> Vec(n)) = fun v -> [1, 2, 3] in 0",
+        ] {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains("fixed by the signature"), "{src}: unexpected message: {err}");
+        }
+    }
+
+    #[test]
+    fn rigid_signature_rejects_other_unprovable_bodies() {
+        let rejected = [
+            // two distinct signature variables are not equal
+            "let f: (Vec(n) -> Vec(m)) = fun v -> v in 0",
+            // wrong base-case length: hypothesis n = 0, body returns length 1
+            "let rec f: (Vec(n) -> Vec(n)) = fun v -> match v | [] -> [1] | h :: t -> h :: f(t) in 0",
+            // off by one, symbolic
+            "let rec f: (Vec(n) -> Vec(n + 1)) = fun v -> 0 :: 0 :: v in 0",
+        ];
+        for src in rejected {
+            assert!(run_source(src).is_err(), "should be rejected: {src}");
+        }
+    }
+
+    #[test]
+    fn rigid_signature_still_accepts_provably_correct_bodies() {
+        let lists = [
+            ("let rec f: (Vec(n) -> Vec(n)) = fun v -> v in f([1, 2])", "[1, 2]"),
+            ("let rec f: (Vec(n) -> Vec(n)) = fun v -> match v | [] -> [] | h :: t -> h :: f(t) in f([1, 2, 3])", "[1, 2, 3]"),
+            ("let rec f: (Vec(n) -> Vec(n + 1)) = fun v -> 0 :: v in f([1, 2])", "[0, 1, 2]"),
+            (
+                "let rec app: (Vec(m) -> Vec(n) -> Vec(m + n)) = fun a -> fun b -> match a | [] -> b | h :: t -> h :: app(t)(b) in app([1, 2])([3])",
+                "[1, 2, 3]",
+            ),
+        ];
+        for (src, want) in lists {
+            assert_eq!(run_source(src).unwrap().to_string(), want, "{src}");
+        }
+        // the same signature used at two different lengths in one program
+        let two = "let rec f: (Vec(n) -> Vec(n)) = fun v -> v in let a: Vec(2) = f([1, 2]) in let b: Vec(3) = f([1, 2, 3]) in 0";
+        assert_eq!(run_source(two).unwrap().as_int(), 0);
+        // Dyn is the escape hatch
+        let dyn_escape = "let rec f: (Vec(n) -> Vec(n)) = fun v -> let r: Dyn = [1, 2, 3] in r in 0";
+        assert_eq!(run_source(dyn_escape).unwrap().as_int(), 0);
+    }
+
+    #[test]
+    fn rigid_variables_are_released_after_the_binding() {
+        // After f is checked, a later, unrelated annotation reusing the name
+        // `n` must be free to bind it again.
+        let src = "let f: (Vec(n) -> Vec(n)) = fun v -> v in let x: Vec(n) = [1, 2] in 0";
+        assert_eq!(run_source(src).unwrap().as_int(), 0);
+    }
+
+    #[test]
+    fn rigid_mutual_recursion_group_shares_a_variable_name() {
+        let src = "let rec even: (Vec(n) -> Int) = fun v -> match v | [] -> 1 | h :: t -> odd(t) \
+                   and odd: (Vec(n) -> Int) = fun v -> match v | [] -> 0 | h :: t -> even(t) in even([1, 2])";
+        assert_eq!(run_source(src).unwrap().as_int(), 1);
     }
 }
