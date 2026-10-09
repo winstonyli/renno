@@ -393,21 +393,14 @@ fn undecided() -> Rel {
 /// `unify_index_expr` as the checker's `Result`: a refutation is its message, and an Unknown is a
 /// static error too (nothing at runtime can decide an index equation before stage 3's `Pending`).
 pub(crate) fn unify_index(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
-    let (ra, rb) = (infer.resolve_index_deep(a), infer.resolve_index_deep(b));
     match unify_index_expr(a, b, infer) {
         Rel::Proven => Ok(()),
         Rel::Refuted(why) => Err(TypeError(why.into_owned(), span)),
-        Rel::Unknown(..) => Err(TypeError(undecided_message(&ra, &rb), span)),
+        // Unknown arises only when the SOP normalizer hits its cap.
+        Rel::Unknown(..) => Err(TypeError("could not decide (expression too large) whether the two index expressions are equal".to_string(), span)),
     }
 }
 
-fn undecided_message(a: &IndexExpr, b: &IndexExpr) -> String {
-    if crate::index_expr::index_exprs_compare(a, b).is_none() {
-        "could not decide (expression too large) whether the two index expressions are equal".to_string()
-    } else {
-        format!("could not decide whether index {a} equals index {b}: solving it is not supported, and no runtime value can check it")
-    }
-}
 // The real unifier. Resolves both sides through infer.subst first, then:
 // an unbound Type::Var on either side gets BOUND (after an occurs-check)
 // to the other, already-resolved side; Type::Dyn on either side succeeds
