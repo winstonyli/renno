@@ -1994,11 +1994,11 @@ fn shape_test(ty: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> Option<T
         Type::Fun(..) => Test::Fun,
         Type::Token(id) => Test::Token(*id),
         // Exact arity, unlike Record's width tolerance.
-        Type::Tuple(items) => Test::Tuple(items.len()),
+        Type::Tuple(items) => Test::TupleOf(vec![Test::Any; items.len()]),
         // Width-tolerant: `v` need only HAVE (at least) every required
         // field -- extra fields are fine, see Pattern::Record's own doc
         // comment for why nothing downstream can ever observe them.
-        Type::Record(fields) => Test::Record(fields.iter().map(|(name, _)| name.clone()).collect()),
+        Type::Record(fields) => Test::RecordOf(fields.iter().map(|(name, _)| (name.clone(), Test::Any)).collect()),
         Type::Union(alts) => Test::Or(alts.iter().map(|alt| shape_test(alt, env, visiting)).collect::<Option<Vec<_>>>()?),
         Type::Named(id) if visiting.contains(id) => Test::Never,
         Type::Named(id) => match env.infer.named_types.get(id) {
@@ -2081,7 +2081,7 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, env: 
 // the cast site `env.span`; `to` is the type whose display text a failure
 // reports.
 fn build_check_node(arena: &mut Arena, value_ref: ExprRef, test: Test, mode: CheckMode, to: &Type, env: &CheckEnv) -> ExprRef {
-    arena.push(Expr::Check(value_ref, Rc::new(CheckSpec { test, mode, to: to.to_string(), span: env.span })))
+    arena.push(Expr::Check(value_ref, Rc::new(CheckSpec { test, defs: Vec::new(), mode, to: to.to_string(), span: env.span })))
 }
 
 // The Bool outcome of `test`: a union picking its alternative.

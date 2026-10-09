@@ -101,27 +101,37 @@ pub enum BinOp {
     Cons,
 }
 
-// The shallow runtime test an `Expr::Check` applies to a value (machine::
-// test_holds). Shape only, never deeper: arity for Tuple, field presence for
-// Record (width-tolerant), the callability tag for Fun.
+// The runtime test an `Expr::Check` applies to a value (machine::test_holds),
+// derived from the target type. It follows the VALUE (finite, immutable,
+// acyclic), so a deep test of a function-free type always terminates. A
+// function position is only a callability tag (the per-call contract is
+// typecheck::wrap_fun_contract's job, and only for a bare Fun target).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Test {
     // Dyn/Var: everything passes. Never: nothing does (a failing branch, or a
-    // Named ancestor already being unfolded).
+    // Named alias already being unfolded with no container in between).
     Any,
     Never,
     Int,
     Float,
     Bool,
     Str,
+    // A list of anything (`ListOf(Any)`, kept as its own fast variant: the
+    // is_list prelude predicate and the Vec(n) length checks use it).
     List,
     Fun,
     // The exact Value::Token with this id.
     Token(u64),
-    // A list of exactly this length.
-    Tuple(usize),
-    // A record with at least these fields.
-    Record(Vec<String>),
+    // A list every element of which passes.
+    ListOf(Box<Test>),
+    // A list of exactly this many elements, position i passing tests[i].
+    TupleOf(Vec<Test>),
+    // A record with at least these fields, each field's value passing its
+    // test (width-tolerant: other fields are never looked at).
+    RecordOf(Vec<(String, Test)>),
+    // `CheckSpec::defs[i]`: a Named alias's body, reached only through a
+    // container so the recursion consumes value structure.
+    Ref(usize),
     // Any alternative passes (a union, first match wins).
     Or(Vec<Test>),
 }
@@ -138,6 +148,9 @@ pub enum CheckMode {
 #[derive(Debug)]
 pub struct CheckSpec {
     pub test: Test,
+    // The bodies `Test::Ref(i)` indexes; empty unless the target reaches a
+    // recursive Named alias.
+    pub defs: Vec<Test>,
     pub mode: CheckMode,
     // The type's display text, for the Assert message.
     pub to: String,

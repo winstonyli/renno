@@ -7177,44 +7177,48 @@ mod tests {
         tree_any(&arena, root, &|n| matches!(n, expr::Expr::Var(v) if v.starts_with("#is_")))
     }
 
-    type ShapeCase = (&'static str, Vec<&'static str>, Vec<(&'static str, &'static str)>, Option<expr::Test>);
+    type ShapeCase = (&'static str, Vec<&'static str>, Vec<(&'static str, &'static str)>, bool);
 
     // (annotation, accepted Dyn values, rejected Dyn values with the expected
-    // message fragment, the native test of its Assert Check -- None when the
-    // crossing stays desugared). Every shape the old builders produced.
+    // message fragment, is one native Assert Check -- false when the crossing
+    // stays desugared). Every shape the old builders produced.
     fn native_check_shapes() -> Vec<ShapeCase> {
-        use expr::Test;
-        let x = || vec!["x".to_string()];
         vec![
-            ("Int", vec!["3"], vec![("true", "type error: expected Int, found Bool")], Some(Test::Int)),
-            ("Float", vec!["1.5"], vec![("\"a\"", "type error: expected Float, found Str")], Some(Test::Float)),
-            ("Bool", vec!["true"], vec![("3", "type error: expected Bool, found Int")], Some(Test::Bool)),
-            ("Str", vec!["\"a\""], vec![("3", "type error: expected Str, found Int")], Some(Test::Str)),
-            ("[Int]", vec!["[1]", "[]"], vec![("3", "type error: expected [Int], found Int")], Some(Test::List)),
-            ("(Int -> Int)", vec!["fun x: Int -> x"], vec![("3", "type error: expected (Dyn -> Dyn), found Int")], Some(Test::Fun)),
+            ("Int", vec!["3"], vec![("true", "type error: expected Int, found Bool")], true),
+            ("Float", vec!["1.5"], vec![("\"a\"", "type error: expected Float, found Str")], true),
+            ("Bool", vec!["true"], vec![("3", "type error: expected Bool, found Int")], true),
+            ("Str", vec!["\"a\""], vec![("3", "type error: expected Str, found Int")], true),
+            ("[Int]", vec!["[1]", "[]"], vec![("3", "type error: expected [Int], found Int")], true),
+            ("(Int -> Int)", vec!["fun x: Int -> x"], vec![("3", "type error: expected (Dyn -> Dyn), found Int")], true),
             (
                 "(Int, Int)",
                 vec!["[1, 2]"],
                 vec![("[1, 2, 3]", "type error: expected (Int, Int), found List"), ("3", "type error: expected (Int, Int), found Int")],
-                Some(Test::Tuple(2)),
+                true,
             ),
             (
                 "{x: Int}",
                 vec!["{x: 1}", "{x: 1, y: 2}"],
                 vec![("{y: 2}", "type error: expected {x: Int}, found Record"), ("5", "type error: expected {x: Int}, found Int")],
-                Some(Test::Record(x())),
+                true,
             ),
-            ("Int | Bool", vec!["3", "true"], vec![("\"a\"", "type error: expected Int | Bool, found Str")], Some(Test::Or(vec![Test::Int, Test::Bool]))),
+            ("Int | Bool", vec!["3", "true"], vec![("\"a\"", "type error: expected Int | Bool, found Str")], true),
             (
                 "Int | (Int, Int) | {x: Int}",
                 vec!["3", "[1, 2]", "{x: 1}"],
                 vec![("[1]", "type error: expected Int | (Int, Int) | {x: Int}, found List"), ("{y: 1}", "found Record")],
-                Some(Test::Or(vec![Test::Int, Test::Tuple(2), Test::Record(x())])),
+                true,
             ),
-            ("Vec(2)", vec!["[1, 2]"], vec![("[1]", "expected [Dyn](2), found List"), ("3", "found Int")], None),
-            ("Int | Vec(2)", vec!["3", "[1, 2]"], vec![("[1]", "found List"), ("true", "found Bool")], None),
-            ("Int | (Int -> Int)", vec!["3", "fun x: Int -> x"], vec![("\"a\"", "type error: expected Int | (Int -> Int), found Str")], None),
+            ("Vec(2)", vec!["[1, 2]"], vec![("[1]", "expected [Dyn](2), found List"), ("3", "found Int")], false),
+            ("Int | Vec(2)", vec!["3", "[1, 2]"], vec![("[1]", "found List"), ("true", "found Bool")], false),
+            ("Int | (Int -> Int)", vec!["3", "fun x: Int -> x"], vec![("\"a\"", "type error: expected Int | (Int -> Int), found Str")], false),
         ]
+    }
+
+    // Some Assert Check (whatever its test) is somewhere in the tree.
+    fn has_native_assert_check(src: &str) -> bool {
+        let (arena, root) = elaborated_tree(src);
+        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(_, s) if s.mode == expr::CheckMode::Assert))
     }
 
     // A bare Fun crossing is a per-call contract: it is only exercised by calling.
@@ -7239,11 +7243,11 @@ mod tests {
     }
 
     #[test]
-    fn every_shallow_dyn_boundary_shape_is_one_native_check() {
+    fn every_dyn_boundary_shape_is_one_native_deep_check() {
         for (ty, _, _, native) in native_check_shapes() {
             let src = crossing(ty, "3");
-            if let Some(test) = native {
-                assert!(has_assert_check(&src, test), "{src}: no native Check");
+            if native {
+                assert!(has_native_assert_check(&src), "{src}: no native Check");
                 let (arena, root) = elaborated_tree(&src);
                 assert!(!has_let_named(&arena, root, "__check_tmp#"), "{src}: still desugared");
             }

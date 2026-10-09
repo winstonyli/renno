@@ -443,14 +443,17 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                         }
                         Frame::Check { spec } => {
                             let spec = spec.clone();
-                            let holds = test_holds(&spec.test, &value);
+                            let holds = test_holds(&spec.test, &spec.defs, &value);
                             cont = rest;
                             control = Control::Apply(match spec.mode {
                                 CheckMode::Probe => Value::Bool(holds),
                                 CheckMode::Assert if holds => value,
                                 CheckMode::Assert => {
                                     set_current_span(spec.span);
-                                    panic!("type error: expected {}, found {}", spec.to, value.type_name())
+                                    let mut path = Vec::new();
+                                    let found = explain(&spec.test, &spec.defs, &value, &mut path);
+                                    let at = if path.is_empty() { String::new() } else { format!(" at {}", path.join(", ")) };
+                                    panic!("type error: expected {}, found {}{at}", spec.to, found.type_name())
                                 }
                             });
                         }
@@ -479,10 +482,23 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
     }
 }
 
-// The one definition of every shallow Dyn-boundary test (Expr::Check) and of
-// the is_int/is_float/... prelude predicates, which share it.
-fn test_holds(test: &Test, v: &Value) -> bool {
-    match test {
+// ---- The deep check: ONE iterative walker ----
+//
+// `test_holds` (every Dyn-boundary Expr::Check, and the is_int/is_float/...
+// prelude predicates) and `explain` (the failure message's "at element 1")
+// are two runs of `walk`, so there is a single definition of the test and the
+// native stack use is O(1) in the value's nesting depth (a recursive check
+// overflowed the worker stack at about 150,000 levels in debug builds). The
+// walker keeps a work list of (test, value) steps and, for `Or`, a stack of
+// choice points: a failing alternative rewinds the work list to the height
+// the `Or` started at and tries the next one. `defs` is the owning
+// CheckSpec's alias table (what Test::Ref indexes; the prelude predicates
+// pass `&[]`). The value is finite and acyclic, and every step consumes
+// structure, so the walk ends.
+
+// A scalar test decided by the value's own tag; None for a compound test.
+fn leaf(t: &Test, v: &Value) -> Option<bool> {
+    Some(match t {
         Test::Any => true,
         Test::Never => false,
         Test::Int => matches!(v, Value::Int(_)),
@@ -496,10 +512,185 @@ fn test_holds(test: &Test, v: &Value) -> bool {
             matches!(v, Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..))
         }
         Test::Token(id) => matches!(v, Value::Token(t) if t == id),
-        Test::Tuple(arity) => matches!(v, Value::List(items) if items.len() == *arity),
-        Test::Record(names) => matches!(v, Value::Record(fields) if names.iter().all(|n| find_field(fields, n).is_some())),
-        Test::Or(alternatives) => alternatives.iter().any(|t| test_holds(t, v)),
+        Test::ListOf(_) | Test::TupleOf(_) | Test::RecordOf(_) | Test::Ref(_) | Test::Or(_) => return None,
+    })
+}
+
+enum Step<'t, 'a> {
+    // Check this value against this test; the u32 is its path node.
+    Test(&'t Test, &'a Value, u32),
+    // The current `Or` alternative passed: drop its choice point.
+    Commit,
+    // Fail at this value (a record missing a field, after the fields it does
+    // have passed: a present failing field is reported before the record).
+    FailAt(&'a Value, u32),
+}
+
+// An `Or` being tried: where to rewind the work list to, the alternatives
+// left, and the failure that got furthest so far.
+struct Choice<'t, 'a> {
+    height: usize,
+    alternatives: &'t [Test],
+    next: usize,
+    value: &'a Value,
+    node: u32,
+    best: Fail<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct Fail<'a> {
+    node: u32,
+    depth: u32,
+    found: &'a Value,
+}
+
+// One step of the way down to a failure.
+#[derive(Clone, Copy)]
+enum Label<'t> {
+    Element(usize),
+    Field(&'t str),
+}
+
+// Path nodes (parent, depth, label), filled only by the tracked run; node 0
+// is the root.
+type Nodes<'t> = Vec<(u32, u32, Label<'t>)>;
+
+fn child<'t, const TRACK: bool>(nodes: &mut Nodes<'t>, parent: u32, label: Label<'t>) -> u32 {
+    if !TRACK {
+        return 0;
     }
+    let depth = nodes[parent as usize].1 + 1;
+    nodes.push((parent, depth, label));
+    (nodes.len() - 1) as u32
+}
+
+// None when `v` passes `test`, else the innermost failure (with TRACK, its
+// path node and depth; an `Or` reports its alternative that got furthest,
+// the first on ties).
+fn walk<'t, 'a, const TRACK: bool>(test: &'t Test, defs: &'t [Test], v: &'a Value, nodes: &mut Nodes<'t>) -> Option<Fail<'a>> {
+    if TRACK {
+        nodes.push((0, 0, Label::Element(0)));
+    }
+    let depth_of = |nodes: &Nodes<'t>, n: u32| if TRACK { nodes[n as usize].1 } else { 0 };
+    let mut work: Vec<Step<'t, 'a>> = vec![Step::Test(test, v, 0)];
+    let mut choices: Vec<Choice<'t, 'a>> = Vec::new();
+    'main: loop {
+        let mut fail: Fail<'a> = 'step: {
+            let Some(step) = work.pop() else { return None };
+            let (t, v, node) = match step {
+                Step::Commit => {
+                    choices.pop();
+                    continue 'main;
+                }
+                Step::FailAt(v, node) => break 'step Fail { node, depth: depth_of(nodes, node), found: v },
+                Step::Test(t, v, node) => (t, v, node),
+            };
+            let here = Fail { node, depth: depth_of(nodes, node), found: v };
+            if let Some(ok) = leaf(t, v) {
+                if ok {
+                    continue 'main;
+                }
+                break 'step here;
+            }
+            match t {
+                Test::Ref(i) => work.push(Step::Test(&defs[*i], v, node)),
+                Test::ListOf(element) => {
+                    let Value::List(items) = v else { break 'step here };
+                    if leaf(element, v).is_some() {
+                        // A scalar element test (`leaf` answers Some for those
+                        // whatever the value): scan inline, nothing pushed.
+                        match items.iter().position(|x| leaf(element, x) == Some(false)) {
+                            None => continue 'main,
+                            Some(i) => {
+                                let n = child::<TRACK>(nodes, node, Label::Element(i));
+                                break 'step Fail { node: n, depth: depth_of(nodes, n), found: &items[i] };
+                            }
+                        }
+                    }
+                    // Reversed, so the stack pops them in element order.
+                    for (i, x) in items.iter().enumerate().rev() {
+                        let n = child::<TRACK>(nodes, node, Label::Element(i));
+                        work.push(Step::Test(element, x, n));
+                    }
+                }
+                Test::TupleOf(elements) => {
+                    let Value::List(items) = v else { break 'step here };
+                    if items.len() != elements.len() {
+                        break 'step here;
+                    }
+                    for (i, (x, element)) in items.iter().zip(elements).enumerate().rev() {
+                        let n = child::<TRACK>(nodes, node, Label::Element(i));
+                        work.push(Step::Test(element, x, n));
+                    }
+                }
+                Test::RecordOf(required) => {
+                    let Value::Record(fields) = v else { break 'step here };
+                    let present: Vec<_> = required.iter().filter_map(|(name, t)| Some((name, t, find_field(fields, name)?))).collect();
+                    if present.len() < required.len() {
+                        work.push(Step::FailAt(v, node));
+                    }
+                    for (name, t, x) in present.into_iter().rev() {
+                        let n = child::<TRACK>(nodes, node, Label::Field(name));
+                        work.push(Step::Test(t, x, n));
+                    }
+                }
+                Test::Or(alternatives) => {
+                    let Some(first) = alternatives.first() else { break 'step here };
+                    choices.push(Choice { height: work.len(), alternatives, next: 1, value: v, node, best: here });
+                    work.push(Step::Commit);
+                    work.push(Step::Test(first, v, node));
+                }
+                _ => unreachable!("scalar tests are decided by `leaf`"),
+            }
+            continue 'main;
+        };
+        // A failure: rewind to the nearest `Or` with an alternative left; an
+        // exhausted one fails with its furthest alternative.
+        loop {
+            let Some(choice) = choices.last_mut() else { return Some(fail) };
+            if fail.depth > choice.best.depth {
+                choice.best = fail;
+            }
+            work.truncate(choice.height);
+            if choice.next < choice.alternatives.len() {
+                let alternative = &choice.alternatives[choice.next];
+                choice.next += 1;
+                work.push(Step::Commit);
+                work.push(Step::Test(alternative, choice.value, choice.node));
+                break;
+            }
+            fail = choices.pop().expect("a choice point was just inspected").best;
+        }
+    }
+}
+
+fn test_holds(test: &Test, defs: &[Test], v: &Value) -> bool {
+    match leaf(test, v) {
+        Some(ok) => ok,
+        None => walk::<false>(test, defs, v, &mut Vec::new()).is_none(),
+    }
+}
+
+// The innermost value that makes `test` fail on `v`, with the way down to it
+// pushed onto `path` ("element 1", "field b"). Cold path of a failing Assert
+// check only: the tracked re-run of `walk`, linear in the value. A union
+// cannot say which alternative was meant: it descends into the one that got
+// furthest. `v` itself when nothing fails.
+fn explain<'a>(test: &Test, defs: &[Test], v: &'a Value, path: &mut Vec<String>) -> &'a Value {
+    let mut nodes = Vec::new();
+    let Some(fail) = walk::<true>(test, defs, v, &mut nodes) else { return v };
+    let mut labels = Vec::new();
+    let mut n = fail.node;
+    while n != 0 {
+        let (parent, _, label) = nodes[n as usize];
+        labels.push(match label {
+            Label::Element(i) => format!("element {i}"),
+            Label::Field(name) => format!("field {name}"),
+        });
+        n = parent;
+    }
+    path.extend(labels.into_iter().rev());
+    fail.found
 }
 
 fn set_current_span(span: Option<Span>) {
@@ -563,7 +754,7 @@ fn as_num_at(v: &Value, span: Option<Span>) -> Num {
         Value::Float(x) => Num::Float(*x),
         _ => {
             set_current_span(span);
-            panic!("expected a number")
+            panic!("type error: expected Int | Float, found {}", v.type_name())
         }
     }
 }
@@ -730,11 +921,11 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 _ => panic!("get expects a list and an int"),
             }
         }
-        Builtin::IsInt => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Int, &v))),
-        Builtin::IsFloat => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Float, &v))),
-        Builtin::IsBool => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Bool, &v))),
-        Builtin::IsStr => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Str, &v))),
-        Builtin::IsList => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::List, &v))),
+        Builtin::IsInt => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Int, &[], &v))),
+        Builtin::IsFloat => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Float, &[], &v))),
+        Builtin::IsBool => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Bool, &[], &v))),
+        Builtin::IsStr => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Str, &[], &v))),
+        Builtin::IsList => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::List, &[], &v))),
         // (record, name) -- args.pop() order matches Get's own (list, i)
         // convention: last-pushed arg (name) pops first.
         // Panics on a missing field the same way Get panics on an
@@ -755,7 +946,7 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 _ => panic!("get_field expects a record and a string"),
             }
         }
-        Builtin::IsFun => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Fun, &v))),
+        Builtin::IsFun => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Fun, &[], &v))),
         // Echoes its argument back unchanged after printing it -- see
         // Builtin::Print's own doc comment.
         Builtin::Print => match args.pop() {
@@ -1056,21 +1247,203 @@ mod tests {
     fn test_holds_covers_every_shape() {
         let record = Value::Record(Rc::new(vec![("x".to_string(), Value::Int(1)), ("y".to_string(), Value::Int(2))]));
         let closure = Value::Builtin(Builtin::Len);
-        assert!(test_holds(&Test::Any, &Value::Bool(true)) && !test_holds(&Test::Never, &Value::Bool(true)));
-        assert!(test_holds(&Test::Int, &Value::Int(1)) && !test_holds(&Test::Int, &Value::Float(1.0)));
-        assert!(test_holds(&Test::Float, &Value::Float(1.0)) && !test_holds(&Test::Float, &Value::Int(1)));
-        assert!(test_holds(&Test::Bool, &Value::Bool(false)) && !test_holds(&Test::Bool, &Value::Int(0)));
-        assert!(test_holds(&Test::Str, &Value::Str(Rc::from("a"))) && !test_holds(&Test::Str, &Value::Int(0)));
-        assert!(test_holds(&Test::List, &list(0)) && !test_holds(&Test::List, &record));
-        assert!(test_holds(&Test::Fun, &closure) && !test_holds(&Test::Fun, &Value::Int(0)));
-        assert!(test_holds(&Test::Token(7), &Value::Token(7)) && !test_holds(&Test::Token(7), &Value::Token(8)));
-        assert!(!test_holds(&Test::Token(7), &Value::Int(7)));
-        assert!(test_holds(&Test::Tuple(2), &list(2)) && !test_holds(&Test::Tuple(2), &list(3)) && !test_holds(&Test::Tuple(2), &record));
-        let fields = |names: &[&str]| Test::Record(names.iter().map(|n| n.to_string()).collect());
-        assert!(test_holds(&fields(&["x"]), &record) && test_holds(&fields(&["x", "y"]), &record));
-        assert!(!test_holds(&fields(&["z"]), &record) && !test_holds(&fields(&["x"]), &list(1)));
+        let holds = |t: &Test, v: &Value| test_holds(t, &[], v);
+        assert!(holds(&Test::Any, &Value::Bool(true)) && !holds(&Test::Never, &Value::Bool(true)));
+        assert!(holds(&Test::Int, &Value::Int(1)) && !holds(&Test::Int, &Value::Float(1.0)));
+        assert!(holds(&Test::Float, &Value::Float(1.0)) && !holds(&Test::Float, &Value::Int(1)));
+        assert!(holds(&Test::Bool, &Value::Bool(false)) && !holds(&Test::Bool, &Value::Int(0)));
+        assert!(holds(&Test::Str, &Value::Str(Rc::from("a"))) && !holds(&Test::Str, &Value::Int(0)));
+        assert!(holds(&Test::List, &list(0)) && !holds(&Test::List, &record));
+        assert!(holds(&Test::Fun, &closure) && !holds(&Test::Fun, &Value::Int(0)));
+        assert!(holds(&Test::Token(7), &Value::Token(7)) && !holds(&Test::Token(7), &Value::Token(8)));
+        assert!(!holds(&Test::Token(7), &Value::Int(7)));
+        let tuple2 = Test::TupleOf(vec![Test::Any, Test::Any]);
+        assert!(holds(&tuple2, &list(2)) && !holds(&tuple2, &list(3)) && !holds(&tuple2, &record));
+        let fields = |names: &[&str]| Test::RecordOf(names.iter().map(|n| (n.to_string(), Test::Any)).collect());
+        assert!(holds(&fields(&["x"]), &record) && holds(&fields(&["x", "y"]), &record));
+        assert!(!holds(&fields(&["z"]), &record) && !holds(&fields(&["x"]), &list(1)));
         let int_or_token = Test::Or(vec![Test::Int, Test::Token(7)]);
-        assert!(test_holds(&int_or_token, &Value::Token(7)) && test_holds(&int_or_token, &Value::Int(1)) && !test_holds(&int_or_token, &Value::Bool(true)));
-        assert!(!test_holds(&Test::Or(vec![]), &Value::Int(1)));
+        assert!(holds(&int_or_token, &Value::Token(7)) && holds(&int_or_token, &Value::Int(1)) && !holds(&int_or_token, &Value::Bool(true)));
+        assert!(!holds(&Test::Or(vec![]), &Value::Int(1)));
+    }
+
+    #[test]
+    fn deep_tests_follow_the_value_and_explain_names_the_failing_element() {
+        let ints = |xs: &[i64]| Value::List(Rc::new(xs.iter().map(|n| Value::Int(*n)).collect()));
+        let list_of_int = Test::ListOf(Box::new(Test::Int));
+        assert!(test_holds(&list_of_int, &[], &ints(&[1, 2])) && test_holds(&list_of_int, &[], &ints(&[])));
+        let mixed = Value::List(Rc::new(vec![Value::Int(1), Value::Bool(true)]));
+        assert!(!test_holds(&list_of_int, &[], &mixed));
+        let mut path = Vec::new();
+        assert_eq!(explain(&list_of_int, &[], &mixed, &mut path).type_name(), "Bool");
+        assert_eq!(path, ["element 1"]);
+
+        let record = Value::Record(Rc::new(vec![("a".to_string(), Value::Int(1)), ("b".to_string(), mixed.clone())]));
+        let nested = Test::RecordOf(vec![("a".to_string(), Test::Int), ("b".to_string(), list_of_int.clone())]);
+        assert!(!test_holds(&nested, &[], &record));
+        let mut path = Vec::new();
+        assert_eq!(explain(&nested, &[], &record, &mut path).type_name(), "Bool");
+        assert_eq!(path, ["field b", "element 1"]);
+
+        // type L = (Int, L) | Bool: the alias body is defs[0], reached through Ref(0).
+        let defs = [Test::Or(vec![Test::TupleOf(vec![Test::Int, Test::Ref(0)]), Test::Bool])];
+        let pair = |a: Value, b: Value| Value::List(Rc::new(vec![a, b]));
+        let good = pair(Value::Int(1), pair(Value::Int(2), Value::Bool(true)));
+        let bad = pair(Value::Int(1), pair(Value::Int(2), Value::Int(3)));
+        assert!(test_holds(&Test::Ref(0), &defs, &good) && !test_holds(&Test::Ref(0), &defs, &bad));
+        let mut path = Vec::new();
+        assert_eq!(explain(&Test::Ref(0), &defs, &bad, &mut path).type_name(), "Int");
+        assert_eq!(path, ["element 1", "element 1"]);
+    }
+
+    // The walker uses O(1) native stack: this runs on the 2 MiB default test
+    // thread, where a recursive check (or a recursive Drop, hence the forgets)
+    // overflows after a few thousand levels.
+    #[test]
+    fn the_walker_handles_a_very_deep_spine_on_a_small_stack() {
+        const DEPTH: usize = 100_000;
+        let pair = |a: Value, b: Value| Value::List(Rc::new(vec![a, b]));
+        let defs = [Test::Or(vec![Test::TupleOf(vec![Test::Int, Test::Ref(0)]), Test::Bool])];
+        let chain = |leaf: Value| (0..DEPTH).fold(leaf, |tail, i| pair(Value::Int(i as i64), tail));
+        let good = chain(Value::Bool(true));
+        assert!(test_holds(&Test::Ref(0), &defs, &good));
+        let bad = chain(Value::Str(Rc::from("x")));
+        assert!(!test_holds(&Test::Ref(0), &defs, &bad));
+        let mut path = Vec::new();
+        assert_eq!(explain(&Test::Ref(0), &defs, &bad, &mut path).type_name(), "Str");
+        assert_eq!(path.len(), DEPTH);
+        // nested single-element lists: [[[...[Int]...]]] against ListOf(Ref) where the alias is [self] | Int
+        let list_defs = [Test::Or(vec![Test::Int, Test::ListOf(Box::new(Test::Ref(0)))])];
+        let nest = (0..DEPTH).fold(Value::Int(1), |inner, _| Value::List(Rc::new(vec![inner])));
+        assert!(test_holds(&Test::Ref(0), &list_defs, &nest));
+        // the nested chains cannot be dropped recursively on this stack
+        std::mem::forget((good, bad, nest));
+    }
+
+    // The old recursive definitions, kept as the oracle for the walker: same
+    // answer, same path, same offending value on random (test, defs, value).
+    fn holds_recursive(test: &Test, defs: &[Test], v: &Value) -> bool {
+        match test {
+            Test::ListOf(t) => matches!(v, Value::List(items) if items.iter().all(|x| holds_recursive(t, defs, x))),
+            Test::TupleOf(ts) => matches!(v, Value::List(items) if items.len() == ts.len() && items.iter().zip(ts).all(|(x, t)| holds_recursive(t, defs, x))),
+            Test::RecordOf(fs) => matches!(v, Value::Record(fields) if fs.iter().all(|(n, t)| find_field(fields, n).is_some_and(|x| holds_recursive(t, defs, x)))),
+            Test::Ref(i) => holds_recursive(&defs[*i], defs, v),
+            Test::Or(alternatives) => alternatives.iter().any(|t| holds_recursive(t, defs, v)),
+            scalar => leaf(scalar, v).expect("scalar"),
+        }
+    }
+
+    fn explain_recursive<'a>(test: &Test, defs: &[Test], v: &'a Value, path: &mut Vec<String>) -> &'a Value {
+        match (test, v) {
+            (Test::Ref(i), _) => explain_recursive(&defs[*i], defs, v, path),
+            (Test::ListOf(t), Value::List(items)) => match items.iter().position(|x| !holds_recursive(t, defs, x)) {
+                Some(i) => {
+                    path.push(format!("element {i}"));
+                    explain_recursive(t, defs, &items[i], path)
+                }
+                None => v,
+            },
+            (Test::TupleOf(ts), Value::List(items)) if items.len() == ts.len() => {
+                match items.iter().zip(ts).position(|(x, t)| !holds_recursive(t, defs, x)) {
+                    Some(i) => {
+                        path.push(format!("element {i}"));
+                        explain_recursive(&ts[i], defs, &items[i], path)
+                    }
+                    None => v,
+                }
+            }
+            (Test::RecordOf(fs), Value::Record(fields)) => {
+                for (name, t) in fs {
+                    if let Some(x) = find_field(fields, name).filter(|x| !holds_recursive(t, defs, x)) {
+                        path.push(format!("field {name}"));
+                        return explain_recursive(t, defs, x, path);
+                    }
+                }
+                v
+            }
+            (Test::Or(alternatives), _) => {
+                let mut best: (Vec<String>, &'a Value) = (Vec::new(), v);
+                for alt in alternatives {
+                    let mut alt_path = Vec::new();
+                    let found = explain_recursive(alt, defs, v, &mut alt_path);
+                    if alt_path.len() > best.0.len() {
+                        best = (alt_path, found);
+                    }
+                }
+                path.extend(best.0);
+                best.1
+            }
+            _ => v,
+        }
+    }
+
+    // xorshift64: fixed seed, no dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    const NAMES: [&str; 3] = ["a", "b", "c"];
+
+    // `refs`: a Ref(0|1) may appear (only under a container, like real tests).
+    fn random_test(r: &mut Rng, depth: u32, refs: bool) -> Test {
+        match if depth == 0 { r.below(5) } else { r.below(11) } {
+            0 => Test::Int,
+            1 => Test::Bool,
+            2 => Test::Any,
+            3 => Test::Str,
+            4 if refs && r.below(2) == 0 => Test::Ref(r.below(2)),
+            4 => Test::Float,
+            5 | 6 => Test::ListOf(Box::new(random_test(r, depth - 1, true))),
+            7 => Test::TupleOf((0..r.below(4)).map(|_| random_test(r, depth - 1, true)).collect()),
+            8 => Test::RecordOf((0..r.below(4)).map(|i| (NAMES[i].to_string(), random_test(r, depth - 1, true))).collect()),
+            _ => Test::Or((0..r.below(4)).map(|_| random_test(r, depth - 1, refs)).collect()),
+        }
+    }
+
+    fn random_value(r: &mut Rng, depth: u32) -> Value {
+        match if depth == 0 { r.below(4) } else { r.below(8) } {
+            0 => Value::Int(1),
+            1 => Value::Bool(true),
+            2 => Value::Str(Rc::from("s")),
+            3 => Value::Float(1.0),
+            4 | 5 => Value::List(Rc::new((0..r.below(4)).map(|_| random_value(r, depth - 1)).collect())),
+            _ => {
+                let mut fields = Vec::new();
+                for name in NAMES {
+                    if r.below(3) > 0 {
+                        fields.push((name.to_string(), random_value(r, depth - 1)));
+                    }
+                }
+                Value::Record(Rc::new(fields))
+            }
+        }
+    }
+
+    #[test]
+    fn the_walker_agrees_with_the_recursive_definition_on_random_cases() {
+        let mut r = Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut failing, total) = (0, 30_000);
+        for _ in 0..total {
+            let defs = [random_test(&mut r, 3, false), random_test(&mut r, 3, false)];
+            let test = random_test(&mut r, 4, false);
+            let v = random_value(&mut r, 4);
+            let want = holds_recursive(&test, &defs, &v);
+            assert_eq!(want, test_holds(&test, &defs, &v), "holds differs: {test:?} {defs:?} {v}");
+            if !want {
+                failing += 1;
+                let (mut want_path, mut got_path) = (Vec::new(), Vec::new());
+                let want_found = explain_recursive(&test, &defs, &v, &mut want_path);
+                let got_found = explain(&test, &defs, &v, &mut got_path);
+                assert_eq!(want_path, got_path, "path differs: {test:?} {defs:?} {v}");
+                assert!(std::ptr::eq(want_found, got_found), "found differs: {test:?} {defs:?} {v}");
+            }
+        }
+        assert!(failing > total / 10 && failing < total, "the generator should produce both outcomes: {failing}/{total} failing");
     }
 }
