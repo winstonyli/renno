@@ -2889,7 +2889,7 @@ mod tests {
     fn explicitly_annotated_higher_order_param_accepts_a_narrower_callback_too() {
         // Companion to the test above, with f's OWN parameter type
         // explicitly annotated instead of inferred -- confirms
-        // coerce()'s own fits() integration works independent of
+        // coerce()'s own relate-driven check works independent of
         // inference, the same way the original ceiling was confirmed
         // to predate the whole full-parametric-polymorphism feature by
         // reproducing on an explicitly-annotated equivalent.
@@ -2905,7 +2905,7 @@ mod tests {
     #[test]
     fn unify_fits_still_rejects_a_callback_requiring_a_field_that_does_not_exist() {
         // Regression guard: unify_fits must not become MORE permissive
-        // than fits() itself -- a callback requiring a field the
+        // than coerce_check itself -- a callback requiring a field the
         // required record doesn't have AT ALL must still be a hard
         // rejection, not silently accepted (or silently discarded, the
         // way the OLD best-effort unify() call in this arm used to
@@ -3046,7 +3046,7 @@ mod tests {
         // Final whole-branch review, Critical: unify() has no arm bridging
         // Type::List(Dyn) and Type::Tuple, but consistent() does (see
         // types.rs, the Type::List/Type::Tuple arm with the Dyn check) --
-        // so coerce() (via fits() -> consistent()) correctly accepts a
+        // so coerce() (via relate) correctly accepts a
         // tuple argument at a [Dyn] parameter, but unify_fits used to hard-
         // reject the very same call right after, since its old catch-all
         // delegated to plain unify() with no consistent() rescue. This
@@ -3066,11 +3066,11 @@ mod tests {
     fn eq_still_rejects_fun_values_that_fit_but_are_not_consistent() {
         // Regression guard for this whole plan's own Global Constraint:
         // consistent()'s own semantics must not change anywhere else.
-        // Two Fun-typed values that ARE fits()-compatible (one accepts
+        // Two Fun-typed values that ARE relate-compatible (one accepts
         // a narrower record than the other requires) but are NOT
         // consistent()-equal (different, non-matching field sets) must
         // still be rejected by ==, exactly as they already are today --
-        // fits()-style tolerance must never leak into consistent()'s
+        // relate-style tolerance must never leak into consistent()'s
         // own equivalence relation.
         let src = r#"
             let f: (({x: Int, y: Int}) -> Int) = fun r -> r.x in
@@ -3674,9 +3674,9 @@ mod tests {
     #[test]
     fn a_vec_typed_value_can_be_passed_where_a_plain_dyn_list_is_expected() {
         // Final review Finding 1+3: a Vec(3)-typed value must be usable
-        // anywhere its wrapped type ([Dyn]) is expected -- the fits()
+        // anywhere its wrapped type ([Dyn]) is expected -- the relate
         // widening fix, exercised through a real function call rather
-        // than a direct fits() unit test.
+        // than a direct relate unit test.
         let src = r#"
             let x: Dyn = [1, 2, 3] in
             let v: Vec(3) = x in
@@ -4079,7 +4079,7 @@ mod tests {
     // calls `coerce(arena, a2, &a_ty, &param_ty_resolved, ...)` BEFORE
     // it ever calls `unify_fits`/`unify()` -- and `coerce` has no
     // `InferCtx` of its own, so it can only fall back to `consistent()`/
-    // `fits()` (types.rs), both of which require exact
+    // the relate-based check, both of which require exact
     // `index_exprs_equal` on the two index expressions with NO variable-
     // binding capability at all. Unifying a parameter's bare `Vec(n)`
     // against a caller's concrete `Vec(3)` (or `Vec(1 + 2)` -- the
@@ -4340,7 +4340,7 @@ mod tests {
     }
 
     // Task 6 review finding: the fix above only excludes an Indexed-vs-
-    // Indexed pair from unify_fits's consistent()/fits() rescue at the TOP
+    // Indexed pair from unify_fits's consistent()/relate rescue at the TOP
     // level of the match -- unify_fits has explicit recursive arms for
     // Fun/Record (both correctly re-run unify_fits itself on their
     // sub-parts, so the exclusion re-fires one level down), but had NONE
@@ -4489,7 +4489,7 @@ mod tests {
     // plain Type::List -- only Indexed-Indexed and List-List are
     // handled), yet each individually satisfies a plain `[Int]` expected
     // type -- `x` via Type::Indexed's own "forget the index" widening
-    // (types::fits's Indexed rescue arm), the list literal trivially.
+    // (relate's Indexed handling), the list literal trivially.
     // Confirms Check mode's own per-branch dispatch makes this succeed
     // with NO runtime boundary check inserted (the reconstructed
     // Expr::If's children are exactly the ORIGINAL ExprRefs pushed below,
@@ -4630,7 +4630,7 @@ mod tests {
     // arms would only reconcile via a widen-to-Dyn fallback. Under Check
     // mode, each is checked against the SAME already-known `[Int]`
     // directly: `v` fits via Vec(n)'s own index-forgetting widening
-    // (types::fits's Indexed rescue arm), `[1, 2]` fits trivially, and
+    // (relate's Indexed handling), `[1, 2]` fits trivially, and
     // the reconstructed Match's own arm bodies are exactly the ORIGINAL
     // ExprRefs pushed below -- no Dyn-boundary check scaffold wrapping
     // either one. This is the genuine, isolated "static precision, not a
@@ -4828,7 +4828,7 @@ mod tests {
     //      unconditionally produce a plain Type::List, never a
     //      Type::Indexed, regardless of what Check-mode `expected` is in
     //      force (see their own arms in elaborate_node). Neither
-    //      consistent() nor fits() (types.rs) has any arm letting a
+    //      consistent() nor relate has any arm letting a
     //      plain List satisfy a required Indexed type -- only two
     //      Type::Indexed values can ever be compared that way. So a
     //      Match arm whose body FRESHLY CONSTRUCTS a list (`[]`, or

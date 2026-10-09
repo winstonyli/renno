@@ -556,7 +556,7 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
                 // Type::Indexed arm is now permissive for a bare index
                 // variable on either side (Task 6, added so coerce() itself
                 // can no-op on a Vec(n) position -- see its own doc
-                // comment), and fits()'s own Indexed arm is guarded to
+                // comment), and the former fits() Indexed arm (now relate) was guarded to
                 // exclude an Indexed `required` (see its doc comment), so
                 // it falls straight through to that SAME consistent() call
                 // for this exact pair shape. Left unguarded, EITHER would
@@ -623,12 +623,12 @@ pub(crate) fn unify_trial(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span
     result
 }
 
-// `Type::Indexed`'s own "forget the index" widening (see types::fits's
-// own new Indexed arm), applied locally wherever an operator cares only
+// `Type::Indexed`'s own "forget the index" widening (the widening
+// relate applies to an Indexed source), applied locally wherever an operator cares only
 // about an operand's wrapped shape, not its statically-tracked length
-// (BinOp::Cons/Concat) -- reusing types::fits itself isn't an option at
+// (BinOp::Cons/Concat) -- relate isn't an option at
 // these two call sites since they run through unify()/consistent()
-// directly, not fits(). One level only: an Indexed value's wrapped type
+// directly, not relate. One level only: an Indexed value's wrapped type
 // is never itself Indexed in this phase (see Type::Indexed's own doc
 // comment).
 fn forget_index(ty: &Type) -> Type {
@@ -1225,6 +1225,7 @@ fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Chec
     }
     build_cast(arena, e, &from, &to, env)
 }
+
 // Casts each Synth-joined arm from its own type to the FINAL joined type, so a
 // typed function that reaches a Dyn (or partly-Dyn Fun) join keeps its
 // parameter checks. Call once, after the whole join: a later arm can still
@@ -1262,6 +1263,7 @@ fn cast_targets(to: &Type, infer: &InferCtx) -> (Type, Type) {
         _ => (Type::Dyn, Type::Dyn),
     }
 }
+
 // Is index variable `v` already bound by a witness in scope (a local one, or
 // one the inference recorded)?
 fn index_witnessed<'a>(env: &'a CheckEnv<'a>) -> impl Fn(&str) -> bool + 'a {
@@ -1328,6 +1330,7 @@ fn cast_up(arena: &mut Arena, res: ExprRef, b: &Type, b_target: &Type, env: &Che
         }
     }
 }
+
 // The closure form of coerce_cast for a Fun `from` (relate_cast is Unknown).
 // Every binder is fresh (cast_binder), so a returned function's wrapper, nested
 // inside this one's lambda, never shadows it. A Vec(n) parameter whose `n` has
@@ -3893,9 +3896,9 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // "Forget" either side's own tracked index for the
                     // purposes of this operator -- Concat only cares
                     // whether an operand is list-shaped, not what its
-                    // statically-known length is (see types::fits's own
-                    // new Type::Indexed arm for the same widening, used
-                    // for the App-argument case instead). Phase 1 has no
+                    // statically-known length is (relate applies the same
+                    // widening to an Indexed source, used for the
+                    // App-argument case instead). Phase 1 has no
                     // rule for the RESULT length of concatenating two
                     // Vec(n)s, so this deliberately drops to the wrapped
                     // type entirely rather than half-tracking it.
