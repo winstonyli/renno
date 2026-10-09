@@ -1296,10 +1296,59 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
         }
         return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span));
     }
-    if !matches!(from, Type::Dyn | Type::Var(_)) || *to == Type::Dyn || matches!(to, Type::Var(_)) {
+    if *to == Type::Dyn || matches!(to, Type::Var(_)) {
         return Ok(e);
     }
-    Ok(build_boundary_check(arena, e, to, &env.with_span(span), &HashSet::new()))
+    let env = env.with_span(span);
+    if matches!(from, Type::Dyn | Type::Var(_)) {
+        return Ok(build_boundary_check(arena, e, to, &env, &HashSet::new()));
+    }
+    // A source that is imprecise only inside (`[Dyn]`, `(Dyn, Int)`, a Union):
+    // check what `to` constrains there. Lengths are the unifier's business
+    // (obligations), so the check target drops every Vec(n) index. An empty
+    // list literal has no element to check.
+    let empty_literal = matches!(&arena[e], Expr::ListLit(items) if items.is_empty());
+    if from == to || empty_literal || !needs_check(&env.infer.resolve_deep(from), to) {
+        return Ok(e);
+    }
+    Ok(build_boundary_check(arena, e, &strip_indexed(to), &env, &HashSet::new()))
+}
+
+// Does a value statically typed `from` still need a runtime check to be
+// trusted as `to`? Asked only of a pair `consistent` accepted. True exactly
+// where `from` is imprecise (Dyn, Var, or a Union that `to` does not cover)
+// at a position `to` constrains. A Fun is never a reason (coerce_cast wraps
+// it) and Named is nominal (equal ids are trusted).
+fn needs_check(from: &Type, to: &Type) -> bool {
+    match (from, to) {
+        (_, Type::Dyn | Type::Var(_)) => false,
+        (Type::Dyn | Type::Var(_), _) => true,
+        (Type::Indexed(wrapped, _), _) => needs_check(wrapped, to),
+        (_, Type::Indexed(wrapped, _)) => needs_check(from, wrapped),
+        (Type::Union(alts), _) => !alts.iter().all(|alt| covered_by(alt, to)),
+        (_, Type::Union(alts)) => !alts.iter().any(|alt| covered_by(from, alt)),
+        (Type::List(a), Type::List(b)) => needs_check(a, b),
+        (Type::Tuple(a), Type::Tuple(b)) => a.iter().zip(b.iter()).any(|(x, y)| needs_check(x, y)),
+        (Type::List(_), Type::Tuple(_)) => true,
+        (Type::Record(a), Type::Record(b)) => b.iter().any(|(name, t)| find_field(a, name).is_none_or(|f| needs_check(f, t))),
+        _ => false,
+    }
+}
+
+fn covered_by(from: &Type, to: &Type) -> bool {
+    consistent(from, to) && !needs_check(from, to)
+}
+
+// `t` without any Vec(n) index, at every depth.
+fn strip_indexed(t: &Type) -> Type {
+    match t {
+        Type::Indexed(wrapped, _) => strip_indexed(wrapped),
+        Type::List(e) => Type::List(Rc::new(strip_indexed(e))),
+        Type::Tuple(ts) => Type::Tuple(Rc::new(ts.iter().map(strip_indexed).collect())),
+        Type::Union(ts) => Type::Union(Rc::new(ts.iter().map(strip_indexed).collect())),
+        Type::Record(fs) => Type::Record(Rc::new(fs.iter().map(|(n, t)| (n.clone(), strip_indexed(t))).collect())),
+        other => other.clone(),
+    }
 }
 
 // `t` with every Indexed whose index mentions a variable `has_value` rejects
