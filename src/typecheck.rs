@@ -572,8 +572,12 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
                 if matches!((&required, &actual), (Type::Indexed(..), Type::Indexed(..))) {
                     return Err(e);
                 }
-                // Never stricter than coerce_check, which accepts every pair relate does not refute.
-                if matches!(relate(&actual, &required, infer), Rel::Refuted(_)) { Err(e) } else { Ok(()) }
+                // Never stricter than coerce_check, which rejects exactly the Refuted and Undecided pairs.
+                match relate(&actual, &required, infer) {
+                    Rel::Refuted(_) => Err(e),
+                    Rel::Unknown(res, _) if res.undecided() => Err(cannot_tell(&actual, &required, span)),
+                    _ => Ok(()),
+                }
             }
         },
     }
@@ -1129,10 +1133,7 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
     match relate(from, to, env.infer) {
         Rel::Proven => Ok(e),
         Rel::Refuted(why) => Err(refuted_error(from, to, &why, &env.infer.named_types, span)),
-        Rel::Unknown(res, _) if res.undecided() => Err(TypeError(
-            format!("cannot tell statically or at run time whether {from} fits {to}: an alternative differs only in a function type, a nominal type or a length"),
-            span,
-        )),
+        Rel::Unknown(res, _) if res.undecided() => Err(cannot_tell(from, to, span)),
         // Left to coerce_cast (a function wrapper) or unify_fits (an index equation).
         Rel::Unknown(res, _) if !res.needs_test() => Ok(e),
         Rel::Unknown(..) => {
@@ -1153,6 +1154,14 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
             Ok(build_boundary_check(arena, e, &target, &env, &HashSet::new()))
         }
     }
+}
+
+// The one message for a non-dischargeable Unknown (Residual::Undecided).
+fn cannot_tell(from: &Type, to: &Type, span: Span) -> TypeError {
+    TypeError(
+        format!("cannot tell statically or at run time whether {from} fits {to}: an alternative differs only in a function type, a nominal type or a length"),
+        span,
+    )
 }
 
 // The message for a Refuted pair: an index pair the old gate passed to the unifier keeps the

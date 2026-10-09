@@ -7964,4 +7964,41 @@ mod tests {
         let src = format!("let f = fun x: Int -> x in let a: {0} | (Int -> Int) = f in let b: {0} | (Int -> Int) = a in 1", alts.join(" | "));
         assert_eq!(run_source(&src).unwrap().as_int(), 1);
     }
+
+    // Final-review finding 1: an Undecided anywhere in the structure is a static error.
+    fn assert_cannot_tell(src: &str) {
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("cannot tell statically or at run time whether"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn undecided_inside_a_union_source_alternative_is_rejected() {
+        assert_cannot_tell("let f = fun x: Int -> x + 1 in let u: ((Int -> Int) | Bool, Int) | Str = (f, 1) in let v: ((Dyn -> Dyn) | Bool, Int) | Str = u in 1");
+        assert_cannot_tell("let f = fun x: Int -> x + 1 in let u: {p: (Int -> Int) | Bool} | Str = {p: f} in let v: {p: (Dyn -> Dyn) | Bool} | Str = u in 1");
+    }
+
+    #[test]
+    fn undecided_inside_a_tuple_or_record_component_is_rejected() {
+        assert_cannot_tell("let f = fun x: Int -> x + 1 in let u: ((Int -> Int) | Bool, Int) = (f, 1) in let v: ((Dyn -> Dyn) | Bool, Int) = u in 1");
+        assert_cannot_tell("let f = fun x: Int -> x + 1 in let u: {p: (Int -> Int) | Bool} = {p: f} in let v: {p: (Dyn -> Dyn) | Bool} = u in 1");
+    }
+
+    #[test]
+    fn undecided_under_an_arrow_is_rejected_in_every_path() {
+        // lambda-parameter annotation (the unify_fits rescue)
+        assert_cannot_tell("let g: (((Int -> Int) | Bool) -> Int) = fun h: ((Dyn -> Dyn) | Bool) -> 1 in g(true)");
+        // function value bound to an arrow annotation (fun_rel)
+        assert_cannot_tell("let k = fun h: ((Dyn -> Dyn) | Bool) -> 1 in let g: (((Int -> Int) | Bool) -> Int) = k in g(true)");
+        // direct call
+        assert_cannot_tell("let k = fun h: ((Dyn -> Dyn) | Bool) -> 1 in let f = fun x: Int -> x in let u: (Int -> Int) | Bool = f in k(u)");
+    }
+
+    #[test]
+    fn the_same_nested_shapes_without_a_dyn_still_run() {
+        assert_eq!(run_source("let f = fun x: Int -> x + 1 in let u: ((Int -> Int) | Bool, Int) | Str = (f, 1) in let v: ((Int -> Int) | Bool, Int) | Str = u in 1").unwrap().as_int(), 1);
+        assert_eq!(run_source("let f = fun x: Int -> x + 1 in let u: {p: (Int -> Int) | Bool} = {p: f} in let v: {p: (Int -> Int) | Bool} = u in 1").unwrap().as_int(), 1);
+        assert_eq!(run_source("let g: (((Int -> Int) | Bool) -> Int) = fun h: ((Int -> Int) | Bool) -> 1 in g(true)").unwrap().as_int(), 1);
+        let k = "let k = fun h: ((Int -> Int) | Bool) -> 1 in let f = fun x: Int -> x in let u: (Int -> Int) | Bool = f in k(u)";
+        assert_eq!(run_source(k).unwrap().as_int(), 1);
+    }
 }

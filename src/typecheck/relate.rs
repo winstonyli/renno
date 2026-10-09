@@ -210,8 +210,9 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
             } else if alts.iter().zip(&rels).any(|(a, r)| match r {
                 // A value test of `to` cannot see this refutation, nor add a function wrapper.
                 Rel::Refuted(w) => !w.observable(),
-                // Only an Imprecise Unknown is a wrapper to add; Incomplete (a cap) stays a runtime test.
-                Rel::Unknown(_, c) => *c == Cause::Imprecise && matches!(infer.resolve(a), Type::Fun(..)),
+                // An Undecided nested in the alternative stays Undecided. Otherwise only an Imprecise
+                // Unknown Fun alternative is a wrapper to add; Incomplete (a cap) stays a runtime test.
+                Rel::Unknown(res, c) => res.undecided() || (*c == Cause::Imprecise && matches!(infer.resolve(a), Type::Fun(..))),
                 Rel::Proven => false,
             }) {
                 Rel::Unknown(Residual::Undecided, Cause::Incomplete)
@@ -271,7 +272,8 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
         _ => Rel::refuted("shape"),
     }
 }
-// Params contravariant, returns covariant; any Unknown component is a wrapper (Residual::Fun).
+// Params contravariant, returns covariant; any Unknown component is a wrapper (Residual::Fun),
+// except an Undecided, which no wrapper can discharge and so propagates.
 fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Rel {
     let Type::Fun(a, r, b) = from else { return Rel::refuted("not a function") };
     let (a2, b2) = match to {
@@ -284,7 +286,7 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
         _ => (Type::Dyn, Type::Dyn),
     };
     match and([go(&a2, a, infer, fuel, d), go(b, &b2, infer, fuel, d)]) {
-        Rel::Unknown(_, c) => Rel::Unknown(Residual::Fun, c),
+        Rel::Unknown(res, c) if !res.undecided() => Rel::Unknown(Residual::Fun, c),
         Rel::Refuted(Why::Shape(w)) => Rel::Refuted(Why::Opaque(w)),
         other => other,
     }
@@ -451,6 +453,12 @@ mod tests {
             ("union mix, opaque alt (fun signature)", uni(&[fun(i.clone(), i.clone()), b.clone()]), uni(&[fun(s.clone(), i.clone()), b.clone()]), U(&["Undecided"], Inc)),
             ("union mix, index alt", uni(&[vec_n(lit(3)), b.clone()]), uni(&[vec_n(lit(4)), b.clone()]), U(&["Undecided"], Inc)),
             ("union mix, fun alt needs a wrapper", uni(&[fun(i.clone(), i.clone()), b.clone()]), uni(&[fun(d.clone(), d.clone()), b.clone()]), U(&["Undecided"], Inc)),
+            ("undecided in a tuple component", tup(&[uni(&[fun(i.clone(), i.clone()), b.clone()]), i.clone()]), tup(&[uni(&[fun(d.clone(), d.clone()), b.clone()]), i.clone()]), U(&["Undecided"], Inc)),
+            ("undecided in a record field", rec(&[("p", uni(&[fun(i.clone(), i.clone()), b.clone()]))]), rec(&[("p", uni(&[fun(d.clone(), d.clone()), b.clone()]))]), U(&["Undecided"], Inc)),
+            ("undecided in a non-fun alt of a union source", uni(&[tup(&[uni(&[fun(i.clone(), i.clone()), b.clone()]), i.clone()]), s.clone()]), uni(&[tup(&[uni(&[fun(d.clone(), d.clone()), b.clone()]), i.clone()]), s.clone()]), U(&["Undecided"], Inc)),
+            ("undecided under an arrow parameter", fun(uni(&[fun(d.clone(), d.clone()), b.clone()]), i.clone()), fun(uni(&[fun(i.clone(), i.clone()), b.clone()]), i.clone()), U(&["Undecided"], Inc)),
+            ("undecided under an arrow result", fun(i.clone(), uni(&[fun(i.clone(), i.clone()), b.clone()])), fun(i.clone(), uni(&[fun(d.clone(), d.clone()), b.clone()])), U(&["Undecided"], Inc)),
+            ("same nested union-with-fun is Proven", tup(&[uni(&[fun(i.clone(), i.clone()), b.clone()]), i.clone()]), tup(&[uni(&[fun(i.clone(), i.clone()), b.clone()]), i.clone()]), P),
             ("union mix, shape only stays a test", uni(&[i.clone(), s.clone()]), uni(&[i.clone(), b.clone()]), U(&["Test"], Imp)),
         ];
         let infer = ctx();
