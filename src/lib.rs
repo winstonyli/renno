@@ -7714,4 +7714,107 @@ mod tests {
         assert_eq!(run_source(&prog("3")).unwrap().as_int(), 0);
         assert_clean_rejection(&prog("true"), BAD_INT);
     }
+
+    // ---- deep container checks (docs/superpowers/plans/2026-10-08-deep-container-checks.md) ----
+
+    fn rejects(src: &str, want: &str) {
+        let err = run_source(src).expect_err(src);
+        assert!(err.contains(want), "{src}: expected `{want}` in `{err}`");
+    }
+
+    #[test]
+    fn deep_a_dyn_list_is_checked_element_by_element() {
+        rejects("let d: Dyn = [1, true] in let xs: [Int] = d in xs", "type error: expected [Int], found Bool at element 1");
+        rejects("let d: Dyn = [1, true] in let xs: [Int] = d in match xs | a :: b :: _ -> b + 1 | _ -> 0", "at element 1");
+        assert_eq!(run_source("let d: Dyn = [1, 2] in let xs: [Int] = d in len(xs)").unwrap().as_int(), 2);
+        assert_eq!(run_source("let d: Dyn = [] in let xs: [Int] = d in len(xs)").unwrap().as_int(), 0);
+    }
+
+    #[test]
+    fn deep_tuples_and_records_check_every_position_and_field() {
+        rejects("let d: Dyn = (1, \"a\") in let p: (Int, Int) = d in p", "type error: expected (Int, Int), found Str at element 1");
+        rejects("let d: Dyn = {a: 1, b: true} in let r: {a: Int, b: Int} = d in r", "found Bool at field b");
+        assert_eq!(run_source("let d: Dyn = {a: 1, b: 2} in let r: {a: Int} = d in r.a").unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn deep_nested_containers_report_the_whole_path() {
+        rejects("let d: Dyn = [[1], [true]] in let xs: [[Int]] = d in xs", "found Bool at element 1, element 0");
+        rejects("let d: Dyn = [(1, \"a\"), (2, 3)] in let xs: [(Int, Str)] = d in xs", "found Int at element 1, element 1");
+        rejects("let d: Dyn = {a: 1, b: [true]} in let r: {a: Int, b: [Int]} = d in r", "at field b, element 0");
+    }
+
+    #[test]
+    fn deep_unions_check_inside_the_alternatives() {
+        rejects("type IS = Int | Str in let d: Dyn = [1, true] in let xs: [IS] = d in xs", "found Bool at element 1");
+        rejects("let u: [Int] | [Str] = map(fun x -> x)([true]) in u", "expected [Int] | [Str], found Bool at element 0");
+        assert_eq!(run_source("type IS = Int | Str in let d: Dyn = [1, \"a\"] in let xs: [IS] = d in len(xs)").unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn deep_float_lists_reject_int_elements() {
+        rejects("let ys: [Dyn] = [1, 2] in let xs: [Float] = ys in xs", "expected [Float], found Int at element 0");
+    }
+
+    #[test]
+    fn deep_recursive_aliases_are_checked_through_the_container() {
+        rejects("type L = (Int, L) | Bool in let d: Dyn = (1, (2, 3)) in let t: L = d in t", "at element 1, element 1");
+        rejects("type T = Int | [T] in let d: Dyn = [1, [2, true]] in let t: T = d in t", "found Bool at element 1, element 1");
+        let ok = "type L = (Int, L) | Bool in let rec mk = fun n -> if n == 0 then true else (n, mk(n - 1)) in let l: L = mk(2000) in 1";
+        assert_eq!(run_source(ok).unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn deep_partly_dyn_sources_are_checked_at_the_gate() {
+        rejects("let p: (Dyn, Int) = (true, 2) in let q: (Int, Int) = p in q", "found Bool at element 0");
+        rejects("let r0: {a: Dyn} = {a: true} in let r: {a: Int} = r0 in r.a", "found Bool at field a");
+        rejects("let g = fun u: [Int] | [Str] -> let xs: [Int] = u in len(xs) in g([\"a\"])", "expected [Int], found Str at element 0");
+        rejects("let f = fun u: Int | Str -> let n: Int = u in n in f(\"a\")", "type error: expected Int, found Str");
+        rejects("let d: Dyn = [1, \"a\"] in let u: Int | Str = d in 1", "expected Int | Str, found List");
+        // an empty list literal has no element to check
+        assert_eq!(run_source("let xs: [Int] = [] in len(xs)").unwrap().as_int(), 0);
+    }
+
+    #[test]
+    fn deep_a_checked_list_with_an_unannotated_producer_is_rejected() {
+        rejects("let f = fun xs: [Int] -> match xs | 1 :: _ -> \"one\" | _ -> \"other\" in f(map(fun x -> x)([true]))", "at element 0");
+    }
+
+    #[test]
+    fn deep_arithmetic_fallback_names_the_type() {
+        rejects("let d: Dyn = [fun x -> true] in let fs: [(Int -> Int)] = d in match fs | [f] -> f(1) + 1 | _ -> 0", "type error: expected Int | Float, found Bool");
+    }
+
+    #[test]
+    fn deep_check_replays_per_resume_of_a_multi_shot_continuation() {
+        let ok = "handle (let xs: [Int] = perform pick(0) in len(xs)) with handler pick(p, resume) -> resume([1, 2]) + resume([3])";
+        assert_eq!(run_source(ok).unwrap().as_int(), 3);
+        let bad = "handle (let xs: [Int] = perform pick(0) in len(xs)) with handler pick(p, resume) -> resume([1, 2]) + resume([1, true])";
+        rejects(bad, "found Bool at element 1");
+    }
+
+    // 200,000 levels exceeds the debug-build ceiling of a NATIVELY recursive
+    // check (it overflows between 100,000 and 150,000 on the 256 MiB worker;
+    // release: about 800,000), so this fails in `cargo test` if the walker ever
+    // recurses natively again. It stays below the debug ceiling of the
+    // pre-existing recursive Drop of a nested value (about 400,000-500,000),
+    // which would abort the test binary first.
+    #[test]
+    fn deep_a_very_deep_recursive_value_is_checked_without_overflowing() {
+        let src = "type L = (Int, L) | Bool in let rec mk = fun n -> if n == 0 then true else (n, mk(n - 1)) in let l: L = mk(200000) in 1";
+        assert_eq!(run_source(src).unwrap().as_int(), 1);
+    }
+
+    // The wrong leaf is at the bottom of a deep chain. The old recursive
+    // `explain` re-tested the remaining spine at every level (quadratic: about
+    // a minute at this depth); the walker's tracked re-run is linear.
+    #[test]
+    fn deep_a_failing_check_at_depth_is_linear_and_names_the_whole_path() {
+        let src = "type L = (Int, L) | Bool in let rec mk = fun n -> if n == 0 then 7 else (n, mk(n - 1)) in let d: Dyn = mk(20000) in let l: L = d in 1";
+        let started = std::time::Instant::now();
+        let err = run_source(src).unwrap_err();
+        assert!(err.starts_with("type error: expected L, found Int at element 1, element 1, element 1"), "{}", &err[..err.len().min(120)]);
+        assert!(err.matches("element 1").count() == 20000, "path length");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "took {:?}", started.elapsed());
+    }
 }
