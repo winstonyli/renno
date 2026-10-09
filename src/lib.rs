@@ -2047,11 +2047,6 @@ mod tests {
     }
 
     #[test]
-    fn zip_pairs_elements_and_stops_at_the_shorter_list() {
-        assert_eq!(run_untyped(r#"zip([1, 2, 3])(["a", "b"])"#).to_string(), "[[1, a], [2, b]]");
-    }
-
-    #[test]
     fn sort_orders_by_the_given_comparator() {
         assert_eq!(run_untyped("sort(fun a -> fun b -> a <= b)([3, 1, 2])").to_string(), "[1, 2, 3]");
     }
@@ -2062,14 +2057,8 @@ mod tests {
     }
 
     #[test]
-    fn split_and_join_round_trip() {
-        assert_eq!(run_untyped(r#"split("a,b,c")(",")"#).to_string(), "[a, b, c]");
+    fn join_concatenates_with_the_separator() {
         assert_eq!(run_untyped(r#"join(["a", "b", "c"])("-")"#).as_str(), "a-b-c");
-    }
-
-    #[test]
-    fn trim_strips_leading_and_trailing_whitespace() {
-        assert_eq!(run_untyped(r#"trim("  hi  ")"#).as_str(), "hi");
     }
 
     #[test]

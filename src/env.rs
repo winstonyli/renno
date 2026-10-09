@@ -34,12 +34,9 @@ pub static PRELUDE: &[(&str, Builtin)] = &[
     ("to_str", Builtin::ToStr),
     ("filter", Builtin::Filter),
     ("reverse", Builtin::Reverse),
-    ("zip", Builtin::Zip),
     ("sort", Builtin::Sort),
     ("range", Builtin::Range),
-    ("split", Builtin::Split),
     ("join", Builtin::Join),
-    ("trim", Builtin::Trim),
 ];
 
 impl Env {

@@ -94,13 +94,6 @@ pub enum Builtin {
     // [a] -> [a]. Single-arg, unlike Filter/Map -- nothing to call back
     // into, just an ordinary structural rebuild.
     Reverse,
-    // ([a], [b]) -> [(a, b)]. Stops at the shorter list -- there's no
-    // renno-level Option/Result to pad the longer one out with, the same
-    // "no partial value to invent" story Get's out-of-range panic and
-    // GetField's missing-field panic already tell, just resolved by
-    // truncating instead of panicking since running out of pairs isn't a
-    // shape error the way indexing past the end is.
-    Zip,
     // ((a, a) -> Bool, [a]) -> [a]. `cmp(x, y)` means "x belongs at or
     // before y". Bool, not a three-way Ordering -- renno has no Ordering
     // type, and Bool is the same contract every other renno-level
@@ -114,18 +107,9 @@ pub enum Builtin {
     // (Int, Int) -> [Int], exclusive of the end (`range(0, 3)` is
     // `[0, 1, 2]`) -- same convention as Rust's own `0..3`, not `..=`.
     Range,
-    // (Str, Str) -> [Str]: `split(s, sep)` -- subject first, same
-    // argument order as Get/GetField's own (subject, ...)
-    // convention. Splitting on "" is left to Rust's own str::split
-    // behavior (an empty-string separator, which yields the string cut
-    // between every char) rather than special-cased.
-    Split,
-    // ([Str], Str) -> Str: `join(parts, sep)` -- the inverse of Split,
-    // same subject-first argument order.
+    // ([Str], Str) -> Str: `join(parts, sep)` -- subject first, same
+    // argument order as Get/GetField's own (subject, ...) convention.
     Join,
-    // Str -> Str: strips leading/trailing whitespace, same definition
-    // Rust's own str::trim uses (Unicode `White_Space`, not just ASCII).
-    Trim,
 }
 
 impl Builtin {
@@ -143,16 +127,13 @@ impl Builtin {
             | Builtin::IsFun
             | Builtin::Print
             | Builtin::ToStr
-            | Builtin::Reverse
-            | Builtin::Trim => 1,
+            | Builtin::Reverse => 1,
             Builtin::Map
             | Builtin::Get
             | Builtin::GetField
             | Builtin::Filter
-            | Builtin::Zip
             | Builtin::Sort
             | Builtin::Range
-            | Builtin::Split
             | Builtin::Join => 2,
             Builtin::Fold => 3,
         }

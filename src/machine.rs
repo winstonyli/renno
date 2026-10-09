@@ -818,20 +818,6 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             }
             _ => panic!("reverse expects a list"),
         },
-        Builtin::Zip => {
-            let (ys, xs) = (args.pop(), args.pop());
-            match (xs, ys) {
-                (Some(Value::List(xs)), Some(Value::List(ys))) => {
-                    let zipped: Vec<Value> = xs
-                        .iter()
-                        .zip(ys.iter())
-                        .map(|(a, b)| Value::List(Rc::new(vec![a.clone(), b.clone()])))
-                        .collect();
-                    Value::List(Rc::new(zipped))
-                }
-                _ => panic!("zip expects two lists"),
-            }
-        }
         Builtin::Sort => {
             let (list, cmp) = (args.pop(), args.pop());
             match (cmp, list) {
@@ -859,16 +845,6 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 _ => panic!("range expects two ints"),
             }
         }
-        Builtin::Split => {
-            let (sep, s) = (args.pop(), args.pop());
-            match (s, sep) {
-                (Some(Value::Str(s)), Some(Value::Str(sep))) => {
-                    let parts: Vec<Value> = s.split(&*sep).map(|p| Value::Str(Rc::from(p))).collect();
-                    Value::List(Rc::new(parts))
-                }
-                _ => panic!("split expects two strings"),
-            }
-        }
         Builtin::Join => {
             let (sep, parts) = (args.pop(), args.pop());
             match (parts, sep) {
@@ -885,10 +861,6 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 _ => panic!("join expects a list and a string"),
             }
         }
-        Builtin::Trim => match args.pop() {
-            Some(Value::Str(s)) => Value::Str(Rc::from(s.trim())),
-            _ => panic!("trim expects a string"),
-        },
     }
 }
 
