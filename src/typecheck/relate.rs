@@ -1,6 +1,5 @@
 //! Directional, infer-aware type relation (design 2026-10-08, section 3.1). Pure and read-only.
-//! Stage 1 adds `Why`/`Undecided`/`relate_cast`; stage 2 consumers: coerce_check, coerce_cast,
-//! unify_fits.
+//! Stage 1 adds `Why`/`Undecided`/`relate_cast`; stage 2 consumers: coerce_check and the unify_fits rescue (T3), coerce_cast (T4).
 use super::{free_index_vars, unify_index_expr, InferCtx};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::types::{row_consistent, Type};

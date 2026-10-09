@@ -11,6 +11,7 @@ use crate::types::{consistent, fits, row_consistent, EffectRow, Type};
 use crate::util::find_field;
 #[allow(dead_code)] // relate has no consumer until T3/T4; T4 removes this
 mod relate;
+use self::relate::relate;
 pub(crate) use self::relate::{Cause, Rel, Residual, Why};
 
 // The Span is always an ORIGINAL (pre-elaboration) node's -- the one whose
@@ -476,17 +477,16 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
     }
 }
 
-// The unification-flavored counterpart to fits(): same directional
+// The unification-flavored counterpart to relate(): same directional
 // walk, but since this IS a unification (not just a static check), it
 // also resolves and BINDS any free Type::Var it finds along the way --
 // exactly like unify() does, via the same delegation to unify() itself
 // for every case that isn't specifically Fun or Record. That delegation
 // first tries unify_trial (binds Type::Vars on success, leaves no trace
-// on failure); if that trial fails, the pair is still accepted when
-// consistent() would accept it, mirroring whatever coerce()/fits() already
-// granted -- unify_fits must never be stricter than coerce() itself, since
-// it runs right after coerce() as a pure add-on (binding Vars), not a
-// second gate. See the catch-all below.
+// on failure); if that trial fails, the pair is still accepted unless
+// relate() refutes it -- unify_fits must never be stricter than
+// coerce_check, since it runs right after coerce() as a pure add-on
+// (binding Vars), not a second gate. See the catch-all below.
 fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
     let required = infer.resolve(required);
     let actual = infer.resolve(actual);
@@ -532,15 +532,15 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
         // match already has none for Union either, so anything that isn't
         // Fun/Record/Tuple/List falls through to the generic catch-all
         // below: unify_trial tries unify() first (which DOES have its own
-        // Indexed arm), with a consistent()/fits() rescue on failure. That
+        // Indexed arm), with a relate() rescue on failure. That
         // path gives Indexed the right answer on match, index mismatch,
         // AND binding a Type::Var reachable only through the wrapped
         // type -- see the design spec's own §3 for the rationale -- so
         // adding a redundant explicit arm here would only duplicate what
         // already works.
-        // ponytail: no Type::Var binding via the consistent()/fits() rescue path
+        // ponytail: no Type::Var binding via the relate() rescue path
         // below -- unify_trial is tried first and binds Vars on success, but a Var
-        // reachable ONLY through consistent()/fits() accepting the pair (e.g. only
+        // reachable ONLY through relate() not refuting the pair (e.g. only
         // resolvable through one alternative of a Union, or only through the
         // List(Dyn)/Tuple bridge, or only through an Indexed value's own
         // forget-the-index widening) stays unbound (reads as Dyn via the unresolved
@@ -575,45 +575,8 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
                 if matches!((&required, &actual), (Type::Indexed(..), Type::Indexed(..))) {
                     return Err(e);
                 }
-                // fits(), not just consistent(): an Indexed-typed `actual`
-                // satisfying a plain-typed `required` position (types::fits's
-                // own new Indexed arm, "forgetting" the index) is a real
-                // fits()/consistent() divergence outside the Fun/Record cases
-                // already special-cased above, and unify_fits's own doc
-                // comment promises it's never stricter than coerce()/fits()
-                // itself -- coerce() already accepts this exact pair via
-                // fits() before unify_fits ever runs on it (Expr::App), so
-                // this must too.
-                if consistent(&required, &actual) || fits(&required, &actual) {
-                    Ok(())
-                } else if let Type::Named(id) = &required {
-                    // Same one-level-unfold rescue as coerce()'s own new
-                    // fallback (see its doc comment) -- unify_fits runs
-                    // right after coerce() on this exact same (required,
-                    // actual) pair (Expr::App's own param_ty/a_ty), so it
-                    // must accept anything coerce() itself just accepted,
-                    // not re-reject it here a second time. A missing
-                    // registry entry IS reachable (not an internal-bug-
-                    // only case): a caller pairing plain parse() with
-                    // plain check() gets an empty registry -- see coerce()'s
-                    // own doc comment on this exact same condition. When
-                    // that happens, skip this rescue (coerce() itself will
-                    // already have skipped it too, for the same reason) and
-                    // fall through to the ordinary Err(e) below.
-                    match infer.named_types.get(id) {
-                        Some(raw) => {
-                            let unfolded = replace_named_with_dyn(&raw.clone(), id);
-                            if consistent(&actual, &unfolded) || fits(&unfolded, &actual) {
-                                Ok(())
-                            } else {
-                                Err(e)
-                            }
-                        }
-                        None => Err(e),
-                    }
-                } else {
-                    Err(e)
-                }
+                // Never stricter than coerce_check, which accepts every pair relate does not refute.
+                if matches!(relate(&actual, &required, infer), Rel::Refuted(_)) { Err(e) } else { Ok(()) }
             }
         },
     }
@@ -1130,69 +1093,14 @@ fn any_fun() -> Type {
     Type::Fun(Rc::new(Type::Dyn), EffectRow::Dyn, Rc::new(Type::Dyn))
 }
 
-// Replaces every occurrence of `Type::Named(id)` inside `ty` with
-// `Type::Dyn` -- used by coerce()'s own one-level-unfold rescue below,
-// and by unify_fits's own matching rescue right above (which runs
-// immediately after coerce() on the very same pair at an App site, and
-// so must never reject anything coerce() itself just accepted), on the
-// SAME id each one just unfolded. See coerce()'s own call site doc
-// comment for why: a self-referential alias's one-level definition
-// necessarily contains this SAME Type::Named leaf again wherever the
-// recursion occurred, and comparing a concrete literal's own
-// substructure against that leaf via the ordinary nominal
-// consistent()/fits() could never succeed.
-//
-// The Union arm is special: a BARE Union alternative that is exactly
-// Type::Named(id) (e.g. `type A = Int | A`) is DROPPED rather than
-// mapped to Dyn, because Dyn is consistent with EVERYTHING -- mapping it
-// to Dyn would make the whole Union trivially satisfied by any value at
-// all (Union([Int, Dyn]) accepts a Str), silently defeating the
-// annotation. Dropping it instead reduces Union([Int, Named(id)]) to
-// just Union([Int]), agreeing with the runtime path's own
-// build_shape_predicate, whose matching Named arm correctly answers
-// `false` for a re-encountered self-reference (see its doc comment) --
-// so the self-referential alternative correctly contributes nothing
-// beyond what's already reachable through the other alternatives, on
-// both the static and runtime path alike. A degenerate fully-self-
-// referential alias with no non-recursive alternative at all (`type A =
-// A`) reduces to an empty Union, which consistent()/fits() both
-// correctly treat as satisfiable by nothing (see their own Union arms) --
-// i.e. "always false," not a crash or silent accept.
-fn replace_named_with_dyn(ty: &Type, id: &str) -> Type {
-    match ty {
-        Type::Named(n) if n == id => Type::Dyn,
-        Type::List(elem) => Type::List(Rc::new(replace_named_with_dyn(elem, id))),
-        Type::Fun(param, row, ret) => Type::Fun(
-            Rc::new(replace_named_with_dyn(param, id)),
-            row.clone(),
-            Rc::new(replace_named_with_dyn(ret, id)),
-        ),
-        Type::Tuple(items) => Type::Tuple(Rc::new(items.iter().map(|t| replace_named_with_dyn(t, id)).collect())),
-        Type::Union(items) => Type::Union(Rc::new(
-            items
-                .iter()
-                .filter(|t| !matches!(t, Type::Named(n) if n == id))
-                .map(|t| replace_named_with_dyn(t, id))
-                .collect(),
-        )),
-        Type::Record(fields) => Type::Record(Rc::new(
-            fields.iter().map(|(n, t)| (n.clone(), replace_named_with_dyn(t, id))).collect(),
-        )),
-        other => other.clone(),
-    }
-}
-
 // The only place a runtime boundary check gets built: `from` is Dyn (or
 // Type::Var, treated identically -- see its own doc comment) and `to` is
 // concrete. If both sides are concrete
-// and disagree, that's a real static error -- reject before running at
-// all, UNLESS `fits(to, from)` succeeds: a directional subtyping check that
-// accepts wider-field Records (see Pattern::Record's own doc comment for why
-// a wider record needs no runtime projection to be used where a narrower
-// type is expected) and narrower-parameter Functions (contravariant
-// parameters, covariant return type). The `from`/`to` parameter order
-// reflects this directionality, unlike consistent()'s own symmetric relation.
-// Both cases incur NO wrapping at all: zero overhead for fully-annotated code.
+// and relate() refutes the pair, that's a real static error -- reject before
+// running at all. relate() is directional (wider-field Records and
+// narrower-parameter Functions fit; see Pattern::Record's own doc comment for
+// why a wider record needs no runtime projection), and a proven pair incurs NO
+// wrapping at all: zero overhead for fully-annotated code.
 // The error, if any, points at `span` -- the CALLER's job to have already
 // looked up via the ORIGINAL (pre-elaboration) ExprRef for the value in
 // question, e.g. `spans[val]` where `val` is a field straight off the
@@ -1212,168 +1120,62 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env
 // The static consistency check plus the Dyn-to-concrete boundary check. A
 // Fun source is returned unchanged; coerce_cast wraps it separately.
 fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env: &CheckEnv) -> Result<ExprRef, TypeError> {
-    let named_types = &env.infer.named_types;
-    if !consistent(from, to) {
-        if fits(to, from) {
-            // needs_check's Union arms lean on `consistent`, which just
-            // failed here; width-subtyped unions are rejected statically
-            // upstream, so that case is unreachable (not asserted).
-            let needs = needs_check(&env.infer.resolve_deep(from), to);
-            return Ok(rescued_gate(arena, e, to, needs, span, env));
-        }
-        // One more rescue, tried only when the exact/width-tolerant
-        // checks above both failed: if `to` is a Named reference,
-        // unfold it ONE level and retry the SAME two-step check
-        // against what it unfolds to. Without this, a literal
-        // structural value (a tuple/union literal -- never itself
-        // Type::Named, since nothing in this file's own elaboration
-        // ever produces that variant for a literal) could NEVER
-        // satisfy a Named-typed position without first crossing a
-        // real Dyn boundary, which would make constructing a
-        // recursive value from a literal effectively impossible.
-        // Deliberately asymmetric -- only `to` (never `from`) gets
-        // unfolded here, matching every other Type::Named consumer in
-        // this file (build_boundary_check/build_shape_predicate/
-        // pattern_could_match all unfold the REQUIRED/target side,
-        // never the actual/source side). Statically proven when it
-        // succeeds, so `e` returns UNCHANGED -- zero overhead, the
-        // same "fully-annotated code pays nothing" property every
-        // other branch of this function already has.
-        // A missing registry entry IS reachable here (not an internal-bug-
-        // only case): a caller pairing plain parse() with plain check()
-        // gets an empty registry even though parse() itself built one
-        // internally (parse()'s own unchanged signature just discards
-        // it) -- see build_boundary_check's own doc comment. When that
-        // happens, skip this rescue entirely (treat `to` as if it weren't
-        // Type::Named for the purposes of this one check) and fall
-        // through to the ordinary mismatch error below, rather than
-        // panicking.
-        // `to`'s registry entry, only when `to` actually is Type::Named --
-        // folded into one Option (rather than nesting `if let Type::Named`
-        // around `if let Some(raw) = ...`) so there's a single if-let
-        // below instead of two, avoiding a clippy::collapsible_if without
-        // reaching for a let-chain (this codebase's own established style
-        // elsewhere: see bind_row_vars's own nested if, left as-is).
-        let named_raw = match to {
-            Type::Named(id) => named_types.get(id).map(|raw| (id, raw)),
-            _ => None,
-        };
-        if let Some((id, raw)) = named_raw {
-            // A self-referential alias's own one-level definition, by
-            // construction, contains this SAME Type::Named leaf again
-            // wherever the recursion occurred (parser::Parser's own
-            // `contains_named`/insert dance) -- e.g. `List`'s own
-            // definition `(Int, List) | Bool` recurses back into
-            // Type::Named(id) at the Tuple's own 2nd position. Compared
-            // via the ordinary NOMINAL consistent()/fits() (a Type::Named
-            // is never structurally consistent with anything but its own
-            // exact id -- Task 1's own committed design, unchanged here),
-            // a concrete literal's own substructure there could NEVER
-            // match -- no literal is ever itself elaborated as
-            // Type::Named. Substituting Dyn at that exact leaf instead
-            // defers it, matching this whole rescue's own "one level
-            // only, nested stays unresolved" character: Dyn is
-            // consistent with anything, so only the outer shape actually
-            // gets checked here.
-            let unfolded = replace_named_with_dyn(raw, id);
-            // ponytail: this whole rescue is a purely static, zero-overhead
-            // decision -- so for a literal value, nothing is EVER checked at
-            // the recursive position past this first level, not deferred to
-            // a later deep check the way a genuine Dyn-boundary crossing
-            // works, just never checked, period (e.g. `f((1, (2, 3)))`
-            // against `List = (Int, List) | Bool` never confirms `3` is
-            // secretly wrapped Bool-shaped anything at that inner position).
-            // Upgrade if a real program needs a malformed literal caught at
-            // this specific position instead of by whatever consumes it later.
-            if consistent(from, &unfolded) || fits(&unfolded, from) {
-                // Only the outer shape was proven statically; a Dyn anywhere in
-                // `from` is checked against the whole alias at run time.
-                let needs = has_dyn(&env.infer.resolve_deep(from));
-                return Ok(rescued_gate(arena, e, to, needs, span, env));
-            }
-        }
-        // Indexing syntax parses on any alias (parser.rs, Case B), so a
-        // non-eligible one only fails here -- name that, not a bare mismatch.
-        if let Type::Indexed(wrapped, _) = to {
-            let indexable = match &**wrapped {
-                Type::List(_) | Type::Var(_) | Type::Dyn => true,
-                Type::Named(id) => qualifying_named_alternatives(id, named_types).is_some(),
-                _ => false,
-            };
-            if !indexable {
-                return Err(TypeError(format!("{wrapped} is not an indexable type"), span));
-            }
-        }
-        return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span));
-    }
-    if *to == Type::Dyn || matches!(to, Type::Var(_)) {
+    // An unsolved variable as written: the unifier binds it after this call, so the old answer
+    // stands until stage 3 resolves residuals at the end (design 3.2).
+    if matches!(to, Type::Var(_)) {
         return Ok(e);
     }
     let env = env.with_span(span);
-    if matches!(from, Type::Dyn | Type::Var(_)) {
-        return Ok(build_boundary_check(arena, e, to, &env, &HashSet::new()));
+    if matches!(from, Type::Var(_)) {
+        return Ok(if *to == Type::Dyn { e } else { build_boundary_check(arena, e, to, &env, &HashSet::new()) });
     }
-    // A source that is imprecise only inside (`[Dyn]`, `(Dyn, Int)`, a Union):
-    // check what `to` constrains there. Lengths are the unifier's business
-    // (obligations), so the check target drops every Vec(n) index. An empty
-    // list literal has no element to check.
-    let empty_literal = matches!(&arena[e], Expr::ListLit(items) if items.is_empty());
-    if from == to || empty_literal || !needs_check(&env.infer.resolve_deep(from), to) {
-        return Ok(e);
-    }
-    Ok(build_boundary_check(arena, e, &strip_indexed(to), &env, &HashSet::new()))
-}
-
-// The tail of coerce_check for a pair accepted by something weaker than
-// `consistent` (width subtyping, the Named rescue): the same runtime decision
-// as the consistent path, so a partly-Dyn source is checked there too, and a
-// pure literal (`needs` false) stays free.
-fn rescued_gate(arena: &mut Arena, e: ExprRef, to: &Type, needs: bool, span: Span, env: &CheckEnv) -> ExprRef {
-    let empty_literal = matches!(&arena[e], Expr::ListLit(items) if items.is_empty());
-    if !needs || empty_literal {
-        return e;
-    }
-    build_boundary_check(arena, e, &strip_indexed(to), &env.with_span(span), &HashSet::new())
-}
-
-// Dyn or an unsolved variable anywhere in `t` outside a function type (a Fun is
-// wrapped by coerce_cast, never checked structurally).
-fn has_dyn(t: &Type) -> bool {
-    match t {
-        Type::Dyn | Type::Var(_) => true,
-        Type::Indexed(w, _) => has_dyn(w),
-        Type::List(e) => has_dyn(e),
-        Type::Tuple(ts) | Type::Union(ts) => ts.iter().any(has_dyn),
-        Type::Record(fs) => fs.iter().any(|(_, t)| has_dyn(t)),
-        _ => false,
+    match relate(from, to, env.infer) {
+        Rel::Proven => Ok(e),
+        Rel::Refuted(why) => Err(refuted_error(from, to, &why, &env.infer.named_types, span)),
+        Rel::Unknown(res, _) if res.undecided() => Err(TypeError(
+            format!("cannot tell statically or at run time whether {from} fits {to}: an alternative differs only in a function type, a nominal type or a length"),
+            span,
+        )),
+        // Left to coerce_cast (a function wrapper) or unify_fits (an index equation).
+        Rel::Unknown(res, _) if !res.needs_test() => Ok(e),
+        Rel::Unknown(..) => {
+            if matches!(&arena[e], Expr::ListLit(items) if items.is_empty()) {
+                // No element to check, but no tuple of positive arity is empty (relate sees `[a]`).
+                // Only a list target is trusted without a test: `[]` is not an alias, union or record
+                // value. (Returning `Ok(e)` for every other target was a soundness hole found in round
+                // 1: `let s: L = []` with `type L = (Int, L) | Bool` ran unchecked.)
+                match strip_indexed(&env.infer.resolve_deep(to)) {
+                    Type::Tuple(ts) if !ts.is_empty() => return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span)),
+                    Type::List(_) => return Ok(e),
+                    _ => {}
+                }
+            }
+            // Lengths are the unifier's (obligations), except from a raw Dyn, whose top-level
+            // length is checked against a witness. Nested lengths stay unchecked (parked, S3).
+            let target = if *from == Type::Dyn { to.clone() } else { strip_indexed(to) };
+            Ok(build_boundary_check(arena, e, &target, &env, &HashSet::new()))
+        }
     }
 }
 
-// Does a value statically typed `from` still need a runtime check to be
-// trusted as `to`? Asked only of a pair `consistent` accepted. True exactly
-// where `from` is imprecise (Dyn, Var, or a Union that `to` does not cover)
-// at a position `to` constrains. A Fun is never a reason (coerce_cast wraps
-// it) and Named is nominal (equal ids are trusted).
-fn needs_check(from: &Type, to: &Type) -> bool {
-    match (from, to) {
-        (_, Type::Dyn | Type::Var(_)) => false,
-        (Type::Dyn | Type::Var(_), _) => true,
-        (Type::Indexed(wrapped, _), _) => needs_check(wrapped, to),
-        (_, Type::Indexed(wrapped, _)) => needs_check(from, wrapped),
-        (Type::Union(alts), _) => !alts.iter().all(|alt| covered_by(alt, to)),
-        (_, Type::Union(alts)) => !alts.iter().any(|alt| covered_by(from, alt)),
-        (Type::List(a), Type::List(b)) => needs_check(a, b),
-        (Type::Tuple(a), Type::Tuple(b)) => a.iter().zip(b.iter()).any(|(x, y)| needs_check(x, y)),
-        (Type::List(_), Type::Tuple(_)) => true,
-        (Type::Record(a), Type::Record(b)) => b.iter().any(|(name, t)| find_field(a, name).is_none_or(|f| needs_check(f, t))),
-        _ => false,
+// The message for a Refuted pair: an index pair the old gate passed to the unifier keeps the
+// unifier's text; an Indexed target on a non-indexable alias says so; otherwise the raw types.
+fn refuted_error(from: &Type, to: &Type, why: &Why, named_types: &HashMap<String, Type>, span: Span) -> TypeError {
+    if let Why::Index { msg, bare: true } = why {
+        return TypeError(msg.clone(), span);
     }
+    if let Type::Indexed(wrapped, _) = to {
+        let indexable = match &**wrapped {
+            Type::List(_) | Type::Var(_) | Type::Dyn => true,
+            Type::Named(id) => qualifying_named_alternatives(id, named_types).is_some(),
+            _ => false,
+        };
+        if !indexable {
+            return TypeError(format!("{wrapped} is not an indexable type"), span);
+        }
+    }
+    TypeError(format!("type mismatch: expected {to}, found {from}"), span)
 }
-
-fn covered_by(from: &Type, to: &Type) -> bool {
-    consistent(from, to) && !needs_check(from, to)
-}
-
 // `t` without any Vec(n) index, at every depth.
 fn strip_indexed(t: &Type) -> Type {
     match t {

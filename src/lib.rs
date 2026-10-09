@@ -3619,7 +3619,7 @@ mod tests {
     #[test]
     fn coerce_rescue_rejects_a_bare_union_self_reference_given_the_wrong_type() {
         // Regression test for the final fix wave's Defect 2:
-        // replace_named_with_dyn's own Union arm used to map a bare
+        // the old rescue's own Union arm used to map a bare
         // Type::Named(id) alternative to Type::Dyn (e.g. Union([Int,
         // Named(id)]) -> Union([Int, Dyn])) instead of dropping it --
         // and Dyn is consistent with EVERYTHING, so the whole Union
@@ -3651,7 +3651,7 @@ mod tests {
         // an Int literal is exactly the one alternative `type A = Int |
         // A` can ever actually reduce to (its own self-reference
         // contributes nothing new), so coerce()'s static rescue must
-        // still accept it after the replace_named_with_dyn fix, the same
+        // still accept it after the old rescue's fix, the same
         // way it did before (this direction was never broken -- the bug
         // was only ever "accepts too much," never "accepts too little").
         let src = r#"
@@ -7133,10 +7133,10 @@ mod tests {
     }
 
     #[test]
-    fn a_named_target_is_not_wrapped_is_a_known_limitation() {
+    fn a_function_into_a_recursive_alias_it_does_not_satisfy_is_rejected() {
         let src = "type F = Dyn -> F in let g: F = fun x: Int -> fun y: Int -> y in let d: Dyn = g in d(true)";
-        // Named targets are not descended: `d(true)` returns the inner function instead of rejecting `true` (spec 7).
-        assert!(matches!(run_source(src).unwrap(), Outcome::Function));
+        // relate unfolds F: the depth-2 result Int is not an F, so this is Refuted (S0 finding 1).
+        assert!(run_source(src).unwrap_err().contains("type mismatch"));
     }
 
     #[test]
@@ -7973,9 +7973,10 @@ mod tests {
     }
 
     #[test]
-    fn deep_literal_into_a_recursive_alias_stays_unchecked_past_level_one() {
-        // parked: coerce's literal rescue accepts it (documented in the gradual-unknown design)
-        assert_eq!(run_source("type L = (Int, L) | Bool in let l: L = (1, (2, 3)) in 1").unwrap().as_int(), 1);
+    fn deep_literal_into_a_recursive_alias_is_checked_at_every_level() {
+        let err = run_source("type L = (Int, L) | Bool in let l: L = (1, (2, 3)) in 1").unwrap_err();
+        assert!(err.contains("type mismatch"), "unexpected message: {err}");
+        assert_eq!(run_source("type L = (Int, L) | Bool in let l: L = (1, (2, true)) in 1").unwrap().as_int(), 1);
     }
 
     #[test]
@@ -7985,5 +7986,57 @@ mod tests {
         // Verified text: a run-time check, not a static mismatch.
         assert!(err.contains("type error: expected (Int, N) | Bool, found Int"), "unexpected message: {err}");
         assert_eq!(run_source("type N = (Int, N) | Bool in let d: Dyn = true in let x: N(1) = d in 1").unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn the_index_gate_sees_index_bindings() {
+        // m1 needs `let rec` (it calls itself; plain `let` fails at run time with "unbound variable: f").
+        // Exact outputs verified in scratch.
+        let cases = [
+            ("let rec f: (Vec(m) -> Vec(m + m)) = fun a -> match a | [] -> [] | h :: t -> h :: h :: f(t) in f([5, 6])", "[5, 5, 6, 6]"),
+            ("let f: (Vec(m) -> Vec(m + 2)) = fun a -> match a | [] -> [0, 0] | h :: t -> 0 :: 0 :: a in f([5, 6])", "[0, 0, 5, 6]"),
+            ("let f: (Vec(m) -> Vec(m + 1)) = fun a -> match a | [] -> [0] | h :: t -> 0 :: a in f([5, 6])", "[0, 5, 6]"),
+        ];
+        for (src, want) in cases {
+            assert_eq!(run_source(src).unwrap().to_string(), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn an_empty_list_literal_into_an_alias_or_union_is_checked_at_run_time() {
+        // Regression for the empty-literal shortcut in coerce_check: these must not be accepted unchecked.
+        let err = run_source("type L = (Int, L) | Bool in let s: L = [] in s").unwrap_err();
+        assert!(err.contains("type error: expected (Int, L) | Bool, found List"), "unexpected message: {err}");
+        let err = run_source("let s: (Int, Int) | Bool = [] in s").unwrap_err();
+        assert!(err.contains("type error: expected (Int, Int) | Bool, found List"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_union_source_is_checked_against_a_union_target() {
+        assert_eq!(run_source("let u: Int | Str = 1 in let w: Int | Bool = u in w").unwrap().as_int(), 1);
+        assert!(run_source("let u: Int | Str = \"a\" in let w: Int | Bool = u in 1").is_err());
+    }
+
+    #[test]
+    fn a_function_with_a_wider_union_parameter_fits() {
+        assert_eq!(run_source("let f = fun x: Int | Str | Bool -> 1 in let g: ((Int | Str) -> Int) = f in g(1)").unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn an_empty_list_literal_is_not_a_pair() {
+        let err = run_source("let t: (Int, Int) = [] in t").unwrap_err();
+        assert!(err.contains("type mismatch: expected (Int, Int)"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_union_source_with_an_alternative_no_test_can_tell_apart_is_rejected() {
+        let err = run_source("let u: (Int -> Int) | Bool = fun x: Int -> x in let w: (Str -> Int) | Bool = u in 0").unwrap_err();
+        assert!(err.contains("cannot tell statically or at run time"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_bound_variable_inside_a_container_is_resolved_by_the_checker() {
+        let err = run_source("let f = fun x -> let s: Str = x in let n: [Int] = [x] in n in f(\"a\")").unwrap_err();
+        assert!(err.contains("type mismatch"), "unexpected message: {err}");
     }
 }
