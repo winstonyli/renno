@@ -4,6 +4,7 @@ use super::{free_index_vars, InferCtx};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::types::{row_consistent, Type};
 use crate::util::find_field;
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 /// Native-stack guard (a source type that is itself very deep). Degenerate aliases are cut earlier
@@ -56,9 +57,10 @@ impl Residual {
 pub(crate) enum Rel {
     Proven,
     Unknown(Residual, Cause),
-    Refuted(&'static str), // short reason tag
+    Refuted(Cow<'static, str>), // why; owned when it carries the failing index pair
 }
 impl Rel {
+    pub(crate) fn refuted(why: &'static str) -> Rel { Rel::Refuted(Cow::Borrowed(why)) }
     /// The distinct residual kinds an Unknown mentions (empty for Proven/Refuted).
     pub(crate) fn kinds(&self) -> BTreeSet<&'static str> {
         let mut out = BTreeSet::new();
@@ -93,7 +95,7 @@ fn and(rels: impl IntoIterator<Item = Rel>) -> Rel {
 // Disjunction over target-Union alternatives (the caller already returned on a Proven one):
 // all Refuted refutes; otherwise Unknown, as precise as its most precise Unknown alternative.
 fn or(rels: Vec<Rel>) -> Rel {
-    let (mut unknowns, mut cause, mut why) = (Vec::new(), Cause::Incomplete, "empty union");
+    let (mut unknowns, mut cause, mut why) = (Vec::new(), Cause::Incomplete, Cow::Borrowed("empty union"));
     for r in rels {
         match r {
             Rel::Unknown(res, c) => {
@@ -142,7 +144,7 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
             if rels.iter().all(|r| *r == Rel::Proven) {
                 Rel::Proven
             } else if !rels.is_empty() && rels.iter().all(|r| matches!(r, Rel::Refuted(_))) {
-                Rel::Refuted("union: no alternative fits")
+                Rel::refuted("union: no alternative fits")
             } else {
                 unknown(Residual::Test)
             }
@@ -160,52 +162,52 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
         }
         (Type::Indexed(wf, i), Type::Indexed(wt, j)) => and([go(wf, wt, infer, fuel, d), relate_index(i, j, infer)]),
         (Type::Indexed(wf, _), _) => go(wf, &to, infer, fuel, d), // forgetting an index is sound; the reverse is not
-        (_, Type::Indexed(..)) => Rel::Refuted("plain type into indexed"),
+        (_, Type::Indexed(..)) => Rel::refuted("plain type into indexed"),
         (Type::Named(a), Type::Named(b)) => {
-            if a == b { Rel::Proven } else { Rel::Refuted("named: different ids") }
+            if a == b { Rel::Proven } else { Rel::refuted("named: different ids") }
         }
         (_, Type::Named(id)) => match infer.named_types.get(id) {
             // Unfolding the same alias against the same source again is a cycle with no new evidence
             // (`type A = Int | A`): no finite derivation, so Refuted rather than Lazy.
-            Some(_) if fuel.unfolding.borrow().iter().any(|(f, i)| i == id && *f == from) => Rel::Refuted("named: cyclic unfolding"),
+            Some(_) if fuel.unfolding.borrow().iter().any(|(f, i)| i == id && *f == from) => Rel::refuted("named: cyclic unfolding"),
             Some(raw) => {
                 fuel.unfolding.borrow_mut().push((from.clone(), id.clone()));
                 let r = go(&from, raw, infer, fuel, d);
                 fuel.unfolding.borrow_mut().pop();
                 r
             }
-            None => Rel::Refuted("named: not in registry"),
+            None => Rel::refuted("named: not in registry"),
         },
-        (Type::Named(_), _) => Rel::Refuted("named: nominal source"),
+        (Type::Named(_), _) => Rel::refuted("named: nominal source"),
         (Type::Int, Type::Int) | (Type::Float, Type::Float) | (Type::Bool, Type::Bool) | (Type::Str, Type::Str) => Rel::Proven,
         (Type::Token(a), Type::Token(b)) => {
-            if a == b { Rel::Proven } else { Rel::Refuted("token") }
+            if a == b { Rel::Proven } else { Rel::refuted("token") }
         }
         (Type::List(a), Type::List(b)) => go(a, b, infer, fuel, d),
         (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => and(a.iter().zip(b.iter()).map(|(x, y)| go(x, y, infer, fuel, d))),
-        (Type::Tuple(_), Type::Tuple(_)) => Rel::Refuted("tuple arity"),
+        (Type::Tuple(_), Type::Tuple(_)) => Rel::refuted("tuple arity"),
         // The tuple/list bridge exists only for a Dyn/Var element (types::consistent's has Dyn only).
         (Type::List(e), Type::Tuple(_)) => {
-            if loose(&infer.resolve(e)) { unknown(Residual::Test) } else { Rel::Refuted("list into tuple") }
+            if loose(&infer.resolve(e)) { unknown(Residual::Test) } else { Rel::refuted("list into tuple") }
         }
         (Type::Tuple(_), Type::List(e)) => {
-            if loose(&infer.resolve(e)) { Rel::Proven } else { Rel::Refuted("tuple into list") }
+            if loose(&infer.resolve(e)) { Rel::Proven } else { Rel::refuted("tuple into list") }
         }
         (Type::Record(a), Type::Record(b)) => and(b.iter().map(|(name, t)| match find_field(a, name) {
             Some(ft) => go(ft, t, infer, fuel, d),
-            None => Rel::Refuted("missing field"),
+            None => Rel::refuted("missing field"),
         })),
         (Type::Fun(..), Type::Fun(..)) => fun_rel(&from, &to, infer, fuel, d),
-        _ => Rel::Refuted("shape"),
+        _ => Rel::refuted("shape"),
     }
 }
 // Params contravariant, returns covariant; any Unknown component is a wrapper (Residual::Fun).
 fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Rel {
-    let Type::Fun(a, r, b) = from else { return Rel::Refuted("not a function") };
+    let Type::Fun(a, r, b) = from else { return Rel::refuted("not a function") };
     let (a2, b2) = match to {
         Type::Fun(a2, r2, b2) => {
             if !row_consistent(r, r2) {
-                return Rel::Refuted("effect row");
+                return Rel::refuted("effect row");
             }
             ((**a2).clone(), (**b2).clone())
         }
@@ -225,7 +227,7 @@ pub(crate) fn relate_index(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Re
     match index_exprs_compare(&a, &b) {
         None => return Rel::Unknown(Residual::IndexEq, Cause::Incomplete),
         Some(IndexCmp::Equal) => return Rel::Proven,
-        Some(IndexCmp::NonzeroConst) => return Rel::Refuted("index: differ by a constant"),
+        Some(IndexCmp::NonzeroConst) => return Rel::refuted("index: differ by a constant"),
         Some(IndexCmp::Other) => {}
     }
     let flexible = |v: &String| !infer.rigid_index.contains(v);
@@ -237,7 +239,7 @@ pub(crate) fn relate_index(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Re
     } else if vars.iter().any(flexible) {
         Rel::Unknown(Residual::IndexEq, Cause::Incomplete)
     } else {
-        Rel::Refuted("index: rigid or literal mismatch")
+        Rel::refuted("index: rigid or literal mismatch")
     }
 }
 #[cfg(test)]

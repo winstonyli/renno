@@ -5,9 +5,8 @@
 //! even several test processes sharing one log cannot interleave inside a line. No buffering, so
 //! nothing is lost to `process::exit` or a panic.
 use super::InferCtx;
-use super::relate::{Rel, relate, relate_index};
+use super::relate::{Rel, relate};
 use crate::expr::ExprRef;
-use crate::index_expr::IndexExpr;
 use crate::span::Span;
 use crate::types::Type;
 use crate::util::find_field;
@@ -39,7 +38,6 @@ pub(super) enum Site {
     NeedsUpcast,
     Eq,
     Concat,
-    IndexUnify,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Old {
@@ -65,7 +63,7 @@ fn new_of(site: Site, rel: &Rel) -> New {
 }
 fn agree(site: Site, old: Old, new: New) -> bool {
     match site {
-        Site::Eq | Site::Concat | Site::IndexUnify => (old == Old::Reject) == (new == New::Reject),
+        Site::Eq | Site::Concat => (old == Old::Reject) == (new == New::Reject),
         _ => matches!((old, new), (Old::Free, New::Free) | (Old::Check, New::Check) | (Old::Reject, New::Reject)),
     }
 }
@@ -117,7 +115,6 @@ fn classify(site: Site, old: Old, rel: &Rel, raw_from_var: bool, from: &Type, to
         _ => false,
     };
     match (site, old, rel) {
-        (Site::IndexUnify, Old::Reject, Rel::Unknown(..)) => "x:index-undecided",
         (Site::CoerceCheck, Old::Free, Rel::Unknown(..)) if dyn_into_named && test_len => "hn:dyn-into-named-unchecked",
         (Site::CoerceCheck, Old::Free, Rel::Unknown(..)) if only("Test") && matches!(from, Type::Union(_)) => "u:union-narrow",
         (Site::CoerceCheck, Old::Free, Rel::Unknown(..)) if only("IndexEq") => "flex:index-bound-later",
@@ -226,34 +223,11 @@ pub(super) fn consistent(infer: &InferCtx, site: Site, a: &Type, b: &Type) -> bo
     }
     old
 }
-pub(super) struct IndexPre {
-    rel: Rel,
-    a: IndexExpr,
-    b: IndexExpr,
-}
-// unify_index_expr binds variables, so the relation is computed before the call.
-pub(super) fn index_pre(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Option<IndexPre> {
-    if !on() {
-        return None;
-    }
-    Some(IndexPre { rel: relate_index(a, b, infer), a: infer.resolve_index_deep(a), b: infer.resolve_index_deep(b) })
-}
-pub(super) fn index_post(pre: Option<IndexPre>, accepted: bool) {
-    let (Some(p), Some(s)) = (pre, sink()) else { return };
-    let old = if accepted { Old::Free } else { Old::Reject };
-    let new = new_of(Site::IndexUnify, &p.rel);
-    if agree(Site::IndexUnify, old, new) {
-        write_line(s, &format!("A\tIndexUnify\t{old:?}\t{new:?}\n"));
-        return;
-    }
-    let class = classify(Site::IndexUnify, old, &p.rel, false, &Type::Int, &Type::Int);
-    d_line(s, Row { site: Site::IndexUnify, old, new, rel: &p.rel, class, pos: None }, &p.a, &p.b);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::relate::{Cause, Residual};
+    use crate::index_expr::IndexExpr;
     use std::rc::Rc;
     #[test]
     fn agree_and_classify_follow_the_verdict_mapping() {
@@ -272,11 +246,10 @@ mod tests {
         assert_eq!(new_of(Site::CoerceCheck, &unk(Residual::All(vec![Residual::Test, Residual::Fun]))), New::Check);
         assert_eq!(classify(Site::CoerceCheck, Old::Free, &unk(Residual::Test), false, &un, &i), "u:union-narrow");
         assert_eq!(classify(Site::CoerceCheck, Old::Reject, &Rel::Proven, false, &vec1, &vec1), "m:ctxfree-index-gate");
-        assert_eq!(classify(Site::IndexUnify, Old::Reject, &Rel::Unknown(Residual::IndexEq, Cause::Incomplete), false, &i, &i), "x:index-undecided");
         assert_eq!(classify(Site::NeedsWrapper, Old::Free, &unk(Residual::Fun), false, &i, &d), "hf:fun-result-dyn");
         assert_eq!(classify(Site::CoerceCheck, Old::Check, &Rel::Proven, true, &i, &i), "late:resolved-var-redundant-check");
         assert_eq!(classify(Site::NeedsDown, Old::Check, &Rel::Proven, false, &i, &i), "cons:over-conservative");
-        assert_eq!(classify(Site::CoerceCheck, Old::Free, &Rel::Refuted("shape"), false, &tup1, &named), "t:recursive-literal");
+        assert_eq!(classify(Site::CoerceCheck, Old::Free, &Rel::refuted("shape"), false, &tup1, &named), "t:recursive-literal");
         assert_eq!(classify(Site::CoerceCheck, Old::Reject, &unk(Residual::Test), false, &Type::List(Rc::new(Type::Var("a".into()))), &tup1), "br:var-bridge");
         assert_eq!(classify(Site::Eq, Old::Reject, &Rel::Proven, false, &rec(2), &rec(1)), "eq:record-width");
         assert_eq!(classify(Site::Eq, Old::Reject, &Rel::Proven, false, &un, &i), "u:union-direction");
@@ -287,7 +260,7 @@ mod tests {
         assert_eq!(classify(Site::NeedsDown, Old::Check, &Rel::Proven, false, &d, &i), "unclassified"); // same
         assert_eq!(classify(Site::Eq, Old::Reject, &Rel::Proven, false, &rec(2), &rec(2)), "unclassified"); // Record present, no width gap
         assert_eq!(classify(Site::CoerceCheck, Old::Reject, &Rel::Proven, false, &vec1, &i), "unclassified"); // only one side Indexed
-        assert_eq!(classify(Site::CoerceCheck, Old::Free, &Rel::Refuted("shape"), false, &tup1, &Type::List(Rc::new(named.clone()))), "unclassified"); // Named only nested
+        assert_eq!(classify(Site::CoerceCheck, Old::Free, &Rel::refuted("shape"), false, &tup1, &Type::List(Rc::new(named.clone()))), "unclassified"); // Named only nested
         assert_eq!(classify(Site::CoerceCheck, Old::Free, &Rel::Proven, false, &i, &i), "unclassified");
         // Classes that had no positive row, and one near miss each (added in round 3).
         let lst = |t: Type| Type::List(Rc::new(t));
@@ -297,7 +270,7 @@ mod tests {
         let idx = |c| Rel::Unknown(Residual::IndexEq, c);
         assert_eq!(classify(Site::CoerceCheck, Old::Free, &unk(Residual::Test), false, &lst(d.clone()), &lst(i.clone())), "h:container-dyn-inside");
         assert_eq!(classify(Site::CoerceCheck, Old::Free, &idx(Cause::Incomplete), false, &vec1, &vec1), "flex:index-bound-later");
-        assert_eq!(classify(Site::CoerceCheck, Old::Free, &Rel::Refuted("index: rigid or literal mismatch"), false, &vec1, &vec1), "rigid:rejected-later-by-unify");
+        assert_eq!(classify(Site::CoerceCheck, Old::Free, &Rel::refuted("index: rigid or literal mismatch"), false, &vec1, &vec1), "rigid:rejected-later-by-unify");
         assert_eq!(classify(Site::CoerceCheck, Old::Free, &len_test(), false, &d, &vecn), "hn:dyn-into-named-unchecked");
         assert_eq!(classify(Site::CoerceCheck, Old::Free, &unk(Residual::Test), false, &Type::Var("a".into()), &named), "hn:dyn-into-named-unchecked");
         assert_eq!(classify(Site::NeedsWrapper, Old::Check, &Rel::Proven, false, &ft(i.clone(), i.clone()), &ft(i.clone(), i.clone())), "cons:over-conservative");
@@ -305,11 +278,10 @@ mod tests {
         assert_eq!(classify(Site::CoerceCheck, Old::Free, &len_test(), false, &lst(d.clone()), &vecn), "unclassified"); // Dyn only nested: not the bare-Dyn hn: shape
         assert_eq!(classify(Site::CoerceCheck, Old::Free, &unk(Residual::All(vec![Residual::IndexEq, Residual::Test])), false, &i, &i), "unclassified"); // flex: IndexEq alone
         assert_eq!(classify(Site::NeedsDown, Old::Free, &idx(Cause::Imprecise), false, &vec1, &vec1), "unclassified"); // flex: only at CoerceCheck
-        assert_eq!(classify(Site::CoerceCheck, Old::Free, &Rel::Refuted("shape"), false, &i, &i), "unclassified"); // rigid: only index refutations
+        assert_eq!(classify(Site::CoerceCheck, Old::Free, &Rel::refuted("shape"), false, &i, &i), "unclassified"); // rigid: only index refutations
         assert_eq!(classify(Site::CoerceCheck, Old::Free, &unk(Residual::Test), false, &lst(un.clone()), &lst(i.clone())), "unclassified"); // Union only nested
         assert_eq!(classify(Site::Eq, Old::Reject, &Rel::Proven, false, &lst(un.clone()), &lst(i.clone())), "unclassified"); // Union only nested
         assert_eq!(classify(Site::CoerceCheck, Old::Reject, &Rel::Proven, false, &lst(i.clone()), &tup1), "unclassified"); // an Int element is no Var bridge
-        assert_eq!(classify(Site::IndexUnify, Old::Reject, &Rel::Refuted("index: rigid or literal mismatch"), false, &i, &i), "unclassified"); // a real reject, not undecided
         assert_eq!(classify(Site::CoerceCheck, Old::Check, &Rel::Proven, false, &i, &i), "unclassified"); // late: the source was not a bare Var
         assert_eq!(classify(Site::NeedsWrapper, Old::Check, &Rel::Proven, false, &ft(i.clone(), d.clone()), &ft(i.clone(), i.clone())), "unclassified"); // different functions: the wrapper was needed
         assert_eq!(classify(Site::NeedsWrapper, Old::Free, &unk(Residual::Test), false, &i, &d), "unclassified"); // hf: Fun kind only

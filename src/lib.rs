@@ -4008,11 +4008,11 @@ mod tests {
     fn unify_index_expr_binds_a_bare_unbound_variable() {
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
-        use crate::typecheck::{unify_index_expr, InferCtx};
+        use crate::typecheck::{unify_index, InferCtx};
         use std::collections::HashMap;
         let mut infer = InferCtx::new(HashMap::new());
         let span = Span { start: 0, end: 0 };
-        unify_index_expr(&IndexExpr::Var("n".to_string()), &IndexExpr::Lit(3), &mut infer, span).unwrap();
+        unify_index(&IndexExpr::Var("n".to_string()), &IndexExpr::Lit(3), &mut infer, span).unwrap();
         assert_eq!(infer.resolve_index(&IndexExpr::Var("n".to_string())), IndexExpr::Lit(3));
     }
 
@@ -4020,11 +4020,11 @@ mod tests {
     fn unify_index_expr_binds_regardless_of_which_side_is_the_variable() {
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
-        use crate::typecheck::{unify_index_expr, InferCtx};
+        use crate::typecheck::{unify_index, InferCtx};
         use std::collections::HashMap;
         let mut infer = InferCtx::new(HashMap::new());
         let span = Span { start: 0, end: 0 };
-        unify_index_expr(&IndexExpr::Lit(3), &IndexExpr::Var("n".to_string()), &mut infer, span).unwrap();
+        unify_index(&IndexExpr::Lit(3), &IndexExpr::Var("n".to_string()), &mut infer, span).unwrap();
         assert_eq!(infer.resolve_index(&IndexExpr::Var("n".to_string())), IndexExpr::Lit(3));
     }
 
@@ -4032,7 +4032,7 @@ mod tests {
     fn unify_index_expr_recurses_through_matching_shapes() {
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
-        use crate::typecheck::{unify_index_expr, InferCtx};
+        use crate::typecheck::{unify_index, InferCtx};
         use std::collections::HashMap;
         use std::rc::Rc;
         let mut infer = InferCtx::new(HashMap::new());
@@ -4043,7 +4043,7 @@ mod tests {
         // bound).
         let lhs = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)));
         let rhs = IndexExpr::Add(Rc::new(IndexExpr::Lit(3)), Rc::new(IndexExpr::Lit(1)));
-        unify_index_expr(&lhs, &rhs, &mut infer, span).unwrap();
+        unify_index(&lhs, &rhs, &mut infer, span).unwrap();
         assert_eq!(infer.resolve_index(&IndexExpr::Var("n".to_string())), IndexExpr::Lit(3));
     }
 
@@ -4051,7 +4051,7 @@ mod tests {
     fn unify_index_expr_succeeds_when_already_sop_equal_with_no_variables() {
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
-        use crate::typecheck::{unify_index_expr, InferCtx};
+        use crate::typecheck::{unify_index, InferCtx};
         use std::collections::HashMap;
         use std::rc::Rc;
         let mut infer = InferCtx::new(HashMap::new());
@@ -4060,7 +4060,7 @@ mod tests {
         // normalization (Phase 1's own index_exprs_equal).
         let lhs = IndexExpr::Mul(Rc::new(IndexExpr::Var("m".to_string())), Rc::new(IndexExpr::Var("n".to_string())));
         let rhs = IndexExpr::Mul(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Var("m".to_string())));
-        unify_index_expr(&lhs, &rhs, &mut infer, span).unwrap();
+        unify_index(&lhs, &rhs, &mut infer, span).unwrap();
         // The real property this test proves: no spurious binding. If
         // shape-recursion ran before the SOP-equality check, it would
         // recurse positionally into (m, n) and (n, m) and bind m := n --
@@ -4074,25 +4074,25 @@ mod tests {
     fn unify_index_expr_fails_on_a_genuine_mismatch() {
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
-        use crate::typecheck::{unify_index_expr, InferCtx};
+        use crate::typecheck::{unify_index, InferCtx};
         use std::collections::HashMap;
         let mut infer = InferCtx::new(HashMap::new());
         let span = Span { start: 0, end: 0 };
-        assert!(unify_index_expr(&IndexExpr::Lit(3), &IndexExpr::Lit(4), &mut infer, span).is_err());
+        assert!(unify_index(&IndexExpr::Lit(3), &IndexExpr::Lit(4), &mut infer, span).is_err());
     }
 
     #[test]
     fn unify_index_expr_rejects_an_occurs_check_violation() {
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
-        use crate::typecheck::{unify_index_expr, InferCtx};
+        use crate::typecheck::{unify_index, InferCtx};
         use std::collections::HashMap;
         use std::rc::Rc;
         let mut infer = InferCtx::new(HashMap::new());
         let span = Span { start: 0, end: 0 };
         // n unified against (n + 1) would be an infinite index expression.
         let rhs = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)));
-        assert!(unify_index_expr(&IndexExpr::Var("n".to_string()), &rhs, &mut infer, span).is_err());
+        assert!(unify_index(&IndexExpr::Var("n".to_string()), &rhs, &mut infer, span).is_err());
     }
 
     // Final review Finding 1: unify_trial only snapshotted/restored
@@ -4146,14 +4146,14 @@ mod tests {
     fn unify_index_expr_resolves_deeply_so_an_already_bound_variable_inside_a_compound_expression_is_recognized() {
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
-        use crate::typecheck::{unify_index_expr, InferCtx};
+        use crate::typecheck::{unify_index, InferCtx};
         use std::collections::HashMap;
         use std::rc::Rc;
         let mut infer = InferCtx::new(HashMap::new());
         infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
         let span = Span { start: 0, end: 0 };
         let lhs = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)));
-        unify_index_expr(&lhs, &IndexExpr::Lit(4), &mut infer, span).unwrap();
+        unify_index(&lhs, &IndexExpr::Lit(4), &mut infer, span).unwrap();
     }
 
     // The related Minor issue Finding 2 also predicted: with deep
@@ -4167,13 +4167,13 @@ mod tests {
     fn unify_index_expr_does_not_false_positive_occurs_check_when_sop_equal() {
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
-        use crate::typecheck::{unify_index_expr, InferCtx};
+        use crate::typecheck::{unify_index, InferCtx};
         use std::collections::HashMap;
         use std::rc::Rc;
         let mut infer = InferCtx::new(HashMap::new());
         let span = Span { start: 0, end: 0 };
         let rhs = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(0)));
-        unify_index_expr(&IndexExpr::Var("n".to_string()), &rhs, &mut infer, span).unwrap();
+        unify_index(&IndexExpr::Var("n".to_string()), &rhs, &mut infer, span).unwrap();
         assert!(infer.index_subst.is_empty());
     }
 
@@ -6335,6 +6335,20 @@ mod tests {
 
     // --- rigid index variables (spec 2026-10-07) ---
 
+
+    // --- unify_index_expr is three-valued (design 2026-10-08 section 3.4 S6, stage 1) ---
+
+    #[test]
+    fn unify_index_expr_is_three_valued() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{unify_index_expr, Rel};
+        let lit = IndexExpr::Lit;
+        let mut infer = rigid_infer(&["n"]);
+        assert_eq!(unify_index_expr(&var("n"), &var("n"), &mut infer), Rel::Proven);
+        assert_eq!(unify_index_expr(&var("k"), &lit(3), &mut infer), Rel::Proven); // binds k
+        assert!(matches!(unify_index_expr(&lit(3), &lit(4), &mut infer), Rel::Refuted(w) if w.contains("index 3 does not unify with index 4")));
+        assert!(matches!(unify_index_expr(&var("n"), &lit(3), &mut infer), Rel::Refuted(w) if w.contains("index variable n is fixed by the signature")));
+    }
     fn rigid_infer(names: &[&str]) -> crate::typecheck::InferCtx {
         let mut infer = crate::typecheck::InferCtx::new(std::collections::HashMap::new());
         for n in names {
@@ -6350,25 +6364,25 @@ mod tests {
     #[test]
     fn rigid_index_variable_refuses_to_bind_to_a_literal() {
         use crate::index_expr::IndexExpr;
-        use crate::typecheck::unify_index_expr;
+        use crate::typecheck::unify_index;
         let span = crate::span::Span { start: 0, end: 0 };
         let mut infer = rigid_infer(&["n"]);
-        let err = unify_index_expr(&var("n"), &IndexExpr::Lit(3), &mut infer, span).unwrap_err();
+        let err = unify_index(&var("n"), &IndexExpr::Lit(3), &mut infer, span).unwrap_err();
         assert!(err.0.contains("index variable n is fixed by the signature"), "unexpected: {}", err.0);
         // Same with the sides swapped, and n stays unbound.
-        assert!(unify_index_expr(&IndexExpr::Lit(3), &var("n"), &mut infer, span).is_err());
+        assert!(unify_index(&IndexExpr::Lit(3), &var("n"), &mut infer, span).is_err());
         assert_eq!(infer.resolve_index(&var("n")), var("n"));
     }
 
     #[test]
     fn flexible_index_variable_yields_to_a_rigid_one_in_either_order() {
-        use crate::typecheck::unify_index_expr;
+        use crate::typecheck::unify_index;
         let span = crate::span::Span { start: 0, end: 0 };
         let mut infer = rigid_infer(&["n"]);
-        unify_index_expr(&var("n"), &var("m"), &mut infer, span).unwrap();
+        unify_index(&var("n"), &var("m"), &mut infer, span).unwrap();
         assert_eq!(infer.resolve_index(&var("m")), var("n"));
         let mut infer = rigid_infer(&["n"]);
-        unify_index_expr(&var("k"), &var("n"), &mut infer, span).unwrap();
+        unify_index(&var("k"), &var("n"), &mut infer, span).unwrap();
         assert_eq!(infer.resolve_index(&var("k")), var("n"));
         assert_eq!(infer.resolve_index(&var("n")), var("n"));
     }
@@ -6376,14 +6390,14 @@ mod tests {
     #[test]
     fn two_distinct_rigid_variables_do_not_unify_but_a_rigid_equals_itself_modulo_sop() {
         use crate::index_expr::IndexExpr;
-        use crate::typecheck::unify_index_expr;
+        use crate::typecheck::unify_index;
         use std::rc::Rc;
         let span = crate::span::Span { start: 0, end: 0 };
         let mut infer = rigid_infer(&["n", "m"]);
-        assert!(unify_index_expr(&var("n"), &var("m"), &mut infer, span).is_err());
+        assert!(unify_index(&var("n"), &var("m"), &mut infer, span).is_err());
         // n against n + 0 is SOP-equal, so it is accepted without binding.
         let n_plus_0 = IndexExpr::Add(Rc::new(var("n")), Rc::new(IndexExpr::Lit(0)));
-        unify_index_expr(&var("n"), &n_plus_0, &mut infer, span).unwrap();
+        unify_index(&var("n"), &n_plus_0, &mut infer, span).unwrap();
         assert_eq!(infer.resolve_index(&var("n")), var("n"));
     }
 

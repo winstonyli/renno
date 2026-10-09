@@ -10,6 +10,7 @@ use crate::span::Span;
 use crate::types::{consistent, fits, row_consistent, EffectRow, Type};
 use crate::util::find_field;
 mod relate;
+pub(crate) use self::relate::Rel;
 mod shadow;
 
 // The Span is always an ORIGINAL (pre-elaboration) node's -- the one whose
@@ -329,82 +330,69 @@ fn occurs_in_index(name: &str, e: &IndexExpr, infer: &InferCtx) -> bool {
 // convention (see occurs_in's neighbors) keeps tests in src/lib.rs --
 // a different module -- rather than because anything outside
 // typecheck.rs is meant to call this directly.
-pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
-    let pre = shadow::index_pre(a, b, infer);
-    let out = unify_index_expr_rec(a, b, infer, span);
-    shadow::index_post(pre, out.is_ok());
-    out }
-fn unify_index_expr_rec(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
-    // resolve_index_deep, not resolve_index -- a shallow resolve only
-    // unwraps a bare Var, so a bound variable buried inside a compound
-    // expression (e.g. `n` in `Add(n, 1)`) stayed unsubstituted and
-    // could make an already-true equality (n=3 => n+1 == 4) look like a
-    // mismatch, or make the SOP-equality arm below miss cases it should
-    // catch (see final review Finding 2).
+pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx) -> Rel {
+    // resolve_index_deep, not resolve_index: a bound variable buried in a compound must be seen.
     let a = infer.resolve_index_deep(a);
     let b = infer.resolve_index_deep(b);
+    let refuted = |why: String| Rel::Refuted(why.into());
     match (&a, &b) {
-        (IndexExpr::Var(n1), IndexExpr::Var(n2)) if n1 == n2 => Ok(()),
-        // A flexible variable yields to a rigid one: bind the flexible side,
-        // never the rigid one. (The or-pattern arm below would otherwise
-        // pick the left variable as the one to bind.)
+        _ if a == b => Rel::Proven,
+        // A flexible variable yields to a rigid one: bind the flexible side, never the rigid one.
         (IndexExpr::Var(rigid), IndexExpr::Var(flex)) if infer.rigid_index.contains(rigid) && !infer.rigid_index.contains(flex) => {
             infer.index_subst.insert(flex.clone(), IndexExpr::Var(rigid.clone()));
-            Ok(())
+            Rel::Proven
         }
         (IndexExpr::Var(name), other) | (other, IndexExpr::Var(name)) => {
-            // A rigid variable (still unbound: both sides are already
-            // resolved) may only be equated, never bound.
+            // A rigid variable may only be equated, never bound.
             if infer.rigid_index.contains(name) {
                 return if crate::index_expr::index_exprs_equal(&a, &b) {
-                    Ok(())
+                    Rel::Proven
                 } else {
-                    Err(TypeError(
-                        format!("index variable {name} is fixed by the signature and cannot equal {other}"),
-                        span,
-                    ))
+                    refuted(format!("index variable {name} is fixed by the signature and cannot equal {other}"))
                 };
             }
             if occurs_in_index(name, other, infer) {
-                // A structural occurrence isn't always a genuine
-                // infinite-expression violation: `n` against `n + 0` (or
-                // any other SOP-equal shape) LOOKS self-referential
-                // positionally, but SOP normalization already proves the
-                // two sides equal, needing no binding at all -- the same
-                // rescue the arm below gives non-Var compound pairs,
-                // extended to cover this arm too (final review Finding
-                // 2's related Minor issue). Only a GENUINE occurs
-                // violation (not SOP-equal either) still errors.
+                // `n` against `n + 0` is SOP-equal; only a GENUINE occurs violation errors.
                 return if crate::index_expr::index_exprs_equal(&a, &b) {
-                    Ok(())
+                    Rel::Proven
                 } else {
-                    Err(TypeError(format!("infinite index expression: {name} occurs in {other}"), span))
+                    refuted(format!("infinite index expression: {name} occurs in {other}"))
                 };
             }
             infer.index_subst.insert(name.clone(), other.clone());
-            Ok(())
+            Rel::Proven
         }
-        // SOP-equality is checked BEFORE the shape-recursion arms below.
-        // Two compound expressions can already be equal under SOP
-        // normalization (e.g. `m*n` vs `n*m`) without being pointwise
-        // equal operand-by-operand -- if shape-recursion ran first here,
-        // it would recurse positionally into (m, n) and (n, m) and bind
-        // `m := n`, aliasing two otherwise-independent variables as an
-        // unintended side effect. Checking equality first means a pair
-        // that's already SOP-equal needs no binding at all; a pair that
-        // ISN'T SOP-equal (e.g. `Add(n, 1)` vs `Add(3, 1)`, not equal
-        // while `n` is unbound) correctly falls through to recursion.
-        _ if crate::index_expr::index_exprs_equal(&a, &b) => Ok(()),
+        // SOP-equality is checked BEFORE the shape-recursion arms below: `m*n` vs `n*m` is equal
+        // without being pointwise equal, and recursing first would bind `m := n`.
+        _ if crate::index_expr::index_exprs_equal(&a, &b) => Rel::Proven,
         (IndexExpr::Add(a1, a2), IndexExpr::Add(b1, b2))
         | (IndexExpr::Sub(a1, a2), IndexExpr::Sub(b1, b2))
-        | (IndexExpr::Mul(a1, a2), IndexExpr::Mul(b1, b2)) => {
-            unify_index_expr_rec(a1, b1, infer, span)?;
-            unify_index_expr_rec(a2, b2, infer, span)
-        }
-        _ => Err(TypeError(format!("type mismatch: index {a} does not unify with index {b}"), span)),
+        | (IndexExpr::Mul(a1, a2), IndexExpr::Mul(b1, b2)) => match unify_index_expr(a1, b1, infer) {
+            Rel::Proven => unify_index_expr(a2, b2, infer),
+            other => other,
+        },
+        _ => refuted(format!("type mismatch: index {a} does not unify with index {b}")),
     }
 }
 
+/// `unify_index_expr` as the checker's `Result`: a refutation is its message, and an Unknown is a
+/// static error too (nothing at runtime can decide an index equation before stage 3's `Pending`).
+pub(crate) fn unify_index(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
+    let (ra, rb) = (infer.resolve_index_deep(a), infer.resolve_index_deep(b));
+    match unify_index_expr(a, b, infer) {
+        Rel::Proven => Ok(()),
+        Rel::Refuted(why) => Err(TypeError(why.into_owned(), span)),
+        Rel::Unknown(..) => Err(TypeError(undecided_message(&ra, &rb), span)),
+    }
+}
+
+fn undecided_message(a: &IndexExpr, b: &IndexExpr) -> String {
+    if crate::index_expr::index_exprs_compare(a, b).is_none() {
+        "could not decide (expression too large) whether the two index expressions are equal".to_string()
+    } else {
+        format!("could not decide whether index {a} equals index {b}: solving it is not supported, and no runtime value can check it")
+    }
+}
 // The real unifier. Resolves both sides through infer.subst first, then:
 // an unbound Type::Var on either side gets BOUND (after an occurs-check)
 // to the other, already-resolved side; Type::Dyn on either side succeeds
@@ -454,7 +442,7 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
         // real index-variable inference in.
         (Type::Indexed(wa, ia), Type::Indexed(wb, ib)) => {
             unify(wa, wb, infer, span)?;
-            unify_index_expr(ia, ib, infer, span)
+            unify_index(ia, ib, infer, span)
         }
         (Type::Fun(p1, _r1, ret1), Type::Fun(p2, _r2, ret2)) => {
             unify(p1, p2, infer, span)?;
@@ -3537,7 +3525,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     && !(actual_is_indexed && base_is_dyn_or_var)
                     && consistent(&actual_ty, &base_alt)
                 {
-                    unify_index_expr(&idx, &IndexExpr::Lit(0), infer, spans[cur_expr])?;
+                    unify_index(&idx, &IndexExpr::Lit(0), infer, spans[cur_expr])?;
                     (expected.clone(), row, expr2)
                 } else {
                     (actual_ty, row, expr2)
