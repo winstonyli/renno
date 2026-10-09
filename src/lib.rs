@@ -6349,6 +6349,53 @@ mod tests {
         assert!(matches!(unify_index_expr(&lit(3), &lit(4), &mut infer), Rel::Refuted(w) if w.contains("index 3 does not unify with index 4")));
         assert!(matches!(unify_index_expr(&var("n"), &lit(3), &mut infer), Rel::Refuted(w) if w.contains("index variable n is fixed by the signature")));
     }
+
+    fn capped_index() -> crate::index_expr::IndexExpr {
+        use crate::index_expr::IndexExpr;
+        use std::rc::Rc;
+        let mut big = IndexExpr::Add(Rc::new(var("a")), Rc::new(var("b")));
+        for _ in 0..6 {
+            big = IndexExpr::Mul(Rc::new(big.clone()), Rc::new(big));
+        }
+        big
+    }
+
+    #[test]
+    fn unify_index_expr_past_the_sop_cap_is_unknown_not_refuted() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{unify_index_expr, Cause, Rel, Residual};
+        use std::rc::Rc;
+        let lit = IndexExpr::Lit;
+        let mut infer = rigid_infer(&["n"]);
+        let undecided = Rel::Unknown(Residual::IndexEq, Cause::Incomplete);
+        let zero_big = IndexExpr::Mul(Rc::new(capped_index()), Rc::new(lit(0)));
+        // rigid arm, occurs arm, compound arm
+        let n_plus = IndexExpr::Add(Rc::new(var("n")), Rc::new(zero_big.clone()));
+        assert_eq!(unify_index_expr(&var("n"), &n_plus, &mut infer), undecided);
+        let q_plus = IndexExpr::Add(Rc::new(var("q")), Rc::new(zero_big.clone()));
+        assert_eq!(unify_index_expr(&var("q"), &q_plus, &mut infer), undecided);
+        let (x_plus, y_plus) = (IndexExpr::Add(Rc::new(var("x")), Rc::new(zero_big.clone())), IndexExpr::Sub(Rc::new(var("y")), Rc::new(zero_big.clone())));
+        assert_eq!(unify_index_expr(&x_plus, &y_plus, &mut infer), undecided);
+        // A structurally identical pair is still Proven, and a positional proof (binding p) is
+        // still a proof; only a failed recursion becomes Unknown.
+        assert_eq!(unify_index_expr(&capped_index(), &capped_index(), &mut infer), Rel::Proven);
+        let (lhs, rhs) = (IndexExpr::Add(Rc::new(var("p")), Rc::new(zero_big.clone())), IndexExpr::Add(Rc::new(lit(5)), Rc::new(zero_big)));
+        assert_eq!(unify_index_expr(&lhs, &rhs, &mut infer), Rel::Proven);
+        assert_eq!(infer.resolve_index(&var("p")), lit(5));
+    }
+
+    #[test]
+    fn an_index_equation_past_the_sop_cap_is_undecided_not_unequal() {
+        let big = "(a + b) * ".repeat(64);
+        let src = format!("let f: (Vec(n) -> Vec(n)) = fun v -> let w: Vec(n + {big}0) = v in v in f([1])");
+        let err = run_source(&src).unwrap_err();
+        assert!(err.contains("could not decide (expression too large)"), "unexpected message: {err}");
+        assert!(!err.contains("fixed by the signature"), "{err}");
+        // The one-factor control normalizes fine and is accepted.
+        let ok = "let f: (Vec(n) -> Vec(n)) = fun v -> let w: Vec(n + (a + b) * 0) = v in v in f([1])";
+        assert_eq!(run_source(ok).unwrap().to_string(), "[1]");
+    }
+
     fn rigid_infer(names: &[&str]) -> crate::typecheck::InferCtx {
         let mut infer = crate::typecheck::InferCtx::new(std::collections::HashMap::new());
         for n in names {

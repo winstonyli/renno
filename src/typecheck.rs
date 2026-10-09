@@ -4,13 +4,13 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::expr::{Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, Pattern, SpanMap, Test};
-use crate::index_expr::IndexExpr;
+use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::plist::PList;
 use crate::span::Span;
 use crate::types::{consistent, fits, row_consistent, EffectRow, Type};
 use crate::util::find_field;
 mod relate;
-pub(crate) use self::relate::Rel;
+pub(crate) use self::relate::{Cause, Rel, Residual};
 mod shadow;
 
 // The Span is always an ORIGINAL (pre-elaboration) node's -- the one whose
@@ -345,34 +345,49 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
         (IndexExpr::Var(name), other) | (other, IndexExpr::Var(name)) => {
             // A rigid variable may only be equated, never bound.
             if infer.rigid_index.contains(name) {
-                return if crate::index_expr::index_exprs_equal(&a, &b) {
-                    Rel::Proven
-                } else {
-                    refuted(format!("index variable {name} is fixed by the signature and cannot equal {other}"))
+                return match index_exprs_compare(&a, &b) {
+                    Some(IndexCmp::Equal) => Rel::Proven,
+                    None => undecided(),
+                    Some(_) => refuted(format!("index variable {name} is fixed by the signature and cannot equal {other}")),
                 };
             }
             if occurs_in_index(name, other, infer) {
                 // `n` against `n + 0` is SOP-equal; only a GENUINE occurs violation errors.
-                return if crate::index_expr::index_exprs_equal(&a, &b) {
-                    Rel::Proven
-                } else {
-                    refuted(format!("infinite index expression: {name} occurs in {other}"))
+                return match index_exprs_compare(&a, &b) {
+                    Some(IndexCmp::Equal) => Rel::Proven,
+                    None => undecided(),
+                    Some(_) => refuted(format!("infinite index expression: {name} occurs in {other}")),
                 };
             }
             infer.index_subst.insert(name.clone(), other.clone());
             Rel::Proven
         }
-        // SOP-equality is checked BEFORE the shape-recursion arms below: `m*n` vs `n*m` is equal
-        // without being pointwise equal, and recursing first would bind `m := n`.
-        _ if crate::index_expr::index_exprs_equal(&a, &b) => Rel::Proven,
-        (IndexExpr::Add(a1, a2), IndexExpr::Add(b1, b2))
-        | (IndexExpr::Sub(a1, a2), IndexExpr::Sub(b1, b2))
-        | (IndexExpr::Mul(a1, a2), IndexExpr::Mul(b1, b2)) => match unify_index_expr(a1, b1, infer) {
-            Rel::Proven => unify_index_expr(a2, b2, infer),
-            other => other,
-        },
-        _ => refuted(format!("type mismatch: index {a} does not unify with index {b}")),
+        _ => {
+            // SOP-equality is checked BEFORE the shape-recursion arms below: `m*n` vs `n*m` is
+            // equal without being pointwise equal, and recursing first would bind `m := n`.
+            let cmp = index_exprs_compare(&a, &b);
+            if cmp == Some(IndexCmp::Equal) {
+                return Rel::Proven;
+            }
+            let rel = match (&a, &b) {
+                (IndexExpr::Add(a1, a2), IndexExpr::Add(b1, b2))
+                | (IndexExpr::Sub(a1, a2), IndexExpr::Sub(b1, b2))
+                | (IndexExpr::Mul(a1, a2), IndexExpr::Mul(b1, b2)) => match unify_index_expr(a1, b1, infer) {
+                    Rel::Proven => unify_index_expr(a2, b2, infer),
+                    other => other,
+                },
+                _ => refuted(format!("type mismatch: index {a} does not unify with index {b}")),
+            };
+            // Past the SOP cap the positional recursion may still prove the pair equal (it binds
+            // nothing unsoundly), but a failure of it proves nothing.
+            if cmp.is_none() && rel != Rel::Proven { undecided() } else { rel }
+        }
     }
+}
+
+/// The checker could neither prove nor refute the equation.
+fn undecided() -> Rel {
+    Rel::Unknown(Residual::IndexEq, Cause::Incomplete)
 }
 
 /// `unify_index_expr` as the checker's `Result`: a refutation is its message, and an Unknown is a
