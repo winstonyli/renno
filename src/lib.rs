@@ -3368,12 +3368,13 @@ mod tests {
     }
 
     #[test]
-    fn a_genuinely_dyn_sourced_value_is_checked_at_runtime_against_a_named_type_one_level_deep() {
+    fn a_genuinely_dyn_sourced_value_is_checked_at_runtime_against_a_named_type_all_the_way_down() {
         // g's own parameter is explicitly Dyn -- it stays Dyn all the
         // way to `f(v)` inside g's body, so THAT call genuinely
         // crosses a real Dyn boundary at runtime (build_boundary_check
         // via coerce's own Dyn/Var early-return-turned-real-check
-        // path), not coerce's static rescue.
+        // path), not coerce's static rescue. The check follows the whole
+        // value, through every level of the recursive alias.
         let src = r#"
             type List = (Int, List) | Bool in
             let f = fun xs: List -> xs in
@@ -3390,6 +3391,17 @@ mod tests {
             Value::List(items) => assert_eq!(items[0].as_int(), 1),
             other => panic!("expected a tuple (Value::List), got {other}"),
         }
+    }
+
+    #[test]
+    fn a_dyn_sourced_value_is_rejected_deep_inside_a_named_recursive_type() {
+        let src = r#"
+            type List = (Int, List) | Bool in
+            let f = fun xs: List -> xs in
+            let g = fun v: Dyn -> f(v) in
+            g((1, (2, 3)))
+        "#;
+        rejects(src, "at element 1, element 1");
     }
 
     #[test]
@@ -3421,7 +3433,7 @@ mod tests {
         // overflow, not a graceful type error). g's own parameter is
         // explicitly Dyn, so it stays Dyn all the way to f(v) -- forcing a
         // real runtime boundary check against A, not coerce's own static
-        // rescue (mirrors a_genuinely_dyn_sourced_value_is_checked_at_runtime_against_a_named_type_one_level_deep
+        // rescue (mirrors a_genuinely_dyn_sourced_value_is_checked_at_runtime_against_a_named_type_all_the_way_down
         // above). With the ancestor-tracking fix, `A`'s own self-reference
         // contributes nothing new to the check -- `type A = Int | A`
         // behaves exactly like plain `Int`, the only alternative that can
@@ -7829,5 +7841,38 @@ mod tests {
         assert!(err.contains("type error: expected (Int, L) | Bool, found Int at element 1, element 1, element 1"), "{}", &err[..err.len().min(160)]);
         assert!(err.matches("element 1").count() == 20000, "path length");
         assert!(started.elapsed() < std::time::Duration::from_secs(30), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn deep_failure_text_is_stable_for_the_whole_matrix() {
+        let cases: [(&str, &str); 6] = [
+            ("let d: Dyn = [1, true] in let xs: [Int] = d in xs", "type error: expected [Int], found Bool at element 1"),
+            ("let d: Dyn = (1, \"a\") in let p: (Int, Int) = d in p", "type error: expected (Int, Int), found Str at element 1"),
+            ("let d: Dyn = {a: 1, b: true} in let r: {a: Int, b: Int} = d in r", "type error: expected {a: Int, b: Int}, found Bool at field b"),
+            ("let d: Dyn = [[1], [true]] in let xs: [[Int]] = d in xs", "type error: expected [[Int]], found Bool at element 1, element 0"),
+            ("let d: Dyn = [1, 2, \"a\"] in let xs: [Int] = d in xs", "found Str at element 2"),
+            ("let d: Dyn = 3 in let xs: [Int] = d in xs", "type error: expected [Int], found Int"),
+        ];
+        for (src, want) in cases {
+            rejects(src, want);
+        }
+        // a top-level mismatch has no path suffix
+        let err = run_source(cases[5].0).unwrap_err();
+        assert!(!err.contains(" at "), "{err}");
+    }
+
+    #[test]
+    fn deep_checks_leave_vec_n_and_functions_in_containers_alone() {
+        // parked (fun-to-dyn spec §7): Vec(n) inside a container is not length-checked...
+        assert_eq!(run_source("let d: Dyn = [[1, 2], [3]] in let xs: [Vec(2)] = d in len(xs)").unwrap().as_int(), 2);
+        // ...and a function inside a container is only a callability tag.
+        assert_eq!(run_source("let d: Dyn = [fun x -> x] in let fs: [(Int -> Int)] = d in len(fs)").unwrap().as_int(), 1);
+        rejects("let d: Dyn = [3] in let fs: [(Int -> Int)] = d in len(fs)", "at element 0");
+    }
+
+    #[test]
+    fn deep_literal_into_a_recursive_alias_stays_unchecked_past_level_one() {
+        // parked: coerce's literal rescue accepts it (documented in the gradual-unknown design)
+        assert_eq!(run_source("type L = (Int, L) | Bool in let l: L = (1, (2, 3)) in 1").unwrap().as_int(), 1);
     }
 }
