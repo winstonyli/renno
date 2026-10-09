@@ -1,0 +1,2 @@
+// Runtime error: a partly-Dyn source ([Dyn]) into [Int] is checked at the gate.
+let ys: [Dyn] = [1, true] in let xs: [Int] = ys in len(xs)

@@ -1,0 +1,2 @@
+// Runtime error: a Dyn tuple annotated (Int, Int) is checked per position; baseline died later in the arithmetic.
+let d: Dyn = (1, "a") in let p: (Int, Int) = d in match p | (a, b) -> a + b

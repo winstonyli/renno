@@ -1,0 +1,2 @@
+// Runtime error: each field value of a Dyn record is checked ("at field b"); baseline died later in the arithmetic.
+let d: Dyn = {a: 1, b: true} in let r: {a: Int, b: Int} = d in r.b + 1

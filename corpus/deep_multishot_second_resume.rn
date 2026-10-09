@@ -1,0 +1,2 @@
+// Runtime error on the SECOND resume of a multi-shot continuation: the deep check replays per resume.
+handle (let xs: [Int] = perform pick(0) in len(xs)) with handler pick(p, resume) -> resume([1, 2]) + resume([1, true])

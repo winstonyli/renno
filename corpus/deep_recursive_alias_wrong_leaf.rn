@@ -1,0 +1,2 @@
+// Runtime error: a wrong leaf inside a recursive alias value is found ("at element 1, element 1").
+type L = (Int, L) | Bool in let d: Dyn = (1, (2, 3)) in let t: L = d in t

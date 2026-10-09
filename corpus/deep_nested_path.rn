@@ -1,0 +1,2 @@
+// Runtime error: nested containers report the whole path ("at field b, element 0").
+let d: Dyn = {a: 1, b: [true]} in let r: {a: Int, b: [Int]} = d in r

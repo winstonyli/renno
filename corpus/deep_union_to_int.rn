@@ -1,0 +1,2 @@
+// Runtime error: a Union-typed value is checked when narrowed to one member.
+let f = fun u: Int | Str -> let n: Int = u in n in f("a")

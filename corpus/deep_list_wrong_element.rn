@@ -1,0 +1,2 @@
+// Runtime error: a Dyn list annotated [Int] is checked element by element ("at element 1").
+let d: Dyn = [1, true] in let xs: [Int] = d in len(xs)
