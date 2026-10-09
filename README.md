@@ -248,7 +248,7 @@ More complete examples for every feature above live in [`examples/`](examples/).
 
 - `lexer.rs` — logos-based tokenizer.
 - `parser.rs` — recursive-descent parser into an arena-allocated AST (`expr.rs`); iteratively flattens long `let`/`fun` chains to keep native stack usage O(1) regardless of chain length.
-- `typecheck.rs` — bidirectional-lite gradual type checker: infers types and effect rows in one pass, desugars a `Dyn`-to-concrete boundary into an ordinary `if <predicate> then value else fail(...)` (a real per-call contract for a `Fun` target) built from prelude builtins rather than a dedicated AST node, and checks match exhaustiveness/reachability.
+- `typecheck.rs` — bidirectional-lite gradual type checker: infers types and effect rows in one pass, turns a `Dyn`-to-concrete boundary into a native `Expr::Check` node (a real per-call contract for a `Fun` target; only `Vec(n)` index checks and a few unions are still desugared into `if`/`fail` code), and checks match exhaustiveness/reachability.
 - `resolve.rs` — static resolver: walks the (already typechecked) AST once and records, for every variable reference, exactly where it lives at runtime (`VarRef::Local { hops, slot }`, `VarRef::Prelude(index)`, or `VarRef::Unbound`) — no name comparison happens during evaluation.
 - `machine.rs` — a trampolined CEK-style step loop (`cont.rs` holds the defunctionalized continuation frames), reading `resolve.rs`'s `VarRef`s to look variables up. No native recursion during evaluation, so no stack-overflow risk from deep programs or from resuming captured continuations.
 - `frame.rs` — the runtime `Env`: a persistent chain of immutable per-scope frames (`Env::get(hops, slot)`), indexed by resolve.rs's static `VarRef::Local`, not by name.
