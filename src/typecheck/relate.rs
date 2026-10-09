@@ -1,12 +1,13 @@
-//! Directional, infer-aware type relation (design 2026-10-08, section 3.1). Stage 0: pure and
-//! read-only; nothing in the checker consults it for a decision.
-use super::{free_index_vars, InferCtx};
+//! Directional, infer-aware type relation (design 2026-10-08, section 3.1). Pure and read-only.
+//! Stage 1 adds `Why`/`Undecided`/`relate_cast`; stage 2 consumers: coerce_check, coerce_cast,
+//! unify_fits.
+use super::{free_index_vars, unify_index_expr, InferCtx};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::types::{row_consistent, Type};
 use crate::util::find_field;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 /// Native-stack guard (a source type that is itself very deep). Degenerate aliases are cut earlier
 /// by the revisit guard in the `Named` arm.
 const MAX_DEPTH: usize = 64;
@@ -28,6 +29,8 @@ pub(crate) enum Residual {
     Len,
     IndexEq,
     Lazy,
+    /// No value test, wrapper or unifier step decides it: a static error.
+    Undecided,
     All(Vec<Residual>),
     Any(Vec<Residual>),
 }
@@ -49,18 +52,62 @@ impl Residual {
             Residual::Lazy => {
                 out.insert("Lazy");
             }
+            Residual::Undecided => {
+                out.insert("Undecided");
+            }
             Residual::All(rs) | Residual::Any(rs) => rs.iter().for_each(|r| r.collect(out)),
         }
+    }
+}
+impl Residual {
+    /// Some part is decided by a value test (lowered by `build_boundary_check`).
+    pub(crate) fn needs_test(&self) -> bool {
+        match self {
+            Residual::Test | Residual::Len | Residual::Lazy => true,
+            Residual::All(rs) | Residual::Any(rs) => rs.iter().any(Residual::needs_test),
+            _ => false,
+        }
+    }
+    pub(crate) fn undecided(&self) -> bool {
+        match self {
+            Residual::Undecided => true,
+            Residual::All(rs) | Residual::Any(rs) => rs.iter().any(Residual::undecided),
+            _ => false,
+        }
+    }
+}
+/// Why a pair is Refuted. Only a `Shape` refutation is seen by the value test that lowers a
+/// `Residual::Test`, which matters when it is one alternative of a Union source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Why {
+    /// A value test tells them apart: base type, tuple arity, missing field, list vs tuple.
+    Shape(&'static str),
+    /// A value test cannot: a function signature or effect row, a nominal id, an index position.
+    Opaque(&'static str),
+    /// An index pair; `msg` is `unify_index_expr`'s text for it. `bare`: either index as written
+    /// is a bare variable (the old gate let those through to the unifier, whose text users see).
+    Index { msg: String, bare: bool },
+}
+impl Why {
+    pub(crate) fn message(&self) -> Cow<'static, str> {
+        match self {
+            Why::Shape(m) | Why::Opaque(m) => Cow::Borrowed(m),
+            Why::Index { msg, .. } => Cow::Owned(msg.clone()),
+        }
+    }
+    fn observable(&self) -> bool {
+        matches!(self, Why::Shape(_))
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Rel {
     Proven,
     Unknown(Residual, Cause),
-    Refuted(Cow<'static, str>), // why; owned when it carries the failing index pair
+    Refuted(Why),
 }
 impl Rel {
-    pub(crate) fn refuted(why: &'static str) -> Rel { Rel::Refuted(Cow::Borrowed(why)) }
+    pub(crate) fn refuted(why: &'static str) -> Rel { Rel::Refuted(Why::Shape(why)) }
+    fn opaque(why: &'static str) -> Rel { Rel::Refuted(Why::Opaque(why)) }
     /// The distinct residual kinds an Unknown mentions (empty for Proven/Refuted).
     pub(crate) fn kinds(&self) -> BTreeSet<&'static str> {
         let mut out = BTreeSet::new();
@@ -95,14 +142,14 @@ fn and(rels: impl IntoIterator<Item = Rel>) -> Rel {
 // Disjunction over target-Union alternatives (the caller already returned on a Proven one):
 // all Refuted refutes; otherwise Unknown, as precise as its most precise Unknown alternative.
 fn or(rels: Vec<Rel>) -> Rel {
-    let (mut unknowns, mut cause, mut why) = (Vec::new(), Cause::Incomplete, Cow::Borrowed("empty union"));
+    let (mut unknowns, mut cause, mut why) = (Vec::new(), Cause::Incomplete, Why::Shape("empty union"));
     for r in rels {
         match r {
             Rel::Unknown(res, c) => {
                 cause = cause.min(c);
                 unknowns.push(res);
             }
-            Rel::Refuted(w) => why = w,
+            Rel::Refuted(w) => if why.observable() { why = w },
             Rel::Proven => return Rel::Proven,
         }
     }
@@ -112,10 +159,11 @@ fn or(rels: Vec<Rel>) -> Rel {
 struct Budget {
     left: Cell<u32>,
     unfolding: RefCell<Vec<(Type, String)>>,
+    ignore_rows: bool,
 }
 impl Default for Budget {
     fn default() -> Self {
-        Budget { left: Cell::new(FUEL), unfolding: RefCell::new(Vec::new()) }
+        Budget { left: Cell::new(FUEL), unfolding: RefCell::new(Vec::new()), ignore_rows: false }
     }
 }
 fn loose(t: &Type) -> bool {
@@ -124,6 +172,10 @@ fn loose(t: &Type) -> bool {
 /// Can a value of type `from` be used where `to` is expected? Resolves bound type and index variables.
 pub(crate) fn relate(from: &Type, to: &Type, infer: &InferCtx) -> Rel {
     go(from, to, infer, &Budget::default(), 0)
+}
+/// `relate` for a cast: effect rows have no runtime representation, so they never decide a cast.
+pub(crate) fn relate_cast(from: &Type, to: &Type, infer: &InferCtx) -> Rel {
+    go(from, to, infer, &Budget { ignore_rows: true, ..Budget::default() }, 0)
 }
 fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> Rel {
     if depth > MAX_DEPTH || fuel.left.get() == 0 {
@@ -134,7 +186,7 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
     let unknown = |r: Residual| Rel::Unknown(r, Cause::Imprecise);
     match (&from, &to) {
         (Type::Var(a), Type::Var(b)) if a == b => Rel::Proven,
-        (Type::Fun(..), t) if loose(t) => fun_rel(&from, &to, infer, fuel, d), // cast as Fun(Dyn, Dyn)
+        (Type::Fun(..), Type::Dyn) => fun_rel(&from, &to, infer, fuel, d), // cast as Fun(Dyn, Dyn)
         (_, t) if loose(t) => Rel::Proven,
         (f, Type::Fun(..)) if loose(f) => unknown(Residual::All(vec![Residual::Test, Residual::Fun])),
         (f, Type::Indexed(..)) if loose(f) => unknown(Residual::All(vec![Residual::Test, Residual::Len])),
@@ -144,7 +196,15 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
             if rels.iter().all(|r| *r == Rel::Proven) {
                 Rel::Proven
             } else if !rels.is_empty() && rels.iter().all(|r| matches!(r, Rel::Refuted(_))) {
-                Rel::refuted("union: no alternative fits")
+                let seen = rels.iter().all(|r| matches!(r, Rel::Refuted(w) if w.observable()));
+                Rel::Refuted(if seen { Why::Shape("union: no alternative fits") } else { Why::Opaque("union: no alternative fits") })
+            } else if alts.iter().zip(&rels).any(|(a, r)| match r {
+                // A value test of `to` cannot see this refutation, nor add a function wrapper.
+                Rel::Refuted(w) => !w.observable(),
+                Rel::Unknown(..) => matches!(infer.resolve(a), Type::Fun(..)),
+                Rel::Proven => false,
+            }) {
+                Rel::Unknown(Residual::Undecided, Cause::Incomplete)
             } else {
                 unknown(Residual::Test)
             }
@@ -162,9 +222,9 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
         }
         (Type::Indexed(wf, i), Type::Indexed(wt, j)) => and([go(wf, wt, infer, fuel, d), relate_index(i, j, infer)]),
         (Type::Indexed(wf, _), _) => go(wf, &to, infer, fuel, d), // forgetting an index is sound; the reverse is not
-        (_, Type::Indexed(..)) => Rel::refuted("plain type into indexed"),
+        (_, Type::Indexed(..)) => Rel::opaque("plain type into indexed"),
         (Type::Named(a), Type::Named(b)) => {
-            if a == b { Rel::Proven } else { Rel::refuted("named: different ids") }
+            if a == b { Rel::Proven } else { Rel::opaque("named: different ids") }
         }
         (_, Type::Named(id)) => match infer.named_types.get(id) {
             // Unfolding the same alias against the same source again is a cycle with no new evidence
@@ -176,9 +236,9 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
                 fuel.unfolding.borrow_mut().pop();
                 r
             }
-            None => Rel::refuted("named: not in registry"),
+            None => Rel::opaque("named: not in registry"),
         },
-        (Type::Named(_), _) => Rel::refuted("named: nominal source"),
+        (Type::Named(_), _) => Rel::opaque("named: nominal source"),
         (Type::Int, Type::Int) | (Type::Float, Type::Float) | (Type::Bool, Type::Bool) | (Type::Str, Type::Str) => Rel::Proven,
         (Type::Token(a), Type::Token(b)) => {
             if a == b { Rel::Proven } else { Rel::refuted("token") }
@@ -206,8 +266,8 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
     let Type::Fun(a, r, b) = from else { return Rel::refuted("not a function") };
     let (a2, b2) = match to {
         Type::Fun(a2, r2, b2) => {
-            if !row_consistent(r, r2) {
-                return Rel::refuted("effect row");
+            if !fuel.ignore_rows && !row_consistent(r, r2) {
+                return Rel::opaque("effect row");
             }
             ((**a2).clone(), (**b2).clone())
         }
@@ -215,6 +275,7 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
     };
     match and([go(&a2, a, infer, fuel, d), go(b, &b2, infer, fuel, d)]) {
         Rel::Unknown(_, c) => Rel::Unknown(Residual::Fun, c),
+        Rel::Refuted(Why::Shape(w)) => Rel::Refuted(Why::Opaque(w)),
         other => other,
     }
 }
@@ -223,24 +284,36 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
 /// unification) -> Unknown(IndexEq, Imprecise); a compound with a flexible variable (needs
 /// solving) -> Unknown(IndexEq, Incomplete); only rigid variables/literals left -> Refuted.
 pub(crate) fn relate_index(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Rel {
-    let (a, b) = (infer.resolve_index_deep(a), infer.resolve_index_deep(b));
-    match index_exprs_compare(&a, &b) {
+    let (ra, rb) = (infer.resolve_index_deep(a), infer.resolve_index_deep(b));
+    match index_exprs_compare(&ra, &rb) {
         None => return Rel::Unknown(Residual::IndexEq, Cause::Incomplete),
         Some(IndexCmp::Equal) => return Rel::Proven,
-        Some(IndexCmp::NonzeroConst) => return Rel::refuted("index: differ by a constant"),
+        Some(IndexCmp::NonzeroConst) => return index_refuted(a, b, infer),
         Some(IndexCmp::Other) => {}
     }
     let flexible = |v: &String| !infer.rigid_index.contains(v);
     let bare_flexible = |e: &IndexExpr| matches!(e, IndexExpr::Var(v) if flexible(v));
-    let mut vars = free_index_vars(&a);
-    vars.extend(free_index_vars(&b));
-    if bare_flexible(&a) || bare_flexible(&b) {
+    let mut vars = free_index_vars(&ra);
+    vars.extend(free_index_vars(&rb));
+    if bare_flexible(&ra) || bare_flexible(&rb) {
         Rel::Unknown(Residual::IndexEq, Cause::Imprecise)
     } else if vars.iter().any(flexible) {
         Rel::Unknown(Residual::IndexEq, Cause::Incomplete)
     } else {
-        Rel::refuted("index: rigid or literal mismatch")
+        index_refuted(a, b, infer)
     }
+}
+/// The unifier's own text for a refuted index pair (run on a scratch copy; nothing is bound).
+fn index_refuted(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Rel {
+    let mut scratch = InferCtx::new(HashMap::new());
+    scratch.index_subst = infer.index_subst.clone();
+    scratch.rigid_index = infer.rigid_index.clone();
+    // (required, actual) = (target, source), the order unify_fits uses.
+    let msg = match unify_index_expr(b, a, &mut scratch) {
+        Rel::Refuted(w) => w.message().into_owned(),
+        _ => format!("type mismatch: index {b} does not unify with index {a}"), // guard: relate refutes only pairs unify cannot bind
+    };
+    Rel::Refuted(Why::Index { msg, bare: matches!(a, IndexExpr::Var(_)) || matches!(b, IndexExpr::Var(_)) })
 }
 #[cfg(test)]
 mod tests {
@@ -364,6 +437,11 @@ mod tests {
             ("vec into plain list", vec_n(lit(3)), list(d.clone()), P),
             ("plain list into vec", list(d.clone()), vec_n(lit(3)), R),
             ("dyn into vec", d.clone(), vec_n(lit(3)), U(&["Len", "Test"], Imp)),
+            ("fun into unbound var", fun(i.clone(), i.clone()), var("u"), P),
+            ("union mix, opaque alt (fun signature)", uni(&[fun(i.clone(), i.clone()), b.clone()]), uni(&[fun(s.clone(), i.clone()), b.clone()]), U(&["Undecided"], Inc)),
+            ("union mix, index alt", uni(&[vec_n(lit(3)), b.clone()]), uni(&[vec_n(lit(4)), b.clone()]), U(&["Undecided"], Inc)),
+            ("union mix, fun alt needs a wrapper", uni(&[fun(i.clone(), i.clone()), b.clone()]), uni(&[fun(d.clone(), d.clone()), b.clone()]), U(&["Undecided"], Inc)),
+            ("union mix, shape only stays a test", uni(&[i.clone(), s.clone()]), uni(&[i.clone(), b.clone()]), U(&["Test"], Imp)),
         ];
         let infer = ctx();
         for (name, from, to, exp) in cases {
@@ -376,6 +454,23 @@ mod tests {
             assert!(ok, "{name}: {from} -> {to}: got {got:?}");
         }
     }
+    #[test]
+    fn refutations_carry_their_kind_and_the_unifier_text() {
+        let infer = ctx();
+        let (i, s) = (Type::Int, Type::Str);
+        assert_eq!(relate(&i, &s, &infer), Rel::Refuted(Why::Shape("shape")));
+        assert!(matches!(relate(&named("M#2"), &named("L#1"), &infer), Rel::Refuted(Why::Opaque(_))));
+        assert!(matches!(relate(&fun(i.clone(), i.clone()), &fun(s.clone(), i.clone()), &infer), Rel::Refuted(Why::Opaque(_))));
+        let rigid = Why::Index { msg: "index variable n is fixed by the signature and cannot equal 3".into(), bare: true };
+        assert_eq!(relate(&vec_n(iv("n")), &vec_n(lit(3)), &infer), Rel::Refuted(rigid));
+        let lits = Why::Index { msg: "type mismatch: index 4 does not unify with index 3".into(), bare: false };
+        assert_eq!(relate(&vec_n(lit(3)), &vec_n(lit(4)), &infer), Rel::Refuted(lits));
+        // Rows have no runtime representation: a cast ignores them.
+        let fx = |row: EffectRow| Type::Fun(Rc::new(i.clone()), row, Rc::new(i.clone()));
+        assert!(matches!(relate(&fx(EffectRow::single("a")), &fx(EffectRow::pure()), &infer), Rel::Refuted(_)));
+        assert_eq!(relate_cast(&fx(EffectRow::single("a")), &fx(EffectRow::pure()), &infer), Rel::Proven);
+    }
+
     #[test]
     fn relate_terminates_on_degenerate_aliases() {
         // type A = A | A | Bool (2^64 steps by depth alone), type B = B, type C = Int | C: unfolding the

@@ -6346,8 +6346,8 @@ mod tests {
         let mut infer = rigid_infer(&["n"]);
         assert_eq!(unify_index_expr(&var("n"), &var("n"), &mut infer), Rel::Proven);
         assert_eq!(unify_index_expr(&var("k"), &lit(3), &mut infer), Rel::Proven); // binds k
-        assert!(matches!(unify_index_expr(&lit(3), &lit(4), &mut infer), Rel::Refuted(w) if w.contains("index 3 does not unify with index 4")));
-        assert!(matches!(unify_index_expr(&var("n"), &lit(3), &mut infer), Rel::Refuted(w) if w.contains("index variable n is fixed by the signature")));
+        assert!(matches!(unify_index_expr(&lit(3), &lit(4), &mut infer), Rel::Refuted(w) if w.message().contains("index 3 does not unify with index 4")));
+        assert!(matches!(unify_index_expr(&var("n"), &lit(3), &mut infer), Rel::Refuted(w) if w.message().contains("index variable n is fixed by the signature")));
     }
 
     fn capped_index() -> crate::index_expr::IndexExpr {
