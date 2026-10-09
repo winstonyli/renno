@@ -101,12 +101,34 @@ fn drop_zero_terms(p: &mut Polynomial) {
 /// documented monomial cap -- an honest "cannot prove equal," not a
 /// claim that the two are actually unequal.
 pub fn index_exprs_equal(a: &IndexExpr, b: &IndexExpr) -> bool {
-    let (Some(mut na), Some(mut nb)) = (normalize(a), normalize(b)) else {
-        return false;
-    };
+    index_exprs_compare(a, b) == Some(IndexCmp::Equal)
+}
+
+/// How two index expressions relate on their sum-of-products forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexCmp {
+    Equal,
+    /// `a - b` is a nonzero constant: unequal under every assignment.
+    NonzeroConst,
+    /// Unequal as polynomials, but some assignment might equate them.
+    Other,
+}
+
+/// `None` = cannot decide (monomial cap or i64 overflow); never "unequal".
+pub fn index_exprs_compare(a: &IndexExpr, b: &IndexExpr) -> Option<IndexCmp> {
+    let (mut na, mut nb) = (normalize(a)?, normalize(b)?);
     drop_zero_terms(&mut na);
     drop_zero_terms(&mut nb);
-    na == nb
+    if na == nb {
+        return Some(IndexCmp::Equal);
+    }
+    let mut diff = na;
+    for (monomial, coeff) in nb {
+        let entry = diff.entry(monomial).or_insert(0);
+        *entry = entry.checked_sub(coeff)?;
+    }
+    drop_zero_terms(&mut diff);
+    Some(if diff.len() == 1 && diff.contains_key(&Vec::<String>::new()) { IndexCmp::NonzeroConst } else { IndexCmp::Other })
 }
 
 #[cfg(test)]
@@ -204,4 +226,16 @@ mod tests {
         // skipped for a self-comparison.
         assert!(!index_exprs_equal(&big, &big));
     }
+
+    #[test]
+    fn compare_distinguishes_equal_nonzero_constant_difference_other_and_cap() {
+        assert_eq!(index_exprs_compare(&add(var("n"), lit(1)), &add(lit(1), var("n"))), Some(IndexCmp::Equal));
+        assert_eq!(index_exprs_compare(&add(var("n"), lit(1)), &add(var("n"), lit(2))), Some(IndexCmp::NonzeroConst));
+        assert_eq!(index_exprs_compare(&lit(3), &lit(4)), Some(IndexCmp::NonzeroConst));
+        assert_eq!(index_exprs_compare(&var("n"), &var("m")), Some(IndexCmp::Other));
+        let mut big = add(var("a"), var("b"));
+        for _ in 0..6 {
+            big = mul(big.clone(), big.clone()); }
+        assert_eq!(index_exprs_compare(&big, &big), None);
+        assert!(!index_exprs_equal(&big, &big)); }
 }

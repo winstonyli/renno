@@ -9,6 +9,8 @@ use crate::plist::PList;
 use crate::span::Span;
 use crate::types::{consistent, fits, row_consistent, EffectRow, Type};
 use crate::util::find_field;
+#[allow(dead_code)] // Task 2 wires it; remove this allow there
+mod relate;
 
 // The Span is always an ORIGINAL (pre-elaboration) node's -- the one whose
 // type was being checked when the error fired, always already in scope
