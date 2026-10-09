@@ -9,8 +9,8 @@ use crate::plist::PList;
 use crate::span::Span;
 use crate::types::{consistent, fits, row_consistent, EffectRow, Type};
 use crate::util::find_field;
-#[allow(dead_code)] // Task 2 wires it; remove this allow there
 mod relate;
+mod shadow;
 
 // The Span is always an ORIGINAL (pre-elaboration) node's -- the one whose
 // type was being checked when the error fired, always already in scope
@@ -330,6 +330,11 @@ fn occurs_in_index(name: &str, e: &IndexExpr, infer: &InferCtx) -> bool {
 // a different module -- rather than because anything outside
 // typecheck.rs is meant to call this directly.
 pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
+    let pre = shadow::index_pre(a, b, infer);
+    let out = unify_index_expr_rec(a, b, infer, span);
+    shadow::index_post(pre, out.is_ok());
+    out }
+fn unify_index_expr_rec(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
     // resolve_index_deep, not resolve_index -- a shallow resolve only
     // unwraps a bare Var, so a bound variable buried inside a compound
     // expression (e.g. `n` in `Add(n, 1)`) stayed unsubstituted and
@@ -393,8 +398,8 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
         (IndexExpr::Add(a1, a2), IndexExpr::Add(b1, b2))
         | (IndexExpr::Sub(a1, a2), IndexExpr::Sub(b1, b2))
         | (IndexExpr::Mul(a1, a2), IndexExpr::Mul(b1, b2)) => {
-            unify_index_expr(a1, b1, infer, span)?;
-            unify_index_expr(a2, b2, infer, span)
+            unify_index_expr_rec(a1, b1, infer, span)?;
+            unify_index_expr_rec(a2, b2, infer, span)
         }
         _ => Err(TypeError(format!("type mismatch: index {a} does not unify with index {b}"), span)),
     }
@@ -1211,6 +1216,11 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env
 // The static consistency check plus the Dyn-to-concrete boundary check. A
 // Fun source is returned unchanged; coerce_cast wraps it separately.
 fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env: &CheckEnv) -> Result<ExprRef, TypeError> {
+    let out = coerce_check_old(arena, e, from, to, span, env);
+    if shadow::on() {
+        shadow::coerce_check(env.infer, from, to, e, out.as_ref().ok().copied(), span); }
+    out }
+fn coerce_check_old(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env: &CheckEnv) -> Result<ExprRef, TypeError> {
     let named_types = &env.infer.named_types;
     if !consistent(from, to) {
         if fits(to, from) {
@@ -1431,7 +1441,7 @@ fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Chec
     // A cast from a type to itself is the identity. (A literal cast keeps the
     // Lambda a Lambda, so an annotated `let rec` binding stays a direct group
     // either way; this guard just avoids a redundant DOWN.)
-    if same_ignoring_rows(&from, &to) || !needs_wrapper(&from, &to) {
+    if same_ignoring_rows(&from, &to) || !shadow::needs_wrapper(env.infer, &from, &to) {
         return e;
     }
     if matches!(arena[e], Expr::Lambda(..)) {
@@ -1487,8 +1497,8 @@ fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env
     let Type::Fun(a, _, b) = from else { unreachable!("build_literal_cast takes a Fun source") };
     let (a_target, b_target) = cast_targets(to);
     let witnessed = index_witnessed(env);
-    let up_body = if needs_upcast(b, &b_target) { literal_up(arena, body, b, &b_target, env) } else { body };
-    if !needs_down(a, &a_target) {
+    let up_body = if shadow::needs_upcast(env.infer, b, &b_target) { literal_up(arena, body, b, &b_target, env) } else { body };
+    if !shadow::needs_down(env.infer, a, &a_target) {
         return arena.push(Expr::Lambda(param, Some(a_target), up_body));
     }
     // The incoming value arrives under a fresh name and is checked outside the
@@ -1539,14 +1549,14 @@ fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Check
     local.extend(witness.as_ref());
     let body_env = CheckEnv { infer: env.infer, local, defer: false, repeatable: true, span: env.span };
     let ca_ref = arena.push(Expr::Var(ca.clone()));
-    let arg = if needs_down(a, &a_target) {
+    let arg = if shadow::needs_down(env.infer, a, &a_target) {
         build_boundary_check(arena, ca_ref, &erase_open_indexed(a, &witnessed), &body_env, &HashSet::new())
     } else {
         ca_ref
     };
     let cf_ref = arena.push(Expr::Var(cf.clone()));
     let call = arena.push(Expr::App(cf_ref, arg));
-    let result = if needs_upcast(b, &b_target) { build_cast(arena, call, b, &b_target, &body_env) } else { call };
+    let result = if shadow::needs_upcast(env.infer, b, &b_target) { build_cast(arena, call, b, &b_target, &body_env) } else { call };
     let body = match &witness {
         Some(w) if w.used.get() => w.bind(arena, &ca, result),
         _ => result,
@@ -4100,7 +4110,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // matching Value variants.
                 BinOp::Eq => {
                     let numeric_pair = matches!(l_ty, Type::Int | Type::Float) && matches!(r_ty, Type::Int | Type::Float);
-                    if !numeric_pair && !consistent(&l_ty, &r_ty) {
+                    if !numeric_pair && !shadow::consistent(infer, shadow::Site::Eq, &l_ty, &r_ty) {
                         return Err(TypeError(
                             format!("type mismatch: cannot compare {l_ty} with {r_ty}"),
                             spans[expr],
@@ -4135,7 +4145,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // type entirely rather than half-tracking it.
                     let l_ty = forget_index(&l_ty);
                     let r_ty = forget_index(&r_ty);
-                    if !consistent(&l_ty, &r_ty) {
+                    if !shadow::consistent(infer, shadow::Site::Concat, &l_ty, &r_ty) {
                         return Err(TypeError(
                             format!("type mismatch: cannot concat {l_ty} with {r_ty}"),
                             spans[expr],

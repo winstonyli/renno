@@ -14,7 +14,7 @@ set -u
 export RUST_BACKTRACE=0
 export RUST_LIB_BACKTRACE=0
 BASE="${1:-target/baseline/renno-4a58bb3.exe}"
-NEW="target/release/renno.exe"
+NEW="${NEW:-target/release/renno.exe}"
 [ -x "$BASE" ] || { echo "missing baseline binary: $BASE"; exit 2; }
 [ -x "$NEW" ] || { echo "missing $NEW (run: cargo build --release)"; exit 2; }
 tmp="$(mktemp -d)"
