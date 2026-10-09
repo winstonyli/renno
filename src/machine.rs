@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
@@ -452,7 +453,7 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                     set_current_span(spec.span);
                                     let mut path = Vec::new();
                                     let found = explain(&spec.test, &spec.defs, &value, &mut path);
-                                    let at = if path.is_empty() { String::new() } else { format!(" at {}", path.join(", ")) };
+                                    let at = if path.is_empty() { String::new() } else { format!(" at {}", path_text(&path)) };
                                     panic!("type error: expected {}, found {}{at}", spec.to, found.type_name())
                                 }
                             });
@@ -524,6 +525,18 @@ enum Step<'t, 'a> {
     // Fail at this value (a record missing a field, after the fields it does
     // have passed: a present failing field is reported before the record).
     FailAt(&'a Value, u32),
+    // Everything above this entered (alias, value) has passed: remember it.
+    Mark((usize, usize)),
+}
+
+// A compound value's identity (its shared allocation), for the walk's memo of
+// decided (alias, value) pairs. Scalars are as cheap to re-test as to look up.
+fn identity(v: &Value) -> Option<usize> {
+    match v {
+        Value::List(items) => Some(Rc::as_ptr(items) as usize),
+        Value::Record(fields) => Some(Rc::as_ptr(fields) as usize),
+        _ => None,
+    }
 }
 
 // An `Or` being tried: where to rewind the work list to, the alternatives
@@ -574,12 +587,23 @@ fn walk<'t, 'a, const TRACK: bool>(test: &'t Test, defs: &'t [Test], v: &'a Valu
     let depth_of = |nodes: &Nodes<'t>, n: u32| if TRACK { nodes[n as usize].1 } else { 0 };
     let mut work: Vec<Step<'t, 'a>> = vec![Step::Test(test, v, 0)];
     let mut choices: Vec<Choice<'t, 'a>> = Vec::new();
+    // Whether an entered (alias, value) passed (true) or failed (false). Both
+    // are pure functions of the pair, so an `Or` whose alternatives share a
+    // compound prefix (`{k: [T], v: Int} | {k: [T], v: Str}`) re-walks it once,
+    // not once per alternative (doubling per level). A skipped failure reports
+    // at the alias position itself: the same furthest-failure ranking as the
+    // first walk, which already holds the deeper report.
+    let mut memo: HashMap<(usize, usize), bool> = HashMap::new();
     'main: loop {
         let mut fail: Fail<'a> = 'step: {
             let step = work.pop()?;
             let (t, v, node) = match step {
                 Step::Commit => {
                     choices.pop();
+                    continue 'main;
+                }
+                Step::Mark(key) => {
+                    memo.insert(key, true);
                     continue 'main;
                 }
                 Step::FailAt(v, node) => break 'step Fail { node, depth: depth_of(nodes, node), found: v },
@@ -593,7 +617,16 @@ fn walk<'t, 'a, const TRACK: bool>(test: &'t Test, defs: &'t [Test], v: &'a Valu
                 break 'step here;
             }
             match t {
-                Test::Ref(i) => work.push(Step::Test(&defs[*i], v, node)),
+                Test::Ref(i) => {
+                    if let Some(p) = identity(v) {
+                        match memo.get(&(*i, p)) {
+                            Some(true) => continue 'main,
+                            Some(false) => break 'step here,
+                            None => work.push(Step::Mark((*i, p))),
+                        }
+                    }
+                    work.push(Step::Test(&defs[*i], v, node));
+                }
                 Test::ListOf(element) => {
                     let Value::List(items) = v else { break 'step here };
                     if leaf(element, v).is_some() {
@@ -651,7 +684,12 @@ fn walk<'t, 'a, const TRACK: bool>(test: &'t Test, defs: &'t [Test], v: &'a Valu
             if fail.depth > choice.best.depth {
                 choice.best = fail;
             }
-            work.truncate(choice.height);
+            // The aliases entered since this `Or` started contain the failure.
+            for step in work.drain(choice.height..) {
+                if let Step::Mark(key) = step {
+                    memo.insert(key, false);
+                }
+            }
             if choice.next < choice.alternatives.len() {
                 let alternative = &choice.alternatives[choice.next];
                 choice.next += 1;
@@ -667,7 +705,12 @@ fn walk<'t, 'a, const TRACK: bool>(test: &'t Test, defs: &'t [Test], v: &'a Valu
 fn test_holds(test: &Test, defs: &[Test], v: &Value) -> bool {
     match leaf(test, v) {
         Some(ok) => ok,
-        None => walk::<false>(test, defs, v, &mut Vec::new()).is_none(),
+        // `Int | Float`, the check on every Dyn arithmetic operand: decided by
+        // the value's tag, with no work list or choice point.
+        None => match test {
+            Test::Or(alternatives) if alternatives.iter().all(|a| leaf(a, v).is_some()) => alternatives.iter().any(|a| leaf(a, v) == Some(true)),
+            _ => walk::<false>(test, defs, v, &mut Vec::new()).is_none(),
+        },
     }
 }
 
@@ -691,6 +734,16 @@ fn explain<'a>(test: &Test, defs: &[Test], v: &'a Value, path: &mut Vec<String>)
     }
     path.extend(labels.into_iter().rev());
     fail.found
+}
+
+// The path as printed: a failure at the bottom of a million-deep value would
+// otherwise print megabytes, so the middle of a long one is elided.
+fn path_text(path: &[String]) -> String {
+    const KEEP: usize = 10;
+    if path.len() <= 2 * KEEP {
+        return path.join(", ");
+    }
+    format!("{}, ... {} more ..., {}", path[..KEEP].join(", "), path.len() - 2 * KEEP, path[path.len() - KEEP..].join(", "))
 }
 
 fn set_current_span(span: Option<Span>) {
@@ -1241,6 +1294,33 @@ mod tests {
 
     fn list(n: usize) -> Value {
         Value::List(Rc::new(vec![Value::Int(0); n]))
+    }
+
+    #[test]
+    fn a_long_path_is_elided_in_the_middle() {
+        let path: Vec<String> = (0..1000).map(|i| format!("element {i}")).collect();
+        let text = path_text(&path);
+        assert!(text.starts_with("element 0, element 1,") && text.ends_with("element 998, element 999"), "{text}");
+        assert!(text.contains("... 980 more ...") && text.len() < 300, "{text}");
+        assert_eq!(path_text(&path[..20]), path[..20].join(", "));
+    }
+
+    // The scalar-`Or` fast path must agree with the walker for every value.
+    #[test]
+    fn a_scalar_or_agrees_with_the_walker() {
+        let list = Value::List(Rc::new(vec![Value::Int(1)]));
+        let values = [Value::Int(1), Value::Float(1.0), Value::Bool(true), list];
+        let ors = [
+            Test::Or(vec![]),
+            Test::Or(vec![Test::Int, Test::Float]),
+            Test::Or(vec![Test::Never, Test::Bool]),
+            Test::Or(vec![Test::Int, Test::ListOf(Box::new(Test::Int))]),
+        ];
+        for t in &ors {
+            for v in &values {
+                assert_eq!(test_holds(t, &[], v), walk::<false>(t, &[], v, &mut Vec::new()).is_none());
+            }
+        }
     }
 
     #[test]

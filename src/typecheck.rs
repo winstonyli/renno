@@ -1212,7 +1212,8 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
     let named_types = &env.infer.named_types;
     if !consistent(from, to) {
         if fits(to, from) {
-            return Ok(e);
+            let needs = needs_check(&env.infer.resolve_deep(from), to);
+            return Ok(rescued_gate(arena, e, to, needs, span, env));
         }
         // One more rescue, tried only when the exact/width-tolerant
         // checks above both failed: if `to` is a Named reference,
@@ -1279,7 +1280,10 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
             // Upgrade if a real program needs a malformed literal caught at
             // this specific position instead of by whatever consumes it later.
             if consistent(from, &unfolded) || fits(&unfolded, from) {
-                return Ok(e);
+                // Only the outer shape was proven statically; a Dyn anywhere in
+                // `from` is checked against the whole alias at run time.
+                let needs = has_dyn(&env.infer.resolve_deep(from));
+                return Ok(rescued_gate(arena, e, to, needs, span, env));
             }
         }
         // Indexing syntax parses on any alias (parser.rs, Case B), so a
@@ -1312,6 +1316,31 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
         return Ok(e);
     }
     Ok(build_boundary_check(arena, e, &strip_indexed(to), &env, &HashSet::new()))
+}
+
+// The tail of coerce_check for a pair accepted by something weaker than
+// `consistent` (width subtyping, the Named rescue): the same runtime decision
+// as the consistent path, so a partly-Dyn source is checked there too, and a
+// pure literal (`needs` false) stays free.
+fn rescued_gate(arena: &mut Arena, e: ExprRef, to: &Type, needs: bool, span: Span, env: &CheckEnv) -> ExprRef {
+    let empty_literal = matches!(&arena[e], Expr::ListLit(items) if items.is_empty());
+    if !needs || empty_literal {
+        return e;
+    }
+    build_boundary_check(arena, e, &strip_indexed(to), &env.with_span(span), &HashSet::new())
+}
+
+// Dyn or an unsolved variable anywhere in `t` outside a function type (a Fun is
+// wrapped by coerce_cast, never checked structurally).
+fn has_dyn(t: &Type) -> bool {
+    match t {
+        Type::Dyn | Type::Var(_) => true,
+        Type::Indexed(w, _) => has_dyn(w),
+        Type::List(e) => has_dyn(e),
+        Type::Tuple(ts) | Type::Union(ts) => ts.iter().any(has_dyn),
+        Type::Record(fs) => fs.iter().any(|(_, t)| has_dyn(t)),
+        _ => false,
+    }
 }
 
 // Does a value statically typed `from` still need a runtime check to be
@@ -1615,8 +1644,8 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
 // descends into an unfold. Needed because a self-referential alias whose
 // recursive occurrence is a BARE Union alternative (e.g. `type A = Int |
 // A`, contrast with `List = (Int, List) | Bool`, where the Tuple's own
-// shape check never inspects element types at all and so never revisits
-// the Named leaf) would otherwise unfold to the exact same Union([Int,
+// shape test reaches the recursion through a `Test::Ref` alias-table entry,
+// so this function never unfolds the Named leaf again) would otherwise unfold to the exact same Union([Int,
 // Named(id)]) forever -- genuine infinite recursion in THIS function's own
 // call stack during elaboration, not a runtime concern.
 fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {

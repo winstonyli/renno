@@ -4646,7 +4646,9 @@ mod tests {
         use std::rc::Rc;
 
         let mut infer = InferCtx::new(HashMap::new());
-        let vec_ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
+        // Int elements: a Dyn-element Vec(n) into [Int] is a real crossing and
+        // is checked; this test is about the index-forgetting widening alone.
+        let vec_ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend_generalized(&Ctx::empty(), "x", vec_ty, &infer);
 
         let mut arena = Arena::new();
@@ -4784,7 +4786,8 @@ mod tests {
         use std::rc::Rc;
 
         let mut infer = InferCtx::new(HashMap::new());
-        let vec_ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
+        // Int elements: see if_check_mode_accepts_branches_that_only_agree_via_the_expected_type.
+        let vec_ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend_generalized(&Ctx::empty(), "v", vec_ty, &infer);
 
         let mut arena = Arena::new();
@@ -7800,6 +7803,40 @@ mod tests {
         assert_eq!(run_source("let xs: [Int] = [] in len(xs)").unwrap().as_int(), 0);
     }
 
+    // coerce_check's early accepts (width subtyping, the Named rescue) used to
+    // skip the partly-Dyn gate.
+    #[test]
+    fn deep_partly_dyn_sources_are_checked_on_the_width_and_named_paths_too() {
+        rejects("let r: {a: Dyn, b: Int} = {a: true, b: 2} in let s: {a: Int} = r in s.a + 1", "found Bool at field a");
+        rejects(
+            "let f = fun s: {a: Int} -> s.a + 1 in let r: {a: Dyn, b: Int} = {a: true, b: 2} in f(r)",
+            "found Bool at field a",
+        );
+        rejects("type L = (Int, L) | Bool in let p: (Int, Dyn) = (1, 2) in let l: L = p in 1", "found Int at element 1");
+        rejects("type T = {v: Int, kids: [T]} in let d: Dyn = [true] in let t: T = {v: 1, kids: d} in 1", "at field kids, element 0");
+        // pure literals stay free and accepted
+        assert_eq!(run_source("type L = (Int, L) | Bool in let l: L = (1, (2, true)) in 1").unwrap().as_int(), 1);
+        assert_eq!(run_source("let s: {a: Int} = {a: 1, b: true} in s.a").unwrap().as_int(), 1);
+    }
+
+    // Union alternatives that share a compound prefix (`k: [T]`, `(L, ..)`)
+    // re-walked it once per alternative: doubling per level, in the passing
+    // and in the failing case.
+    #[test]
+    fn deep_union_alternatives_sharing_a_prefix_do_not_blow_up() {
+        let rec = "type T = {k: [T], v: Int} | {k: [T], v: Str} in let rec mk = fun n: Int -> fun leaf: Dyn -> if n == 0 then {k: [], v: leaf} else {k: [mk(n - 1)(leaf)], v: \"s\"}";
+        let tup = "type T = (T, Int) | (T, Bool) | Bool in let rec mk = fun n: Int -> fun leaf: Dyn -> if n == 0 then leaf else (mk(n - 1)(leaf), true)";
+        for (head, ok_leaf, bad_leaf, at) in [(rec, "\"s\"", "1.5", "field k"), (tup, "true", "7", "element 0")] {
+            let started = std::time::Instant::now();
+            let ok = format!("{head} in let d: Dyn = mk(22)({ok_leaf}) in let t: T = d in 1");
+            assert_eq!(run_source(&ok).unwrap().as_int(), 1);
+            let bad = format!("{head} in let d: Dyn = mk(22)({bad_leaf}) in let t: T = d in 1");
+            let err = run_source(&bad).unwrap_err();
+            assert!(err.contains(at), "{}", &err[..err.len().min(200)]);
+            assert!(started.elapsed() < std::time::Duration::from_secs(2), "took {:?}", started.elapsed());
+        }
+    }
+
     #[test]
     fn deep_a_checked_list_with_an_unannotated_producer_is_rejected() {
         rejects("let f = fun xs: [Int] -> match xs | 1 :: _ -> \"one\" | _ -> \"other\" in f(map(fun x -> x)([true]))", "at element 0");
@@ -7839,7 +7876,8 @@ mod tests {
         let started = std::time::Instant::now();
         let err = run_source(src).unwrap_err();
         assert!(err.contains("type error: expected (Int, L) | Bool, found Int at element 1, element 1, element 1"), "{}", &err[..err.len().min(160)]);
-        assert!(err.matches("element 1").count() == 20000, "path length");
+        assert!(err.contains("element 1, ... 19980 more ..., element 1"), "path elision");
+        assert!(err.len() < 1000, "message length {}", err.len());
         assert!(started.elapsed() < std::time::Duration::from_secs(30), "took {:?}", started.elapsed());
     }
 
@@ -7865,6 +7903,9 @@ mod tests {
     fn deep_checks_leave_vec_n_and_functions_in_containers_alone() {
         // parked (fun-to-dyn spec §7): Vec(n) inside a container is not length-checked...
         assert_eq!(run_source("let d: Dyn = [[1, 2], [3]] in let xs: [Vec(2)] = d in len(xs)").unwrap().as_int(), 2);
+        // an alias whose body reaches Vec(n) becomes Any as a whole inside a container
+        let alias = "type A = (Int, [A]) | Vec(2) in let d: Dyn = (1, [[1, 2, 3]]) in let a: A = d in 1";
+        assert_eq!(run_source(alias).unwrap().as_int(), 1);
         // ...and a function inside a container is only a callability tag.
         assert_eq!(run_source("let d: Dyn = [fun x -> x] in let fs: [(Int -> Int)] = d in len(fs)").unwrap().as_int(), 1);
         rejects("let d: Dyn = [3] in let fs: [(Int -> Int)] = d in len(fs)", "at element 0");
