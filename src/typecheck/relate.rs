@@ -6,7 +6,9 @@ use crate::types::{row_consistent, Type};
 use crate::util::find_field;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 /// Native-stack guard (a source type that is itself very deep). Degenerate aliases are cut earlier
 /// by the revisit guard in the `Named` arm.
 const MAX_DEPTH: usize = 64;
@@ -34,6 +36,7 @@ pub(crate) enum Residual {
     Any(Vec<Residual>),
 }
 impl Residual {
+    #[cfg(test)]
     fn collect(&self, out: &mut BTreeSet<&'static str>) {
         match self {
             Residual::Test => {
@@ -108,6 +111,7 @@ impl Rel {
     pub(crate) fn refuted(why: &'static str) -> Rel { Rel::Refuted(Why::Shape(why)) }
     fn opaque(why: &'static str) -> Rel { Rel::Refuted(Why::Opaque(why)) }
     /// The distinct residual kinds an Unknown mentions (empty for Proven/Refuted).
+    #[cfg(test)]
     pub(crate) fn kinds(&self) -> BTreeSet<&'static str> {
         let mut out = BTreeSet::new();
         if let Rel::Unknown(r, _) = self {
@@ -115,6 +119,7 @@ impl Rel {
         }
         out
     }
+    #[cfg(test)]
     pub(crate) fn cause(&self) -> Option<Cause> {
         if let Rel::Unknown(_, c) = self { Some(*c) } else { None }
     }
@@ -488,5 +493,28 @@ mod tests {
         // The depth guard is the backstop for a source that is itself too deep.
         let deep = (0..70).fold(Type::Int, |t, _| list(t));
         assert!(matches!(relate(&deep, &deep, &infer), Rel::Unknown(Residual::Lazy, Cause::Incomplete)));
+    }
+
+    #[test]
+    fn relate_cast_decides_down_and_wrapper() {
+        let infer = ctx();
+        let (i, s, d, b) = (Type::Int, Type::Str, Type::Dyn, Type::Bool);
+        let rec_ = |ns: &[&str]| rec(&ns.iter().map(|n| (*n, Type::Int)).collect::<Vec<_>>());
+        let p = |f: &Type, t: &Type| relate_cast(f, t, &infer) == Rel::Proven;
+        // DOWN of a source param `a` against target param `t` iff !p(t, a) (was needs_down(a, t)).
+        assert!(p(&i, &d) && p(&i, &var("u")) && p(&i, &i));
+        assert!(!p(&d, &i) && !p(&uni(&[i.clone(), b.clone()]), &i) && !p(&list(d.clone()), &list(i.clone())));
+        assert!(!p(&rec_(&["x"]), &rec_(&["x", "y"])));
+        assert!(!p(&vec_n(iv("m")), &vec_n(lit(3))) && p(&vec_n(lit(3)), &vec_n(lit(3))));
+        assert!(p(&uni(&[i.clone(), s.clone()]), &uni(&[i.clone(), s.clone()]))); // cons: no redundant DOWN
+        // A wrapper iff the Fun source is Unknown (was needs_wrapper).
+        assert!(matches!(relate_cast(&fun(i.clone(), i.clone()), &d, &infer), Rel::Unknown(..)));
+        assert!(p(&fun(d.clone(), d.clone()), &d) && p(&fun(d.clone(), named("L#1")), &d));
+        assert!(matches!(relate_cast(&fun(d.clone(), fun(i.clone(), i.clone())), &d, &infer), Rel::Unknown(..)));
+        // Migrated from the fits unit tests.
+        assert!(p(&fun(rec_(&["x"]), i.clone()), &fun(rec_(&["x", "y"]), i.clone())));
+        assert!(matches!(relate(&fun(rec_(&["z"]), i.clone()), &fun(rec_(&["x", "y"]), i.clone()), &infer), Rel::Refuted(_)));
+        assert!(p(&fun(i.clone(), i.clone()), &fun(i.clone(), d.clone())));
+        assert!(matches!(relate(&fun(i.clone(), s.clone()), &fun(i.clone(), i.clone()), &infer), Rel::Refuted(_)));
     }
 }

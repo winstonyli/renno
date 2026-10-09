@@ -7,11 +7,10 @@ use crate::expr::{Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, Pattern, Sp
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::plist::PList;
 use crate::span::Span;
-use crate::types::{consistent, fits, row_consistent, EffectRow, Type};
+use crate::types::{consistent, row_consistent, EffectRow, Type};
 use crate::util::find_field;
-#[allow(dead_code)] // relate has no consumer until T3/T4; T4 removes this
 mod relate;
-use self::relate::relate;
+use self::relate::{relate, relate_cast};
 pub(crate) use self::relate::{Cause, Rel, Residual, Why};
 
 // The Span is always an ORIGINAL (pre-elaboration) node's -- the one whose
@@ -1207,21 +1206,6 @@ fn erase_open_indexed(t: &Type, has_value: &dyn Fn(&str) -> bool) -> Type {
     }
 }
 
-// Structural equality that ignores effect rows (no runtime row representation).
-// Intentionally Fun/structure-only with an == fallback. coerce_cast uses it as
-// a cheap identity guard so an equal-up-to-rows cast skips a redundant DOWN
-// (needs_wrapper already answers false for equal concrete types).
-fn same_ignoring_rows(a: &Type, b: &Type) -> bool {
-    match (a, b) {
-        (Type::Fun(p, _, r), Type::Fun(p2, _, r2)) => same_ignoring_rows(p, p2) && same_ignoring_rows(r, r2),
-        (Type::List(x), Type::List(y)) => same_ignoring_rows(x, y),
-        (Type::Tuple(xs), Type::Tuple(ys)) | (Type::Union(xs), Type::Union(ys)) => xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| same_ignoring_rows(x, y)),
-        (Type::Record(xs), Type::Record(ys)) => xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|((n, x), (m, y))| n == m && same_ignoring_rows(x, y)),
-        (Type::Indexed(w, i), Type::Indexed(w2, i2)) => i == i2 && same_ignoring_rows(w, w2),
-        _ => a == b,
-    }
-}
-
 // Wraps a Fun-typed `e` so that, seen as `to` (Dyn or a Fun), its argument is
 // re-checked against the parameter type it was really declared with and a
 // returned function is wrapped in turn. Closure form:
@@ -1231,10 +1215,9 @@ fn same_ignoring_rows(a: &Type, b: &Type) -> bool {
 fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let from = env.infer.resolve_deep(from);
     let to = env.infer.resolve_deep(to);
-    // A cast from a type to itself is the identity. (A literal cast keeps the
-    // Lambda a Lambda, so an annotated `let rec` binding stays a direct group
-    // either way; this guard just avoids a redundant DOWN.)
-    if same_ignoring_rows(&from, &to) || !needs_wrapper(&from, &to) {
+    // Only a function value relate cannot prove is wrapped. Refuted never reaches here from
+    // coerce (coerce_check reported it); joins and Dyn sinks cannot refute a Fun.
+    if !matches!(from, Type::Fun(..)) || !matches!(relate_cast(&from, &to, env.infer), Rel::Unknown(..)) {
         return e;
     }
     if matches!(arena[e], Expr::Lambda(..)) {
@@ -1242,7 +1225,6 @@ fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Chec
     }
     build_cast(arena, e, &from, &to, env)
 }
-
 // Casts each Synth-joined arm from its own type to the FINAL joined type, so a
 // typed function that reaches a Dyn (or partly-Dyn Fun) join keeps its
 // parameter checks. Call once, after the whole join: a later arm can still
@@ -1261,15 +1243,25 @@ fn cast_binder(base: &str) -> String {
     fresh_index_name(base)
 }
 
-// The (parameter, result) types a cast aims at: those of a Fun target, Dyn for
-// both when the target is Dyn.
-fn cast_targets(to: &Type) -> (Type, Type) {
+// The (parameter, result) types a cast aims at: those of a Fun target (a Named one
+// unfolded a step, a Union with exactly one Fun alternative aimed at it), Dyn for both otherwise.
+fn cast_targets(to: &Type, infer: &InferCtx) -> (Type, Type) {
     match to {
         Type::Fun(a2, _, b2) => ((**a2).clone(), (**b2).clone()),
+        Type::Named(id) => match infer.named_types.get(id) {
+            Some(raw) if !matches!(raw, Type::Named(_)) => cast_targets(raw, infer),
+            _ => (Type::Dyn, Type::Dyn),
+        },
+        Type::Union(alts) => {
+            let mut funs = alts.iter().filter(|t| matches!(t, Type::Fun(..)));
+            match (funs.next(), funs.next()) {
+                (Some(f), None) => cast_targets(f, infer),
+                _ => (Type::Dyn, Type::Dyn),
+            }
+        }
         _ => (Type::Dyn, Type::Dyn),
     }
 }
-
 // Is index variable `v` already bound by a witness in scope (a local one, or
 // one the inference recorded)?
 fn index_witnessed<'a>(env: &'a CheckEnv<'a>) -> impl Fn(&str) -> bool + 'a {
@@ -1288,10 +1280,10 @@ fn index_witnessed<'a>(env: &'a CheckEnv<'a>) -> impl Fn(&str) -> bool + 'a {
 fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let Expr::Lambda(param, _, body) = arena[e].clone() else { unreachable!("build_literal_cast takes a Lambda") };
     let Type::Fun(a, _, b) = from else { unreachable!("build_literal_cast takes a Fun source") };
-    let (a_target, b_target) = cast_targets(to);
+    let (a_target, b_target) = cast_targets(to, env.infer);
     let witnessed = index_witnessed(env);
-    let up_body = if needs_upcast(b, &b_target) { literal_up(arena, body, b, &b_target, env) } else { body };
-    if !needs_down(a, &a_target) {
+    let up_body = cast_up(arena, body, b, &b_target, env, true);
+    if relate_cast(&a_target, a, env.infer) == Rel::Proven {
         return arena.push(Expr::Lambda(param, Some(a_target), up_body));
     }
     // The incoming value arrives under a fresh name and is checked outside the
@@ -1319,7 +1311,24 @@ fn literal_up(arena: &mut Arena, body: ExprRef, b: &Type, b_target: &Type, env: 
     }
 }
 
-// The closure form of coerce_cast for a Fun `from` (needs_wrapper holds).
+// UP for a result `res` of type `b` seen as `b_target`: nothing when relate proves it; a function
+// result is cast in turn; any other result is checked against what the target promises (h03).
+// Runs once per call: repeatable, records no obligations.
+fn cast_up(arena: &mut Arena, res: ExprRef, b: &Type, b_target: &Type, env: &CheckEnv, literal: bool) -> ExprRef {
+    if relate_cast(b, b_target, env.infer) == Rel::Proven {
+        return res;
+    }
+    match b {
+        Type::Fun(..) if literal => literal_up(arena, res, b, b_target, env),
+        Type::Fun(..) => build_cast(arena, res, b, b_target, env),
+        _ => {
+            let body_env = CheckEnv { infer: env.infer, local: env.local.clone(), defer: false, repeatable: true, span: env.span };
+            let target = erase_open_indexed(b_target, &index_witnessed(&body_env));
+            build_boundary_check(arena, res, &target, &body_env, &HashSet::new())
+        }
+    }
+}
+// The closure form of coerce_cast for a Fun `from` (relate_cast is Unknown).
 // Every binder is fresh (cast_binder), so a returned function's wrapper, nested
 // inside this one's lambda, never shadows it. A Vec(n) parameter whose `n` has
 // no witness in scope binds one from `__ca#k` (DOWN then needs only is_list:
@@ -1333,7 +1342,7 @@ fn literal_up(arena: &mut Arena, body: ExprRef, b: &Type, b_target: &Type, env: 
 // `f([1])` is rejected. Pinned by a test.
 fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let Type::Fun(a, _, b) = from else { unreachable!("build_cast takes a Fun source") };
-    let (a_target, b_target) = cast_targets(to);
+    let (a_target, b_target) = cast_targets(to, env.infer);
     let cf = cast_binder("__cf");
     let ca = cast_binder("__ca");
     let witnessed = index_witnessed(env);
@@ -1342,63 +1351,20 @@ fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Check
     local.extend(witness.as_ref());
     let body_env = CheckEnv { infer: env.infer, local, defer: false, repeatable: true, span: env.span };
     let ca_ref = arena.push(Expr::Var(ca.clone()));
-    let arg = if needs_down(a, &a_target) {
+    let arg = if relate_cast(&a_target, a, env.infer) != Rel::Proven {
         build_boundary_check(arena, ca_ref, &erase_open_indexed(a, &witnessed), &body_env, &HashSet::new())
     } else {
         ca_ref
     };
     let cf_ref = arena.push(Expr::Var(cf.clone()));
     let call = arena.push(Expr::App(cf_ref, arg));
-    let result = if needs_upcast(b, &b_target) { build_cast(arena, call, b, &b_target, &body_env) } else { call };
+    let result = cast_up(arena, call, b, &b_target, &body_env, false);
     let body = match &witness {
         Some(w) if w.used.get() => w.bind(arena, &ca, result),
         _ => result,
     };
     let lambda = arena.push(Expr::Lambda(ca, Some(a_target), body));
     arena.push(Expr::Let(cf, None, e, lambda))
-}
-// True iff `t` has no Dyn, Var, Union or free index variable at any depth:
-// a type a strict (non-gradual) `fits` check can be trusted on. A Union
-// counts as loose because `fits(Int, Int | Bool)` holds. Named and Token
-// are tolerated (nominal leaves). All take resolve_deep'd types.
-pub(crate) fn loose_free(t: &Type) -> bool {
-    match t {
-        Type::Dyn | Type::Var(_) | Type::Union(_) => false,
-        Type::List(elem) => loose_free(elem),
-        Type::Fun(p, _, r) => loose_free(p) && loose_free(r),
-        Type::Tuple(items) => items.iter().all(loose_free),
-        Type::Record(fields) => fields.iter().all(|(_, t)| loose_free(t)),
-        Type::Indexed(wrapped, _) => loose_free(wrapped) && index_vars_as_written(t).is_empty(),
-        _ => true,
-    }
-}
-
-// `a_src` statically fits `a_target` and nothing about the target is loose.
-// Argument order mirrors fits' param contravariance: fits(act_param, req_param).
-pub(crate) fn strict_fits(a_target: &Type, a_src: &Type) -> bool {
-    fits(a_src, a_target) && loose_free(a_target)
-}
-
-// Must a value of type `a_src` be re-checked at runtime to be used as `a_target`?
-pub(crate) fn needs_down(a_src: &Type, a_target: &Type) -> bool {
-    !matches!(a_src, Type::Dyn | Type::Var(_)) && !strict_fits(a_target, a_src)
-}
-
-// Does a return value of type `b` need a wrapper to be seen as `b_target`?
-// Recurses only into a bare Fun return; never Named, Union, Tuple, Record, List.
-fn needs_upcast(b: &Type, b_target: &Type) -> bool {
-    matches!(b, Type::Fun(..)) && needs_wrapper(b, b_target)
-}
-
-// Does casting `from` (a Fun) to `to` (Dyn, read as Fun(Dyn, _, Dyn), or a
-// Fun) need a wrapper around the function value?
-pub(crate) fn needs_wrapper(from: &Type, to: &Type) -> bool {
-    let Type::Fun(a, _, b) = from else { return false };
-    match to {
-        Type::Dyn => needs_down(a, &Type::Dyn) || needs_upcast(b, &Type::Dyn),
-        Type::Fun(a2, _, b2) => needs_down(a, a2) || needs_upcast(b, b2),
-        _ => false,
-    }
 }
 
 // Like `coerce`, but the target is "Int or Float" rather than one fixed

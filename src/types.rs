@@ -333,48 +333,6 @@ pub fn record_satisfies(required: &[(String, Type)], actual: &[(String, Type)]) 
     required.iter().all(|(name, ty)| find_field(actual, name).is_some_and(|aty| consistent(ty, aty)))
 }
 
-// A directional generalization of record_satisfies to also cover Fun:
-// is `actual` safely substitutable wherever `required` is expected?
-// Fun is contravariant on its param (a function that accepts a WIDER
-// range of inputs -- i.e. a NARROWER required param type -- can stand
-// in for one declared to need only a narrower range) and covariant on
-// its return (a function promising a MORE PRECISE, narrower return can
-// stand in for one that only promised something wider). Record reuses
-// record_satisfies's own width-tolerant shape (walk `required`'s own
-// fields, find_field into `actual`), but recurses through `fits`
-// itself rather than `consistent` -- deliberately a SEPARATE function
-// from record_satisfies, not a generalization it delegates to:
-// consistent()'s own Type::Record arm needs record_satisfies to keep
-// recursing through consistent() (exact, symmetric), since Eq/Union-
-// membership must NOT silently gain Fun's own contravariant tolerance
-// through a Record field. Everything else delegates straight to
-// consistent(), unchanged.
-pub fn fits(required: &Type, actual: &Type) -> bool {
-    match (required, actual) {
-        (Type::Fun(req_param, req_row, req_ret), Type::Fun(act_param, act_row, act_ret)) => {
-            fits(act_param, req_param) && fits(req_ret, act_ret) && row_consistent(req_row, act_row)
-        }
-        (Type::Record(required), Type::Record(actual)) => required
-            .iter()
-            .all(|(name, ty)| find_field(actual, name).is_some_and(|aty| fits(ty, aty))),
-        // "Forgetting" an Indexed value's own tracked index is a sound,
-        // one-directional widening -- an Indexed-typed value is usable
-        // anywhere its wrapped type is expected (e.g. a Vec(3)-typed list
-        // passed where a plain [T] is required), the same direction every
-        // other relation in this function already models. Guarded so this
-        // ONLY fires when `required` itself isn't Indexed: two Indexed
-        // types must still go through consistent()'s own exact-index arm
-        // above (via the catch-all below), and a plain, non-Indexed
-        // `actual` must NOT satisfy a required Indexed position -- that
-        // asymmetry is the entire point of tracking the index at all, so
-        // there is deliberately no symmetric arm the other way.
-        (required, Type::Indexed(actual_wrapped, _)) if !matches!(required, Type::Indexed(..)) => {
-            fits(required, actual_wrapped)
-        }
-        _ => consistent(required, actual),
-    }
-}
-
 pub fn row_consistent(a: &EffectRow, b: &EffectRow) -> bool {
     match (a, b) {
         (EffectRow::Dyn, _) | (_, EffectRow::Dyn) => true,

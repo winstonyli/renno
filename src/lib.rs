@@ -3063,85 +3063,6 @@ mod tests {
     }
 
     #[test]
-    fn fits_accepts_a_callback_requiring_a_narrower_record_than_required() {
-        // The actual motivating case: a Fun requiring {x: Int, y: Int}
-        // as its own param is satisfied by an actual Fun that only
-        // requires {x: Int} -- contravariant parameter subtyping.
-        // Swapped on purpose: fits(required, actual) checks
-        // fits(actual_param, required_param), not the other way
-        // around -- get this backwards and the test below (which
-        // checks the REJECT direction) would also wrongly pass.
-        use types::{fits, EffectRow, Type};
-        let required = Type::Fun(
-            std::rc::Rc::new(Type::Record(std::rc::Rc::new(vec![
-                ("x".to_string(), Type::Int),
-                ("y".to_string(), Type::Int),
-            ]))),
-            EffectRow::Dyn,
-            std::rc::Rc::new(Type::Int),
-        );
-        let actual = Type::Fun(
-            std::rc::Rc::new(Type::Record(std::rc::Rc::new(vec![("x".to_string(), Type::Int)]))),
-            EffectRow::Dyn,
-            std::rc::Rc::new(Type::Int),
-        );
-        assert!(fits(&required, &actual));
-    }
-
-    #[test]
-    fn fits_rejects_a_callback_requiring_a_field_that_does_not_exist_in_what_is_required() {
-        // The narrower callback must still name a field that's ACTUALLY
-        // present in what the wider requirement supplies. Careful with
-        // the exact shape here: {y: Int} alone WOULD correctly fit
-        // {x: Int, y: Int} (it's a genuinely valid narrower requirement
-        // -- any value satisfying {x, y} also has field y) -- that's
-        // NOT the case this test is for. This test uses {z: Int}, a
-        // field {x: Int, y: Int} doesn't have AT ALL, to test genuine
-        // non-substitutability, not just "a different single field."
-        use types::{fits, EffectRow, Type};
-        let required = Type::Fun(
-            std::rc::Rc::new(Type::Record(std::rc::Rc::new(vec![
-                ("x".to_string(), Type::Int),
-                ("y".to_string(), Type::Int),
-            ]))),
-            EffectRow::Dyn,
-            std::rc::Rc::new(Type::Int),
-        );
-        let actual = Type::Fun(
-            std::rc::Rc::new(Type::Record(std::rc::Rc::new(vec![("z".to_string(), Type::Int)]))),
-            EffectRow::Dyn,
-            std::rc::Rc::new(Type::Int),
-        );
-        assert!(!fits(&required, &actual));
-    }
-
-    #[test]
-    fn fits_accepts_a_callback_whose_return_type_is_narrower_than_required() {
-        // Final whole-branch review, Important #2: every other fits()/
-        // coerce()/unify_fits() test in this plan uses Int on BOTH sides
-        // of the return type, so a covariant-vs-contravariant bug in the
-        // return-type check specifically (e.g. fits(req_ret, act_ret)
-        // silently swapped to fits(act_ret, req_ret)) would pass the whole
-        // suite undetected. Covariant return: a callback promising to
-        // return an Int (a MORE PRECISE, narrower promise) can stand in
-        // for one that only promised to return Dyn (a WIDER, less precise
-        // promise) -- the opposite direction from the param check.
-        use types::{fits, EffectRow, Type};
-        let required = Type::Fun(std::rc::Rc::new(Type::Int), EffectRow::Dyn, std::rc::Rc::new(Type::Dyn));
-        let actual = Type::Fun(std::rc::Rc::new(Type::Int), EffectRow::Dyn, std::rc::Rc::new(Type::Int));
-        assert!(fits(&required, &actual));
-    }
-
-    #[test]
-    fn fits_rejects_a_callback_whose_return_type_is_wrong() {
-        // Companion rejection case for the covariance test above.
-        use types::{fits, EffectRow, Type};
-        let required = Type::Fun(std::rc::Rc::new(Type::Int), EffectRow::Dyn, std::rc::Rc::new(Type::Int));
-        let actual = Type::Fun(std::rc::Rc::new(Type::Int), EffectRow::Dyn, std::rc::Rc::new(Type::Str));
-        assert!(!fits(&required, &actual));
-    }
-
-    #[test]
     fn eq_still_rejects_fun_values_that_fit_but_are_not_consistent() {
         // Regression guard for this whole plan's own Global Constraint:
         // consistent()'s own semantics must not change anywhere else.
@@ -3730,35 +3651,6 @@ mod tests {
     }
 
     #[test]
-    fn fits_requires_both_wrapped_type_and_index_to_match() {
-        use crate::index_expr::IndexExpr;
-        use std::rc::Rc;
-        use types::Type;
-        let a = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(3)));
-        let b = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(3)));
-        assert!(types::fits(&a, &b));
-        let c = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(4)));
-        assert!(!types::fits(&a, &c));
-    }
-
-    #[test]
-    fn fits_lets_an_indexed_value_satisfy_its_own_plain_wrapped_type() {
-        // The "forget the index" widening (final review Finding 1+3): an
-        // Indexed-typed value is usable anywhere its wrapped type is
-        // required -- a real Vec(3) satisfies a required plain [Int].
-        use crate::index_expr::IndexExpr;
-        use std::rc::Rc;
-        use types::Type;
-        let vec3 = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(3)));
-        assert!(types::fits(&Type::List(Rc::new(Type::Int)), &vec3));
-        // The REVERSE must NOT hold -- a plain [Int] does not carry the
-        // length guarantee a required Vec(3) position promises, and
-        // silently letting it through would defeat the entire point of
-        // tracking the index in the first place.
-        assert!(!types::fits(&vec3, &Type::List(Rc::new(Type::Int))));
-    }
-
-    #[test]
     fn a_vec_typed_value_can_be_pattern_matched_with_nil_and_cons() {
         // Final review Finding 1+3: before the fix, pattern_could_match's
         // Type::Indexed gap AND bind_pattern_vars's Pattern::Cons hard
@@ -4240,38 +4132,6 @@ mod tests {
             !contains_check(&arena, elaborated),
             "expected unify()'s own Type::Indexed arm to bind n := 3 via unify_index_expr, keeping the if's result precisely Indexed(3) so the Vec(3) annotation needs no runtime check"
         );
-    }
-
-    #[test]
-    fn needs_down_decides_when_a_source_value_must_be_re_checked_against_a_target() {
-        use crate::index_expr::IndexExpr;
-        use crate::typecheck::needs_down;
-        use std::rc::Rc;
-        use types::Type;
-        let list = |t: Type| Type::List(Rc::new(t));
-        let rec = |names: &[&str]| Type::Record(Rc::new(names.iter().map(|n| (n.to_string(), Type::Int)).collect()));
-        let vec_of = |i: IndexExpr| Type::Indexed(Rc::new(list(Type::Int)), Rc::new(i));
-        assert!(!needs_down(&Type::Dyn, &Type::Int));
-        assert!(!needs_down(&Type::Var("a".to_string()), &Type::Int));
-        assert!(!needs_down(&Type::Int, &Type::Int));
-        assert!(needs_down(&Type::Int, &Type::Dyn));
-        assert!(needs_down(&Type::Int, &Type::Union(Rc::new(vec![Type::Int, Type::Bool]))));
-        assert!(needs_down(&list(Type::Int), &list(Type::Dyn)));
-        assert!(needs_down(&rec(&["x", "y"]), &rec(&["x"])));
-        assert!(needs_down(&vec_of(IndexExpr::Lit(3)), &vec_of(IndexExpr::Var("m".to_string()))));
-        assert!(!needs_down(&vec_of(IndexExpr::Lit(3)), &vec_of(IndexExpr::Lit(3))));
-    }
-
-    #[test]
-    fn needs_wrapper_decides_when_a_function_cast_needs_a_wrapper() {
-        use crate::typecheck::needs_wrapper;
-        use std::rc::Rc;
-        use types::{EffectRow, Type};
-        let fun = |a: Type, b: Type| Type::Fun(Rc::new(a), EffectRow::Dyn, Rc::new(b));
-        assert!(needs_wrapper(&fun(Type::Int, Type::Int), &Type::Dyn));
-        assert!(!needs_wrapper(&fun(Type::Dyn, Type::Dyn), &Type::Dyn));
-        assert!(needs_wrapper(&fun(Type::Dyn, fun(Type::Int, Type::Int)), &Type::Dyn));
-        assert!(!needs_wrapper(&fun(Type::Dyn, Type::Named("T#1".to_string())), &Type::Dyn));
     }
 
     #[test]
@@ -7126,10 +6986,10 @@ mod tests {
     }
 
     #[test]
-    fn a_union_target_is_not_wrapped_is_a_known_limitation() {
+    fn a_function_into_a_union_target_is_wrapped() {
         let src = "let h: ((Dyn -> Dyn) | Bool) = fun x: Int -> x in (fun k: (Dyn -> Dyn) -> k(true))(h)";
-        // Union targets are not descended: the cast is skipped and the argument is unchecked (spec 7).
-        assert_eq!(run_source(src).unwrap(), Outcome::Bool(true));
+        // The single Fun alternative is the cast target, so `true` meets the Int parameter (S0 finding 2).
+        assert!(run_source(src).unwrap_err().contains("expected Int"));
     }
 
     #[test]
@@ -8038,5 +7898,57 @@ mod tests {
     fn a_bound_variable_inside_a_container_is_resolved_by_the_checker() {
         let err = run_source("let f = fun x -> let s: Str = x in let n: [Int] = [x] in n in f(\"a\")").unwrap_err();
         assert!(err.contains("type mismatch"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_dyn_result_is_checked_where_the_target_promises_more() {
+        let curried = "let mk = fun a: Int -> (fun b: Int -> if b == 0 then true else 1) in let k: (Int -> Int -> Int) = mk in k(1)(0) + 1";
+        let err = run_source(curried).unwrap_err();
+        assert!(err.contains("found Bool") && !err.contains("Int | Float"), "unexpected message: {err}");
+        let err = run_source("let f = fun x: Int -> let d: Dyn = true in d in let g: (Int -> Int) = f in g(1) + 1").unwrap_err();
+        assert!(err.contains("found Bool") && !err.contains("Int | Float"), "unexpected message: {err}");
+        assert_eq!(run_source("let f = fun a: Int -> fun b: Dyn -> b in let g: (Int -> Int -> Int) = f in g(1)(2)").unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_function_into_a_recursive_alias_it_may_satisfy_is_wrapped() {
+        // Unknown, not Refuted: wrapped against the unfolding, so `true` meets the Int parameter.
+        let err = run_source("type G = Dyn -> (G | Int) in let g: G = fun x: Int -> x in let d: Dyn = g in d(true)").unwrap_err();
+        assert!(err.contains("expected Int"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_literal_lambda_with_a_dyn_result_is_checked_against_the_target() {
+        // The literal (in-place) cast path: cast_up with `literal` set.
+        let src = "let apply = fun h: (Int -> Int) -> h(3) in apply(fun x: Int -> let d: Dyn = true in d)";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("found Bool") && !err.contains("Int | Float"), "unexpected message: {err}");
+        let ok = "let apply = fun h: (Int -> Int) -> h(3) in apply(fun x: Int -> let d: Dyn = x in d)";
+        assert_eq!(run_source(ok).unwrap().as_int(), 3);
+    }
+
+    #[test]
+    fn a_cast_result_check_runs_again_on_every_resume() {
+        // The wrapper body is repeatable: a multi-shot handler resumes through the UP check once per shot.
+        let head = "let f: (Int -> Dyn) = fun x -> perform choose(x) in let g: (Int -> Int) = f in handle g(1) + 0 with handler choose(p, resume) -> ";
+        assert_eq!(run_source(&format!("{head}resume(10) + resume(20)")).unwrap().as_int(), 30);
+        let err = run_source(&format!("{head}resume(10) + (if resume(true) then 1 else 2)")).unwrap_err();
+        assert!(err.contains("expected Int, found Bool"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_fixed_length_result_is_checked_in_a_cast() {
+        let err = run_source("let f: (Int -> Dyn) = fun v -> [1] in let g: (Int -> Vec(2)) = f in g(1)").unwrap_err();
+        assert!(err.contains("expected [Dyn](2), found List"), "unexpected message: {err}");
+        assert_eq!(run_source("let f: (Int -> Dyn) = fun v -> [1, 2] in let g: (Int -> Vec(2)) = f in g(1)").unwrap().to_string(), "[1, 2]");
+    }
+
+    #[test]
+    fn a_function_returning_a_function_into_a_recursive_alias_is_wrapped_at_each_level() {
+        // Baseline rejected both (fits could not unfold G); relate says Unknown, so the pair is wrapped.
+        let head = "type G = Dyn -> (G | Int) in let g: G = fun x: Int -> fun y: Int -> y in let d: Dyn = g in ";
+        assert_eq!(run_source(&format!("{head}d(1)(2)")).unwrap().as_int(), 2);
+        let err = run_source(&format!("{head}d(1)(true)")).unwrap_err();
+        assert!(err.contains("expected Int, found Bool"), "unexpected message: {err}");
     }
 }
