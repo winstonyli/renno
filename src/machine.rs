@@ -576,7 +576,7 @@ fn walk<'t, 'a, const TRACK: bool>(test: &'t Test, defs: &'t [Test], v: &'a Valu
     let mut choices: Vec<Choice<'t, 'a>> = Vec::new();
     'main: loop {
         let mut fail: Fail<'a> = 'step: {
-            let Some(step) = work.pop() else { return None };
+            let step = work.pop()?;
             let (t, v, node) = match step {
                 Step::Commit => {
                     choices.pop();
