@@ -1675,11 +1675,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
         // surface as an unrelated bare panic instead of this function's own
         // clean "type error: expected ..., found ..." message.
         //
-        // Only Type::List-wrapped Indexed types are reachable this early
-        // -- a Type::Named-wrapped Indexed (derived index-refinement) is
-        // a later phase's own concern, nothing before this phase can
-        // construct one yet (see index_expr_to_expr's own doc comment
-        // for the matching "Phase 2 only" note on the index side).
+        // List-wrapped: compare the length; any other wrapper is checked as itself (the index has no runtime length).
         Type::Indexed(wrapped, index) => match wrapped.as_ref() {
             Type::List(_) => {
                 let tmp = fresh_index_name("__check_tmp");
@@ -1692,7 +1688,8 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
                 let if_expr = arena.push(Expr::If(cond, tmp_ref, fail));
                 arena.push(Expr::Let(tmp, None, e, if_expr))
             }
-            _ => e,
+            // An alias (or Dyn/Var) wrapper: no runtime length to compare, but the shape is checked.
+            _ => build_boundary_check(arena, e, wrapped, env, visiting),
         },
         // Look up what this id unfolds to and build ITS OWN boundary
         // check, exactly as if `to` had been written directly as that

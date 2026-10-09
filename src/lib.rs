@@ -7977,4 +7977,13 @@ mod tests {
         // parked: coerce's literal rescue accepts it (documented in the gradual-unknown design)
         assert_eq!(run_source("type L = (Int, L) | Bool in let l: L = (1, (2, 3)) in 1").unwrap().as_int(), 1);
     }
+
+    #[test]
+    fn dyn_into_an_indexed_alias_is_checked_against_the_alias() {
+        // The index is dropped (no runtime length for an alias); the alias shape is not.
+        let err = run_source("type N = (Int, N) | Bool in let d: Dyn = 5 in let x: N(1) = d in x").unwrap_err();
+        // Verified text: a run-time check, not a static mismatch.
+        assert!(err.contains("type error: expected (Int, N) | Bool, found Int"), "unexpected message: {err}");
+        assert_eq!(run_source("type N = (Int, N) | Bool in let d: Dyn = true in let x: N(1) = d in 1").unwrap().as_int(), 1);
+    }
 }
