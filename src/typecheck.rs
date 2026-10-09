@@ -1272,7 +1272,7 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
             // ponytail: this whole rescue is a purely static, zero-overhead
             // decision -- so for a literal value, nothing is EVER checked at
             // the recursive position past this first level, not deferred to
-            // a later shallow check the way a genuine Dyn-boundary crossing
+            // a later deep check the way a genuine Dyn-boundary crossing
             // works, just never checked, period (e.g. `f((1, (2, 3)))`
             // against `List = (Int, List) | Bool` never confirms `3` is
             // secretly wrapped Bool-shaped anything at that inner position).
@@ -1531,7 +1531,7 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
         Type::Int | Type::Float => Ok(e),
         Type::Dyn | Type::Var(_) => {
             let numeric = Type::Union(Rc::new(vec![Type::Int, Type::Float]));
-            Ok(build_check_node(arena, e, Test::Or(vec![Test::Int, Test::Float]), CheckMode::Assert, &numeric, &env.with_span(span)))
+            Ok(build_check_node(arena, e, Shape::plain(Test::Or(vec![Test::Int, Test::Float])), CheckMode::Assert, &numeric, &env.with_span(span)))
         }
         other => Err(TypeError(format!("type mismatch: expected Int or Float, found {other}"), span)),
     }
@@ -1546,9 +1546,10 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
 // left open (that's coerce's own job, checked before this is ever
 // called).
 //
-// Every shallow shape (Int/Float/Bool/Str/List/Token/Tuple arity/Record
-// fields/a union of those, a Named one unfolded) is ONE native Expr::Check
-// node (build_shape_check): no let, no env frame, no builtin call. Fun gets
+// Every function-free shape (Int/Float/Bool/Str/Token, and List/Tuple/Record
+// of those checked element by element, a union of those, a Named alias
+// through any depth) is ONE native Expr::Check node (build_shape_check): no
+// let, no env frame, no builtin call. Fun gets
 // a real per-call contract (wrap_fun_contract, since a bare callability tag
 // can't see inside a closure -- "callable" isn't "callable with this
 // exact signature"). What a Check can't express stays desugared: a Vec(n)
@@ -1572,13 +1573,11 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
 fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
     match to {
         Type::Int | Type::Float | Type::Bool | Type::Str | Type::List(_) | Type::Token(_) | Type::Tuple(_) | Type::Record(_) => {
-            build_shape_check(arena, e, to, env, visiting)
+            build_shape_check(arena, e, to, env)
         }
         Type::Fun(param_ty, _row, ret_ty) => wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone(), env, visiting),
-        Type::Union(_) if shape_test(to, env, visiting).is_none() || needs_contract(to, env, visiting) => {
-            build_union_check(arena, e, to, env, visiting)
-        }
-        Type::Union(_) => build_shape_check(arena, e, to, env, visiting),
+        Type::Union(_) if shape_of(to, env).is_none() || needs_contract(to, env, visiting) => build_union_check(arena, e, to, env, visiting),
+        Type::Union(_) => build_shape_check(arena, e, to, env),
         // Dyn accepts everything, so a check against it is the identity. Not
         // unreachable: wrap_fun_contract checks a call's result against the
         // Fun's return type, which is Dyn for `Dyn -> Dyn` (and nested
@@ -1611,12 +1610,13 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
             }
             _ => e,
         },
-        // One level only, matching every other shape check in this
-        // file: look up what this id unfolds to and build ITS OWN
-        // boundary check, exactly as if `to` had been written directly
-        // as that unfolded shape. Any Type::Named NESTED inside that
-        // unfolded shape stays unresolved -- checked later, lazily,
-        // only if something else separately touches that position.
+        // Look up what this id unfolds to and build ITS OWN boundary
+        // check, exactly as if `to` had been written directly as that
+        // unfolded shape. A Type::Named nested inside a container of that
+        // shape is checked by the native deep test (shape_of's `Ref`s); one
+        // reached only through a Fun or desugared Vec(n) position stays
+        // unresolved -- checked later, lazily, only if something else
+        // separately touches that position.
         // A missing registry entry IS reachable (not an internal-bug-only
         // case): parser::parse (the original, unchanged signature) builds
         // its own named_types registry but discards it rather than
@@ -1904,7 +1904,7 @@ fn index_var_to_expr(arena: &mut Arena, name: &str, env: &CheckEnv) -> ExprRef {
         // An untyped caller may have passed a non-list for the witness
         // parameter; `len` would panic on it, so test is_list first.
         let list_ref = arena.push(Expr::Var(w.hidden.clone()));
-        let is_list = build_probe(arena, list_ref, Test::List, &Type::List(Rc::new(Type::Dyn)), env);
+        let is_list = build_probe(arena, list_ref, Shape::plain(Test::List), &Type::List(Rc::new(Type::Dyn)), env);
         let len_ref = arena.push(Expr::Var(w.hidden.clone()));
         let len_call = build_prelude_call(arena, "len", len_ref);
         let msg = arena.push(Expr::Str(format!("type error: index variable {name}'s witness is not a list")));
@@ -1933,7 +1933,7 @@ fn index_var_to_expr(arena: &mut Arena, name: &str, env: &CheckEnv) -> ExprRef {
 // together). Also returns the `len(value) == <index>` node, which a
 // deferred obligation patches in place (resolve_obligations).
 fn build_indexed_shape_cond(arena: &mut Arena, value_ref: ExprRef, index: &IndexExpr, env: &CheckEnv) -> (ExprRef, ExprRef) {
-    let is_list = build_probe(arena, value_ref, Test::List, &Type::List(Rc::new(Type::Dyn)), env);
+    let is_list = build_probe(arena, value_ref, Shape::plain(Test::List), &Type::List(Rc::new(Type::Dyn)), env);
     let len_var = prelude_var(arena, "len");
     let len_call = arena.push(Expr::App(len_var, value_ref));
     let index_expr = index_expr_to_expr(arena, index, env);
@@ -1942,7 +1942,7 @@ fn build_indexed_shape_cond(arena: &mut Arena, value_ref: ExprRef, index: &Index
     (arena.push(Expr::If(is_list, len_eq, false_lit)), len_eq)
 }
 
-// The union check for a union a single Check can't express (shape_test is
+// The union check for a union a single Check can't express (shape_of is
 // None: a Vec(n) alternative; or needs_contract: a Fun alternative):
 // `let __check_tmp = e in if <alt1-shape> then <alt1's OWN full check>
 // else if <alt2-shape> then <alt2's OWN full check> else ... else
@@ -1974,40 +1974,99 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, v
     arena.push(Expr::Let(tmp, None, e, result))
 }
 
-// The shallow runtime test for `ty` as one native Test, or None when it
-// can't be one: a Vec(n) length compare needs the index expression
-// evaluated in the environment (build_indexed_shape_cond), so it -- and any
-// union or Named alias reaching one -- stays desugared. `visiting` is the
-// same ancestor set as build_boundary_check's: a Named already being
-// unfolded is `Never` here (re-trying it adds nothing beyond the
-// non-recursive alternatives, so `type A = Int | A` behaves as plain Int),
-// an unregistered Named is `Any` ("no information here"). Mirrors what
-// the old predicate builder answered, arm for arm.
-fn shape_test(ty: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> Option<Test> {
+// A native Test plus the alias table its `Test::Ref`s index.
+struct Shape {
+    test: Test,
+    defs: Vec<Test>,
+}
+
+impl Shape {
+    // A test with no alias references.
+    fn plain(test: Test) -> Shape {
+        Shape { test, defs: Vec::new() }
+    }
+}
+
+// One Named alias body being turned into a Test. Opaque: it holds a Vec(n)
+// somewhere a Test cannot express, so a Ref to it tests nothing.
+enum Slot {
+    Building,
+    Ready(Test),
+    Opaque,
+}
+
+#[derive(Default)]
+struct Defs {
+    ids: HashMap<String, usize>,
+    slots: Vec<Slot>,
+}
+
+// `ty` as one native Shape, or None when it can't be one: a Vec(n) length
+// compare needs the index expression evaluated in the environment
+// (build_indexed_shape_cond), so it -- and any union or Named alias reaching
+// one at the top -- stays desugared.
+fn shape_of(ty: &Type, env: &CheckEnv) -> Option<Shape> {
+    let mut defs = Defs::default();
+    let test = shape_test(ty, env, &mut defs, &HashSet::new())?;
+    let defs = defs.slots.into_iter().map(|slot| if let Slot::Ready(t) = slot { t } else { Test::Any }).collect();
+    Some(Shape { test, defs })
+}
+
+// The deep test for `ty`: what the value must be, element by element
+// (function-free types; a Fun position is only a callability tag, and a
+// Vec(n) inside a container is left unchecked as `Any`). `unguarded` holds
+// the Named aliases unfolded since the last container: meeting one again
+// there would loop without consuming the value, so it is `Never` (making
+// `type A = Int | A` behave as plain Int). Past a container, a Named alias
+// becomes one `Ref` into `defs`, whose body is built once, so a recursive
+// alias terminates because the value does. An unregistered Named is `Any`
+// ("no information here").
+fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &HashSet<String>) -> Option<Test> {
+    let element = |t: &Type, defs: &mut Defs| shape_test(t, env, defs, &HashSet::new()).unwrap_or(Test::Any);
     Some(match ty {
         Type::Dyn | Type::Var(_) => Test::Any,
         Type::Int => Test::Int,
         Type::Float => Test::Float,
         Type::Bool => Test::Bool,
         Type::Str => Test::Str,
-        Type::List(_) => Test::List,
+        Type::List(el) => match element(el, defs) {
+            Test::Any => Test::List,
+            t => Test::ListOf(Box::new(t)),
+        },
         Type::Fun(..) => Test::Fun,
         Type::Token(id) => Test::Token(*id),
         // Exact arity, unlike Record's width tolerance.
-        Type::Tuple(items) => Test::TupleOf(vec![Test::Any; items.len()]),
+        Type::Tuple(items) => Test::TupleOf(items.iter().map(|t| element(t, defs)).collect()),
         // Width-tolerant: `v` need only HAVE (at least) every required
         // field -- extra fields are fine, see Pattern::Record's own doc
         // comment for why nothing downstream can ever observe them.
-        Type::Record(fields) => Test::RecordOf(fields.iter().map(|(name, _)| (name.clone(), Test::Any)).collect()),
-        Type::Union(alts) => Test::Or(alts.iter().map(|alt| shape_test(alt, env, visiting)).collect::<Option<Vec<_>>>()?),
-        Type::Named(id) if visiting.contains(id) => Test::Never,
+        Type::Record(fields) => Test::RecordOf(fields.iter().map(|(name, t)| (name.clone(), element(t, defs))).collect()),
+        Type::Union(alts) => Test::Or(alts.iter().map(|alt| shape_test(alt, env, defs, unguarded)).collect::<Option<Vec<_>>>()?),
+        Type::Named(id) if unguarded.contains(id) => Test::Never,
         Type::Named(id) => match env.infer.named_types.get(id) {
-            Some(raw) => shape_test(raw, env, &extend_visiting(visiting, id))?,
             None => Test::Any,
+            Some(raw) if !unguarded.is_empty() => shape_test(raw, env, defs, &extend_visiting(unguarded, id))?,
+            Some(raw) => match defs.ids.get(id) {
+                Some(&i) if matches!(defs.slots[i], Slot::Opaque) => return None,
+                Some(&i) => Test::Ref(i),
+                None => {
+                    let i = defs.slots.len();
+                    defs.slots.push(Slot::Building);
+                    defs.ids.insert(id.clone(), i);
+                    match shape_test(raw, env, defs, &extend_visiting(unguarded, id)) {
+                        Some(t) => defs.slots[i] = Slot::Ready(t),
+                        None => {
+                            defs.slots[i] = Slot::Opaque;
+                            return None;
+                        }
+                    }
+                    Test::Ref(i)
+                }
+            },
         },
         Type::Indexed(wrapped, _) => match wrapped.as_ref() {
             Type::List(_) => return None,
-            other => shape_test(other, env, visiting)?,
+            other => shape_test(other, env, defs, unguarded)?,
         },
     })
 }
@@ -2033,14 +2092,14 @@ fn needs_contract(ty: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> bool
 }
 
 // The bare boolean half of build_boundary_check's per-type dispatch --
-// "does `value_ref` shallowly look like `ty`," with no let-binding and no
+// "does `value_ref` match `ty`'s deep shape," with no let-binding and no
 // failure of its own, so build_union_check can try several of these in turn
-// before deciding anything. A native Probe wherever shape_test has a Test;
+// before deciding anything. A native Probe wherever shape_of has a Shape;
 // only a Vec(n) length compare (directly, or reached through a union or
 // alias) is built from ordinary If/Bool nodes.
 fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
-    if let Some(test) = shape_test(ty, env, visiting) {
-        return build_probe(arena, value_ref, test, ty, env);
+    if let Some(shape) = shape_of(ty, env) {
+        return build_probe(arena, value_ref, shape, ty, env);
     }
     match ty {
         // An Indexed value's LENGTH is real, provable shape information this
@@ -2067,10 +2126,13 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, env: 
             }
             result
         }
-        // shape_test is None for a Named only past a registered, unvisited
-        // unfold (a visited or unregistered one answers Never/Any).
+        // A Named already being unfolded above (`type A = Vec(2) | A`): its
+        // other alternatives are tried separately, so it adds nothing here.
+        Type::Named(id) if visiting.contains(id) => build_probe(arena, value_ref, Shape::plain(Test::Never), ty, env),
+        // shape_of is None for a Named only when its body reaches a Vec(n)
+        // (an unregistered one answers Any).
         Type::Named(id) => {
-            let raw = env.infer.named_types.get(id).expect("shape_test answered None for an unregistered alias");
+            let raw = env.infer.named_types.get(id).expect("shape_of answered None for an unregistered alias");
             build_shape_predicate(arena, value_ref, raw, env, &extend_visiting(visiting, id))
         }
         _ => unreachable!("every other type has a native shape test"),
@@ -2080,31 +2142,29 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, env: 
 // An Expr::Check of `value_ref` against `test` in the given mode, blaming
 // the cast site `env.span`; `to` is the type whose display text a failure
 // reports.
-fn build_check_node(arena: &mut Arena, value_ref: ExprRef, test: Test, mode: CheckMode, to: &Type, env: &CheckEnv) -> ExprRef {
-    arena.push(Expr::Check(value_ref, Rc::new(CheckSpec { test, defs: Vec::new(), mode, to: to.to_string(), span: env.span })))
+fn build_check_node(arena: &mut Arena, value_ref: ExprRef, shape: Shape, mode: CheckMode, to: &Type, env: &CheckEnv) -> ExprRef {
+    arena.push(Expr::Check(value_ref, Rc::new(CheckSpec { test: shape.test, defs: shape.defs, mode, to: to.to_string(), span: env.span })))
 }
 
-// The Bool outcome of `test`: a union picking its alternative.
-fn build_probe(arena: &mut Arena, value_ref: ExprRef, test: Test, to: &Type, env: &CheckEnv) -> ExprRef {
-    build_check_node(arena, value_ref, test, CheckMode::Probe, to, env)
+// The Bool outcome of `shape`: a union picking its alternative.
+fn build_probe(arena: &mut Arena, value_ref: ExprRef, shape: Shape, to: &Type, env: &CheckEnv) -> ExprRef {
+    build_check_node(arena, value_ref, shape, CheckMode::Probe, to, env)
 }
 
 // A check that always fails with "type error: expected {to}, found
 // {type of value_ref}" -- the else-branch of every desugared check.
 fn build_type_error(arena: &mut Arena, value_ref: ExprRef, to: &Type, env: &CheckEnv) -> ExprRef {
-    build_check_node(arena, value_ref, Test::Never, CheckMode::Assert, to, env)
+    build_check_node(arena, value_ref, Shape::plain(Test::Never), CheckMode::Assert, to, env)
 }
 
 // The one native check: `e` evaluated once and tested against `to`'s whole
-// shallow shape (shape_test) -- arity for Tuple, field PRESENCE
-// (width-tolerantly) for Record, not that each position/field's own value
-// matches ITS OWN element type. A full recursive check is possible but not
-// built yet; this matches the same "confirm the shape, not deeper"
-// precedent every other Dyn boundary check here already sets. Callers pass
-// only a type shape_test answers (Fun callers ask for any_fun()).
-fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
-    let test = shape_test(to, env, visiting).expect("build_shape_check takes a type with a native shape test");
-    build_check_node(arena, e, test, CheckMode::Assert, to, env)
+// deep shape (shape_of) -- every list element, tuple position and record
+// field, through Named aliases. A failure names the innermost offender
+// (machine::explain). Callers pass only a type shape_of answers (Fun callers
+// ask for any_fun()).
+fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> ExprRef {
+    let shape = shape_of(to, env).expect("build_shape_check takes a type with a native shape test");
+    build_check_node(arena, e, shape, CheckMode::Assert, to, env)
 }
 
 // A synthesized reference to the prelude builtin `name`. Spelled `#name`,
@@ -2151,7 +2211,7 @@ fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: 
     let arg_var = fresh_index_name("__contract_arg");
     let fn_var_ref = arena.push(Expr::Var(fn_var.clone()));
     let arg_var_ref = arena.push(Expr::Var(arg_var.clone()));
-    let checked_fn = build_shape_check(arena, fn_var_ref, &any_fun(), env, &HashSet::new());
+    let checked_fn = build_shape_check(arena, fn_var_ref, &any_fun(), env);
     let call = arena.push(Expr::App(checked_fn, arg_var_ref));
     let witness = list_length_var(&param_ty, env.infer).map(|var| IndexWitness::new(var, &arg_var));
     let checked_call = match &witness {
@@ -3687,7 +3747,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             };
             let checked_target = if matches!(target_ty, Type::Dyn | Type::Var(_)) {
                 let required = Type::Record(Rc::new(vec![(name.clone(), Type::Dyn)]));
-                build_shape_check(arena, target2, &required, &CheckEnv::at(infer, spans[target]), &HashSet::new())
+                build_shape_check(arena, target2, &required, &CheckEnv::at(infer, spans[target]))
             } else {
                 target2
             };
@@ -3880,7 +3940,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // uses, rather than leaving it to a differently-worded
                     // panic in machine.rs. Can't know what it might perform,
                     // so the call contributes an unknown (Dyn) row.
-                    let f3 = build_shape_check(arena, f2, &any_fun(), &CheckEnv::at(infer, spans[f]), &HashSet::new());
+                    let f3 = build_shape_check(arena, f2, &any_fun(), &CheckEnv::at(infer, spans[f]));
                     // The argument crosses into an unknown function, so it is
                     // cast to Dyn like any other Dyn position (a typed
                     // function argument gets its wrapper).

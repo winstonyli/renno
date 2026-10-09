@@ -3442,6 +3442,15 @@ mod tests {
         assert_eq!(result.as_int(), 1);
     }
 
+    // The same bare self-reference next to a Vec(n) alternative: shape_of is
+    // None for A, so the desugared predicate path unfolds A and meets it again
+    // (once overflowed the elaborator's own stack).
+    #[test]
+    fn a_vec_n_union_self_reference_does_not_infinite_loop_at_a_dyn_boundary() {
+        assert_eq!(run_source("type A = Vec(2) | A in let d: Dyn = [1, 2] in let l: A = d in 1").unwrap().as_int(), 1);
+        rejects("type A = Vec(2) | A in let d: Dyn = 3 in let l: A = d in 1", "type error: expected [Dyn](2) | A, found Int");
+    }
+
     #[test]
     fn matching_on_a_named_typed_value_is_not_incorrectly_flagged_as_impossible() {
         // Without this task's own fix, pattern_could_match would reject
@@ -7817,7 +7826,7 @@ mod tests {
         let src = "type L = (Int, L) | Bool in let rec mk = fun n -> if n == 0 then 7 else (n, mk(n - 1)) in let d: Dyn = mk(20000) in let l: L = d in 1";
         let started = std::time::Instant::now();
         let err = run_source(src).unwrap_err();
-        assert!(err.starts_with("type error: expected L, found Int at element 1, element 1, element 1"), "{}", &err[..err.len().min(120)]);
+        assert!(err.contains("type error: expected (Int, L) | Bool, found Int at element 1, element 1, element 1"), "{}", &err[..err.len().min(160)]);
         assert!(err.matches("element 1").count() == 20000, "path length");
         assert!(started.elapsed() < std::time::Duration::from_secs(30), "took {:?}", started.elapsed());
     }
