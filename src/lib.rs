@@ -1929,9 +1929,8 @@ mod tests {
 
     #[test]
     fn dyn_boundary_to_record_rejects_wrong_field_names() {
-        // Fixed limitation: is_record/has_field give the Dyn-to-Record
-        // boundary a real, name-aware check now (build_shape_predicate's
-        // own Record arm) -- a same-arity value with entirely different
+        // The Dyn-to-Record boundary check is name-aware (the native
+        // Record test) -- a same-arity value with entirely different
         // field names is correctly rejected, not silently accepted.
         let src = r#"
             handle
@@ -2035,12 +2034,6 @@ mod tests {
         assert!(!run_source("{x: 1, y: 2} == {x: 1, y: 3}").unwrap().as_bool());
     }
 
-    #[test]
-    fn is_record_and_has_field_builtins() {
-        let src = r#"(is_record({x: 1}), has_field({x: 1})("x"), has_field({x: 1})("y"), is_record(5))"#;
-        assert_eq!(run_untyped(src).to_string(), "[true, true, false, false]");
-    }
-
     // --- stdlib ---
 
     #[test]
@@ -2103,11 +2096,9 @@ mod tests {
 
     #[test]
     fn dyn_boundary_to_record_reports_a_clean_error_for_a_non_record_value() {
-        // Regression: build_shape_predicate's Record arm used to check
-        // has_field BEFORE is_record, so a non-Record Dyn value hit
-        // has_field's own panic ("expects a record and a string")
-        // instead of the ordinary desugared type-error message every
-        // other boundary check produces.
+        // Regression: a non-Record Dyn value at a Record boundary must
+        // produce the ordinary type-error message every other boundary
+        // check produces, not an internal field-lookup panic.
         let src = r#"
             handle
               let y = perform choose(0) in
@@ -2218,7 +2209,7 @@ mod tests {
         // Regression: a Dyn-target `.field` used to dispatch straight to
         // get_field with no shape check first, so a non-record value hit
         // get_field's own internal-assertion panic instead of the file's
-        // ordinary fail()+type_name() message every other Dyn-boundary
+        // ordinary type-error message every other Dyn-boundary
         // Record check produces. Now goes through build_shape_check
         // first, same as any other Dyn-to-Record boundary.
         let src = r#"
@@ -6968,12 +6959,12 @@ mod tests {
         assert_eq!(run_source(&format!("{d}d(1)(2)")).unwrap().as_int(), 3);
     }
 
-    // The DOWN check calls builtins (is_int, fail, type_name); a parameter
+    // The DOWN check calls builtins (is_int, fail); a parameter
     // named like one must not capture them.
     #[test]
     fn a_literal_parameter_named_like_a_builtin_does_not_capture_the_check() {
         assert_eq!(run_source("let d: Dyn = fun is_int: Int -> is_int + 1 in d(2)").unwrap().as_int(), 3);
-        for name in ["fail", "type_name", "is_int", "is_list"] {
+        for name in ["fail", "is_int", "is_list"] {
             let src = format!("let d: Dyn = fun {name}: Int -> {name} + 1 in d(true)");
             let err = run_source(&src).expect_err(&src);
             assert!(err.contains("type error: expected Int, found Bool"), "{src}: {err}");
@@ -7100,13 +7091,10 @@ mod tests {
             ("let is_int = 0 in len(map(fun x: Int -> x + 1)([1, 2]))", 2),
             ("let g = fun is_int: Bool -> len(map(fun x: Int -> x + 1)([1, 2])) in g(true)", 2),
             ("let is_list = 0 in len(map(fun v: [Int] -> len(v))([[1], [2]]))", 2),
-            ("let has_field = 0 in len(map(fun r: {x: Int} -> 1)([{x: 1}]))", 1),
-            ("let is_record = 0 in len(map(fun r: {x: Int} -> 1)([{x: 1}]))", 1),
             ("let len = 0 in let f = fun a: Vec(n) -> fun b: Vec(n) -> 7 in let d: Dyn = f in d([1])([2])", 7),
             ("let is_fun = 0 in let d: Dyn = fun x: Int -> x in d(1)", 1),
             ("let is_bool = 0 in let d: Dyn = fun x: Bool -> 1 in d(true)", 1),
             ("let is_float = 0 in let d: Dyn = fun x: Float -> 1 in d(1.5)", 1),
-            ("let type_name = 0 in let d: Dyn = fun x: Int -> x in d(1)", 1),
         ] {
             assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
         }
@@ -7115,7 +7103,7 @@ mod tests {
         for src in [
             "let fail = fun x -> 0 in let f = fun a: Int -> a + 1 in let d: Dyn = f in d(true)",
             "let is_int = fun x -> true in let x: Dyn = true in let y: Int = x in y",
-            "let type_name = fun x -> \"\" in let fail = 0 in let x: Dyn = true in let y: Int = x in y",
+            "let fail = 0 in let x: Dyn = true in let y: Int = x in y",
         ] {
             let err = run_source(src).unwrap_err();
             assert!(err.contains("type error: expected Int, found Bool"), "{src}: {err}");
@@ -7194,10 +7182,10 @@ mod tests {
     }
 
     // A synthesized call to one of the prelude predicates a check used to
-    // desugar into (`#is_int`, `#type_name`, `#has_field`, ...).
+    // desugar into (`#is_int`, `#is_list`, ...).
     fn calls_a_check_predicate(src: &str) -> bool {
         let (arena, root) = elaborated_tree(src);
-        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Var(v) if v.starts_with("#is_") || v == "#type_name" || v == "#has_field"))
+        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Var(v) if v.starts_with("#is_")))
     }
 
     type ShapeCase = (&'static str, Vec<&'static str>, Vec<(&'static str, &'static str)>, Option<expr::Test>);

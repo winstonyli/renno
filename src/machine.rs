@@ -735,19 +735,8 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
         Builtin::IsBool => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Bool, &v))),
         Builtin::IsStr => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Str, &v))),
         Builtin::IsList => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::List, &v))),
-        Builtin::IsRecord => Value::Bool(matches!(args.pop(), Some(Value::Record(_)))),
         // (record, name) -- args.pop() order matches Get's own (list, i)
         // convention: last-pushed arg (name) pops first.
-        Builtin::HasField => {
-            let (name, record) = (args.pop(), args.pop());
-            match (record, name) {
-                (Some(Value::Record(fields)), Some(Value::Str(name))) => {
-                    Value::Bool(find_field(&fields, &name).is_some())
-                }
-                _ => panic!("has_field expects a record and a string"),
-            }
-        }
-        // Same (record, name) argument order as HasField just above.
         // Panics on a missing field the same way Get panics on an
         // out-of-range index -- renno has no Option/Result to return
         // instead. The common case (target statically known to have this
@@ -767,10 +756,6 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             }
         }
         Builtin::IsFun => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Fun, &v))),
-        Builtin::TypeName => match args.pop() {
-            Some(v) => Value::Str(Rc::from(v.type_name())),
-            None => panic!("type_name expects one argument"),
-        },
         // Echoes its argument back unchanged after printing it -- see
         // Builtin::Print's own doc comment.
         Builtin::Print => match args.pop() {

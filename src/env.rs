@@ -26,13 +26,10 @@ pub static PRELUDE: &[(&str, Builtin)] = &[
     ("is_str", Builtin::IsStr),
     ("is_list", Builtin::IsList),
     ("is_fun", Builtin::IsFun),
-    ("is_record", Builtin::IsRecord),
-    ("has_field", Builtin::HasField),
     // Runtime half of `.field` access's own desugaring
     // (typecheck::elaborate_node's Expr::FieldAccess arm) --
     // same "ordinary prelude builtin, not hidden" treatment.
     ("get_field", Builtin::GetField),
-    ("type_name", Builtin::TypeName),
     ("print", Builtin::Print),
     ("to_str", Builtin::ToStr),
     ("filter", Builtin::Filter),
@@ -60,12 +57,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prelude_table_has_27_unique_names() {
-        assert_eq!(PRELUDE.len(), 27);
+    fn prelude_table_has_unique_names() {
         let mut names: Vec<&str> = PRELUDE.iter().map(|(n, _)| *n).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 27, "duplicate name in PRELUDE");
+        assert_eq!(names.len(), PRELUDE.len(), "duplicate name in PRELUDE");
     }
 
     #[test]

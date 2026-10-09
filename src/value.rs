@@ -53,21 +53,11 @@ pub enum Builtin {
     // "a Dyn-sourced shape mismatch panics at the point of use" as this
     // interpreter's one error-handling story.
     Get,
-    // (Dyn, Str) -> Bool -- does this Record have a field with this name?
-    // Record's own field-presence analogue to Get: named lookup instead
-    // of positional, and a bool instead of panicking, since "does it have
-    // this field" (unlike "index N of this list") is a genuinely common
-    // question to ask about a value whose exact shape isn't statically
-    // known -- width subtyping means a Dyn-sourced record's exact field
-    // set is routinely broader than what any one annotation names. (A
-    // Dyn-to-Record boundary check is a native Expr::Check with Test::Record,
-    // which machine::test_holds answers the same way.)
-    HasField,
     // (Dyn, Str) -> Dyn -- extracts a named field's value. What `.field`
     // access desugars into (typecheck::elaborate_node's own
     // Expr::FieldAccess arm) rather than a dedicated runtime opcode --
     // same "no new machine.rs code" story, since this is just an ordinary
-    // two-argument call like HasField. Panics, like Get, rather than returning an
+    // two-argument call like Get. Panics, like Get, rather than returning an
     // Option: renno has no Option/Result in the prelude, and every other
     // Dyn-sourced shape mismatch already panics at the point of use.
     GetField,
@@ -82,14 +72,6 @@ pub enum Builtin {
     IsStr,
     IsList,
     IsFun,
-    // Dyn -> Bool. Record's own tag test, same story as the other IsX
-    // builtins above -- see Value::Record's own doc comment for why it's
-    // a distinct kind from List (name-keyed, not positional) rather than
-    // reusing IsList.
-    IsRecord,
-    // Dyn -> Str: the same string Value::type_name() computes (the "found
-    // {type}" half of a boundary-check failure message).
-    TypeName,
     // Dyn -> Dyn: writes the argument's own Display impl to stdout (same
     // rendering the REPL/CLI already gives a program's final result --
     // see main.rs's run_and_print) followed by a newline, then returns
@@ -133,7 +115,7 @@ pub enum Builtin {
     // `[0, 1, 2]`) -- same convention as Rust's own `0..3`, not `..=`.
     Range,
     // (Str, Str) -> [Str]: `split(s, sep)` -- subject first, same
-    // argument order as Get/HasField/GetField's own (subject, ...)
+    // argument order as Get/GetField's own (subject, ...)
     // convention. Splitting on "" is left to Rust's own str::split
     // behavior (an empty-string separator, which yields the string cut
     // between every char) rather than special-cased.
@@ -159,15 +141,12 @@ impl Builtin {
             | Builtin::IsStr
             | Builtin::IsList
             | Builtin::IsFun
-            | Builtin::IsRecord
-            | Builtin::TypeName
             | Builtin::Print
             | Builtin::ToStr
             | Builtin::Reverse
             | Builtin::Trim => 1,
             Builtin::Map
             | Builtin::Get
-            | Builtin::HasField
             | Builtin::GetField
             | Builtin::Filter
             | Builtin::Zip
