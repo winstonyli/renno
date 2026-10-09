@@ -1212,6 +1212,9 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
     let named_types = &env.infer.named_types;
     if !consistent(from, to) {
         if fits(to, from) {
+            // needs_check's Union arms lean on `consistent`, which just
+            // failed here; width-subtyped unions are rejected statically
+            // upstream, so that case is unreachable (not asserted).
             let needs = needs_check(&env.infer.resolve_deep(from), to);
             return Ok(rescued_gate(arena, e, to, needs, span, env));
         }
