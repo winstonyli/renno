@@ -545,8 +545,9 @@ mod tests {
             assert_eq!(relate_cast(&t, &t.clone(), &infer), Rel::Proven);
         }
         // A cap on a non-identical pair is a runtime test, never Undecided.
-        let (d1, d2) = (0..MAX_DEPTH + 6).fold((Type::Int, Type::Int), |(a, b), _| (fun(Type::Int, a), fun(Type::Int, b)));
+        let (d1, d2) = (0..MAX_DEPTH + 6).fold((Type::Int, Type::Bool), |(a, b), _| (fun(Type::Int, a), fun(Type::Int, b)));
         let (u1, u2) = (uni(&[d1, Type::Bool]), uni(&[d2, Type::Bool, Type::Str]));
-        assert!(!matches!(relate(&u1, &u2, &infer), Rel::Unknown(Residual::Undecided, _)));
+        let got = relate(&u1, &u2, &infer);
+        assert!(!matches!(got, Rel::Unknown(Residual::Undecided, _)), "{got:?}");
     }
 }

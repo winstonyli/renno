@@ -8001,4 +8001,18 @@ mod tests {
         let k = "let k = fun h: ((Int -> Int) | Bool) -> 1 in let f = fun x: Int -> x in let u: (Int -> Int) | Bool = f in k(u)";
         assert_eq!(run_source(k).unwrap().as_int(), 1);
     }
+
+    #[test]
+    fn a_union_past_the_depth_cap_with_a_differing_leaf_is_a_run_time_check_not_undecided() {
+        // 70 nested arrows (past relate's MAX_DEPTH) inside a union: the cap must lower to a
+        // run-time test, never to the static "cannot tell" error.
+        let ty = |leaf: &str| format!("{}{}{}", "(Int -> ".repeat(70), leaf, ")".repeat(70));
+        let src = format!(
+            "let d: Dyn = {} 5 in let a: {} | Bool = d in let b: {} | Bool = a in let e: Dyn = b in e{}",
+            "fun x -> ".repeat(70), ty("Int"), ty("Bool"), "(1)".repeat(70)
+        );
+        let err = run_source(&src).unwrap_err();
+        assert!(err.contains("expected Bool, found Int"), "unexpected message: {err}");
+        assert!(!err.contains("cannot tell"), "{err}");
+    }
 }
