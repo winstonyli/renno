@@ -1,5 +1,5 @@
 //! Directional, infer-aware type relation (design 2026-10-08, section 3.1). Pure and read-only.
-//! Stage 1 adds `Why`/`Undecided`/`relate_cast`; stage 2 consumers: coerce_check and the unify_fits rescue (T3), coerce_cast (T4).
+//! S2 T1 added `Why`/`Undecided`/`relate_cast`; consumers: coerce_check and the unify_fits rescue (T3), coerce_cast (T4).
 use super::{free_index_vars, unify_index_expr, InferCtx};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::types::{row_consistent, Type};
@@ -21,7 +21,7 @@ pub(crate) enum Cause {
     Imprecise,
     Incomplete,
 }
-/// The runtime work that would decide an Unknown. Unit placeholders: S2 adds payloads. `Fun` is
+/// The runtime work that would decide an Unknown. Unit placeholders: payloads are deferred to S3. `Fun` is
 /// a wrapper around a function value (no value test); a Dyn used as a function is `Test` + `Fun`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Residual {
@@ -108,7 +108,7 @@ pub(crate) enum Rel {
     Refuted(Why),
 }
 impl Rel {
-    pub(crate) fn refuted(why: &'static str) -> Rel { Rel::Refuted(Why::Shape(why)) }
+    fn refuted(why: &'static str) -> Rel { Rel::Refuted(Why::Shape(why)) }
     fn opaque(why: &'static str) -> Rel { Rel::Refuted(Why::Opaque(why)) }
     /// The distinct residual kinds an Unknown mentions (empty for Proven/Refuted).
     #[cfg(test)]
@@ -293,7 +293,7 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
 /// Incomplete); differ by a nonzero constant -> Refuted; a bare flexible variable (bound by
 /// unification) -> Unknown(IndexEq, Imprecise); a compound with a flexible variable (needs
 /// solving) -> Unknown(IndexEq, Incomplete); only rigid variables/literals left -> Refuted.
-pub(crate) fn relate_index(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Rel {
+fn relate_index(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Rel {
     let (ra, rb) = (infer.resolve_index_deep(a), infer.resolve_index_deep(b));
     match index_exprs_compare(&ra, &rb) {
         None => return Rel::Unknown(Residual::IndexEq, Cause::Incomplete),

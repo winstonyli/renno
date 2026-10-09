@@ -75,7 +75,7 @@ pub enum Type {
     // though a registry entry for a genuinely recursive alias
     // structurally contains this SAME leaf pointing at itself.
     // build_shape_predicate/build_boundary_check/pattern_could_match/
-    // coerce/unify_fits (typecheck.rs) are the consumers that ever look
+    // relate/unify_fits (typecheck.rs) are the consumers that ever look
     // up what a Named id stands for, and only one level at a time -- see
     // their own doc comments.
     Named(String),
@@ -254,11 +254,10 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         //
         // A bare, unbound index variable on EITHER side is permissive,
         // mirroring Type::Var's own unconditional permissiveness just
-        // above -- this is specifically what lets coerce() no-op on a
-        // Vec(n) parameter/annotation the same way it already no-ops
-        // on an ordinary Type::Var one, so a REAL binding can happen
-        // afterward via unify_fits (see Expr::App/Let/LetRec's own
-        // elaboration). The guard is IndexExpr::Var specifically, not
+        // above -- historically this let coerce() no-op on a Vec(n)
+        // parameter/annotation; coerce now decides on relate (which
+        // treats a flexible index variable as Unknown), so this arm
+        // matters only for `==`/`++`/Union-membership and pattern checks. The guard is IndexExpr::Var specifically, not
         // "contains a variable anywhere" -- Vec(n+1) against Vec(4)
         // still correctly requires exact SOP-equality, matching
         // unify_index_expr's own identical no-equation-solving limit.
@@ -327,8 +326,8 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
 // including for two Record types (exact field-set match, used by `==`
 // and Union-alternative membership) -- width subtyping is a one-way
 // "does this value fit where that type is expected" question, asked only
-// by typecheck::coerce, alongside (not instead of) its own consistent()
-// check.
+// by relate (typecheck/relate.rs), which has its own Record arm; this
+// helper survives for consistent()'s width-aware callers.
 pub fn record_satisfies(required: &[(String, Type)], actual: &[(String, Type)]) -> bool {
     required.iter().all(|(name, ty)| find_field(actual, name).is_some_and(|aty| consistent(ty, aty)))
 }

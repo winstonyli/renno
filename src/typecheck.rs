@@ -515,8 +515,8 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
         // Indexed pair, so the Type::Indexed-vs-Type::Indexed rescue
         // exclusion just below never fires and a genuine bound-index
         // conflict (n already bound to 3, freshly compared against an
-        // incompatible Vec(2)) is wrongly rescued by consistent()'s own
-        // permissiveness one level down. Recursing through unify_fits
+        // incompatible Vec(2)) is wrongly rescued by the relate-based
+        // rescue's permissiveness one level down. Recursing through unify_fits
         // itself (not unify_trial/the bare rescue) re-fires that exclusion
         // at the nesting depth where the Indexed pair actually appears --
         // same fix shape the Record arm above already gets right for
@@ -552,14 +552,12 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
             Err(e) => {
                 // An Indexed-vs-Indexed pair already has full, authoritative
                 // handling via unify()'s own dedicated Indexed arm (see this
-                // match's own doc comment above) -- but consistent()'s
-                // Type::Indexed arm is now permissive for a bare index
-                // variable on either side (Task 6, added so coerce() itself
-                // can no-op on a Vec(n) position -- see its own doc
-                // comment), and the former fits() Indexed arm (now relate) was guarded to
-                // exclude an Indexed `required` (see its doc comment), so
-                // it falls straight through to that SAME consistent() call
-                // for this exact pair shape. Left unguarded, EITHER would
+                // match's own doc comment above) -- but relate treats a bare
+                // flexible index variable on either side as Unknown rather
+                // than Refuted (so coerce() itself can no-op on a Vec(n)
+                // position and a real binding can happen afterward via
+                // unify_fits), so the rescue below would accept this pair
+                // too. Left unguarded, it would
                 // wrongly rescue a genuine index conflict unify_index_expr
                 // just correctly rejected here (e.g. n already bound to 3
                 // by an earlier Vec(n) annotation, freshly compared against

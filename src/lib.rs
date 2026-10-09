@@ -3264,11 +3264,11 @@ mod tests {
     fn coerce_accepts_a_tuple_literal_against_a_named_type_via_a_one_level_unfold() {
         // xs: List is a CONCRETE annotation, not Dyn -- the tuple
         // literal's own inferred type is a plain Type::Tuple, never
-        // itself Type::Named, so this exercises coerce()'s own new
-        // unfold-and-retry rescue (Step 3), not a runtime boundary
+        // itself Type::Named, so this exercises relate's one-level
+        // unfold of the alias (Proven), not a runtime boundary
         // check at all. Confirmed statically accepted with zero
-        // wrapping: if this compiles and runs to completion, the
-        // rescue worked; a wrong implementation would surface as a
+        // wrapping: if this compiles and runs to completion, relate
+        // proved it; a wrong implementation would surface as a
         // static "type mismatch" error from check_with_named_types
         // instead.
         let src = r#"
@@ -3294,7 +3294,7 @@ mod tests {
         // way to `f(v)` inside g's body, so THAT call genuinely
         // crosses a real Dyn boundary at runtime (build_boundary_check
         // via coerce's own Dyn/Var early-return-turned-real-check
-        // path), not coerce's static rescue. The check follows the whole
+        // path), not a static proof by relate. The check follows the whole
         // value, through every level of the recursive alias.
         let src = r#"
             type List = (Int, List) | Bool in
@@ -3538,8 +3538,9 @@ mod tests {
     }
 
     #[test]
-    fn coerce_rescue_rejects_a_bare_union_self_reference_given_the_wrong_type() {
-        // Regression test for the final fix wave's Defect 2:
+    fn coerce_rejects_a_bare_union_self_reference_given_the_wrong_type() {
+        // Regression test for the final fix wave's Defect 2
+        // (the static rescue it names was replaced by relate in S2):
         // the old rescue's own Union arm used to map a bare
         // Type::Named(id) alternative to Type::Dyn (e.g. Union([Int,
         // Named(id)]) -> Union([Int, Dyn])) instead of dropping it --
@@ -3551,7 +3552,7 @@ mod tests {
         // (build_shape_predicate's own ancestor-guard correctly reduces
         // `A` to just `Int` for a re-encountered self-reference). A `Str`
         // argument must be statically rejected -- this is coerce()'s own
-        // STATIC rescue specifically (both `xs`/the argument are fully
+        // STATIC check (relate) specifically (both `xs`/the argument are fully
         // concrete, no Dyn boundary involved at all, unlike Task 3's own
         // a_bare_union_self_reference_does_not_infinite_loop_at_a_dyn_boundary
         // test above, or pattern_could_match's own bare-Union coverage in
@@ -3567,12 +3568,12 @@ mod tests {
     }
 
     #[test]
-    fn coerce_rescue_accepts_a_bare_union_self_reference_given_the_reachable_alternative() {
+    fn coerce_accepts_a_bare_union_self_reference_given_the_reachable_alternative() {
         // The accept-side counterpart to the rejection test just above --
         // an Int literal is exactly the one alternative `type A = Int |
         // A` can ever actually reduce to (its own self-reference
-        // contributes nothing new), so coerce()'s static rescue must
-        // still accept it after the old rescue's fix, the same
+        // contributes nothing new), so coerce()'s static check (relate)
+        // must still accept it, the same
         // way it did before (this direction was never broken -- the bug
         // was only ever "accepts too much," never "accepts too little").
         let src = r#"
@@ -3608,11 +3609,11 @@ mod tests {
         // Final review Finding 4: unify()'s own Type::Indexed arm had
         // zero real test coverage -- deleting it entirely and re-running
         // the suite still passed, because Expr::App's own unify_fits
-        // falls back to consistent() on a unify() failure, and
-        // consistent() already has its OWN, independent SOP-equality
+        // falls back to a relate-based rescue on a unify() failure, and
+        // relate already has its OWN, independent index-equality
         // arm. The one call site where that's NOT true is If/Match's own
         // unify_trial: its failure fallback is a silent widen-to-Dyn,
-        // with no consistent()-based rescue at all.
+        // with no rescue at all.
         //
         // `a`/`b` are Vec(3)/Vec(2+1)-typed PARAMETERS (never actually
         // called -- this whole expression is elaborated, not run) --
