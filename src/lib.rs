@@ -7951,4 +7951,16 @@ mod tests {
         let err = run_source(&format!("{head}d(1)(true)")).unwrap_err();
         assert!(err.contains("expected Int, found Bool"), "unexpected message: {err}");
     }
+
+    #[test]
+    fn identical_types_beyond_the_relate_caps_are_accepted() {
+        // Deeper than MAX_DEPTH, and a union wider than the fuel: both once failed as
+        // "cannot tell statically" although the two sides are the same type.
+        let deep = |n: usize| format!("{}Int{}", "(Int -> ".repeat(n), ")".repeat(n));
+        let src = format!("let g = fun x: Int -> 0 in let d: Dyn = g in let a: {0} | Bool = d in let b: {0} | Bool = a in 1", deep(70));
+        assert_eq!(run_source(&src).unwrap().as_int(), 1);
+        let alts: Vec<String> = (1..=120).map(|k| format!("({})", vec!["Int,"; k].join(" "))).collect();
+        let src = format!("let f = fun x: Int -> x in let a: {0} | (Int -> Int) = f in let b: {0} | (Int -> Int) = a in 1", alts.join(" | "));
+        assert_eq!(run_source(&src).unwrap().as_int(), 1);
+    }
 }

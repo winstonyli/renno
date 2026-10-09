@@ -182,6 +182,11 @@ pub(crate) fn relate_cast(from: &Type, to: &Type, infer: &InferCtx) -> Rel {
     go(from, to, infer, &Budget { ignore_rows: true, ..Budget::default() }, 0)
 }
 fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> Rel {
+    // Structurally identical types relate whatever their size (every arm below proves a pair of
+    // equal components), so a type deeper or wider than the caps is not Unknown against itself.
+    if from == to {
+        return Rel::Proven;
+    }
     if depth > MAX_DEPTH || fuel.left.get() == 0 {
         return Rel::Unknown(Residual::Lazy, Cause::Incomplete);
     }
@@ -205,7 +210,8 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
             } else if alts.iter().zip(&rels).any(|(a, r)| match r {
                 // A value test of `to` cannot see this refutation, nor add a function wrapper.
                 Rel::Refuted(w) => !w.observable(),
-                Rel::Unknown(..) => matches!(infer.resolve(a), Type::Fun(..)),
+                // Only an Imprecise Unknown is a wrapper to add; Incomplete (a cap) stays a runtime test.
+                Rel::Unknown(_, c) => *c == Cause::Imprecise && matches!(infer.resolve(a), Type::Fun(..)),
                 Rel::Proven => false,
             }) {
                 Rel::Unknown(Residual::Undecided, Cause::Incomplete)
@@ -436,7 +442,7 @@ mod tests {
             ("rigid vs flexible compound (x2)", vec_n(iv("n")), vec_n(add(iv("k"), lit(1))), U(&["IndexEq"], Inc)),
             ("rigid vs n+1", vec_n(iv("n")), vec_n(add(iv("n"), lit(1))), R),
             ("sop equal", vec_n(add(iv("n"), lit(1))), vec_n(add(lit(1), iv("n"))), P),
-            ("sop cap (x1)", vec_n(big.clone()), vec_n(big), U(&["IndexEq"], Inc)),
+            ("sop cap (x1)", vec_n(big.clone()), vec_n(add(big, lit(1))), U(&["IndexEq"], Inc)),
             ("index_subst applied (m6)", vec_n(lit(1)), vec_n(add(iv("z"), lit(1))), P),
             ("vec into plain list", vec_n(lit(3)), list(d.clone()), P),
             ("plain list into vec", list(d.clone()), vec_n(lit(3)), R),
@@ -491,8 +497,8 @@ mod tests {
         assert_eq!(relate(&Type::Int, &named("C#3"), &infer), Rel::Proven);
         assert!(matches!(relate(&Type::Str, &named("C#3"), &infer), Rel::Refuted(_)));
         // The depth guard is the backstop for a source that is itself too deep.
-        let deep = (0..70).fold(Type::Int, |t, _| list(t));
-        assert!(matches!(relate(&deep, &deep, &infer), Rel::Unknown(Residual::Lazy, Cause::Incomplete)));
+        let deep = |leaf: Type| (0..70).fold(leaf, |t, _| list(t));
+        assert!(matches!(relate(&deep(Type::Int), &deep(Type::Bool), &infer), Rel::Unknown(Residual::Lazy, Cause::Incomplete)));
     }
 
     #[test]
@@ -516,5 +522,23 @@ mod tests {
         assert!(matches!(relate(&fun(rec_(&["z"]), i.clone()), &fun(rec_(&["x", "y"]), i.clone()), &infer), Rel::Refuted(_)));
         assert!(p(&fun(i.clone(), i.clone()), &fun(i.clone(), d.clone())));
         assert!(matches!(relate(&fun(i.clone(), s.clone()), &fun(i.clone(), i.clone()), &infer), Rel::Refuted(_)));
+    }
+
+    #[test]
+    fn identical_types_relate_beyond_the_caps() {
+        let infer = ctx();
+        let mut deep = Type::Int;
+        for _ in 0..(MAX_DEPTH + 6) {
+            deep = fun(Type::Int, deep);
+        }
+        let wide = uni(&(1..=120).map(|k| tup(&vec![Type::Int; k])).chain([fun(Type::Int, Type::Int)]).collect::<Vec<_>>());
+        for t in [deep, wide] {
+            assert_eq!(relate(&t, &t.clone(), &infer), Rel::Proven);
+            assert_eq!(relate_cast(&t, &t.clone(), &infer), Rel::Proven);
+        }
+        // A cap on a non-identical pair is a runtime test, never Undecided.
+        let (d1, d2) = (0..MAX_DEPTH + 6).fold((Type::Int, Type::Int), |(a, b), _| (fun(Type::Int, a), fun(Type::Int, b)));
+        let (u1, u2) = (uni(&[d1, Type::Bool]), uni(&[d2, Type::Bool, Type::Str]));
+        assert!(!matches!(relate(&u1, &u2, &infer), Rel::Unknown(Residual::Undecided, _)));
     }
 }
