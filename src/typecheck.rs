@@ -311,26 +311,6 @@ fn occurs_in_index(name: &str, e: &IndexExpr, infer: &InferCtx) -> bool {
     }
 }
 
-// Outcome of asking whether a rigid index variable's equation holds.
-// SOP normalization over index polynomials either proves two sides equal
-// or refutes them, so `Unknown` is unreachable today; it exists as the
-// marked place for the future gradual runtime check (spec 2026-10-07,
-// "Potential future step").
-enum RigidEq {
-    Equal,
-    Unequal,
-    #[allow(dead_code)]
-    Unknown,
-}
-
-fn classify_rigid_eq(a: &IndexExpr, b: &IndexExpr) -> RigidEq {
-    if crate::index_expr::index_exprs_equal(a, b) {
-        RigidEq::Equal
-    } else {
-        RigidEq::Unequal
-    }
-}
-
 // A real, but DELIBERATELY NARROW unifier for IndexExpr -- see the
 // design spec's own §4 and this plan's Global Constraints for why:
 // this binds a BARE unbound variable to whatever it's compared
@@ -369,12 +349,13 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
             // A rigid variable (still unbound: both sides are already
             // resolved) may only be equated, never bound.
             if infer.rigid_index.contains(name) {
-                return match classify_rigid_eq(&a, &b) {
-                    RigidEq::Equal => Ok(()),
-                    RigidEq::Unequal | RigidEq::Unknown => Err(TypeError(
+                return if crate::index_expr::index_exprs_equal(&a, &b) {
+                    Ok(())
+                } else {
+                    Err(TypeError(
                         format!("index variable {name} is fixed by the signature and cannot equal {other}"),
                         span,
-                    )),
+                    ))
                 };
             }
             if occurs_in_index(name, other, infer) {

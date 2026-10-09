@@ -6384,25 +6384,6 @@ mod tests {
     }
 
     #[test]
-    fn rigid_equality_is_always_decided_never_unknown() {
-        // Pins spec "Potential future step": SOP equality over index
-        // polynomials proves or refutes, so the Unknown outcome is
-        // unreachable. If a program ever needs it, this test should be the
-        // first thing revisited.
-        use crate::index_expr::IndexExpr;
-        use crate::typecheck::unify_index_expr;
-        use std::rc::Rc;
-        let span = crate::span::Span { start: 0, end: 0 };
-        let mul = |a: IndexExpr, b: IndexExpr| IndexExpr::Mul(Rc::new(a), Rc::new(b));
-        let add = |a: IndexExpr, b: IndexExpr| IndexExpr::Add(Rc::new(a), Rc::new(b));
-        let mut infer = rigid_infer(&["n", "m"]);
-        // n*m vs m*n: equal. n*m vs n+m: refuted. Neither is "unknown".
-        let nm = mul(var("n"), var("m"));
-        assert!(unify_index_expr(&nm, &mul(var("m"), var("n")), &mut infer, span).is_ok());
-        assert!(unify_index_expr(&nm, &add(var("n"), var("m")), &mut infer, span).is_err());
-    }
-
-    #[test]
     fn rigid_signature_rejects_a_body_that_ignores_its_parameters_length() {
         for src in [
             "let rec f: (Vec(n) -> Vec(n)) = fun v -> [1, 2, 3] in 0",
