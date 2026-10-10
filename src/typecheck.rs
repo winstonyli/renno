@@ -1770,7 +1770,7 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
 // the type registry and index state (InferCtx, as of where the check is
 // spliced); `local` holds witnesses bound inside synthesized code
 // (wrap_fun_contract). `defer` is false inside a cast's synthesized body
-// (build_cast, cast_up), which records no obligations.
+// (build_cast, cast_up) and in resolve_obligations, which record no obligations.
 struct CheckEnv<'a> {
     infer: &'a InferCtx,
     local: Vec<&'a IndexWitness>,

@@ -21,7 +21,7 @@ pub(crate) enum Cause {
     Imprecise,
     Incomplete,
 }
-/// The runtime work that would decide an Unknown. Unit placeholders: payloads are deferred to S3. `Fun` is
+/// The runtime work that would decide an Unknown. Unit placeholders: payloads were not built (S3 lowers from `to`). `Fun` is
 /// a wrapper around a function value (no value test); a Dyn used as a function is `Test` + `Fun`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Residual {
