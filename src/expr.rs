@@ -126,6 +126,9 @@ pub enum Test {
     ListOf(Box<Test>),
     // A list of exactly this many elements, each passing (a Vec(k) with a literal k).
     ListLen(Box<Test>, usize),
+    // A list as long as `CheckSpec::lens[slot]` says, each element passing (a
+    // Vec(n) with a non-literal n; the slot is read when the check is entered).
+    ListLenArg(Box<Test>, usize),
     // A list of exactly this many elements, position i passing tests[i].
     TupleOf(Vec<Test>),
     // A record with at least these fields, each field's value passing its
@@ -153,6 +156,10 @@ pub struct CheckSpec {
     // The bodies `Test::Ref(i)` indexes; empty unless the target reaches a
     // recursive Named alias.
     pub defs: Vec<Test>,
+    // The length slots `Test::ListLenArg` reads, each an `Expr::Len` node. A
+    // node rather than a field here, so resolve_obligations patches it in
+    // place and every copy of this Check (Pending, a finished cast) sees it.
+    pub lens: Vec<ExprRef>,
     pub mode: CheckMode,
     // The type's display text, for the Assert message.
     pub to: String,
@@ -161,12 +168,57 @@ pub struct CheckSpec {
     pub span: Option<Span>,
 }
 
+// A length slot's term: an index expression as the run-time check reads it.
+// Evaluating one is total (machine::eval_len), so a Check evaluates its slots
+// on entry whatever the value turns out to be.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LenExpr {
+    Lit(i64),
+    // The length of the list a hidden alias holds: an Expr::Var node naming
+    // the alias, and the index variable it witnesses (for the message).
+    Witness(ExprRef, Rc<str>),
+    Add(Box<LenExpr>, Box<LenExpr>),
+    Sub(Box<LenExpr>, Box<LenExpr>),
+    Mul(Box<LenExpr>, Box<LenExpr>),
+    // Any length: an isolated unconstrained variable, so only "is a list".
+    Any,
+    // An index variable nothing at run time holds: a list fails the check.
+    NoValue(Rc<str>),
+}
+
+impl LenExpr {
+    // Appends the witness Var nodes this term reads to `out`.
+    pub fn witnesses(&self, out: &mut Vec<ExprRef>) {
+        match self {
+            LenExpr::Witness(var, _) => out.push(*var),
+            LenExpr::Add(a, b) | LenExpr::Sub(a, b) | LenExpr::Mul(a, b) => {
+                a.witnesses(out);
+                b.witnesses(out);
+            }
+            LenExpr::Lit(_) | LenExpr::Any | LenExpr::NoValue(_) => {}
+        }
+    }
+}
+
+// A length slot's value, read when its Check is entered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Len {
+    Exact(usize),
+    Any,
+    // No list is this long: the term is negative or overflows.
+    Never,
+    NoValue(Rc<str>),
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     // `e` tested natively against `spec` -- evaluates `e` once, no effects,
     // no env frame. Typecheck-synthesized only (a Dyn-boundary check);
     // never written by the parser.
     Check(ExprRef, Rc<CheckSpec>),
+    // A Check's length slot (CheckSpec::lens). Typecheck-synthesized only and
+    // never evaluated on its own: the owning Check reads it on entry.
+    Len(LenExpr),
     Int(i64),
     // A second numeric literal kind, distinct from Int -- see types::
     // Type::Float's own doc comment for how far the Int/Float interop
@@ -282,7 +334,12 @@ impl Expr {
     pub fn children(&self, out: &mut Vec<ExprRef>) {
         match self {
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => {}
-            Expr::Check(e, _) | Expr::FieldAccess(e, _) | Expr::Lambda(_, _, e) | Expr::Perform(_, e) => out.push(*e),
+            Expr::Check(e, spec) => {
+                out.push(*e);
+                out.extend(&spec.lens);
+            }
+            Expr::Len(term) => term.witnesses(out),
+            Expr::FieldAccess(e, _) | Expr::Lambda(_, _, e) | Expr::Perform(_, e) => out.push(*e),
             Expr::MakeHandler { body, .. } => out.push(*body),
             Expr::Tuple(items) | Expr::ListLit(items) => out.extend(items),
             Expr::Record(fields) => out.extend(fields.iter().map(|(_, v)| *v)),

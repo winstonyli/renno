@@ -2109,7 +2109,7 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, env: 
 // the cast site `env.span`; `to` is the type whose display text a failure
 // reports.
 fn build_check_node(arena: &mut Arena, value_ref: ExprRef, shape: Shape, mode: CheckMode, to: &Type, env: &CheckEnv) -> ExprRef {
-    arena.push(Expr::Check(value_ref, Rc::new(CheckSpec { test: shape.test, defs: shape.defs, mode, to: to.to_string(), span: env.span })))
+    arena.push(Expr::Check(value_ref, Rc::new(CheckSpec { test: shape.test, defs: shape.defs, lens: Vec::new(), mode, to: to.to_string(), span: env.span })))
 }
 
 // The Bool outcome of `shape`: a union picking its alternative.
@@ -3590,7 +3590,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     let node = arena[expr].clone();
     match node {
         // Emitted by elaboration itself (Dyn-boundary checks), never parsed.
-        Expr::Check(..) => unreachable!("Expr::Check is typecheck output, never elaboration input"),
+        Expr::Check(..) | Expr::Len(_) => unreachable!("Expr::Check and Expr::Len are typecheck output, never elaboration input"),
         Expr::Int(_) => Ok((Type::Int, EffectRow::pure(), expr)),
         Expr::Float(_) => Ok((Type::Float, EffectRow::pure(), expr)),
         Expr::Bool(_) => Ok((Type::Bool, EffectRow::pure(), expr)),

@@ -146,7 +146,9 @@ mod tests {
         pred(&arena[root])
             || match &arena[root] {
                 Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
-                Expr::Check(e, _) | Expr::FieldAccess(e, _) | Expr::Perform(_, e) => go(e),
+                Expr::Check(e, spec) => go(e) || spec.lens.iter().any(go),
+                Expr::Len(_) => false,
+                Expr::FieldAccess(e, _) | Expr::Perform(_, e) => go(e),
                 Expr::ListLit(items) | Expr::Tuple(items) => items.iter().any(go),
                 Expr::Lambda(_, _, body) | Expr::MakeHandler { body, .. } => go(body),
                 Expr::App(a, b) | Expr::BinOp(_, a, b) | Expr::Let(_, _, a, b) | Expr::Handle { body: a, handler: b } => go(a) || go(b),
@@ -2443,7 +2445,7 @@ g(len)").unwrap_err();
         let five = arena.push(Expr::Int(5));
         spans.push(Span { start: 10, end: 11 });
         // Synthesized after parsing: a Check around `f`, a spanless leaf, and the App over both.
-        let spec = std::rc::Rc::new(crate::expr::CheckSpec { test: crate::expr::Test::Fun, defs: vec![], mode: crate::expr::CheckMode::Assert, to: String::new(), span: None });
+        let spec = std::rc::Rc::new(crate::expr::CheckSpec { test: crate::expr::Test::Fun, defs: vec![], lens: vec![], mode: crate::expr::CheckMode::Assert, to: String::new(), span: None });
         let check = arena.push(Expr::Check(f, spec));
         let leaf = arena.push(Expr::Bool(true));
         let pair = arena.push(Expr::Tuple(vec![check, five]));
@@ -6952,7 +6954,7 @@ g(len)").unwrap_err();
         use expr::Expr;
         let mut go = |r: &expr::ExprRef| let_rec_groups_direct(arena, *r, out);
         match &arena[root] {
-            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => {}
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::Len(_) => {}
             Expr::Check(operand, _) => go(operand),
             Expr::ListLit(items) | Expr::Tuple(items) => items.iter().for_each(go),
             Expr::Lambda(_, _, body) => go(body),
@@ -7372,6 +7374,26 @@ g(len)").unwrap_err();
         let (arena, root) = elaborated_tree(lit);
         assert!(!has_let_named(&arena, root, "__check_tmp#"));
         assert_clean_rejection("let d: Dyn = [1, 2, 3] in let y: Vec(2) = d in 1", "type error: expected [Dyn](2), found List");
+    }
+
+    #[test]
+    fn a_length_slot_reading_a_non_list_witness_is_a_clean_type_error() {
+        // Spec section 8, test 5. A typed program cannot pass a non-list for a
+        // witness (the parameter's own check runs first), so the Check is built
+        // by hand: `let h = 5 in <[1, 2] checked against Vec(n), n read from h>`.
+        use crate::expr::{CheckMode, CheckSpec, Expr, LenExpr, Test};
+        let (mut arena, mut spans, root) = parser::parse("let h = 5 in [1, 2]").unwrap();
+        let Expr::Let(name, ann, val, body) = arena[root].clone() else { panic!("not a let") };
+        let witness = arena.push(Expr::Var("h".into()));
+        let slot = arena.push(Expr::Len(LenExpr::Witness(witness, "n".into())));
+        let test = Test::ListLenArg(Box::new(Test::Any), 0);
+        let spec = CheckSpec { test, defs: vec![], lens: vec![slot], mode: CheckMode::Assert, to: "[Dyn](n)".into(), span: None };
+        let check = arena.push(Expr::Check(body, std::rc::Rc::new(spec)));
+        let top = arena.push(Expr::Let(name, ann, val, check));
+        expr::fill_synthesized_spans(&arena, top, &mut spans);
+        expect_run_error("type error: index variable n has no runtime value to check a length against", || {
+            machine::run(&arena, top, Env::prelude(), &spans);
+        });
     }
 
     #[test]

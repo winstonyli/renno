@@ -153,7 +153,22 @@ fn visit(
                 work.push(Work::Visit(*v));
             }
         }
-        Expr::FieldAccess(target, _) | Expr::Check(target, _) => work.push(Work::Visit(*target)),
+        Expr::FieldAccess(target, _) => work.push(Work::Visit(*target)),
+        // A Check's length slots are evaluated in the Check's own scope,
+        // on entry, before the target value exists.
+        Expr::Check(target, spec) => {
+            work.push(Work::Visit(*target));
+            for slot in spec.lens.iter().rev() {
+                work.push(Work::Visit(*slot));
+            }
+        }
+        Expr::Len(term) => {
+            let mut witnesses = Vec::new();
+            term.witnesses(&mut witnesses);
+            for w in witnesses.into_iter().rev() {
+                work.push(Work::Visit(w));
+            }
+        }
         Expr::Lambda(param, _, body) => scoped(work, vec![param.clone()], *body),
         Expr::App(f, a) => {
             work.push(Work::Visit(*a));

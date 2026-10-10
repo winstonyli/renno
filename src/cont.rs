@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use crate::env::Env;
-use crate::expr::{BinOp, CheckSpec, ExprRef, Pattern};
+use crate::expr::{BinOp, CheckSpec, ExprRef, Len, Pattern};
 use crate::span::Span;
 use crate::value::{HandlerData, Value};
 
@@ -65,8 +65,9 @@ pub enum Frame {
     // comment for why records need a
     // name-keyed runtime shape ListElems has no way to produce.
     RecordElems { names: Rc<Vec<String>>, remaining: Vec<ExprRef>, done: Vec<Value>, env: Env },
-    // The operand of an Expr::Check has just evaluated -- test it.
-    Check { spec: Rc<CheckSpec> },
+    // The operand of an Expr::Check has just evaluated -- test it against
+    // the spec, with the length slots read when the Check was entered.
+    Check { spec: Rc<CheckSpec>, lens: Vec<Len> },
     PerformPayload { effect: String },
     // `handle body with handler_expr`: handler_expr has just evaluated to a
     // Value::Handler -- next step installs it as a HandlerMark and evals body.

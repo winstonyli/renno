@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::{Env, PRELUDE};
-use crate::expr::{Arena, BinOp, CheckMode, Expr, ExprRef, Pattern, SpanMap, Test};
+use crate::expr::{Arena, BinOp, CheckMode, Expr, ExprRef, Len, LenExpr, Pattern, SpanMap, Test};
 use crate::frame::Bindings;
 use crate::resolve::{is_direct_group, resolve, Resolved, VarRef};
 use crate::span::Span;
@@ -104,9 +104,13 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                 }
                 match &arena[expr] {
                 Expr::Check(operand, spec) => {
-                    cont = Cont::cons(Frame::Check { spec: spec.clone() }, cont);
+                    // The slots read the env the operand is evaluated in (no
+                    // allocation when there are none).
+                    let lens = spec.lens.iter().map(|slot| eval_slot(arena, *slot, &env, resolved)).collect();
+                    cont = Cont::cons(Frame::Check { spec: spec.clone(), lens }, cont);
                     control = Control::Eval(*operand, env);
                 }
+                Expr::Len(_) => unreachable!("an Expr::Len slot is read by its Check, never evaluated"),
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
                 Expr::Float(x) => control = Control::Apply(Value::Float(*x)),
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
@@ -444,21 +448,28 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                 }
                             }
                         }
-                        Frame::Check { spec } => {
-                            let spec = spec.clone();
-                            let holds = test_holds(&spec.test, &spec.defs, &value);
-                            cont = rest;
-                            control = Control::Apply(match spec.mode {
-                                CheckMode::Probe => Value::Bool(holds),
-                                CheckMode::Assert if holds => value,
-                                CheckMode::Assert => {
+                        // Decided while `frame` is still borrowed (nothing
+                        // is cloned); `cont` is reassigned after its last use.
+                        Frame::Check { spec, lens } => {
+                            let holds = test_holds(&spec.test, &spec.defs, lens, &value);
+                            if !holds {
+                                // A length nothing at run time holds, reached
+                                // on a list: that is the failure, in either mode.
+                                if let Some(name) = reached_no_value(&spec.test, &spec.defs, lens, &value) {
+                                    set_current_span(spec.span);
+                                    crate::run_error!("type error: index variable {name} has no runtime value to check a length against")
+                                }
+                                if spec.mode == CheckMode::Assert {
                                     set_current_span(spec.span);
                                     let mut path = Vec::new();
-                                    let found = explain(&spec.test, &spec.defs, &value, &mut path);
+                                    let found = explain(&spec.test, &spec.defs, lens, &value, &mut path);
                                     let at = if path.is_empty() { String::new() } else { format!(" at {}", path_text(&path)) };
                                     crate::run_error!("type error: expected {}, found {}{at}", spec.to, found.type_name())
                                 }
-                            });
+                            }
+                            let probe = spec.mode == CheckMode::Probe;
+                            cont = rest;
+                            control = Control::Apply(if probe { Value::Bool(holds) } else { value });
                         }
                         Frame::PerformPayload { effect } => {
                             let effect = effect.clone();
@@ -495,8 +506,9 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
 // walker keeps a work list of (test, value) steps and, for `Or`, a stack of
 // choice points: a failing alternative rewinds the work list to the height
 // the `Or` started at and tries the next one. `defs` is the owning
-// CheckSpec's alias table (what Test::Ref indexes; the prelude predicates
-// pass `&[]`). The value is finite and acyclic, and every step consumes
+// CheckSpec's alias table (what Test::Ref indexes) and `lens` the values of
+// its length slots (what Test::ListLenArg reads); the prelude predicates pass
+// `&[]` for both. The value is finite and acyclic, and every step consumes
 // structure, so the walk ends.
 
 // A scalar test decided by the value's own tag; None for a compound test.
@@ -515,8 +527,43 @@ fn leaf(t: &Test, v: &Value) -> Option<bool> {
             matches!(v, Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..))
         }
         Test::Token(id) => matches!(v, Value::Token(t) if t == id),
-        Test::ListOf(_) | Test::ListLen(..) | Test::TupleOf(_) | Test::RecordOf(_) | Test::Ref(_) | Test::Or(_) => return None,
+        Test::ListOf(_) | Test::ListLen(..) | Test::ListLenArg(..) | Test::TupleOf(_) | Test::RecordOf(_) | Test::Ref(_) | Test::Or(_) => return None,
     })
+}
+
+// A Check's length slot under `env`: the Expr::Len node's term, evaluated.
+fn eval_slot(arena: &Arena, slot: ExprRef, env: &Env, resolved: &Resolved) -> Len {
+    let Expr::Len(term) = &arena[slot] else { panic!("internal: a Check's length slot is not an Expr::Len") };
+    match eval_len(term, env, resolved) {
+        Ok(n) => usize::try_from(n).map_or(Len::Never, Len::Exact),
+        Err(len) => len,
+    }
+}
+
+// A length term's integer value, or (Err) the slot value it reduces to
+// instead. Total: a witness that is not a list is NoValue and an overflow is
+// Never, so evaluating a slot never panics whatever an untyped caller passed;
+// only the test decides. The first non-integer operand, left to right, wins.
+fn eval_len(term: &LenExpr, env: &Env, resolved: &Resolved) -> Result<i64, Len> {
+    let arith = |a: &LenExpr, b: &LenExpr, op: fn(i64, i64) -> Option<i64>| {
+        let (a, b) = (eval_len(a, env, resolved)?, eval_len(b, env, resolved)?);
+        op(a, b).ok_or(Len::Never)
+    };
+    match term {
+        LenExpr::Lit(n) => Ok(*n),
+        LenExpr::Witness(var, name) => match resolved.get(*var) {
+            Some(VarRef::Local { hops, slot }) => match env.get(hops, slot) {
+                Value::List(items) => i64::try_from(items.len()).map_err(|_| Len::Never),
+                _ => Err(Len::NoValue(name.clone())),
+            },
+            other => panic!("internal: witness of {name} resolved to {other:?}"),
+        },
+        LenExpr::Add(a, b) => arith(a, b, i64::checked_add),
+        LenExpr::Sub(a, b) => arith(a, b, i64::checked_sub),
+        LenExpr::Mul(a, b) => arith(a, b, i64::checked_mul),
+        LenExpr::Any => Err(Len::Any),
+        LenExpr::NoValue(name) => Err(Len::NoValue(name.clone())),
+    }
 }
 
 enum Step<'t, 'a> {
@@ -581,8 +628,15 @@ fn child<'t, const TRACK: bool>(nodes: &mut Nodes<'t>, parent: u32, label: Label
 
 // None when `v` passes `test`, else the innermost failure (with TRACK, its
 // path node and depth; an `Or` reports its alternative that got furthest,
-// the first on ties).
-fn walk<'t, 'a, const TRACK: bool>(test: &'t Test, defs: &'t [Test], v: &'a Value, nodes: &mut Nodes<'t>) -> Option<Fail<'a>> {
+// the first on ties). `no_value` gets the first NoValue slot reached on a list.
+fn walk<'t, 'a, const TRACK: bool>(
+    test: &'t Test,
+    defs: &'t [Test],
+    lens: &'t [Len],
+    v: &'a Value,
+    nodes: &mut Nodes<'t>,
+    no_value: &mut Option<&'t str>,
+) -> Option<Fail<'a>> {
     if TRACK {
         nodes.push((0, 0, Label::Element(0)));
     }
@@ -658,6 +712,22 @@ fn walk<'t, 'a, const TRACK: bool>(test: &'t Test, defs: &'t [Test], v: &'a Valu
                         work.push(Step::Test(element, x, n));
                     }
                 }
+                Test::ListLenArg(element, slot) => {
+                    let Value::List(items) = v else { break 'step here };
+                    match &lens[*slot] {
+                        Len::Exact(len) if items.len() == *len => {}
+                        Len::Any => {}
+                        Len::NoValue(name) => {
+                            no_value.get_or_insert(&**name);
+                            break 'step here;
+                        }
+                        Len::Exact(_) | Len::Never => break 'step here,
+                    }
+                    for (i, x) in items.iter().enumerate().rev() {
+                        let n = child::<TRACK>(nodes, node, Label::Element(i));
+                        work.push(Step::Test(element, x, n));
+                    }
+                }
                 Test::TupleOf(elements) => {
                     let Value::List(items) = v else { break 'step here };
                     if items.len() != elements.len() {
@@ -714,16 +784,30 @@ fn walk<'t, 'a, const TRACK: bool>(test: &'t Test, defs: &'t [Test], v: &'a Valu
     }
 }
 
-fn test_holds(test: &Test, defs: &[Test], v: &Value) -> bool {
+fn test_holds(test: &Test, defs: &[Test], lens: &[Len], v: &Value) -> bool {
     match leaf(test, v) {
         Some(ok) => ok,
         // `Int | Float`, the check on every Dyn arithmetic operand: decided by
         // the value's tag, with no work list or choice point.
         None => match test {
             Test::Or(alternatives) if alternatives.iter().all(|a| leaf(a, v).is_some()) => alternatives.iter().any(|a| leaf(a, v) == Some(true)),
-            _ => walk::<false>(test, defs, v, &mut Vec::new()).is_none(),
+            _ => walk::<false>(test, defs, lens, v, &mut Vec::new(), &mut None).is_none(),
         },
     }
+}
+
+// The index variable a failing check could not compare a length against: the
+// first NoValue slot the walk reached on a list (an `Or` alternative that
+// reached one and failed counts, so a union reports it only when every
+// alternative fails). None for an ordinary mismatch. Cold path: re-walks only
+// when a slot is NoValue.
+fn reached_no_value<'t>(test: &'t Test, defs: &'t [Test], lens: &'t [Len], v: &Value) -> Option<&'t str> {
+    if !lens.iter().any(|len| matches!(len, Len::NoValue(_))) {
+        return None;
+    }
+    let mut no_value = None;
+    walk::<false>(test, defs, lens, v, &mut Vec::new(), &mut no_value);
+    no_value
 }
 
 // The innermost value that makes `test` fail on `v`, with the way down to it
@@ -731,9 +815,9 @@ fn test_holds(test: &Test, defs: &[Test], v: &Value) -> bool {
 // check only: the tracked re-run of `walk`, linear in the value. A union
 // cannot say which alternative was meant: it descends into the one that got
 // furthest. `v` itself when nothing fails.
-fn explain<'a>(test: &Test, defs: &[Test], v: &'a Value, path: &mut Vec<String>) -> &'a Value {
+fn explain<'a>(test: &Test, defs: &[Test], lens: &[Len], v: &'a Value, path: &mut Vec<String>) -> &'a Value {
     let mut nodes = Vec::new();
-    let Some(fail) = walk::<true>(test, defs, v, &mut nodes) else { return v };
+    let Some(fail) = walk::<true>(test, defs, lens, v, &mut nodes, &mut None) else { return v };
     let mut labels = Vec::new();
     let mut n = fail.node;
     while n != 0 {
@@ -986,11 +1070,11 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 _ => crate::run_error!("get expects a list and an int"),
             }
         }
-        Builtin::IsInt => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Int, &[], &v))),
-        Builtin::IsFloat => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Float, &[], &v))),
-        Builtin::IsBool => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Bool, &[], &v))),
-        Builtin::IsStr => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Str, &[], &v))),
-        Builtin::IsList => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::List, &[], &v))),
+        Builtin::IsInt => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Int, &[], &[], &v))),
+        Builtin::IsFloat => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Float, &[], &[], &v))),
+        Builtin::IsBool => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Bool, &[], &[], &v))),
+        Builtin::IsStr => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Str, &[], &[], &v))),
+        Builtin::IsList => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::List, &[], &[], &v))),
         // (record, name) -- args.pop() order matches Get's own (list, i)
         // convention: last-pushed arg (name) pops first.
         // Panics on a missing field the same way Get panics on an
@@ -1011,7 +1095,7 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 _ => crate::run_error!("get_field expects a record and a string"),
             }
         }
-        Builtin::IsFun => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Fun, &[], &v))),
+        Builtin::IsFun => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Fun, &[], &[], &v))),
         // Echoes its argument back unchanged after printing it -- see
         // Builtin::Print's own doc comment.
         Builtin::Print => match args.pop() {
@@ -1330,7 +1414,7 @@ mod tests {
         ];
         for t in &ors {
             for v in &values {
-                assert_eq!(test_holds(t, &[], v), walk::<false>(t, &[], v, &mut Vec::new()).is_none());
+                assert_eq!(test_holds(t, &[], &[], v), walk::<false>(t, &[], &[], v, &mut Vec::new(), &mut None).is_none());
             }
         }
     }
@@ -1339,7 +1423,7 @@ mod tests {
     fn test_holds_covers_every_shape() {
         let record = Value::Record(Rc::new(vec![("x".to_string(), Value::Int(1)), ("y".to_string(), Value::Int(2))]));
         let closure = Value::Builtin(Builtin::Len);
-        let holds = |t: &Test, v: &Value| test_holds(t, &[], v);
+        let holds = |t: &Test, v: &Value| test_holds(t, &[], &[], v);
         assert!(holds(&Test::Any, &Value::Bool(true)) && !holds(&Test::Never, &Value::Bool(true)));
         assert!(holds(&Test::Int, &Value::Int(1)) && !holds(&Test::Int, &Value::Float(1.0)));
         assert!(holds(&Test::Float, &Value::Float(1.0)) && !holds(&Test::Float, &Value::Int(1)));
@@ -1363,18 +1447,18 @@ mod tests {
     fn deep_tests_follow_the_value_and_explain_names_the_failing_element() {
         let ints = |xs: &[i64]| Value::List(Rc::new(xs.iter().map(|n| Value::Int(*n)).collect()));
         let list_of_int = Test::ListOf(Box::new(Test::Int));
-        assert!(test_holds(&list_of_int, &[], &ints(&[1, 2])) && test_holds(&list_of_int, &[], &ints(&[])));
+        assert!(test_holds(&list_of_int, &[], &[], &ints(&[1, 2])) && test_holds(&list_of_int, &[], &[], &ints(&[])));
         let mixed = Value::List(Rc::new(vec![Value::Int(1), Value::Bool(true)]));
-        assert!(!test_holds(&list_of_int, &[], &mixed));
+        assert!(!test_holds(&list_of_int, &[], &[], &mixed));
         let mut path = Vec::new();
-        assert_eq!(explain(&list_of_int, &[], &mixed, &mut path).type_name(), "Bool");
+        assert_eq!(explain(&list_of_int, &[], &[], &mixed, &mut path).type_name(), "Bool");
         assert_eq!(path, ["element 1"]);
 
         let record = Value::Record(Rc::new(vec![("a".to_string(), Value::Int(1)), ("b".to_string(), mixed.clone())]));
         let nested = Test::RecordOf(vec![("a".to_string(), Test::Int), ("b".to_string(), list_of_int.clone())]);
-        assert!(!test_holds(&nested, &[], &record));
+        assert!(!test_holds(&nested, &[], &[], &record));
         let mut path = Vec::new();
-        assert_eq!(explain(&nested, &[], &record, &mut path).type_name(), "Bool");
+        assert_eq!(explain(&nested, &[], &[], &record, &mut path).type_name(), "Bool");
         assert_eq!(path, ["field b", "element 1"]);
 
         // type L = (Int, L) | Bool: the alias body is defs[0], reached through Ref(0).
@@ -1382,9 +1466,9 @@ mod tests {
         let pair = |a: Value, b: Value| Value::List(Rc::new(vec![a, b]));
         let good = pair(Value::Int(1), pair(Value::Int(2), Value::Bool(true)));
         let bad = pair(Value::Int(1), pair(Value::Int(2), Value::Int(3)));
-        assert!(test_holds(&Test::Ref(0), &defs, &good) && !test_holds(&Test::Ref(0), &defs, &bad));
+        assert!(test_holds(&Test::Ref(0), &defs, &[], &good) && !test_holds(&Test::Ref(0), &defs, &[], &bad));
         let mut path = Vec::new();
-        assert_eq!(explain(&Test::Ref(0), &defs, &bad, &mut path).type_name(), "Int");
+        assert_eq!(explain(&Test::Ref(0), &defs, &[], &bad, &mut path).type_name(), "Int");
         assert_eq!(path, ["element 1", "element 1"]);
     }
 
@@ -1398,16 +1482,16 @@ mod tests {
         let defs = [Test::Or(vec![Test::TupleOf(vec![Test::Int, Test::Ref(0)]), Test::Bool])];
         let chain = |leaf: Value| (0..DEPTH).fold(leaf, |tail, i| pair(Value::Int(i as i64), tail));
         let good = chain(Value::Bool(true));
-        assert!(test_holds(&Test::Ref(0), &defs, &good));
+        assert!(test_holds(&Test::Ref(0), &defs, &[], &good));
         let bad = chain(Value::Str(Rc::from("x")));
-        assert!(!test_holds(&Test::Ref(0), &defs, &bad));
+        assert!(!test_holds(&Test::Ref(0), &defs, &[], &bad));
         let mut path = Vec::new();
-        assert_eq!(explain(&Test::Ref(0), &defs, &bad, &mut path).type_name(), "Str");
+        assert_eq!(explain(&Test::Ref(0), &defs, &[], &bad, &mut path).type_name(), "Str");
         assert_eq!(path.len(), DEPTH);
         // nested single-element lists: [[[...[Int]...]]] against ListOf(Ref) where the alias is [self] | Int
         let list_defs = [Test::Or(vec![Test::Int, Test::ListOf(Box::new(Test::Ref(0)))])];
         let nest = (0..DEPTH).fold(Value::Int(1), |inner, _| Value::List(Rc::new(vec![inner])));
-        assert!(test_holds(&Test::Ref(0), &list_defs, &nest));
+        assert!(test_holds(&Test::Ref(0), &list_defs, &[], &nest));
         // the nested chains cannot be dropped recursively on this stack
         std::mem::forget((good, bad, nest));
     }
@@ -1494,6 +1578,7 @@ mod tests {
             4 if refs && r.below(2) == 0 => Test::Ref(r.below(2)),
             4 => Test::Float,
             5 => Test::ListOf(Box::new(random_test(r, depth - 1, true))),
+            6 if r.below(2) == 0 => Test::ListLenArg(Box::new(random_test(r, depth - 1, true)), r.below(4)),
             6 => Test::ListLen(Box::new(random_test(r, depth - 1, true)), r.below(4)),
             7 => Test::TupleOf((0..r.below(4)).map(|_| random_test(r, depth - 1, true)).collect()),
             8 => Test::RecordOf((0..r.below(4)).map(|i| (NAMES[i].to_string(), random_test(r, depth - 1, true))).collect()),
@@ -1520,21 +1605,79 @@ mod tests {
         }
     }
 
+    // The slot values the random tests' ListLenArg(_, 0..4) read: one of each kind.
+    fn test_lens() -> Vec<Len> {
+        vec![Len::Exact(2), Len::Any, Len::NoValue(Rc::from("n")), Len::Never]
+    }
+
+    // `test` with each ListLenArg replaced by what its slot means, for the
+    // recursive oracle: Exact(k) a literal ListLen, Any a plain ListOf, and a
+    // slot with no value (NoValue, Never) a test nothing passes.
+    fn subst_lens(test: &Test, lens: &[Len]) -> Test {
+        let go = |t: &Test| subst_lens(t, lens);
+        match test {
+            Test::ListLenArg(t, slot) => match &lens[*slot] {
+                Len::Exact(k) => Test::ListLen(Box::new(go(t)), *k),
+                Len::Any => Test::ListOf(Box::new(go(t))),
+                Len::NoValue(_) | Len::Never => Test::Never,
+            },
+            Test::ListOf(t) => Test::ListOf(Box::new(go(t))),
+            Test::ListLen(t, k) => Test::ListLen(Box::new(go(t)), *k),
+            Test::TupleOf(ts) => Test::TupleOf(ts.iter().map(go).collect()),
+            Test::RecordOf(fs) => Test::RecordOf(fs.iter().map(|(name, t)| (name.clone(), go(t))).collect()),
+            Test::Or(ts) => Test::Or(ts.iter().map(go).collect()),
+            scalar => scalar.clone(),
+        }
+    }
+
+    #[test]
+    fn a_length_slot_is_exact_any_or_no_value() {
+        let lens = test_lens();
+        let list = |n: i64| Value::List(Rc::new((0..n).map(Value::Int).collect()));
+        let arg = |slot| Test::ListLenArg(Box::new(Test::Int), slot);
+        assert!(test_holds(&arg(0), &[], &lens, &list(2)));
+        assert!(!test_holds(&arg(0), &[], &lens, &list(3)));
+        assert!(test_holds(&arg(1), &[], &lens, &list(5)));
+        // Any skips only the length: the elements are still tested.
+        assert!(!test_holds(&arg(1), &[], &lens, &Value::List(Rc::new(vec![Value::Bool(true)]))));
+        assert!(!test_holds(&arg(2), &[], &lens, &list(2)));
+        assert!(!test_holds(&arg(3), &[], &lens, &list(0)));
+        // A NoValue slot is reported only when the walk reaches it on a list,
+        // inside a failing union alternative too.
+        assert_eq!(reached_no_value(&arg(2), &[], &lens, &list(1)), Some("n"));
+        assert_eq!(reached_no_value(&arg(2), &[], &lens, &Value::Int(1)), None);
+        assert_eq!(reached_no_value(&arg(0), &[], &lens, &list(1)), None);
+        let or = Test::Or(vec![arg(2), Test::Bool]);
+        assert_eq!(reached_no_value(&or, &[], &lens, &list(1)), Some("n"));
+        assert!(test_holds(&or, &[], &lens, &Value::Bool(true)));
+        // One slot shared by every element: [Vec(n)] with n = 2.
+        let nested = Test::ListOf(Box::new(Test::ListLenArg(Box::new(Test::Any), 0)));
+        assert!(test_holds(&nested, &[], &lens, &Value::List(Rc::new(vec![list(2), list(2)]))));
+        let bad = Value::List(Rc::new(vec![list(2), list(1)]));
+        assert!(!test_holds(&nested, &[], &lens, &bad));
+        let mut path = Vec::new();
+        explain(&nested, &[], &lens, &bad, &mut path);
+        assert_eq!(path, ["element 1"]);
+    }
+
     #[test]
     fn the_walker_agrees_with_the_recursive_definition_on_random_cases() {
         let mut r = Rng(0x9E37_79B9_7F4A_7C15);
+        let lens = test_lens();
         let (mut failing, total) = (0, 30_000);
         for _ in 0..total {
             let defs = [random_test(&mut r, 3, false), random_test(&mut r, 3, false)];
             let test = random_test(&mut r, 4, false);
             let v = random_value(&mut r, 4);
-            let want = holds_recursive(&test, &defs, &v);
-            assert_eq!(want, test_holds(&test, &defs, &v), "holds differs: {test:?} {defs:?} {v}");
+            // The oracle sees each slot's meaning spelled out as a plain test.
+            let (want_test, want_defs) = (subst_lens(&test, &lens), defs.each_ref().map(|d| subst_lens(d, &lens)));
+            let want = holds_recursive(&want_test, &want_defs, &v);
+            assert_eq!(want, test_holds(&test, &defs, &lens, &v), "holds differs: {test:?} {defs:?} {v}");
             if !want {
                 failing += 1;
                 let (mut want_path, mut got_path) = (Vec::new(), Vec::new());
-                let want_found = explain_recursive(&test, &defs, &v, &mut want_path);
-                let got_found = explain(&test, &defs, &v, &mut got_path);
+                let want_found = explain_recursive(&want_test, &want_defs, &v, &mut want_path);
+                let got_found = explain(&test, &defs, &lens, &v, &mut got_path);
                 assert_eq!(want_path, got_path, "path differs: {test:?} {defs:?} {v}");
                 assert!(std::ptr::eq(want_found, got_found), "found differs: {test:?} {defs:?} {v}");
             }
