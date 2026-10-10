@@ -1124,14 +1124,17 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env
 // The static consistency check plus the Dyn-to-concrete boundary check. A
 // Fun source is returned unchanged; coerce_cast wraps it separately.
 fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env: &CheckEnv) -> Result<ExprRef, TypeError> {
-    // An unsolved variable keeps the check here: binding it later (even to Dyn) proves nothing
-    // about the values that reach this point, so a check is never deferred (only casts are,
-    // Pending; deferring checks dropped the Int test of `let y: Int = x` once a later
-    // `let d: Dyn = f` bound f's type to Dyn).
+    let env = env.with_span(span);
+    // A variable solved since it was read is judged (and reported) by its solution. An unsolved
+    // one keeps the check here: binding it later (even to Dyn) proves nothing about the values
+    // that reach this point, so a check is never deferred (only casts are, Pending; deferring
+    // checks dropped the Int test of `let y: Int = x` once a later `let d: Dyn = f` bound f's
+    // type to Dyn).
+    let solved = |t: &Type| if matches!(t, Type::Var(_)) { env.infer.resolve_deep(t) } else { t.clone() };
+    let (from, to) = (&solved(from), &solved(to));
     if matches!(to, Type::Var(_)) {
         return Ok(e);
     }
-    let env = env.with_span(span);
     if matches!(from, Type::Var(_)) {
         return Ok(if *to == Type::Dyn { e } else { build_boundary_check(arena, e, to, &env, &HashSet::new()) });
     }

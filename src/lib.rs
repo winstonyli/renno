@@ -8067,4 +8067,16 @@ mod tests {
         rejects(&format!("{f} f([1])"), "type error: expected [Dyn](3) | Bool, found List");
         assert_eq!(run_source(&format!("{f} f([1, 2, 3])")).unwrap().as_int(), 1);
     }
+
+    #[test]
+    fn a_variable_solved_before_its_check_is_judged_by_its_solution() {
+        // `n: Int = x` solves x to Int, so `if x` is a static mismatch (was: a run-time Bool check).
+        for src in ["let f = fun x -> let n: Int = x in if x then 1 else 2 in 0", "let f = fun x -> let n: Int = x in if x then 1 else 2 in f(1)"] {
+            let err = run_source(src).expect_err(src);
+            assert!(err.contains("type mismatch: expected Bool, found Int"), "{src}: {err}");
+        }
+        assert_eq!(run_source("let f = fun x -> let n: Int = x in n + 1 in f(1)").unwrap().as_int(), 2);
+        // A Dyn argument is still checked at run time.
+        assert_clean_rejection("let f = fun x -> let n: Int = x in n in let d: Dyn = true in f(d)", BAD_INT);
+    }
 }
