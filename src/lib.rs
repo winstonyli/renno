@@ -7588,14 +7588,28 @@ mod tests {
     }
 
     #[test]
-    fn sink_first_then_call_is_still_unchecked_known_limitation() {
-        // The Var is bound to a Fun only after the sink was elaborated; the
-        // flag dies with the binding (spec 2026-10-08-var-passthrough-casts
-        // section 7, item 1). Pinned: flips if a deferred sink patch lands.
-        let src = "let ap = fun g -> let r = map(g)([true]) in g(1) in ap(fun x: Int -> x + 1)";
-        let r = std::panic::catch_unwind(|| run_source(src));
-        let clean = matches!(&r, Ok(Err(e)) if e.contains(BAD_INT));
-        assert!(!clean, "now rejected cleanly; remove the known_limitation pin");
+    fn sink_first_then_call_is_checked_at_the_sink() {
+        // The Var is bound to a Fun only after the sink was elaborated: the cast
+        // waits (Pending) and is built under the final substitution.
+        for src in [
+            "let ap = fun g -> let r = map(g)([true]) in g(1) in ap(fun x: Int -> x + 1)",
+            "(fun g -> let r = map(g)([true]) in g(1))(fun x: Int -> x + 1)",
+            "let ap = fun g -> let r = handle (perform e(g)) with handler e(p, resume) -> p(true) in g(1) in ap(fun x: Int -> x + 1)",
+        ] {
+            assert_clean_rejection(src, BAD_INT);
+        }
+        assert_eq!(run_source("let ap = fun g -> let r = map(g)([2]) in g(1) in ap(fun x: Int -> x + 1)").unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_check_is_never_deferred_past_a_later_binding_to_dyn() {
+        // `let d: Dyn = f` binds f's own type variable to Dyn after `y: Int = x` was read;
+        // a check deferred to the end would see Dyn -> Dyn and drop the Int test.
+        assert_clean_rejection("let rec f = fun x -> let d: Dyn = f in let y: Int = x in d in let k: Dyn = f(1) in k(\"a\")", "type error: expected Int, found Str");
+        assert_clean_rejection(
+            "let rec f = fun x -> let d: Dyn = f in let z = x + 1 in let y: Int = x in d in let k: Dyn = f(1) in k(1.5)",
+            "type error: expected Int, found Float",
+        );
     }
 
     #[test]

@@ -132,6 +132,8 @@ pub(crate) struct InferCtx {
     // A RefCell because the check builders only see a shared &InferCtx
     // (CheckEnv), the same reason IndexWitness.used is a Cell.
     obligations: RefCell<Vec<Obligation>>,
+    // Casts deferred to the end of inference (Pending).
+    pendings: RefCell<Vec<Pending>>,
     // How many function bodies (Lambda, handler clause) enclose the point
     // being elaborated: code inside one can run any number of times.
     repeatable_depth: usize,
@@ -163,6 +165,7 @@ impl InferCtx {
             index_rename: HashMap::new(),
             index_witness: Vec::new(),
             obligations: RefCell::new(Vec::new()),
+            pendings: RefCell::new(Vec::new()),
             repeatable_depth: 0,
             named_types,
             dyn_sunk: HashSet::new(),
@@ -391,7 +394,7 @@ fn undecided() -> Rel {
 }
 
 /// `unify_index_expr` as the checker's `Result`: a refutation is its message, and an Unknown is a
-/// static error too (nothing at runtime can decide an index equation before stage 3's `Pending`).
+/// static error too (no run-time test decides an index equation; Pending defers only casts).
 pub(crate) fn unify_index(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
     match unify_index_expr(a, b, infer) {
         Rel::Proven => Ok(()),
@@ -1121,8 +1124,10 @@ fn coerce(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env
 // The static consistency check plus the Dyn-to-concrete boundary check. A
 // Fun source is returned unchanged; coerce_cast wraps it separately.
 fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Span, env: &CheckEnv) -> Result<ExprRef, TypeError> {
-    // An unsolved variable as written: the unifier binds it after this call, so the old answer
-    // stands until stage 3 resolves residuals at the end (design 3.2).
+    // An unsolved variable keeps the check here: binding it later (even to Dyn) proves nothing
+    // about the values that reach this point, so a check is never deferred (only casts are,
+    // Pending; deferring checks dropped the Int test of `let y: Int = x` once a later
+    // `let d: Dyn = f` bound f's type to Dyn).
     if matches!(to, Type::Var(_)) {
         return Ok(e);
     }
@@ -1154,6 +1159,66 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
             let target = if *from == Type::Dyn { to.clone() } else { erase_open_indexed(to, &env) };
             Ok(build_boundary_check(arena, e, &target, &env, &HashSet::new()))
         }
+    }
+}
+
+// `t` as a cast built now would read it: solved type variables substituted, each index
+// through runtime_index (a witnessed variable stays, so a Match hypothesis restored later
+// cannot change what it means).
+fn snapshot_type(t: &Type, infer: &InferCtx, witness_vars: &[&str]) -> Type {
+    let go = |t: &Type| snapshot_type(t, infer, witness_vars);
+    match infer.resolve(t) {
+        Type::Fun(p, r, b) => Type::Fun(Rc::new(go(&p)), r, Rc::new(go(&b))),
+        Type::List(e) => Type::List(Rc::new(go(&e))),
+        Type::Tuple(ts) => Type::Tuple(Rc::new(ts.iter().map(go).collect())),
+        Type::Union(ts) => Type::Union(Rc::new(ts.iter().map(go).collect())),
+        Type::Record(fs) => Type::Record(Rc::new(fs.iter().map(|(n, t)| (n.clone(), go(t))).collect())),
+        Type::Indexed(w, i) => Type::Indexed(Rc::new(go(&w)), Rc::new(runtime_index(&i, infer, witness_vars, false))),
+        other => other,
+    }
+}
+
+// A cast whose types still hold an unsolved type variable (design 3.2, casts only): `slot`
+// stands in for the cast and resolve_pendings fills it once inference has finished, so a
+// variable solved after the cast site (sink-then-call) still gets its function wrapper.
+struct Pending {
+    slot: ExprRef,
+    e: ExprRef,
+    from: Type,
+    to: Type,
+    witnesses: Vec<(String, String)>,
+    repeatable: bool,
+    span: Option<Span>,
+}
+
+// Every witness in scope is marked used: the final cast may read any of them.
+fn defer_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
+    let node = arena[e].clone();
+    let slot = arena.push(node);
+    let in_scope: Vec<&IndexWitness> = env.infer.index_witness.iter().chain(env.local.iter().copied()).collect();
+    for w in &in_scope {
+        w.used.set(true);
+    }
+    let vars: Vec<&str> = in_scope.iter().map(|w| w.var.as_str()).collect();
+    let (from, to) = (snapshot_type(from, env.infer, &vars), snapshot_type(to, env.infer, &vars));
+    let witnesses = in_scope.iter().map(|w| (w.var.clone(), w.hidden.clone())).collect();
+    let repeatable = env.infer.repeatable_depth > 0 || env.repeatable;
+    env.infer.pendings.borrow_mut().push(Pending { slot, e, from, to, witnesses, repeatable, span: env.span });
+    slot
+}
+
+// Builds every pending cast under the final substitution, in record order (an inner cast
+// first, so an outer one copies its finished node). Runs before resolve_obligations.
+fn resolve_pendings(arena: &mut Arena, infer: &InferCtx) {
+    for p in infer.pendings.take() {
+        let witnesses: Vec<IndexWitness> =
+            p.witnesses.iter().map(|(var, hidden)| IndexWitness { var: var.clone(), hidden: hidden.clone(), used: Cell::new(true) }).collect();
+        let env = CheckEnv { infer, local: witnesses.iter().collect(), defer: true, repeatable: p.repeatable, span: p.span };
+        let vars: Vec<&str> = p.witnesses.iter().map(|(var, _)| var.as_str()).collect();
+        let (from, to) = (snapshot_type(&p.from, infer, &vars), snapshot_type(&p.to, infer, &vars));
+        let result = cast_now(arena, p.e, &from, &to, &env);
+        let node = arena[result].clone();
+        arena[p.slot] = node;
     }
 }
 
@@ -1223,6 +1288,14 @@ fn erase_open_indexed(t: &Type, env: &CheckEnv) -> Type {
 fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let from = env.infer.resolve_deep(from);
     let to = env.infer.resolve_deep(to);
+    if !free_type_vars_resolved(&from, env.infer).is_empty() || !free_type_vars_resolved(&to, env.infer).is_empty() {
+        return defer_cast(arena, e, &from, &to, env);
+    }
+    cast_now(arena, e, &from, &to, env)
+}
+
+fn cast_now(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
+    let (from, to) = (from.clone(), to.clone());
     // Only a function value relate cannot prove is wrapped. Refuted never reaches here from
     // coerce (coerce_check reported it); joins and Dyn sinks cannot refute a Fun.
     if !matches!(from, Type::Fun(..)) || !matches!(relate_cast(&from, &to, env.infer), Rel::Unknown(..)) {
@@ -4419,6 +4492,7 @@ pub fn check(arena: &mut Arena, root: ExprRef, spans: &SpanMap) -> Result<ExprRe
 pub fn check_with_named_types(arena: &mut Arena, root: ExprRef, spans: &SpanMap, named_types: HashMap<String, Type>) -> Result<ExprRef, TypeError> {
     let mut infer = InferCtx::new(named_types);
     let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), spans, &mut infer)?;
+    resolve_pendings(arena, &infer);
     resolve_obligations(arena, &infer);
     match row {
         EffectRow::Closed(unhandled) if !unhandled.is_empty() => {
