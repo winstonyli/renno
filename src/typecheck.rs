@@ -138,6 +138,9 @@ impl CheckDef {
 // eval_pure runs it now: evaluation is deterministic, so it passes at run time
 // too. That decides the shape guard on a prelude constructor (`List` in
 // `List(Int)`) and leaves every check on a parameter or a `let` fallible.
+// `bound_names` comes from the parsed tree, so a binder elaboration adds
+// (`__check_tmp`, `__contract_fn`) looks closed; evaluated alone it is unbound,
+// so such a check counts as fallible, which is the safe answer.
 // Each check is decided on its own: one inside a closed operand (in a function
 // body, say) did not necessarily run when the outer one passed.
 fn fallible_check(arena: &Arena, root: ExprRef, spans: &SpanMap, infer: &InferCtx) -> bool {
