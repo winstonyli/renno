@@ -2248,10 +2248,10 @@ enum PendingElab {
 // Recognizes the handler-expression shapes this codebase actually
 // produces (MakeHandler, optionally wrapped in deep(...)/shallow(...))
 // well enough to know which effect name a `handle` discharges. Anything
-// else (a bare variable, a computed handler) returns None -- Handle then
-// conservatively does NOT subtract anything from the body's row, which is
-// the sound direction to fail in: at worst it over-reports an effect as
-// possibly-unhandled, never hides a real one.
+// else (a bare variable, a computed handler) returns None --
+// Handle then widens the body's row to Dyn, which is
+// the sound direction: an unknown handler may catch anything, so the
+// effect check defers to run time instead of rejecting.
 fn discharged_effect(arena: &Arena, handler: ExprRef) -> Option<String> {
     match &arena[handler] {
         Expr::MakeHandler { effect, .. } => Some(effect.clone()),
@@ -3782,7 +3782,13 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
 
         Expr::App(f, a) => {
             let (f_ty, f_row, f2) = elaborate(arena, f, ctx, spans, infer)?;
-            let f_ty = infer.resolve(&f_ty);
+            let mut f_ty = infer.resolve(&f_ty);
+            // A callee typed by a (recursive) alias is called through its body, one step.
+            let unfolded = match &f_ty {
+                Type::Named(id) => infer.named_types.get(id).filter(|raw| !matches!(raw, Type::Named(_))).cloned(),
+                _ => None,
+            };
+            f_ty = unfolded.unwrap_or(f_ty);
             // A callee whose parameter type mentions an Indexed type
             // (`Vec(n)`, `T(n)`, bare or nested in a tuple/list) gets its argument CHECKED against it, so a
             // list/tuple literal argument can satisfy the index -- Synth
@@ -4147,18 +4153,19 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // same convention, so a concretely-typed handler expression
             // (Int, Bool, Fun) can never legitimately be one. Reject it
             // statically instead of letting it reach machine.rs's panic.
-            if handler_ty != Type::Dyn {
+            let handler_ty = infer.resolve_deep(&handler_ty);
+            if !matches!(handler_ty, Type::Dyn | Type::Var(_)) {
                 return Err(TypeError(
                     format!("handle: expected a handler value, found expression of type {handler_ty}"),
                     spans[handler],
                 ));
             }
             // Discharge the effect this handler catches, if we can
-            // statically tell which one that is. If not, conservatively
-            // leave body_row untouched (over-approximate, never hide).
+            // statically tell which one that is. An unknown handler (a
+            // variable, a parameter) may catch anything: the row becomes Dyn.
             let row = match discharged_effect(arena, handler) {
                 Some(effect) => body_row.remove(&effect),
-                None => body_row,
+                None => EffectRow::Dyn,
             };
             let row = EffectRow::union(&row, &handler_row);
             Ok((Type::Dyn, row, arena.push(Expr::Handle { body: body2, handler: handler2 })))

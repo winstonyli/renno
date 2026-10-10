@@ -2666,6 +2666,21 @@ mod tests {
         assert!(err.0.contains("expected a handler value"), "unexpected message: {}", err.0);
     }
 
+    #[test]
+    fn unknown_handler_and_named_callee_are_accepted() {
+        // e04: a handler through an unannotated parameter; t16: through a variable.
+        let e04 = "let run = fun h -> handle (perform op(1)) with h in run(handler op(p, resume) -> resume(p))";
+        assert_eq!(run_source(e04).unwrap(), Outcome::Int(1));
+        let t16 = "let h = handler op(p, resume) -> resume(p) in handle (perform op(1)) with h";
+        assert_eq!(run_source(t16).unwrap(), Outcome::Int(1));
+        // t18: a callee typed by a recursive alias.
+        let t18 = "type F = Dyn -> F in let rec g: F = fun x -> g in g(1)(2)";
+        assert!(run_source(t18).is_ok());
+        // A handler that does not catch the effect still reaches the run-time error.
+        let miss = "let h = handler other(p, resume) -> resume(p) in handle (perform op(1)) with h";
+        assert!(run_source(miss).unwrap_err().contains("unhandled effect: op"));
+    }
+
     // --- closed effect-row typing ---
 
     #[test]
