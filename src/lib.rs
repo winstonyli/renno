@@ -159,6 +159,19 @@ mod tests {
             }
     }
 
+    // Does the elaborated program still bind `name` (a `let` or `let rec`)?
+    // False when typecheck erased the binding.
+    fn elaborated_binds(src: &str, name: &str) -> bool {
+        use expr::Expr;
+        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        tree_any(&arena, elaborated, &|e| match e {
+            Expr::Let(v, ..) => v == name,
+            Expr::LetRec(bindings, _) => bindings.iter().any(|(v, _, _)| v == name),
+            _ => false,
+        })
+    }
+
     // handle { let x = perform choose(0) in x + 100 } with
     // handler choose(p, resume) -> resume(1) + resume(2)
     //
@@ -4164,16 +4177,7 @@ g(len)").unwrap_err();
     // (spec section 1); one read as a value, or not proved at check time, stays.
     #[test]
     fn a_type_let_only_annotations_read_is_erased() {
-        use expr::Expr;
-        let binds = |src: &str, name: &str| {
-            let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-            let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
-            tree_any(&arena, elaborated, &|e| match e {
-                Expr::Let(v, ..) => v == name,
-                Expr::LetRec(bindings, _) => bindings.iter().any(|(v, _, _)| v == name),
-                _ => false,
-            })
-        };
+        let binds = elaborated_binds;
         assert!(!binds("let T = List(Int) in let x: T = [1] in x", "T"));
         assert!(!binds("let T = Int in let U = List(T) in let x: U = [1] in x", "U"));
         assert!(!binds("let rec L = Union((Tuple((Int, L)), Bool)) in let l: L = (1, true) in l", "L"));
@@ -4216,6 +4220,30 @@ g(len)").unwrap_err();
     fn annotations_read_a_non_recursive_let_rec_like_the_run_time() {
         assert_eq!(run_source("let T = Int in let rec T = (fun u -> u)(T) and k = 5 in let y: T = 1 in y").unwrap(), Outcome::Int(1));
         assert_eq!(run_source("let Int = Bool in let rec Int = (fun u -> u)(Int) and k = 5 in let y: Int = true in y").unwrap(), Outcome::Bool(true));
+    }
+
+    // A type let is dropped only when running it cannot fail. The check-time
+    // evaluation skips the checks elaboration adds, so a let whose value (or a
+    // definition it calls) holds a check that could fail stays and runs.
+    #[test]
+    fn a_type_let_whose_run_time_checks_can_fail_is_kept() {
+        for src in [
+            "let T = (fun a -> if true then a else 5)(Int) in let y: T = 1 in y",
+            "let G = fun a -> (if true then a else 5) in let T = G(Int) in let y: T = 1 in y",
+            "let G = fun a -> (let d: Dyn = a in let i: Int = d in Int) in let T = G(Int) in let y: T = 1 in y",
+        ] {
+            assert!(elaborated_binds(src, "T"), "{src}");
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains("expected Int, found Type"), "{src}: {err}");
+        }
+        // A check in a function body did not run when the shape guard on the
+        // function passed.
+        let src = "let T = (let g: Dyn = fun a -> (let i: Int = a in Int) in g)(true) in let y: T = 1 in y";
+        assert!(elaborated_binds(src, "T"));
+        assert!(run_source(src).unwrap_err().contains("expected Int, found Bool"));
+        // Only closures or type literals: running them cannot fail.
+        assert!(!elaborated_binds("let rec Rep = fun n -> if n == 0 then Int else List(Rep(n - 1)) in let x: Rep(1) = [1] in x", "Rep"));
+        assert!(!elaborated_binds("let Pair = fun a -> Tuple((a, a)) in let x: Pair(Int) = (1, 2) in x", "Pair"));
     }
 
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain

@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -93,16 +93,13 @@ pub(crate) struct CheckDef {
     node: DefNode,
     // The scope before the binder: where the right-hand side's names resolve.
     ctx: Ctx,
-    // An annotation's evaluation used this definition and finished, so its
-    // right-hand side is pure and terminates.
+    // The elaborated value(s): what the run time evaluates for this binder.
+    values: Vec<ExprRef>,
+    // Memo of CheckDef::fallible.
+    fallible: OnceCell<bool>,
+    // An annotation's evaluation finished with this definition, and its
+    // binding cannot fail at run time (mark_proven).
     proven: Cell<bool>,
-    // The binder or its right-hand side carries an annotation, which the
-    // check-time evaluation ignores.
-    annotated: bool,
-    // Proved by an evaluation in which no definition was annotated: every
-    // run-time check in the elaborated value then guards an operation that
-    // evaluation performed itself (a call of a Dyn callee, say), so none can fail.
-    vouched: Cell<bool>,
     // Something named the binder at value position (lookup).
     used: Cell<bool>,
 }
@@ -114,47 +111,57 @@ enum DefNode {
 }
 
 impl CheckDef {
-    // A `let` the run time does not need: an annotation proved its value, no
-    // value-position reference reads it, and no run-time check in its
-    // elaborated value can fail where the check-time evaluation succeeded. A
-    // check that came from an annotation can: the evaluation ignores annotations.
-    fn erasable(&self, arena: &Arena, vals: &[ExprRef], infer: &InferCtx) -> bool {
-        self.proven.get() && !self.used.get() && (self.vouched.get() || !vals.iter().any(|v| has_check(arena, *v, infer)))
+    // A binding the run time does not need: proven, and no value-position
+    // reference reads it.
+    fn erasable(&self) -> bool {
+        self.proven.get() && !self.used.get()
+    }
+
+    // Evaluating the binding only builds closures or type literals, so it
+    // cannot fail: a check inside a function body runs only when something
+    // calls it, and a caller looks the binder up (`used`).
+    fn inert(&self, arena: &Arena) -> bool {
+        self.values.iter().all(|v| matches!(arena[*v], Expr::Lambda(..) | Expr::TypeLit(_)))
+    }
+
+    // Some value holds a run-time check that could fail (fallible_check). The
+    // answer cannot change once the values are elaborated: a later cast slot
+    // lies in later code.
+    fn fallible(&self, arena: &Arena, spans: &SpanMap, infer: &InferCtx) -> bool {
+        *self.fallible.get_or_init(|| self.values.iter().any(|v| fallible_check(arena, *v, spans, infer)))
     }
 }
 
-// Does the parsed tree at `root` carry an annotation anywhere?
-fn has_annotation(arena: &Arena, root: ExprRef) -> bool {
-    let mut work = vec![root];
-    let mut kids = Vec::new();
-    while let Some(n) = work.pop() {
-        match &arena[n] {
-            Expr::Lambda(_, Some(_), _) | Expr::Let(_, Some(_), ..) => return true,
-            Expr::LetRec(bindings, _) if bindings.iter().any(|(_, a, _)| a.is_some()) => return true,
-            _ => {}
-        }
-        kids.clear();
-        arena[n].children(&mut kids);
-        work.extend(&kids);
-    }
-    false
-}
-
-// Does the elaborated tree at `root` hold a run-time check: a Check node, or a
-// cast slot resolve_pendings has yet to fill?
-fn has_check(arena: &Arena, root: ExprRef, infer: &InferCtx) -> bool {
+// Can a run-time check in the elaborated tree at `root` fail? A cast slot
+// resolve_pendings has yet to fill can. So can a Check, unless its operand is
+// closed (it names nothing a program binder binds) and the check passes when
+// eval_pure runs it now: evaluation is deterministic, so it passes at run time
+// too. That decides the shape guard on a prelude constructor (`List` in
+// `List(Int)`) and leaves every check on a parameter or a `let` fallible.
+// Each check is decided on its own: one inside a closed operand (in a function
+// body, say) did not necessarily run when the outer one passed.
+fn fallible_check(arena: &Arena, root: ExprRef, spans: &SpanMap, infer: &InferCtx) -> bool {
     let slots: HashSet<ExprRef> = infer.pendings.borrow().iter().map(|p| p.slot).collect();
+    let mut closed = Vec::new();
     let mut work = vec![root];
     let mut kids = Vec::new();
     while let Some(n) = work.pop() {
-        if matches!(arena[n], Expr::Check(..)) || slots.contains(&n) {
+        if slots.contains(&n) {
             return true;
         }
+        if let Expr::Check(operand, spec) = &arena[n] {
+            if !spec.lens.is_empty() || crate::resolve::free_vars(arena, *operand).iter().any(|name| infer.bound_names.contains(name)) {
+                return true;
+            }
+            closed.push(n);
+        }
         kids.clear();
         arena[n].children(&mut kids);
         work.extend(&kids);
     }
-    false
+    closed
+        .into_iter()
+        .any(|n| !matches!(crate::machine::eval_pure(arena, n, spans, crate::machine::ANNOTATION_FUEL), crate::machine::Pure::Done(_)))
 }
 
 // pub(crate), not private, only because this project's own test
@@ -264,15 +271,15 @@ impl InferCtx {
         }
     }
 
-    fn new_def(&mut self, node: DefNode, annotated: bool, ctx: &Ctx) -> Rc<CheckDef> {
+    fn new_def(&mut self, node: DefNode, values: Vec<ExprRef>, ctx: &Ctx) -> Rc<CheckDef> {
         self.def_seq += 1;
         Rc::new(CheckDef {
             seq: self.def_seq,
             node,
             ctx: ctx.clone(),
+            values,
+            fallible: OnceCell::new(),
             proven: Cell::new(false),
-            annotated,
-            vouched: Cell::new(false),
             used: Cell::new(false),
         })
     }
@@ -3151,16 +3158,21 @@ fn annotation_type(arena: &mut Arena, ann: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     let defs = definitions_used(arena, ann, &[], ctx, infer).map_err(err)?;
     let root = wrap_in_definitions(arena, ann, &defs);
     let ty = crate::machine::eval_type(arena, root, spans).map_err(err)?;
-    mark_proven(&defs);
+    mark_proven(arena, &defs, spans, infer);
     Ok(ty)
 }
 
-// `defs` took part in an evaluation that finished (CheckDef::proven, vouched).
-fn mark_proven(defs: &[Rc<CheckDef>]) {
-    let vouched = !defs.iter().any(|d| d.annotated);
+// `defs` took part in a check-time evaluation that finished. The evaluation
+// ran their parsed values, without the checks elaboration added, so a
+// definition is proven only if its run-time binding cannot fail: it is
+// inert, or no definition in `defs` holds a check that could fail (the
+// binding may call any of them).
+fn mark_proven(arena: &Arena, defs: &[Rc<CheckDef>], spans: &SpanMap, infer: &InferCtx) {
+    let clean = !defs.iter().any(|d| d.fallible(arena, spans, infer));
     for def in defs {
-        def.proven.set(true);
-        def.vouched.set(def.vouched.get() || vouched);
+        if clean || def.inert(arena) {
+            def.proven.set(true);
+        }
     }
 }
 
@@ -3242,7 +3254,7 @@ fn recursive_type_group(
         });
         let root = wrap_in_definitions(arena, leaves, &defs);
         let Ok(ty) = crate::machine::eval_type(arena, root, spans) else { return Ok(None) };
-        mark_proven(&defs);
+        mark_proven(arena, &defs, spans, infer);
         results.push(ty);
     }
     let mut values = Vec::with_capacity(results.len());
@@ -3314,7 +3326,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         (val_ty, val_row, val2)
                     }
                 };
-                let def = infer.new_def(DefNode::Let(var.clone(), val), ann.is_some() || has_annotation(arena, val), &cur_ctx);
+                let def = infer.new_def(DefNode::Let(var.clone(), val), vec![val3], &cur_ctx);
                 cur_ctx = extend_defined(&cur_ctx, &var, bound_ty.clone(), infer, Some(def.clone()));
                 pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3, def });
                 cur_expr = body;
@@ -3338,9 +3350,9 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 if let Some(values) = recursive_type_group(arena, &bindings, &cur_ctx, spans, infer)? {
                     let lits: Vec<(String, Option<ExprRef>, ExprRef)> =
                         bindings.iter().zip(values).map(|((name, _, _), ty)| (name.clone(), None, type_lit(arena, ty))).collect();
-                    let def = infer.new_def(DefNode::Group(Rc::new(lits.clone())), false, &cur_ctx);
+                    let vals = lits.iter().map(|(_, _, lit)| *lit).collect();
+                    let def = infer.new_def(DefNode::Group(Rc::new(lits.clone())), vals, &cur_ctx);
                     def.proven.set(true);
-                    def.vouched.set(true);
                     let mut elaborated = Vec::with_capacity(lits.len());
                     for (name, _, lit) in lits {
                         cur_ctx = extend_defined(&cur_ctx, &name, Type::Dyn, infer, Some(def.clone()));
@@ -3393,8 +3405,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     };
                     elaborated.push((name.clone(), bound_ty, val_row, val3));
                 }
-                let annotated = bindings.iter().any(|(_, a, v)| a.is_some() || has_annotation(arena, *v));
-                let def = infer.new_def(DefNode::Group(bindings.clone()), annotated, &cur_ctx);
+                let values = elaborated.iter().map(|(_, _, _, v)| *v).collect();
+                let def = infer.new_def(DefNode::Group(bindings.clone()), values, &cur_ctx);
                 for (name, bound_ty, _, _) in elaborated.iter() {
                     cur_ctx = extend_defined(&cur_ctx, name, bound_ty.clone(), infer, Some(def.clone()));
                 }
@@ -3605,7 +3617,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // through unchanged, row is the union of val's and body's.
                 result_row = EffectRow::union(&val_row, &result_row);
                 // A type let only annotations read is dead at run time.
-                if def.erasable(arena, &[val], infer) {
+                if def.erasable() {
                     continue;
                 }
                 let ann = type_lit(arena, bound_ty);
@@ -3618,8 +3630,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 for (_, _, val_row, _) in &bindings {
                     result_row = EffectRow::union(val_row, &result_row);
                 }
-                let vals: Vec<ExprRef> = bindings.iter().map(|(_, _, _, v)| *v).collect();
-                if def.erasable(arena, &vals, infer) {
+                if def.erasable() {
                     continue;
                 }
                 let group: Vec<(String, Option<ExprRef>, ExprRef)> =
