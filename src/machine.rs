@@ -132,7 +132,7 @@ pub fn eval_type(arena: &Arena, ann: ExprRef, spans: &SpanMap) -> Result<Type, S
     }
     match eval_pure(arena, ann, spans, ANNOTATION_FUEL) {
         Pure::Done(Value::Type(t)) => Ok((*t).clone()),
-        Pure::Done(v) => Err(format!("an annotation must be a type, found {}", v.type_name())),
+        Pure::Done(v) => Err(format!("annotation did not evaluate to a type, found {}", v.type_name())),
         Pure::Stuck(Stuck::Fuel) => Err(format!("annotation did not finish within {ANNOTATION_FUEL} steps")),
         Pure::Stuck(Stuck::Effect) => Err("an annotation cannot perform an effect".to_string()),
         Pure::Stuck(Stuck::Builtin) => Err("an annotation can only call the type constructors".to_string()),
@@ -1363,6 +1363,17 @@ fn construct_type(ctor: TypeCtor, arg: Value) -> Type {
         (TypeCtor::Vec, Value::Int(n)) if n >= 0 => {
             Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Lit(n)))
         }
+        // (T, k) is T at index k; (T, Vec(n)) takes the index n, which is
+        // how the parser passes a symbolic `Indexed(T, n)`.
+        (TypeCtor::Indexed, Value::List(items)) => match &items[..] {
+            [Value::Type(t), Value::Int(k)] if *k >= 0 => Type::Indexed(t.clone(), Rc::new(IndexExpr::Lit(*k))),
+            [Value::Type(t), Value::Type(i)] => match &**i {
+                Type::Indexed(_, index) => Type::Indexed(t.clone(), index.clone()),
+                _ => crate::run_error!("Indexed expects (type, index)"),
+            },
+            _ => crate::run_error!("Indexed expects (type, index)"),
+        },
+        (TypeCtor::TypeOf, Value::Token(id)) => Type::Token(id),
         (ctor, arg) => crate::run_error!("{ctor:?} cannot take a {}", arg.type_name()),
     }
 }
@@ -1483,6 +1494,9 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Token(x), Value::Token(y)) => x == y,
+        // Structural (spec section 9.2): a recursive type compares by its
+        // Named id, so this terminates.
+        (Value::Type(x), Value::Type(y)) => x == y,
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_eq(a, b))
         }

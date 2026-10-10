@@ -50,6 +50,8 @@ pub static PRELUDE: &[(&str, Builtin)] = &[
     ("Union", Builtin::Ty(TypeCtor::Union)),
     ("Fun", Builtin::Ty(TypeCtor::Fun)),
     ("Vec", Builtin::Ty(TypeCtor::Vec)),
+    ("Indexed", Builtin::Ty(TypeCtor::Indexed)),
+    ("TypeOf", Builtin::Ty(TypeCtor::TypeOf)),
 ];
 
 impl Env {

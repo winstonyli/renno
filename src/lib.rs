@@ -3979,7 +3979,7 @@ g(len)").unwrap_err();
             _ => panic!("List(1) must be an error"),
         }
         match eval_type_of_program("1 + 2") {
-            Err(msg) => assert_eq!(msg, "an annotation must be a type, found Int"),
+            Err(msg) => assert_eq!(msg, "annotation did not evaluate to a type, found Int"),
             Ok(t) => panic!("1 + 2 is not a type, got {t}"),
         }
     }
@@ -4013,6 +4013,24 @@ g(len)").unwrap_err();
     fn a_value_named_like_a_type_does_not_change_annotations_yet() {
         assert_eq!(run_source("let Int = 5 in let x: Int = 3 in x + Int").unwrap().as_int(), 8);
         assert_eq!(run_source("let List = 2 in let xs: [Int] = [1] in len(xs) + List").unwrap().as_int(), 3);
+    }
+
+    // Stage B's constructors and `==` on type values (spec section 9): Indexed
+    // takes (type, index), TypeOf takes a token, and `==` is structural.
+    #[test]
+    fn type_values_index_brand_and_compare() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        assert_eq!(ok("to_str(Indexed(List(Int), 2))"), "[Int](2)");
+        let err = run_source("Indexed(List(Int), true)").unwrap_err();
+        assert!(err.contains("Indexed expects (type, index)"), "{err}");
+        assert_eq!(ok("let B = opaque in TypeOf(B) == TypeOf(B)"), "true");
+        assert_eq!(ok("let B = opaque in let C = opaque in TypeOf(B) == TypeOf(C)"), "false");
+        let err = run_source("TypeOf(1)").unwrap_err();
+        assert!(err.contains("TypeOf cannot take a Int"), "{err}");
+        assert_eq!(ok("Int == Int"), "true");
+        assert_eq!(ok("List(Int) == List(Int)"), "true");
+        assert_eq!(ok("List(Int) == List(Str)"), "false");
+        assert_eq!(ok("Union((Int, Str)) == Union((Str, Int))"), "false");
     }
 
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain

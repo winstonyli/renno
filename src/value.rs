@@ -139,6 +139,12 @@ pub enum TypeCtor {
     // A non-negative Int k -> Vec(k). A symbolic index (`Vec(n)`) is not a
     // value: the parser keeps it as an Expr::TypeLit.
     Vec,
+    // (T, k) or (T, an indexed type) -> T at that index. The parser passes
+    // `Indexed(T, n)` as (T, Vec(n)), so the index may name a variable.
+    Indexed,
+    // A token (the value of an `opaque`) -> the singleton type of that brand.
+    // Only code holding the token can name its type.
+    TypeOf,
 }
 
 impl TypeCtor {
@@ -150,7 +156,14 @@ impl TypeCtor {
             TypeCtor::Bool => Some(Type::Bool),
             TypeCtor::Str => Some(Type::Str),
             TypeCtor::Dyn => Some(Type::Dyn),
-            TypeCtor::List | TypeCtor::Tuple | TypeCtor::Record | TypeCtor::Union | TypeCtor::Fun | TypeCtor::Vec => None,
+            TypeCtor::List
+            | TypeCtor::Tuple
+            | TypeCtor::Record
+            | TypeCtor::Union
+            | TypeCtor::Fun
+            | TypeCtor::Vec
+            | TypeCtor::Indexed
+            | TypeCtor::TypeOf => None,
         }
     }
 }
