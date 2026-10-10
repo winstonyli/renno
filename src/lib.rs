@@ -8027,4 +8027,27 @@ mod tests {
         assert!(err.contains("expected Bool, found Int"), "unexpected message: {err}");
         assert!(!err.contains("cannot tell"), "{err}");
     }
+
+    #[test]
+    fn an_open_vec_m_result_is_checked_against_the_wrappers_argument() {
+        // The target's parameter variable is witnessed by the wrapper's own argument, so UP
+        // compares the result's length with it (was: a list check only).
+        for src in [
+            "let f: (Dyn -> Dyn) = fun v -> [1] in let g: (Vec(n) -> Vec(n)) = f in let d: Dyn = g in len(d([1, 2]))",
+            "let f: (Vec(m) -> Dyn) = fun v -> [1] in let g: (Vec(m) -> Vec(m)) = f in g([1, 2])",
+            "let f: (Dyn -> Dyn) = fun v -> [1] in let g: (Vec(n) -> Vec(n)) | Bool = f in let d: Dyn = g in len(d([1, 2]))",
+        ] {
+            rejects(src, "type error: expected [Dyn](");
+        }
+        let ok = "let f: (Vec(m) -> Dyn) = fun v -> v in let g: (Vec(m) -> Vec(m)) = f in len(g([1, 2]))";
+        assert_eq!(run_source(ok).unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_flexible_vec_n_union_into_a_literal_length_union_checks_the_length() {
+        // The literal 3 has a runtime value, so the check keeps it (was: stripped to a list check).
+        let f = "let f = fun v: Vec(n) -> let a: Vec(n) | Bool = v in let b: Vec(3) | Bool = a in 1 in";
+        rejects(&format!("{f} f([1])"), "type error: expected [Dyn](3) | Bool, found List");
+        assert_eq!(run_source(&format!("{f} f([1, 2, 3])")).unwrap().as_int(), 1);
+    }
 }

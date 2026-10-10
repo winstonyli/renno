@@ -1148,9 +1148,10 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
                     _ => {}
                 }
             }
-            // Lengths are the unifier's (obligations), except from a raw Dyn, whose top-level
-            // length is checked against a witness. Nested lengths stay unchecked (parked, S3).
-            let target = if *from == Type::Dyn { to.clone() } else { strip_indexed(to) };
+            // A raw Dyn source's lengths are all checked (against witnesses, or as
+            // obligations). Any other source's only where the index has a runtime value
+            // (erase_open_indexed); the rest are the unifier's.
+            let target = if *from == Type::Dyn { to.clone() } else { erase_open_indexed(to, &env) };
             Ok(build_boundary_check(arena, e, &target, &env, &HashSet::new()))
         }
     }
@@ -1194,15 +1195,15 @@ fn strip_indexed(t: &Type) -> Type {
     }
 }
 
-// `t` with every Indexed whose index mentions a variable `has_value` rejects
-// reduced to the type it wraps, so build_boundary_check never needs a witness
-// it cannot get. Deliberate extension: a non-bare index (Vec(n+1)) keeps its
-// length compare when every variable in it is witnessed in scope; otherwise
-// the check degrades to is_list only (see build_cast).
-fn erase_open_indexed(t: &Type, has_value: &dyn Fn(&str) -> bool) -> Type {
-    let go = |t: &Type| erase_open_indexed(t, has_value);
+// `t` with every Indexed whose index has no runtime value at this boundary
+// (index_has_value) reduced to the type it wraps, so build_boundary_check never
+// needs a witness it cannot get. A non-bare index (Vec(n+1)) keeps its length
+// compare when every variable in it has a value; otherwise the check degrades
+// to is_list only (see build_cast).
+fn erase_open_indexed(t: &Type, env: &CheckEnv) -> Type {
+    let go = |t: &Type| erase_open_indexed(t, env);
     match t {
-        Type::Indexed(w, i) if free_index_vars(i).iter().all(|v| has_value(v)) => Type::Indexed(Rc::new(go(w)), i.clone()),
+        Type::Indexed(w, i) if index_has_value(i, env) => Type::Indexed(Rc::new(go(w)), i.clone()),
         Type::Indexed(w, _) => go(w),
         Type::List(e) => Type::List(Rc::new(go(e))),
         Type::Tuple(ts) => Type::Tuple(Rc::new(ts.iter().map(go).collect())),
@@ -1271,6 +1272,14 @@ fn cast_targets(to: &Type, infer: &InferCtx) -> (Type, Type) {
     }
 }
 
+// Does every variable of index `i` have a runtime value at this boundary: a
+// witness in scope, or a static binding whose own variables do (the order
+// index_var_to_expr reads them in)?
+fn index_has_value(i: &IndexExpr, env: &CheckEnv) -> bool {
+    let vars: Vec<&str> = env.local.iter().copied().chain(env.infer.index_witness.iter()).map(|w| w.var.as_str()).collect();
+    free_index_vars(&runtime_index(i, env.infer, &vars, false)).iter().all(|v| vars.contains(&v.as_str()))
+}
+
 // Is index variable `v` already bound by a witness in scope (a local one, or
 // one the inference recorded)?
 fn index_witnessed<'a>(env: &'a CheckEnv<'a>) -> impl Fn(&str) -> bool + 'a {
@@ -1290,7 +1299,6 @@ fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env
     let Expr::Lambda(param, _, body) = arena[e].clone() else { unreachable!("build_literal_cast takes a Lambda") };
     let Type::Fun(a, _, b) = from else { unreachable!("build_literal_cast takes a Fun source") };
     let (a_target, b_target) = cast_targets(to, env.infer);
-    let witnessed = index_witnessed(env);
     let up_body = cast_up(arena, body, b, &b_target, env, true);
     if relate_cast(&a_target, a, env.infer) == Rel::Proven {
         return arena.push(Expr::Lambda(param, Some(a_target), up_body));
@@ -1300,7 +1308,7 @@ fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env
     // the value.
     let ca = cast_binder("__ca");
     let ca_ref = arena.push(Expr::Var(ca.clone()));
-    let checked = build_boundary_check(arena, ca_ref, &erase_open_indexed(a, &witnessed), env, &HashSet::new());
+    let checked = build_boundary_check(arena, ca_ref, &erase_open_indexed(a, env), env, &HashSet::new());
     let body = arena.push(Expr::Let(param, None, checked, up_body));
     arena.push(Expr::Lambda(ca, Some(a_target), body))
 }
@@ -1332,7 +1340,7 @@ fn cast_up(arena: &mut Arena, res: ExprRef, b: &Type, b_target: &Type, env: &Che
         Type::Fun(..) => build_cast(arena, res, b, b_target, env),
         _ => {
             let body_env = CheckEnv { infer: env.infer, local: env.local.clone(), defer: false, repeatable: true, span: env.span };
-            let target = erase_open_indexed(b_target, &index_witnessed(&body_env));
+            let target = erase_open_indexed(b_target, &body_env);
             build_boundary_check(arena, res, &target, &body_env, &HashSet::new())
         }
     }
@@ -1340,11 +1348,13 @@ fn cast_up(arena: &mut Arena, res: ExprRef, b: &Type, b_target: &Type, env: &Che
 
 // The closure form of coerce_cast for a Fun `from` (relate_cast is Unknown).
 // Every binder is fresh (cast_binder), so a returned function's wrapper, nested
-// inside this one's lambda, never shadows it. A Vec(n) parameter whose `n` has
-// no witness in scope binds one from `__ca#k` (DOWN then needs only is_list:
-// the length half would be `len(__ca#k) == n`, a tautology); a variable already
-// witnessed in scope is never rebound, so a nested wrapper compares against
-// the outer value. Any other open index degrades to is_list.
+// inside this one's lambda, never shadows it. A Vec(n) parameter, of the source
+// or of the target, whose `n` has no witness in scope binds one from `__ca#k`
+// (one hidden alias for both): DOWN then needs only is_list (the length half
+// would be `len(__ca#k) == n`, a tautology), and UP compares a `Vec(n)` result
+// with the argument. A variable already witnessed in scope is never rebound,
+// so a nested wrapper compares against the outer value. Any other open index
+// degrades to is_list.
 // Known limitation (spec 2026-10-08 sec 7): a monomorphic `n` that no witness
 // in scope covers (e.g. `n` fixed by an earlier Dyn-to-Vec(n) check, then
 // `let f = fun w: Vec(n) -> .. in let d: Dyn = f in d([1])`) gets a fresh
@@ -1356,22 +1366,28 @@ fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Check
     let cf = cast_binder("__cf");
     let ca = cast_binder("__ca");
     let witnessed = index_witnessed(env);
-    let witness = list_length_var(a, env.infer).filter(|v| !witnessed(v)).map(|var| IndexWitness::new(var, &ca));
+    let hidden = fresh_index_name(&format!("list_{ca}"));
+    let witnesses: Vec<IndexWitness> = [list_length_var(a, env.infer), list_length_var(&a_target, env.infer)]
+        .into_iter()
+        .flatten()
+        .filter(|v| !witnessed(v))
+        .map(|var| IndexWitness { var, hidden: hidden.clone(), used: Cell::new(false) })
+        .collect();
     let mut local = env.local.clone();
-    local.extend(witness.as_ref());
+    local.extend(witnesses.iter());
     let body_env = CheckEnv { infer: env.infer, local, defer: false, repeatable: true, span: env.span };
     let ca_ref = arena.push(Expr::Var(ca.clone()));
     let arg = if relate_cast(&a_target, a, env.infer) != Rel::Proven {
-        build_boundary_check(arena, ca_ref, &erase_open_indexed(a, &witnessed), &body_env, &HashSet::new())
+        build_boundary_check(arena, ca_ref, &erase_open_indexed(a, env), &body_env, &HashSet::new())
     } else {
         ca_ref
     };
     let cf_ref = arena.push(Expr::Var(cf.clone()));
     let call = arena.push(Expr::App(cf_ref, arg));
     let result = cast_up(arena, call, b, &b_target, &body_env, false);
-    let body = match &witness {
-        Some(w) if w.used.get() => w.bind(arena, &ca, result),
-        _ => result,
+    let body = match witnesses.iter().find(|w| w.used.get()) {
+        Some(w) => w.bind(arena, &ca, result),
+        None => result,
     };
     let lambda = arena.push(Expr::Lambda(ca, Some(a_target), body));
     arena.push(Expr::Let(cf, None, e, lambda))
