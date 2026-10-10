@@ -125,9 +125,9 @@ mod tests {
     }
 
     // Walks the elaborated tree looking for a runtime boundary check: a
-    // native Expr::Check, or a Vec(n) index check (still desugared into
-    // `let __check_tmp = ... in if ... then ... else ...`, detected by that
-    // Let's fixed binder name). Needed because arena-indexed Expr's derived
+    // native Expr::Check, or a union check with a Fun alternative (still
+    // desugared into `let __check_tmp = ... in if ... then ... else ...`,
+    // detected by that Let's fixed binder name). Needed because arena-indexed Expr's derived
     // Debug only prints the immediate node (children are plain ExprRef
     // indices, so Debug does not recurse through them).
     fn contains_check(arena: &expr::Arena, root: expr::ExprRef) -> bool {
@@ -3494,13 +3494,17 @@ g(len)").unwrap_err();
         assert_eq!(result.as_int(), 1);
     }
 
-    // The same bare self-reference next to a Vec(n) alternative: shape_of is
-    // None for A, so the desugared predicate path unfolds A and meets it again
-    // (once overflowed the elaborator's own stack).
+    // The same bare self-reference next to a Vec alternative: the shape test
+    // meets A again before any container and answers Never instead of
+    // unfolding it forever (once overflowed the elaborator's own stack).
     #[test]
     fn a_vec_n_union_self_reference_does_not_infinite_loop_at_a_dyn_boundary() {
         assert_eq!(run_source("type A = Vec(2) | A in let d: Dyn = [1, 2] in let l: A = d in 1").unwrap().as_int(), 1);
         rejects("type A = Vec(2) | A in let d: Dyn = 3 in let l: A = d in 1", "type error: expected [Dyn](2) | A, found Int");
+        // A variable length too (index names are program-wide, so the alias's n is xs's).
+        let var = |v: &str| format!("type A = Vec(n) | A in let f = fun xs: Vec(n) -> let d: Dyn = {v} in let l: A = d in 1 in f([1, 2])");
+        assert_eq!(run_source(&var("[3, 4]")).unwrap().as_int(), 1);
+        rejects(&var("[3]"), "type error: expected [Dyn](n) | A, found List");
     }
 
     #[test]
@@ -4400,9 +4404,9 @@ g(len)").unwrap_err();
         // annotating `x` (a genuine Dyn value) directly as `Vec(n)`: a bare
         // index variable crossing an ACTUAL Dyn boundary hits a separate,
         // pre-existing gap this task does not touch -- coerce()'s runtime
-        // boundary check (build_boundary_check/index_expr_to_expr) splices
+        // boundary check (build_boundary_check) then spliced
         // the index variable into the check as an ordinary Expr::Var, which
-        // assumes (see index_expr_to_expr's own doc comment) it is always a
+        // assumed it was always a
         // real, in-scope RUNTIME parameter by this phase -- true for a
         // dependently-typed function parameter (`fun n: Int -> fun v:
         // Vec(n) -> v`), but not for a bare index variable minted by a
@@ -7361,19 +7365,80 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn a_vec_n_index_check_stays_desugared_but_tests_natively() {
-        // A variable index is compared in the environment: desugared, with a native list probe.
+    fn a_vec_n_index_check_is_one_native_check_with_a_length_slot() {
+        // A variable index is read from a length slot (here v's length, through its witness):
+        // one native Check, no desugared let/if and no synthesized `#len`/`#fail` call.
         let src = "let f = fun v: Vec(n) -> let d: Dyn = [1, 2] in let y: Vec(n) = d in 1 in f([1, 2])";
+        assert!(has_assert_check(src, expr::Test::ListLenArg(Box::new(expr::Test::Any), 0)));
         let (arena, root) = elaborated_tree(src);
-        assert!(has_let_named(&arena, root, "__check_tmp#"));
-        assert!(tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(_, s) if s.test == expr::Test::List && s.mode == expr::CheckMode::Probe)));
+        assert!(!has_let_named(&arena, root, "__check_tmp#"));
+        assert!(tree_any(&arena, root, &|n| matches!(n, expr::Expr::Len(expr::LenExpr::Witness(..)))));
+        assert!(!tree_any(&arena, root, &|n| matches!(n, expr::Expr::Var(v) if v == "#len" || v == "#fail")));
         assert!(!calls_a_check_predicate(src));
+        assert_eq!(run_source(src).unwrap().as_int(), 1);
+        assert_clean_rejection(&src.replace("[1, 2] in let y", "[1, 2, 3] in let y"), "type error: expected [Dyn](n), found List");
         // A literal length is one native test.
         let lit = "let d: Dyn = [1, 2] in let y: Vec(2) = d in 1";
         assert!(has_assert_check(lit, expr::Test::ListLen(Box::new(expr::Test::Any), 2)));
         let (arena, root) = elaborated_tree(lit);
         assert!(!has_let_named(&arena, root, "__check_tmp#"));
         assert_clean_rejection("let d: Dyn = [1, 2, 3] in let y: Vec(2) = d in 1", "type error: expected [Dyn](2), found List");
+    }
+
+    // A Vec(n) inside a container, or as a union alternative, checks its
+    // length against n's run-time value (spec 2026-10-10-cc3-len-slots,
+    // section 8, tests 1-3). In `within`, n is the length of xs, 2.
+    fn within(ty: &str, v: &str) -> String {
+        format!("let f = fun xs: Vec(n) -> let d: Dyn = {v} in let y: {ty} = d in 1 in f([1, 2])")
+    }
+
+    #[test]
+    fn a_nested_vec_n_is_length_checked_against_its_run_time_value() {
+        // One slot shared by every element of [Vec(n)].
+        rejects(&within("[Vec(n)]", "[[1], [1, 2]]"), "type error: expected [[Dyn](n)], found List at element 0");
+        assert_eq!(run_source(&within("[Vec(n)]", "[[1, 2], [3, 4]]")).unwrap().as_int(), 1);
+        // A Dyn parameter crossed into [Vec(n)] on a call.
+        rejects("let g = fun xs: Vec(n) -> fun d: Dyn -> let ys: [Vec(n)] = d in len(ys) in g([1, 2])([[1, 2], [3]])", "found List at element 1");
+        // Tuple, record, and through a recursive alias (index names are program-wide).
+        rejects(&within("(Vec(n), Int)", "([1], 3)"), "type error: expected ([Dyn](n), Int), found List at element 0");
+        assert_eq!(run_source(&within("(Vec(n), Int)", "([1, 2], 3)")).unwrap().as_int(), 1);
+        rejects(&within("{a: Vec(n)}", "{a: [1]}"), "type error: expected {a: [Dyn](n)}, found List at field a");
+        let alias = |v: &str| format!("type T = (Vec(n), T) | Bool in {}", within("T", v));
+        rejects(&alias("([1, 2], ([1], true))"), "found List at element 1, element 0");
+        assert_eq!(run_source(&alias("([1, 2], ([3, 4], true))")).unwrap().as_int(), 1);
+        // Index arithmetic over the slot.
+        rejects(&within("[Vec(n + 1)]", "[[1, 2]]"), "type error: expected [[Dyn](n + 1)], found List at element 0");
+        assert_eq!(run_source(&within("[Vec(n + 1)]", "[[1, 2, 3]]")).unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn a_union_with_a_vec_n_alternative_is_one_native_check() {
+        let union = within("Vec(n) | Bool", "true");
+        let slot = expr::Test::ListLenArg(Box::new(expr::Test::Any), 0);
+        assert!(has_assert_check(&union, expr::Test::Or(vec![slot, expr::Test::Bool])));
+        let (arena, root) = elaborated_tree(&union);
+        assert!(!has_let_named(&arena, root, "__check_tmp#"));
+        assert_eq!(run_source(&union).unwrap().as_int(), 1);
+        assert_eq!(run_source(&within("Vec(n) | Bool", "[3, 4]")).unwrap().as_int(), 1);
+        rejects(&within("Vec(n) | Bool", "[1]"), "type error: expected [Dyn](n) | Bool, found List");
+        // A list of another length still falls through to a later alternative.
+        assert_eq!(run_source(&within("Vec(n) | [Int]", "[1]")).unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn a_nested_length_obligation_resolves_like_a_top_level_one() {
+        // Spec section 8, test 4: n has no run-time value at the crossing.
+        // One crossing constrains nothing: the slot is Any, the elements are still lists.
+        assert_eq!(run_source("let d: Dyn = [[1], [2, 3]] in let ys: [Vec(n)] = d in len(ys)").unwrap().as_int(), 2);
+        rejects("let d: Dyn = [[1], 2] in let ys: [Vec(n)] = d in len(ys)", "type error: expected [[Dyn](n)], found Int at element 1");
+        // Bound later by unification: the slot reads the binding.
+        let later = |v: &str| format!("let d: Dyn = {v} in let ys: [Vec(n)] = d in let g = fun zs: [Vec(2)] -> len(zs) in g(ys)");
+        assert_eq!(run_source(&later("[[1, 2], [3, 4]]")).unwrap().as_int(), 2);
+        rejects(&later("[[1, 2], [3]]"), "type error: expected [[Dyn](n)], found List at element 1");
+        // Two crossings share n with nothing to compare against: the clean failure, text unchanged.
+        let no_value = "type error: index variable n has no runtime value to check a length against";
+        rejects("let d: Dyn = [[1], [2, 3]] in let ys: [Vec(n)] = d in let zs: [Vec(n)] = d in len(ys)", no_value);
+        rejects("let d: Dyn = {a: [1]} in let r: {a: Vec(n)} = d in let s: {a: Vec(n)} = d in 1", no_value);
     }
 
     #[test]
@@ -7394,6 +7459,44 @@ g(len)").unwrap_err();
         expect_run_error("type error: index variable n has no runtime value to check a length against", || {
             machine::run(&arena, top, Env::prelude(), &spans);
         });
+    }
+
+    #[test]
+    fn every_length_slot_belongs_to_one_reachable_check() {
+        // Spec section 5(a): a slot is resolved in the scope of the Check that
+        // owns it, so a copied Check reachable from a second place would share
+        // its slots across scopes. Casts and pending casts copy only a cast's
+        // top node, never a Check: every slot has exactly one reachable owner.
+        fn owners(arena: &expr::Arena, r: expr::ExprRef, out: &mut std::collections::HashMap<expr::ExprRef, usize>) {
+            if let expr::Expr::Check(_, spec) = &arena[r] {
+                for slot in &spec.lens {
+                    *out.entry(*slot).or_insert(0) += 1;
+                }
+            }
+            let mut kids = Vec::new();
+            arena[r].children(&mut kids);
+            for k in kids {
+                owners(arena, k, out);
+            }
+        }
+        let programs = [
+            within("[Vec(n)]", "[[1, 2]]"),
+            within("Vec(n) | (Int -> Int)", "[1, 2]"),
+            format!("type T = (Vec(n), T) | Bool in {}", within("T", "true")),
+            // a closure-form cast to Dyn: the inner wrapper checks ys against the witness of xs
+            "let f = fun xs: Vec(n) -> fun ys: Vec(n) -> len(ys) in let d: Dyn = f in d([1, 2])([3, 4])".to_string(),
+            // a pending (sink-then-call) cast next to a slot
+            "let ap = fun g -> let d: Dyn = g in let r = g([1, 2]) in d in let h = ap(fun xs: Vec(n) -> fun ys: [Vec(n)] -> len(ys)) in let e: Dyn = [[1]] in let zs: [Vec(m)] = e in h([1, 2])([[3, 4]])".to_string(),
+            "let d: Dyn = [[1, 2]] in let ys: [Vec(n)] = d in let g = fun zs: [Vec(2)] -> len(zs) in g(ys)".to_string(),
+        ];
+        for src in &programs {
+            let (arena, root) = elaborated_tree(src);
+            let mut out = std::collections::HashMap::new();
+            owners(&arena, root, &mut out);
+            assert!(!out.is_empty(), "{src}: no length slot");
+            assert!(out.values().all(|&n| n == 1), "{src}: a slot with several owners {out:?}");
+            assert!(!run_source(src).is_err_and(|e| e.contains("internal error")), "{src}");
+        }
     }
 
     #[test]
@@ -7985,7 +8088,7 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn deep_checks_check_a_literal_vec_length_but_only_tag_a_function_in_a_container() {
+    fn deep_checks_check_a_vec_length_but_only_tag_a_function_in_a_container() {
         // A literal Vec(k) inside a container is length-checked natively...
         rejects("let d: Dyn = [[1, 2], [3]] in let xs: [Vec(2)] = d in len(xs)", "type error: expected [[Dyn](2)], found List at element 1");
         assert_eq!(run_source("let d: Dyn = [[1, 2], [3, 4]] in let xs: [Vec(2)] = d in len(xs)").unwrap().as_int(), 2);
@@ -7993,9 +8096,10 @@ g(len)").unwrap_err();
         let alias = "type A = (Int, [A]) | Vec(2) in let d: Dyn = (1, [[1, 2, 3]]) in let a: A = d in 1";
         assert_eq!(run_source(alias).unwrap().as_int(), 1);
         rejects("type A = (Int, [A]) | Vec(3) in let d: Dyn = (1, [[1, 2]]) in let a: A = d in 1", "at element 1, element 0");
-        // ...but a nested Vec(n) with a variable n is not (parked: needs the length in the environment).
-        let var = "let f = fun v: Vec(n) -> let d: Dyn = [[1, 2], [3]] in let xs: [Vec(n)] = d in len(xs) in f([1, 2])";
-        assert_eq!(run_source(var).unwrap().as_int(), 2);
+        // ...and so is a nested Vec(n) whose n has a run-time value (here v's length)...
+        let var = |d: &str| format!("let f = fun v: Vec(n) -> let d: Dyn = {d} in let xs: [Vec(n)] = d in len(xs) in f([1, 2])");
+        rejects(&var("[[1, 2], [3]]"), "type error: expected [[Dyn](n)], found List at element 1");
+        assert_eq!(run_source(&var("[[1, 2], [3, 4], [5, 6]]")).unwrap().as_int(), 3);
         // ...and a function inside a container is only a callability tag.
         assert_eq!(run_source("let d: Dyn = [fun x -> x] in let fs: [(Int -> Int)] = d in len(fs)").unwrap().as_int(), 1);
         rejects("let d: Dyn = [3] in let fs: [(Int -> Int)] = d in len(fs)", "at element 0");

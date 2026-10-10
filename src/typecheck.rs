@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::expr::{Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, Pattern, SpanMap, Test};
+use crate::expr::{Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, LenExpr, Pattern, SpanMap, Test};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::plist::PList;
 use crate::span::Span;
@@ -120,9 +120,9 @@ pub(crate) struct InferCtx {
     index_rename: HashMap<String, String>,
     // Runtime values for index variables, innermost last: while a Lambda
     // whose parameter is Vec(n) is elaborated, `n` is that parameter's
-    // length. A Dyn-to-Vec(n) boundary check inside reads `len(hidden)` of a
+    // length. A Dyn-to-Vec(n) boundary check inside reads the length of a
     // hidden alias (`hidden = param`), which the Lambda inserts at its entry
-    // only if some check used it. See index_var_to_expr. Pushed and popped
+    // only if some check used it. See index_len_term. Pushed and popped
     // by elaborate_mode's Lambda frames; an elaboration error abandons the
     // whole check, so an Err path never needs to pop.
     index_witness: Vec<IndexWitness>,
@@ -1355,7 +1355,7 @@ fn cast_targets(to: &Type, infer: &InferCtx) -> (Type, Type) {
 
 // Does every variable of index `i` have a runtime value at this boundary: a
 // witness in scope, or a static binding whose own variables do (the order
-// index_var_to_expr reads them in)?
+// index_len_term reads them in)?
 fn index_has_value(i: &IndexExpr, env: &CheckEnv) -> bool {
     let vars: Vec<&str> = env.local.iter().copied().chain(env.infer.index_witness.iter()).map(|w| w.var.as_str()).collect();
     free_index_vars(&runtime_index(i, env.infer, &vars, false)).iter().all(|v| vars.contains(&v.as_str()))
@@ -1505,18 +1505,18 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
 // left open (that's coerce's own job, checked before this is ever
 // called).
 //
-// Every function-free shape (Int/Float/Bool/Str/Token, and List/Tuple/Record
-// of those checked element by element, a union of those, a Named alias
-// through any depth) is ONE native Expr::Check node (build_shape_check): no
-// let, no env frame, no builtin call. Fun gets
+// Every function-free shape (Int/Float/Bool/Str/Token, Vec(k) and Vec(n),
+// and List/Tuple/Record of those checked element by element, a union of
+// those, a Named alias through any depth) is ONE native Expr::Check node
+// (build_shape_check): no let, no env frame, no builtin call; a Vec(n)
+// length is read from a length slot the Check evaluates on entry. Fun gets
 // a real per-call contract (wrap_fun_contract, since a bare callability tag
 // can't see inside a closure -- "callable" isn't "callable with this
-// exact signature"). What a Check can't express stays desugared: a Vec(n)
-// length compare (it evaluates an index expression in the environment, so
-// it keeps the `let tmp = e in if cond then tmp else <failing Check>`
-// skeleton) and a union with a Fun or Vec(n) alternative (build_union_check,
-// which picks the alternative with Probe checks). Every failure panics with
-// the same "type error: expected X, found Y" text.
+// exact signature"). A union with a Fun alternative stays desugared
+// (build_union_check, which picks the alternative with Probe checks). Every
+// failure panics with the same "type error: expected X, found Y" text, or
+// the "index variable n has no runtime value" text when a length slot had
+// no value.
 // `visiting` is the set of Named ids currently being unfolded somewhere
 // ABOVE this call in the SAME unfold chain (an ancestor set, not a global
 // history) -- empty at every genuinely fresh entry point (coerce's own
@@ -1535,43 +1535,25 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
             build_shape_check(arena, e, to, env)
         }
         Type::Fun(param_ty, _row, ret_ty) => wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone(), env, visiting),
-        Type::Union(_) if shape_of(to, env).is_none() || needs_contract(to, env, visiting) => build_union_check(arena, e, to, env, visiting),
+        Type::Union(_) if needs_contract(to, env, visiting) => build_union_check(arena, e, to, env, visiting),
         Type::Union(_) => build_shape_check(arena, e, to, env),
         // Dyn accepts everything, so a check against it is the identity. Not
         // unreachable: wrap_fun_contract checks a call's result against the
         // Fun's return type, which is Dyn for `Dyn -> Dyn` (and nested
         // builders reach it through tuple/union alternatives).
         Type::Dyn | Type::Var(_) => e,
-        // A literal length (and every nested position) is one native test.
-        Type::Indexed(w, _) if matches!(**w, Type::List(_)) && shape_of(to, env).is_some() => build_shape_check(arena, e, to, env),
-        // is-a-list-then-len-equals-the-index, checked against the index
-        // EXPRESSION (not a fixed arity literal), so this keeps the let/if
-        // skeleton: binding `e` once is what keeps it evaluated exactly
-        // once. The list test has to run BEFORE `len`: `len` panics
-        // internally (see machine.rs) on a non-list argument, which would
-        // surface as an unrelated bare panic instead of this function's own
-        // clean "type error: expected ..., found ..." message.
-        //
-        // List-wrapped: compare the length; any other wrapper is checked as itself (the index has no runtime length).
-        Type::Indexed(wrapped, index) => match wrapped.as_ref() {
-            Type::List(_) => {
-                let tmp = fresh_index_name("__check_tmp");
-                let tmp_ref = arena.push(Expr::Var(tmp.clone()));
-                let cond = build_indexed_shape_cond(arena, tmp_ref, index, env);
-                let fail = build_type_error(arena, tmp_ref, to, env);
-                let if_expr = arena.push(Expr::If(cond, tmp_ref, fail));
-                arena.push(Expr::Let(tmp, None, e, if_expr))
-            }
-            // An alias (or Dyn/Var) wrapper: no runtime length to compare, but the shape is checked.
-            _ => build_boundary_check(arena, e, wrapped, env, visiting),
-        },
+        // A list's length, literal or read at run time from a length slot,
+        // is part of its one native test.
+        Type::Indexed(w, _) if matches!(**w, Type::List(_)) => build_shape_check(arena, e, to, env),
+        // An alias (or Dyn/Var) wrapper: no runtime length to compare, but the shape is checked.
+        Type::Indexed(wrapped, _) => build_boundary_check(arena, e, wrapped, env, visiting),
         // Look up what this id unfolds to and build ITS OWN boundary
         // check, exactly as if `to` had been written directly as that
         // unfolded shape. A Type::Named nested inside a container of that
         // shape is checked by the native deep test (shape_of's `Ref`s); one
-        // reached only through a Fun or desugared Vec(n) position stays
-        // unresolved -- checked later, lazily, only if something else
-        // separately touches that position.
+        // reached only through a Fun position stays unresolved -- checked
+        // later, lazily, only if something else separately touches that
+        // position.
         // A missing registry entry IS reachable (not an internal-bug-only
         // case): parser::parse (the original, unchanged signature) builds
         // its own named_types registry but discards it rather than
@@ -1643,10 +1625,11 @@ impl IndexWitness {
 // index with every binding known at the crossing substituted (runtime_index),
 // so a Match arm's hypothesis, restored after the arm, stays in force.
 // `witnesses` are the (variable, hidden alias) pairs in scope at the
-// crossing, outermost first. `len_eq` is the check's `len(value) == <index>`
-// node, which resolve_obligations patches in place.
+// crossing, outermost first. `slot` is the check's `Expr::Len` length slot,
+// which resolve_obligations patches in place (every copy of the Check shares
+// it).
 struct Obligation {
-    len_eq: ExprRef,
+    slot: ExprRef,
     index: IndexExpr,
     witnesses: Vec<(String, String)>,
     // The crossing sits inside a function body, so one site can produce many
@@ -1671,7 +1654,7 @@ impl Obligation {
     }
 }
 
-// `e` as a runtime check reads it (index_var_to_expr's order): a variable
+// `e` as a runtime check reads it (index_len_term's order): a variable
 // with a witness stays, a bound one is replaced by its binding, recursively,
 // an unbound one stays. With `by_alias`, an unbound variable that a witness's
 // own variable has since been unified with is renamed to that witness's
@@ -1703,12 +1686,12 @@ fn runtime_index(e: &IndexExpr, infer: &InferCtx, witness_vars: &[&str], by_alia
     }
 }
 
-// Records an obligation for a crossing (a union alternative's too) when its index has a
-// variable index_var_to_expr cannot give a runtime value (the check built
-// for it holds that clean failure until resolved). Every witness in scope
-// is marked used: the resolved check may read any of them, and their alias
+// Records an obligation for a length slot (a union alternative's too) when its
+// index has a variable index_len_term cannot give a runtime value (the slot
+// holds that clean `NoValue` failure until resolved). Every witness in scope
+// is marked used: the resolved slot may read any of them, and their alias
 // binders are emitted (or not) before typechecking finishes.
-fn record_obligation(len_eq: ExprRef, index: &IndexExpr, env: &CheckEnv) {
+fn record_obligation(slot: ExprRef, index: &IndexExpr, env: &CheckEnv) {
     let in_scope: Vec<&IndexWitness> = env.infer.index_witness.iter().chain(env.local.iter().copied()).collect();
     let vars: Vec<&str> = in_scope.iter().map(|w| w.var.as_str()).collect();
     let index = runtime_index(index, env.infer, &vars, false);
@@ -1719,18 +1702,18 @@ fn record_obligation(len_eq: ExprRef, index: &IndexExpr, env: &CheckEnv) {
         w.used.set(true);
     }
     let witnesses = in_scope.iter().map(|w| (w.var.clone(), w.hidden.clone())).collect();
-    env.infer.obligations.borrow_mut().push(Obligation { len_eq, index, witnesses, repeatable: env.infer.repeatable_depth > 0 || env.repeatable });
+    env.infer.obligations.borrow_mut().push(Obligation { slot, index, witnesses, repeatable: env.infer.repeatable_depth > 0 || env.repeatable });
 }
 
-// Patches every obligation's `len(value) == <index>` node once inference has
-// finished, so bindings made after the crossing count: the index under the
-// final bindings, each variable read from a witness in scope at the
-// crossing, otherwise the clean "no runtime value" failure. Runs before
-// anything evaluates the tree.
+// Patches every obligation's length slot once inference has finished, so
+// bindings made after the crossing count: the index under the final
+// bindings, each variable read from a witness in scope at the crossing,
+// otherwise the clean `NoValue` failure. Runs before anything evaluates the
+// tree.
 //
 // An index that is still a bare unbound variable no other obligation
 // mentions, and that sits in no function body, constrains nothing, so the
-// check is `is_list` alone (the node becomes `true`). Two crossings sharing
+// check is "is a list" alone (the slot becomes `Any`). Two crossings sharing
 // one such variable would claim equal lengths with nothing to compare
 // against, so they keep the clean failure. So does a variable unified with any
 // other index variable, in either direction (e.g. inside a match arm whose
@@ -1753,21 +1736,17 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
                 && mentions.get(name) == Some(&1)
                 && !infer.index_subst.values().any(|v| free_index_vars(v).contains(name)));
         if unconstrained {
-            arena[ob.len_eq] = Expr::Bool(true);
+            arena[ob.slot] = Expr::Len(LenExpr::Any);
             continue;
         }
-        let len_call = match &arena[ob.len_eq] {
-            Expr::BinOp(BinOp::Eq, len_call, _) => *len_call,
-            _ => unreachable!("an obligation's len_eq is the BinOp built by build_indexed_shape_cond"),
-        };
         let witnesses: Vec<IndexWitness> = ob
             .witnesses
             .iter()
             .map(|(var, hidden)| IndexWitness { var: var.clone(), hidden: hidden.clone(), used: Cell::new(true) })
             .collect();
         let env = CheckEnv { infer, local: witnesses.iter().collect(), defer: false, repeatable: false, span: None };
-        let index_ref = index_expr_to_expr(arena, &index, &env);
-        arena[ob.len_eq] = Expr::BinOp(BinOp::Eq, len_call, index_ref);
+        let term = index_len_term(arena, &index, &env);
+        arena[ob.slot] = Expr::Len(term);
     }
 }
 
@@ -1816,92 +1795,40 @@ impl<'a> CheckEnv<'a> {
     }
 }
 
-// Translates an IndexExpr into an ordinary Expr the machine can evaluate,
-// for splicing into a synthesized runtime check. See index_var_to_expr for
-// where each variable's runtime value comes from.
-fn index_expr_to_expr(arena: &mut Arena, e: &IndexExpr, env: &CheckEnv) -> ExprRef {
-    match e {
-        IndexExpr::Var(name) => index_var_to_expr(arena, name, env),
-        IndexExpr::Lit(n) => arena.push(Expr::Int(*n)),
-        IndexExpr::Add(a, b) => {
-            let a2 = index_expr_to_expr(arena, a, env);
-            let b2 = index_expr_to_expr(arena, b, env);
-            arena.push(Expr::BinOp(BinOp::Add, a2, b2))
-        }
-        IndexExpr::Sub(a, b) => {
-            let a2 = index_expr_to_expr(arena, a, env);
-            let b2 = index_expr_to_expr(arena, b, env);
-            arena.push(Expr::BinOp(BinOp::Sub, a2, b2))
-        }
-        IndexExpr::Mul(a, b) => {
-            let a2 = index_expr_to_expr(arena, a, env);
-            let b2 = index_expr_to_expr(arena, b, env);
-            arena.push(Expr::BinOp(BinOp::Mul, a2, b2))
-        }
-    }
-}
-
-// An index variable's runtime value, first match wins:
-// 1. a witness: `len` of the innermost list parameter (or contract
-//    argument) typed Vec(name);
+// An index as a length slot reads it at run time, per variable, first match
+// wins:
+// 1. a witness: the length of the innermost list parameter (or contract
+//    argument) typed Vec(name), read through its hidden alias;
 // 2. its static binding in index_subst, translated in turn;
 // 3. otherwise nothing at runtime holds it (an existential from a plain
-//    `let x: Vec(n) = <Dyn>`, or a call-site instantiation): the check fails
-//    with a clean type error rather than reading an unbound variable.
+//    `let x: Vec(n) = <Dyn>`, or a call-site instantiation): `NoValue`, the
+//    check's clean failure rather than a read of an unbound variable.
 // A same-named TERM variable (`fun n: Int -> fun v: Vec(n)`) is never used:
 // the typechecker does not link a term `n` to the index `n`, so reading it
 // would let a wrong-length value through (or reject a right one).
-fn index_var_to_expr(arena: &mut Arena, name: &str, env: &CheckEnv) -> ExprRef {
-    let witness = env.local.iter().rev().copied().chain(env.infer.index_witness.iter().rev()).find(|w| w.var == name);
-    if let Some(w) = witness {
-        w.used.set(true);
-        // An untyped caller may have passed a non-list for the witness
-        // parameter; `len` would panic on it, so test is_list first.
-        let list_ref = arena.push(Expr::Var(w.hidden.clone()));
-        let is_list = build_probe(arena, list_ref, Shape::plain(Test::List), &Type::List(Rc::new(Type::Dyn)), env);
-        let len_ref = arena.push(Expr::Var(w.hidden.clone()));
-        let len_call = build_prelude_call(arena, "len", len_ref);
-        let msg = arena.push(Expr::Str(format!("type error: index variable {name}'s witness is not a list")));
-        let fail_var = prelude_var(arena, "fail");
-        let fail_call = arena.push(Expr::App(fail_var, msg));
-        return arena.push(Expr::If(is_list, len_call, fail_call));
+fn index_len_term(arena: &mut Arena, e: &IndexExpr, env: &CheckEnv) -> LenExpr {
+    let mut go = |x: &IndexExpr| Box::new(index_len_term(arena, x, env));
+    match e {
+        IndexExpr::Var(name) => {
+            let witness = env.local.iter().rev().copied().chain(env.infer.index_witness.iter().rev()).find(|w| w.var == *name);
+            if let Some(w) = witness {
+                w.used.set(true);
+                return LenExpr::Witness(arena.push(Expr::Var(w.hidden.clone())), name.as_str().into());
+            }
+            match env.infer.index_subst.get(name) {
+                Some(bound) => index_len_term(arena, bound, env),
+                None => LenExpr::NoValue(name.as_str().into()),
+            }
+        }
+        IndexExpr::Lit(n) => LenExpr::Lit(*n),
+        IndexExpr::Add(a, b) => LenExpr::Add(go(a), go(b)),
+        IndexExpr::Sub(a, b) => LenExpr::Sub(go(a), go(b)),
+        IndexExpr::Mul(a, b) => LenExpr::Mul(go(a), go(b)),
     }
-    if let Some(bound) = env.infer.index_subst.get(name) {
-        return index_expr_to_expr(arena, bound, env);
-    }
-    let msg = arena.push(Expr::Str(format!("type error: index variable {name} has no runtime value to check a length against")));
-    let fail_var = prelude_var(arena, "fail");
-    arena.push(Expr::App(fail_var, msg))
 }
 
-// The raw boolean condition shared by build_boundary_check's and
-// build_shape_predicate's own Type::Indexed(List(_), _) arms: "is
-// `value_ref` list-shaped AND does its length equal `index`". The list
-// probe has to run BEFORE `len`: `len` panics internally (see machine.rs)
-// on a non-list argument, which would surface as an unrelated bare panic
-// instead of a clean "type error: expected ..., found ..." message.
-// Returning the bare condition (not a full Let/If/fail wrapper) lets
-// build_boundary_check wrap it in its let/if skeleton (evaluating
-// `value_ref` exactly once) while build_shape_predicate uses it directly as
-// its own bare predicate (no let-binding, callers may OR several of these
-// together). With `env.defer` it records an obligation on its
-// `len(value) == <index>` node (record_obligation), which resolve_obligations
-// patches in place; a union alternative's compare is deferred the same way.
-fn build_indexed_shape_cond(arena: &mut Arena, value_ref: ExprRef, index: &IndexExpr, env: &CheckEnv) -> ExprRef {
-    let is_list = build_probe(arena, value_ref, Shape::plain(Test::List), &Type::List(Rc::new(Type::Dyn)), env);
-    let len_var = prelude_var(arena, "len");
-    let len_call = arena.push(Expr::App(len_var, value_ref));
-    let index_expr = index_expr_to_expr(arena, index, env);
-    let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, index_expr));
-    if env.defer {
-        record_obligation(len_eq, index, env);
-    }
-    let false_lit = arena.push(Expr::Bool(false));
-    arena.push(Expr::If(is_list, len_eq, false_lit))
-}
-
-// The union check for a union a single Check can't express (shape_of is
-// None: a Vec(n) alternative; or needs_contract: a Fun alternative):
+// The union check for a union a single Check can't express (needs_contract:
+// a Fun alternative):
 // `let __check_tmp = e in if <alt1-shape> then <alt1's OWN full check>
 // else if <alt2-shape> then <alt2's OWN full check> else ... else
 // <failing Check>` -- tries each alternative's shape predicate
@@ -1931,60 +1858,52 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, v
     arena.push(Expr::Let(tmp, None, e, result))
 }
 
-// A native Test plus the alias table its `Test::Ref`s index.
+// A native Test plus the alias table its `Test::Ref`s index and the length
+// slots its `Test::ListLenArg`s index: each an index as the check reads it
+// (runtime_index), turned into an `Expr::Len` node by build_check_node.
 struct Shape {
     test: Test,
     defs: Vec<Test>,
+    lens: Vec<IndexExpr>,
 }
 
 impl Shape {
-    // A test with no alias references.
+    // A test with no alias references and no length slots.
     fn plain(test: Test) -> Shape {
-        Shape { test, defs: Vec::new() }
+        Shape { test, defs: Vec::new(), lens: Vec::new() }
     }
 }
 
-// One Named alias body being turned into a Test. Opaque: it holds a Vec(n)
-// somewhere a Test cannot express, so a Ref to it tests nothing.
-enum Slot {
-    Building,
-    Ready(Test),
-    Opaque,
-}
-
+// What shape_test accumulates: each Named alias body (None while it is being
+// built) and the length slots.
 #[derive(Default)]
 struct Defs {
     ids: HashMap<String, usize>,
-    slots: Vec<Slot>,
+    bodies: Vec<Option<Test>>,
+    lens: Vec<IndexExpr>,
 }
 
-// `ty` as one native Shape, or None when it can't be one: a Vec(n) length
-// compare with a non-literal index needs the index expression evaluated in the
-// environment (build_indexed_shape_cond), so it -- and any union or Named alias
-// reaching one at the top -- stays desugared.
-fn shape_of(ty: &Type, env: &CheckEnv) -> Option<Shape> {
+// `ty` as one native Shape.
+fn shape_of(ty: &Type, env: &CheckEnv) -> Shape {
     let mut defs = Defs::default();
-    let test = shape_test(ty, env, &mut defs, &HashSet::new())?;
-    let defs = defs.slots.into_iter().map(|slot| if let Slot::Ready(t) = slot { t } else { Test::Any }).collect();
-    Some(Shape { test, defs })
+    let test = shape_test(ty, env, &mut defs, &HashSet::new());
+    let bodies = defs.bodies.into_iter().map(|body| body.expect("every alias body is built before shape_test returns")).collect();
+    Shape { test, defs: bodies, lens: defs.lens }
 }
 
 // The deep test for `ty`: what the value must be, element by element
-// (function-free types; a Fun position is only a callability tag, and a
-// Vec(n) inside a container is checked as its list when n has no literal
-// value). `unguarded` holds
+// (function-free types; a Fun position is only a callability tag). A Vec(n)
+// whose index is not a literal reads its length from a slot (len_slot).
+// `unguarded` holds
 // the Named aliases unfolded since the last container: meeting one again
 // there would loop without consuming the value, so it is `Never` (making
 // `type A = Int | A` behave as plain Int). Past a container, a Named alias
 // becomes one `Ref` into `defs`, whose body is built once, so a recursive
 // alias terminates because the value does. An unregistered Named is `Any`
 // ("no information here").
-fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &HashSet<String>) -> Option<Test> {
-    // An element's length with no literal value is not checked; its shape is (strip_indexed).
-    let element = |t: &Type, defs: &mut Defs| {
-        shape_test(t, env, defs, &HashSet::new()).or_else(|| shape_test(&strip_indexed(t), env, defs, &HashSet::new())).unwrap_or(Test::Any)
-    };
-    Some(match ty {
+fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &HashSet<String>) -> Test {
+    let element = |t: &Type, defs: &mut Defs| shape_test(t, env, defs, &HashSet::new());
+    match ty {
         Type::Dyn | Type::Var(_) => Test::Any,
         Type::Int => Test::Int,
         Type::Float => Test::Float,
@@ -2002,39 +1921,51 @@ fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &HashSet<St
         // field -- extra fields are fine, see Pattern::Record's own doc
         // comment for why nothing downstream can ever observe them.
         Type::Record(fields) => Test::RecordOf(fields.iter().map(|(name, t)| (name.clone(), element(t, defs))).collect()),
-        Type::Union(alts) => Test::Or(alts.iter().map(|alt| shape_test(alt, env, defs, unguarded)).collect::<Option<Vec<_>>>()?),
+        Type::Union(alts) => Test::Or(alts.iter().map(|alt| shape_test(alt, env, defs, unguarded)).collect()),
         Type::Named(id) if unguarded.contains(id) => Test::Never,
         Type::Named(id) => match env.infer.named_types.get(id) {
             None => Test::Any,
-            Some(raw) if !unguarded.is_empty() => shape_test(raw, env, defs, &extend_visiting(unguarded, id))?,
+            Some(raw) if !unguarded.is_empty() => shape_test(raw, env, defs, &extend_visiting(unguarded, id)),
             Some(raw) => match defs.ids.get(id) {
-                Some(&i) if matches!(defs.slots[i], Slot::Opaque) => return None,
                 Some(&i) => Test::Ref(i),
                 None => {
-                    let i = defs.slots.len();
-                    defs.slots.push(Slot::Building);
+                    let i = defs.bodies.len();
+                    defs.bodies.push(None);
                     defs.ids.insert(id.clone(), i);
-                    match shape_test(raw, env, defs, &extend_visiting(unguarded, id)) {
-                        Some(t) => defs.slots[i] = Slot::Ready(t),
-                        None => {
-                            defs.slots[i] = Slot::Opaque;
-                            return None;
-                        }
-                    }
+                    let body = shape_test(raw, env, defs, &extend_visiting(unguarded, id));
+                    defs.bodies[i] = Some(body);
                     Test::Ref(i)
                 }
             },
         },
-        // A literal length is a native test; any other index a desugared compare (build_indexed_shape_cond).
+        // A literal length is tested as is; any other index is read from a slot.
         Type::Indexed(wrapped, index) => match (wrapped.as_ref(), env.infer.resolve_index_deep(index)) {
             (Type::List(el), IndexExpr::Lit(k)) => match usize::try_from(k) {
                 Ok(k) => Test::ListLen(Box::new(element(el, defs)), k),
                 Err(_) => Test::Never,
             },
-            (Type::List(_), _) => return None,
-            (other, _) => shape_test(other, env, defs, unguarded)?,
+            (Type::List(el), _) => {
+                let slot = len_slot(index, env, defs);
+                Test::ListLenArg(Box::new(element(el, defs)), slot)
+            }
+            (other, _) => shape_test(other, env, defs, unguarded),
         },
-    })
+    }
+}
+
+// The length slot for a Vec(index): one per distinct index as the check reads
+// it (runtime_index), so every position with the same index, at any depth and
+// through every level of a recursive alias, compares against one value.
+fn len_slot(index: &IndexExpr, env: &CheckEnv, defs: &mut Defs) -> usize {
+    let vars: Vec<&str> = env.local.iter().copied().chain(env.infer.index_witness.iter()).map(|w| w.var.as_str()).collect();
+    let index = runtime_index(index, env.infer, &vars, false);
+    match defs.lens.iter().position(|slot| *slot == index) {
+        Some(i) => i,
+        None => {
+            defs.lens.push(index);
+            defs.lens.len() - 1
+        }
+    }
 }
 
 fn extend_visiting(visiting: &HashSet<String>, id: &str) -> HashSet<String> {
@@ -2058,58 +1989,38 @@ fn needs_contract(ty: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> bool
 }
 
 // The bare boolean half of build_boundary_check's per-type dispatch --
-// "does `value_ref` match `ty`'s deep shape," with no let-binding and no
-// failure of its own, so build_union_check can try several of these in turn
-// before deciding anything. A native Probe wherever shape_of has a Shape;
-// only a Vec(n) length compare (directly, or reached through a union or
-// alias) is built from ordinary If/Bool nodes.
+// "does `value_ref` match `ty`'s deep shape," a native Probe with no failure
+// of its own, so build_union_check can try several of these in turn before
+// deciding anything. A Named already being unfolded above (`type A = A |
+// (Int -> Int)`) answers false: its other alternatives are tried separately,
+// and build_boundary_check's Named arm relies on this alternative never
+// being selected.
 fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
-    if let Some(shape) = shape_of(ty, env) {
-        return build_probe(arena, value_ref, shape, ty, env);
-    }
-    match ty {
-        // An Indexed value's LENGTH is real, provable shape information this
-        // check must not throw away -- this is what lets build_union_check
-        // correctly fall through a Vec(3) alternative to try a plain [Int]
-        // alternative next instead of routing a length-5 list into Vec(3)'s
-        // own full check (which would then reject it) just because it merely
-        // "looks like some list." The same condition build_boundary_check's
-        // own Indexed arm uses. A Type::Named-wrapped Indexed (derived
-        // index-refinement) is a later phase's own concern -- nothing before
-        // this phase can construct one yet -- so it delegates to the shape.
-        Type::Indexed(wrapped, index) => match wrapped.as_ref() {
-            Type::List(_) => build_indexed_shape_cond(arena, value_ref, index, env),
-            other => build_shape_predicate(arena, value_ref, other, env, visiting),
-        },
-        // `if pred1 then true else if pred2 then true else ... false`,
-        // short-circuiting like the Test::Or it stands in for.
-        Type::Union(alts) => {
-            let mut result = arena.push(Expr::Bool(false));
-            for alt in alts.iter().rev() {
-                let pred = build_shape_predicate(arena, value_ref, alt, env, visiting);
-                let true_lit = arena.push(Expr::Bool(true));
-                result = arena.push(Expr::If(pred, true_lit, result));
-            }
-            result
-        }
-        // A Named already being unfolded above (`type A = Vec(2) | A`): its
-        // other alternatives are tried separately, so it adds nothing here.
-        Type::Named(id) if visiting.contains(id) => build_probe(arena, value_ref, Shape::plain(Test::Never), ty, env),
-        // shape_of is None for a Named only when its body reaches a Vec(n)
-        // (an unregistered one answers Any).
-        Type::Named(id) => {
-            let raw = env.infer.named_types.get(id).expect("shape_of answered None for an unregistered alias");
-            build_shape_predicate(arena, value_ref, raw, env, &extend_visiting(visiting, id))
-        }
-        _ => unreachable!("every other type has a native shape test"),
-    }
+    let shape = match ty {
+        Type::Named(id) if visiting.contains(id) => Shape::plain(Test::Never),
+        _ => shape_of(ty, env),
+    };
+    build_probe(arena, value_ref, shape, ty, env)
 }
 
 // An Expr::Check of `value_ref` against `test` in the given mode, blaming
 // the cast site `env.span`; `to` is the type whose display text a failure
-// reports.
+// reports. Each length slot becomes an `Expr::Len` node (index_len_term);
+// with `env.defer`, one whose index has a variable with no run-time value
+// here records an obligation (record_obligation), which resolve_obligations
+// patches in place.
 fn build_check_node(arena: &mut Arena, value_ref: ExprRef, shape: Shape, mode: CheckMode, to: &Type, env: &CheckEnv) -> ExprRef {
-    arena.push(Expr::Check(value_ref, Rc::new(CheckSpec { test: shape.test, defs: shape.defs, lens: Vec::new(), mode, to: to.to_string(), span: env.span })))
+    let mut lens = Vec::with_capacity(shape.lens.len());
+    for index in &shape.lens {
+        let term = index_len_term(arena, index, env);
+        let slot = arena.push(Expr::Len(term));
+        if env.defer {
+            record_obligation(slot, index, env);
+        }
+        lens.push(slot);
+    }
+    let spec = CheckSpec { test: shape.test, defs: shape.defs, lens, mode, to: to.to_string(), span: env.span };
+    arena.push(Expr::Check(value_ref, Rc::new(spec)))
 }
 
 // The Bool outcome of `shape`: a union picking its alternative.
@@ -2126,29 +2037,23 @@ fn build_type_error(arena: &mut Arena, value_ref: ExprRef, to: &Type, env: &Chec
 // The one native check: `e` evaluated once and tested against `to`'s whole
 // deep shape (shape_of) -- every list element, tuple position and record
 // field, through Named aliases. A failure names the innermost offender
-// (machine::explain). Callers pass only a type shape_of answers (Fun callers
-// ask for any_fun()).
+// (machine::explain).
 fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> ExprRef {
-    let shape = shape_of(to, env).expect("build_shape_check takes a type with a native shape test");
+    let shape = shape_of(to, env);
     build_check_node(arena, e, shape, CheckMode::Assert, to, env)
 }
 
 // A synthesized reference to the prelude builtin `name`. Spelled `#name`,
 // which no source text can bind or lex, and which `resolve` maps straight to
-// the prelude table: a user binding named like the builtin (`let len = ..`,
-// a parameter `fail`) cannot capture a synthesized call. EVERY builtin
-// synthesized code still calls (`len`, `fail`, `get_field`) goes through here.
+// the prelude table: a user binding named like the builtin (a parameter
+// `get_field`) cannot capture a synthesized call. The one builtin synthesized
+// code still calls, `get_field`, goes through here.
 fn prelude_var(arena: &mut Arena, name: &str) -> ExprRef {
     arena.push(Expr::Var(format!("#{name}")))
 }
 
-fn build_prelude_call(arena: &mut Arena, name: &str, value_ref: ExprRef) -> ExprRef {
-    let v = prelude_var(arena, name);
-    arena.push(Expr::App(v, value_ref))
-}
-
-// `builtin(value_ref, str_arg)` -- the two-argument counterpart to
-// build_prelude_call, used by `.field` access's get_field desugaring.
+// `builtin(value_ref, str_arg)`, used by `.field` access's get_field
+// desugaring.
 fn build_str_call(arena: &mut Arena, builtin: &str, value_ref: ExprRef, str_arg: &str) -> ExprRef {
     let f = prelude_var(arena, builtin);
     let applied = arena.push(Expr::App(f, value_ref));
