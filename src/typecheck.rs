@@ -3345,18 +3345,50 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // just g's annotation-or-Dyn) would wrongly depend on
             // which one happens to come first in the `and` chain.
             Expr::LetRec(bindings, body) => {
-                // A recursive type: each value is replaced by the type it
-                // built, and the names are type values (Dyn) for the body.
-                if let Some(values) = recursive_type_group(arena, &bindings, &cur_ctx, spans, infer)? {
-                    let lits: Vec<(String, Option<ExprRef>, ExprRef)> =
-                        bindings.iter().zip(values).map(|((name, _, _), ty)| (name.clone(), None, type_lit(arena, ty))).collect();
-                    let vals = lits.iter().map(|(_, _, lit)| *lit).collect();
-                    let def = infer.new_def(DefNode::Group(Rc::new(lits.clone())), vals, &cur_ctx);
-                    def.proven.set(true);
+                // A recursive type: the names are type values (Dyn), each
+                // bound to the type its value built.
+                if let Some(types) = recursive_type_group(arena, &bindings, &cur_ctx, spans, infer)? {
+                    let lits: Rc<Vec<(String, Option<ExprRef>, ExprRef)>> = Rc::new(
+                        bindings.iter().zip(&types).map(|((name, _, _), ty)| (name.clone(), None, type_lit(arena, ty.clone()))).collect(),
+                    );
+                    // Each value is elaborated once, with the names bound to
+                    // their types (a definition of its own, so an annotation
+                    // inside a value can name the group): its type errors are
+                    // reported and its run-time checks kept.
+                    let inner = infer.new_def(DefNode::Group(lits.clone()), Vec::new(), &cur_ctx);
+                    let mut val_ctx = cur_ctx.clone();
+                    for (name, _, _) in lits.iter() {
+                        val_ctx = extend_defined(&val_ctx, name, Type::Dyn, infer, Some(inner.clone()));
+                    }
+                    let mut vals = Vec::with_capacity(bindings.len());
+                    for (_, _, v) in bindings.iter() {
+                        vals.push(elaborate(arena, *v, &val_ctx, spans, infer)?.2);
+                    }
+                    // The run time binds each name to its type. If a check in
+                    // a value could fail, the value still runs first, with
+                    // the names bound to their types, and is then dropped.
+                    let fallible = vals.iter().any(|v| fallible_check(arena, *v, spans, infer));
+                    let values: Vec<ExprRef> = vals
+                        .iter()
+                        .zip(&types)
+                        .map(|(v, ty)| {
+                            let lit = type_lit(arena, ty.clone());
+                            if !fallible {
+                                return lit;
+                            }
+                            let run = arena.push(Expr::Let("_".to_string(), None, *v, lit));
+                            types.iter().zip(lits.iter()).rev().fold(run, |inner, (t, (name, _, _))| {
+                                let t = type_lit(arena, t.clone());
+                                arena.push(Expr::Let(name.clone(), None, t, inner))
+                            })
+                        })
+                        .collect();
+                    let def = infer.new_def(DefNode::Group(lits.clone()), values.clone(), &cur_ctx);
+                    mark_proven(arena, std::slice::from_ref(&def), spans, infer);
                     let mut elaborated = Vec::with_capacity(lits.len());
-                    for (name, _, lit) in lits {
-                        cur_ctx = extend_defined(&cur_ctx, &name, Type::Dyn, infer, Some(def.clone()));
-                        elaborated.push((name, Type::Dyn, EffectRow::pure(), lit));
+                    for ((name, _, _), value) in lits.iter().zip(values) {
+                        cur_ctx = extend_defined(&cur_ctx, name, Type::Dyn, infer, Some(def.clone()));
+                        elaborated.push((name.clone(), Type::Dyn, EffectRow::pure(), value));
                     }
                     pending.push(PendingElab::LetRec { bindings: elaborated, def });
                     cur_expr = body;

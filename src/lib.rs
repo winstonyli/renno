@@ -4246,6 +4246,33 @@ g(len)").unwrap_err();
         assert!(!elaborated_binds("let Pair = fun a -> Tuple((a, a)) in let x: Pair(Int) = (1, 2) in x", "Pair"));
     }
 
+    // A recursive type's values are elaborated once, with the names bound to
+    // their types: their type errors are reported and their casts kept.
+    #[test]
+    fn a_type_groups_values_are_type_checked() {
+        for (src, want) in [
+            ("let rec L = Union((Tuple((Int, L)), (fun u -> Bool)((1, 2) == (1, 2, 3)))) in to_str(L)", "cannot compare (Int, Int) with (Int, Int, Int)"),
+            ("let rec L = Union((Tuple((Int, L)), (fun u -> Bool)(match 1 | _ -> 1 | 2 -> 2))) in to_str(L)", "unreachable match arm"),
+            ("let rec L = Union((Tuple((Int, L)), (fun u -> Bool)(match (1, 2) | (a, b, c) -> 1 | _ -> 2))) in to_str(L)", "can never match"),
+            ("let rec L = Union((Tuple((Int, L)), (fun x: Nope -> Bool)(1))) in to_str(L)", "unbound variable: Nope"),
+            ("let rec L = Union((Tuple((Int, L)), (fun x: L -> Bool)((1, 2)))) in to_str(L)", "type mismatch: expected L, found (Int, Int)"),
+        ] {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains(want), "{src}: {err}");
+        }
+        // An annotation inside a value can name the group.
+        assert_eq!(run_source("let rec L = Union((Tuple((Int, L)), (fun x: L -> Bool)((1, true)))) in let l: L = (1, true) in l").unwrap(), Outcome::List(vec![Outcome::Int(1), Outcome::Bool(true)]));
+        // A cast the value needs is kept, so the group stays and fails at run time.
+        let src = "let rec L = Union((Tuple((Int, L)), (fun a -> if true then a else 5)(Bool))) in let l: L = (1, true) in l";
+        assert!(elaborated_binds(src, "L"));
+        assert!(run_source(src).unwrap_err().contains("expected Int, found Type"));
+        // A kept check that passes: the value runs first (the `_` binding)
+        // and the type keeps its identity.
+        let src = "let z: Dyn = 0 in let rec L = Union((Tuple((Int, L)), (fun x: Int -> Bool)(z))) in (to_str(L), L == L)";
+        assert!(elaborated_binds(src, "_"));
+        assert_eq!(run_source(src).unwrap(), Outcome::List(vec![Outcome::Str("L".to_string()), Outcome::Bool(true)]));
+    }
+
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain
     // parser::parse + machine::run with NO typecheck::check pass at all,
     // so a plain `: T` annotation (unlike a `where` refinement, which the
