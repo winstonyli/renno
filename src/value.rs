@@ -4,6 +4,7 @@ use std::rc::Rc;
 use crate::cont::Cont;
 use crate::env::Env;
 use crate::expr::ExprRef;
+use crate::types::Type;
 
 // A handler as data: which effect it handles, the clause body, the env it
 // closes over (the body's two binders, payload and resume, are pushed as a
@@ -110,6 +111,48 @@ pub enum Builtin {
     // ([Str], Str) -> Str: `join(parts, sep)` -- subject first, same
     // argument order as Get/GetField's own (subject, ...) convention.
     Join,
+    // A prelude type constructor (`Int`, `List`, `Tuple`, ...): a constant
+    // reads as its Value::Type, a constructor builds one from its argument.
+    Ty(TypeCtor),
+}
+
+// The prelude names that build type values. An annotation is desugared into
+// calls to these (parser::type_call) and evaluated by machine::eval_pure; in
+// value position they are ordinary prelude bindings.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TypeCtor {
+    Int,
+    Float,
+    Bool,
+    Str,
+    Dyn,
+    // T -> [T]
+    List,
+    // A non-empty tuple or list of types -> (A, B, ...)
+    Tuple,
+    // A record of types -> {x: A, ...}
+    Record,
+    // A non-empty tuple or list of types -> A | B | ...
+    Union,
+    // (A, B) -> (A -> B); (A, "e", B) -> (A ->{e} B), the row variable by name.
+    Fun,
+    // A non-negative Int k -> Vec(k). A symbolic index (`Vec(n)`) is not a
+    // value: the parser keeps it as an Expr::TypeLit.
+    Vec,
+}
+
+impl TypeCtor {
+    // The constants, which a prelude lookup turns straight into a type value.
+    pub fn constant(self) -> Option<Type> {
+        match self {
+            TypeCtor::Int => Some(Type::Int),
+            TypeCtor::Float => Some(Type::Float),
+            TypeCtor::Bool => Some(Type::Bool),
+            TypeCtor::Str => Some(Type::Str),
+            TypeCtor::Dyn => Some(Type::Dyn),
+            TypeCtor::List | TypeCtor::Tuple | TypeCtor::Record | TypeCtor::Union | TypeCtor::Fun | TypeCtor::Vec => None,
+        }
+    }
 }
 
 impl Builtin {
@@ -127,7 +170,8 @@ impl Builtin {
             | Builtin::IsFun
             | Builtin::Print
             | Builtin::ToStr
-            | Builtin::Reverse => 1,
+            | Builtin::Reverse
+            | Builtin::Ty(_) => 1,
             Builtin::Map
             | Builtin::Get
             | Builtin::GetField
@@ -136,6 +180,17 @@ impl Builtin {
             | Builtin::Range
             | Builtin::Join => 2,
             Builtin::Fold => 3,
+        }
+    }
+
+    // What a prelude reference to this builtin evaluates to.
+    pub fn value(self) -> Value {
+        match self {
+            Builtin::Ty(c) => match c.constant() {
+                Some(t) => Value::Type(Rc::new(t)),
+                None => Value::Builtin(self),
+            },
+            _ => Value::Builtin(self),
         }
     }
 }
@@ -193,6 +248,9 @@ pub enum Value {
     // arguments collected so far. Applying it adds one more; once the
     // count reaches `Builtin::arity`, the real operation dispatches.
     PartialBuiltin(Builtin, Rc<Vec<Value>>),
+    // A type as a value: what the prelude type constructors build and an
+    // annotation evaluates to (machine::eval_pure).
+    Type(Rc<Type>),
 }
 
 impl Value {
@@ -235,6 +293,7 @@ impl Value {
             Value::Record(_) => "Record",
             Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => "Fun",
             Value::Handler(_) => "Handler",
+            Value::Type(_) => "Type",
         }
     }
 }
@@ -286,6 +345,7 @@ impl fmt::Display for Value {
                 write!(f, "<function>")
             }
             Value::Handler(_) => write!(f, "<handler>"),
+            Value::Type(t) => write!(f, "{t}"),
         }
     }
 }
@@ -311,6 +371,8 @@ pub enum Outcome {
     Record(Vec<(String, Outcome)>),
     Function,
     Handler,
+    // A type value, as its display text.
+    Type(String),
 }
 
 impl Outcome {
@@ -355,6 +417,7 @@ impl From<&Value> for Outcome {
                 Outcome::Function
             }
             Value::Handler(_) => Outcome::Handler,
+            Value::Type(t) => Outcome::Type(t.to_string()),
         }
     }
 }
@@ -391,6 +454,7 @@ impl fmt::Display for Outcome {
             }
             Outcome::Function => write!(f, "<function>"),
             Outcome::Handler => write!(f, "<handler>"),
+            Outcome::Type(t) => write!(f, "{t}"),
         }
     }
 }

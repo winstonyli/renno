@@ -6,10 +6,12 @@ use crate::cont::{Cont, ContNode, Frame};
 use crate::env::{Env, PRELUDE};
 use crate::expr::{Arena, BinOp, CheckMode, Expr, ExprRef, Len, LenExpr, Pattern, SpanMap, Test};
 use crate::frame::Bindings;
+use crate::index_expr::IndexExpr;
 use crate::resolve::{is_direct_group, resolve, Resolved, VarRef};
 use crate::span::Span;
+use crate::types::{EffectRow, Type};
 use crate::util::find_field;
-use crate::value::{Builtin, HandlerData, Value};
+use crate::value::{Builtin, HandlerData, TypeCtor, Value};
 
 enum Control {
     Eval(ExprRef, Env),
@@ -64,7 +66,78 @@ pub fn run(arena: &Arena, expr: ExprRef, env: Env, spans: &SpanMap) -> Value {
     debug_assert!(env.is_root(), "machine::run expects Env::prelude() (the root)");
     // One static pass, then the trampoline only ever indexes: see resolve.rs.
     let resolved = resolve(arena, expr);
-    run_loop(arena, Control::Eval(expr, env), Cont::nil(), spans, &resolved)
+    finished(run_loop::<false>(arena, Control::Eval(expr, env), Cont::nil(), spans, &resolved, 0))
+}
+
+// The ordinary (non-pure) loop never gets stuck.
+fn finished(r: Result<Value, Stuck>) -> Value {
+    match r {
+        Ok(v) => v,
+        Err(why) => unreachable!("only eval_pure gets stuck ({why:?})"),
+    }
+}
+
+// Why a check-time evaluation (eval_pure) could not finish. Each one leaves a
+// value only the run time can compute (spec section 2's "stuck" outcome).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Stuck {
+    // The step budget ran out.
+    Fuel,
+    // A `perform`: effects never run at check time.
+    Effect,
+    // A builtin outside the pure fragment (`print`, `map`, ...).
+    Builtin,
+}
+
+// What eval_pure produced.
+pub enum Pure {
+    Done(Value),
+    Stuck(Stuck),
+    // A run-time error the evaluation hit (applying a non-function, `handle`,
+    // a constructor given the wrong argument...): it would fail at run time too.
+    Error(String),
+}
+
+// The step budget of one check-time evaluation (spec section 5). Measured
+// 2026-10-10: every corpus and example annotation takes at most 9 steps; the
+// largest in the lib tests takes 7628 (a union of 120 tuples). Stage A's
+// annotations always finish, so the budget only has to be far above that.
+pub const ANNOTATION_FUEL: u64 = 1_000_000;
+
+// The check-mode entry into the machine's step loop (spec section 1): evaluates
+// `expr` with no enclosing scope, no effects and at most `fuel` steps. It never
+// prints, and it leaves CURRENT_SPAN as it found it.
+pub fn eval_pure(arena: &Arena, expr: ExprRef, spans: &SpanMap, fuel: u64) -> Pure {
+    let resolved = resolve(arena, expr);
+    let saved_span = current_span();
+    let run = std::panic::AssertUnwindSafe(|| run_loop::<true>(arena, Control::Eval(expr, Env::prelude()), Cont::nil(), spans, &resolved, fuel));
+    let result = std::panic::catch_unwind(run);
+    CURRENT_SPAN.with(|c| c.set(saved_span));
+    match result {
+        Ok(Ok(v)) => Pure::Done(v),
+        Ok(Err(why)) => Pure::Stuck(why),
+        Err(payload) => match payload.downcast::<crate::util::RunError>() {
+            Ok(e) => Pure::Error(e.0),
+            Err(other) => std::panic::resume_unwind(other),
+        },
+    }
+}
+
+// An annotation's Type: eval_pure, which must finish with a type value. Every
+// annotation the parser builds is closed, so in Stage A only a hand-built tree
+// reaches the Err arms (Stage C turns Stuck into a run-time residual).
+pub fn eval_type(arena: &Arena, ann: ExprRef, spans: &SpanMap) -> Result<Type, String> {
+    if let Expr::TypeLit(t) = &arena[ann] {
+        return Ok((**t).clone());
+    }
+    match eval_pure(arena, ann, spans, ANNOTATION_FUEL) {
+        Pure::Done(Value::Type(t)) => Ok((*t).clone()),
+        Pure::Done(v) => Err(format!("an annotation must be a type, found {}", v.type_name())),
+        Pure::Stuck(Stuck::Fuel) => Err(format!("annotation did not finish within {ANNOTATION_FUEL} steps")),
+        Pure::Stuck(Stuck::Effect) => Err("an annotation cannot perform an effect".to_string()),
+        Pure::Stuck(Stuck::Builtin) => Err("an annotation can only call the type constructors".to_string()),
+        Pure::Error(msg) => Err(msg),
+    }
 }
 
 // Calls a renno function VALUE from native Rust code (used by fold/map's
@@ -83,10 +156,13 @@ pub fn run(arena: &Arena, expr: ExprRef, env: Env, spans: &SpanMap) -> Value {
 // this is the expected shape for a structural-recursion primitive anyway
 // -- fold/map are conventionally pure transformations.
 pub fn apply(arena: &Arena, func: Value, arg: Value, spans: &SpanMap, resolved: &Resolved) -> Value {
-    run_loop(arena, Control::Apply(arg), Cont::cons(Frame::AppArg { func, callee_span: None }, Cont::nil()), spans, resolved)
+    finished(run_loop::<false>(arena, Control::Apply(arg), Cont::cons(Frame::AppArg { func, callee_span: None }, Cont::nil()), spans, resolved, 0))
 }
 
-fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap, resolved: &Resolved) -> Value {
+// PURE is eval_pure's check mode: a step budget (`fuel`), no effects, only the
+// type-constructor builtins. Every PURE test is a constant, so the ordinary
+// instance (`run_loop::<false>`) compiles without them: no cost on the hot path.
+fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap, resolved: &Resolved, mut fuel: u64) -> Result<Value, Stuck> {
     loop {
         // A list or record literal's accumulator frame that only this evaluation holds is
         // moved, not cloned, so building n elements is O(n). A frame a captured
@@ -100,6 +176,12 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
         }
         match control {
             Control::Eval(expr, env) => {
+                if PURE {
+                    if fuel == 0 {
+                        return Err(Stuck::Fuel);
+                    }
+                    fuel -= 1;
+                }
                 // `spans` covers every node the PARSER produced, but the
                 // tree actually running here is typecheck's ELABORATED
                 // one -- full of re-emitted and brand-new (Check, contract
@@ -126,6 +208,7 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
                 Expr::Str(s) => control = Control::Apply(Value::Str(Rc::from(s.as_str()))),
                 Expr::Token(id) => control = Control::Apply(Value::Token(*id)),
+                Expr::TypeLit(t) => control = Control::Apply(Value::Type(t.clone())),
                 // Always 2+ items (see Expr::Tuple's own doc comment), so
                 // unlike ListLit there's no empty-case to special-case --
                 // same left-to-right Frame::ListElems machinery either way,
@@ -190,7 +273,7 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                 Expr::Var(name) => {
                     control = Control::Apply(match resolved.get(expr) {
                         Some(VarRef::Local { hops, slot }) => env.get(hops, slot),
-                        Some(VarRef::Prelude(i)) => Value::Builtin(PRELUDE[i as usize].1),
+                        Some(VarRef::Prelude(i)) => PRELUDE[i as usize].1.value(),
                         // Lazy, at evaluation time -- CURRENT_SPAN was set at
                         // the top of this Eval step, so the message keeps its
                         // source location exactly as before the resolver.
@@ -254,10 +337,17 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                     control = Control::Eval(*c, env);
                 }
                 Expr::Perform(effect, payload) => {
+                    if PURE {
+                        return Err(Stuck::Effect);
+                    }
                     cont = Cont::cons(Frame::PerformPayload { effect: effect.clone() }, cont);
                     control = Control::Eval(*payload, env);
                 }
                 Expr::Handle { body, handler } => {
+                    if PURE {
+                        // It would capture a continuation at check time (spec section 2).
+                        crate::run_error!("an annotation cannot contain `handle`")
+                    }
                     cont = Cont::cons(Frame::InstallHandler { body: *body, env: env.clone() }, cont);
                     control = Control::Eval(*handler, env);
                 }
@@ -281,7 +371,7 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
             // eagerly cloning the whole frame (most fields on most arms
             // would otherwise be cloned and immediately discarded).
             Control::Apply(value) => match &*cont.0 {
-                ContNode::Nil => return value,
+                ContNode::Nil => return Ok(value),
                 ContNode::Frame(frame, rest) => {
                     let rest = rest.clone();
                     // Each arm clones the specific fields it needs into
@@ -330,9 +420,13 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                     control = Control::Apply(value);
                                 }
                                 Value::Builtin(b) => {
+                                    if PURE && !matches!(b, Builtin::Ty(_)) {
+                                        return Err(Stuck::Builtin);
+                                    }
                                     set_current_span(callee_span);
                                     control = Control::Apply(collect_builtin_arg(arena, b, Vec::new(), value, spans, resolved));
                                 }
+                                // Never Ty: every type constructor takes one argument.
                                 Value::PartialBuiltin(b, prev_args) => {
                                     let args = (*prev_args).clone();
                                     set_current_span(callee_span);
@@ -1234,7 +1328,53 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 _ => crate::run_error!("join expects a list and a string"),
             }
         }
+        // The constants (Int, ...) never get here: Builtin::value hands them
+        // out as Value::Type already.
+        Builtin::Ty(ctor) => match args.pop() {
+            Some(arg) => Value::Type(Rc::new(construct_type(ctor, arg))),
+            None => crate::run_error!("a type constructor expects one argument"),
+        },
     }
+}
+
+// What a type constructor builds from its argument (spec section 3's call forms).
+fn construct_type(ctor: TypeCtor, arg: Value) -> Type {
+    match (ctor, arg) {
+        (TypeCtor::List, Value::Type(t)) => Type::List(t),
+        (TypeCtor::Tuple, Value::List(items)) if !items.is_empty() => Type::Tuple(Rc::new(types_of(&items, "Tuple"))),
+        (TypeCtor::Union, Value::List(items)) if !items.is_empty() => Type::Union(Rc::new(types_of(&items, "Union"))),
+        (TypeCtor::Record, Value::Record(fields)) => {
+            let mut fields: Vec<(String, Type)> = fields
+                .iter()
+                .map(|(n, v)| match v {
+                    Value::Type(t) => (n.clone(), (**t).clone()),
+                    other => crate::run_error!("Record expects a record of types, field `{n}` is a {}", other.type_name()),
+                })
+                .collect();
+            fields.sort_by(|a, b| a.0.cmp(&b.0));
+            Type::Record(Rc::new(fields))
+        }
+        // (A, B) is `A -> B`; (A, "e", B) is `A ->{e} B`.
+        (TypeCtor::Fun, Value::List(items)) => match &items[..] {
+            [Value::Type(a), Value::Type(b)] => Type::Fun(a.clone(), EffectRow::Dyn, b.clone()),
+            [Value::Type(a), Value::Str(row), Value::Type(b)] => Type::Fun(a.clone(), EffectRow::Var(row.to_string()), b.clone()),
+            _ => crate::run_error!("Fun expects (param, result) or (param, \"row\", result) types"),
+        },
+        (TypeCtor::Vec, Value::Int(n)) if n >= 0 => {
+            Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Lit(n)))
+        }
+        (ctor, arg) => crate::run_error!("{ctor:?} cannot take a {}", arg.type_name()),
+    }
+}
+
+fn types_of(items: &[Value], ctor: &str) -> Vec<Type> {
+    items
+        .iter()
+        .map(|v| match v {
+            Value::Type(t) => (**t).clone(),
+            other => crate::run_error!("{ctor} expects types, found a {}", other.type_name()),
+        })
+        .collect()
 }
 
 // What trying an arm's pattern (from some starting index) turned up.

@@ -145,7 +145,7 @@ mod tests {
         let go = |r: &expr::ExprRef| tree_any(arena, *r, pred);
         pred(&arena[root])
             || match &arena[root] {
-                Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
+                Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::TypeLit(_) => false,
                 Expr::Check(e, spec) => go(e) || spec.lens.iter().any(go),
                 Expr::Len(_) => false,
                 Expr::FieldAccess(e, _) | Expr::Perform(_, e) => go(e),
@@ -3917,6 +3917,78 @@ g(len)").unwrap_err();
         assert_eq!(named_types.len(), 1);
     }
 
+    // Types are values (spec 2026-10-10, Stage A): every annotation form is
+    // sugar for a call to a prelude type constructor, and evaluating the call
+    // form with the check-time evaluator gives the same Type the sugar does.
+    fn eval_type_of_program(src: &str) -> Result<types::Type, String> {
+        let (arena, spans, root) = parser::parse(src)?;
+        machine::eval_type(&arena, root, &spans)
+    }
+
+    #[test]
+    fn annotation_sugar_is_a_call_to_the_type_constructors() {
+        let pairs = [
+            ("Int", "Int"),
+            ("Float", "Float"),
+            ("Bool", "Bool"),
+            ("Str", "Str"),
+            ("Dyn", "Dyn"),
+            ("[Int]", "List(Int)"),
+            ("(Int, Str)", "Tuple((Int, Str))"),
+            ("(Int,)", "Tuple((Int,))"),
+            ("{y: Bool, x: Int}", "Record({x: Int, y: Bool})"),
+            ("(Int | Str | Bool)", "Union((Int, Str, Bool))"),
+            ("(Int | Str) -> Int", "Fun((Union((Int, Str)), Int))"),
+            ("Int ->{e} Int", "Fun((Int, \"e\", Int))"),
+            ("[Int -> [Bool]]", "List(Fun((Int, List(Bool))))"),
+            ("Int -> Int -> Int", "Fun((Int, Fun((Int, Int))))"),
+            ("Vec(3)", "Vec(3)"),
+            ("([Int], [Int])", "let t = List(Int) in Tuple((t, t))"),
+        ];
+        for (sugar, call) in pairs {
+            let want = parser::parse_type_string(sugar).unwrap_or_else(|e| panic!("{sugar}: {e}"));
+            let got = eval_type_of_program(call).unwrap_or_else(|e| panic!("{call}: {e}"));
+            assert_eq!(got, want, "{sugar} vs {call}");
+        }
+    }
+
+    // What the check-time evaluator does with what it cannot or must not run.
+    #[test]
+    fn eval_pure_is_stuck_on_effects_and_fuel_and_errors_on_bad_types() {
+        use machine::{eval_pure, Pure, Stuck};
+        let pure = |src: &str, fuel: u64| {
+            let (arena, spans, root) = parser::parse(src).unwrap();
+            eval_pure(&arena, root, &spans, fuel)
+        };
+        assert!(matches!(pure("1 + 2", 100), Pure::Done(value::Value::Int(3))));
+        assert!(matches!(pure("perform ask(1)", 100), Pure::Stuck(Stuck::Effect)));
+        assert!(matches!(pure("print(1)", 100), Pure::Stuck(Stuck::Builtin)));
+        assert!(matches!(pure("map(fun x -> x)([1])", 100), Pure::Stuck(Stuck::Builtin)));
+        assert!(matches!(pure("(fun x -> x(x))(fun x -> x(x))", 1000), Pure::Stuck(Stuck::Fuel)));
+        match pure("handle 1 with handler e(p, k) -> 0", 100) {
+            Pure::Error(msg) => assert!(msg.contains("cannot contain `handle`"), "{msg}"),
+            _ => panic!("handle must be an error at check time"),
+        }
+        match pure("List(1)", 100) {
+            Pure::Error(msg) => assert_eq!(msg, "List cannot take a Int"),
+            _ => panic!("List(1) must be an error"),
+        }
+        match eval_type_of_program("1 + 2") {
+            Err(msg) => assert_eq!(msg, "an annotation must be a type, found Int"),
+            Ok(t) => panic!("1 + 2 is not a type, got {t}"),
+        }
+    }
+
+    // The type constructors are ordinary prelude values at value position.
+    #[test]
+    fn type_constructors_are_values() {
+        assert_eq!(run_source("to_str(List(Int))").unwrap().to_string(), "[Int]");
+        assert_eq!(run_source("to_str(Fun((Int, Str)))").unwrap().to_string(), "(Int -> Str)");
+        assert_eq!(run_source("let t = Tuple((Int, Bool)) in t").unwrap().to_string(), "(Int, Bool)");
+        let err = run_source("List(1)").unwrap_err();
+        assert!(err.contains("List cannot take a Int"), "{err}");
+    }
+
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain
     // parser::parse + machine::run with NO typecheck::check pass at all,
     // so a plain `: T` annotation (unlike a `where` refinement, which the
@@ -6958,7 +7030,7 @@ g(len)").unwrap_err();
         use expr::Expr;
         let mut go = |r: &expr::ExprRef| let_rec_groups_direct(arena, *r, out);
         match &arena[root] {
-            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::Len(_) => {}
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::Len(_) | Expr::TypeLit(_) => {}
             Expr::Check(operand, _) => go(operand),
             Expr::ListLit(items) | Expr::Tuple(items) => items.iter().for_each(go),
             Expr::Lambda(_, _, body) => go(body),

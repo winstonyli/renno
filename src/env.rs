@@ -1,4 +1,4 @@
-use crate::value::Builtin;
+use crate::value::{Builtin, TypeCtor};
 
 pub use crate::frame::Env;
 
@@ -37,6 +37,19 @@ pub static PRELUDE: &[(&str, Builtin)] = &[
     ("sort", Builtin::Sort),
     ("range", Builtin::Range),
     ("join", Builtin::Join),
+    // The type constructors: an annotation is desugared into calls to these
+    // (as `#Int`, `#List`, ..., which no user binding can capture).
+    ("Int", Builtin::Ty(TypeCtor::Int)),
+    ("Float", Builtin::Ty(TypeCtor::Float)),
+    ("Bool", Builtin::Ty(TypeCtor::Bool)),
+    ("Str", Builtin::Ty(TypeCtor::Str)),
+    ("Dyn", Builtin::Ty(TypeCtor::Dyn)),
+    ("List", Builtin::Ty(TypeCtor::List)),
+    ("Tuple", Builtin::Ty(TypeCtor::Tuple)),
+    ("Record", Builtin::Ty(TypeCtor::Record)),
+    ("Union", Builtin::Ty(TypeCtor::Union)),
+    ("Fun", Builtin::Ty(TypeCtor::Fun)),
+    ("Vec", Builtin::Ty(TypeCtor::Vec)),
 ];
 
 impl Env {

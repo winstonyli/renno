@@ -268,6 +268,11 @@ pub enum Expr {
     // it with a loop over the Vec rather than a fixed-shape match.
     ListLit(Vec<ExprRef>),
     Var(String),
+    // A type value as a literal (it evaluates to Value::Type). The parser
+    // writes one where an annotation names something that is not an
+    // expression yet: a `type` alias, or an index (`Vec(n)`, `T(n + 1)`);
+    // typecheck writes one for every annotation it re-emits.
+    TypeLit(Rc<Type>),
     // param annotation is optional -- None means Dyn. The typechecker fills
     // this in (or leaves it) when elaborating; the parser fills it in only
     // when the source has an explicit `: Type` annotation.
@@ -333,7 +338,7 @@ impl Expr {
     // Appends this node's direct sub-expressions to `out`.
     pub fn children(&self, out: &mut Vec<ExprRef>) {
         match self {
-            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => {}
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::TypeLit(_) => {}
             Expr::Check(e, spec) => {
                 out.push(*e);
                 out.extend(&spec.lens);

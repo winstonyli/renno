@@ -3503,6 +3503,10 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         // A singleton per source position -- see Expr::Token's own doc
         // comment.
         Expr::Token(id) => Ok((Type::Token(id), EffectRow::pure(), expr)),
+        // A type value is Dyn to the checker, like the prelude's type names
+        // (Stage A has no type of types). The parser only puts one in an
+        // annotation slot, which is never elaborated as a value.
+        Expr::TypeLit(_) => Ok((Type::Dyn, EffectRow::pure(), expr)),
         Expr::Var(name) => Ok((lookup(ctx, &name, infer), EffectRow::pure(), expr)),
 
         // Per-position types, no widening -- unlike ListLit just below,

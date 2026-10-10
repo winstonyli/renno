@@ -1,4 +1,4 @@
-use cranelift_entity::SecondaryMap;
+use cranelift_entity::EntityRef;
 
 use crate::env::PRELUDE;
 use crate::expr::{Arena, Expr, ExprRef, Pattern};
@@ -22,13 +22,18 @@ pub enum VarRef {
 
 // Side table keyed by the SAME ExprRef as the Arena (the SpanMap idiom):
 // only Expr::Var nodes get an entry (an unbound name gets VarRef::Unbound).
+// Dense over the range of Var nodes the walk met, `base..base + vars.len()`,
+// not over the whole arena prefix: machine::eval_type resolves each annotation
+// on its own, and a table sized to the annotation's position would make
+// checking quadratic in the program size.
 pub struct Resolved {
-    vars: SecondaryMap<ExprRef, Option<VarRef>>,
+    base: usize,
+    vars: Vec<Option<VarRef>>,
 }
 
 impl Resolved {
     pub fn get(&self, expr: ExprRef) -> Option<VarRef> {
-        self.vars[expr]
+        self.vars.get(expr.index().wrapping_sub(self.base)).copied().flatten()
     }
 }
 
@@ -68,7 +73,7 @@ enum Work {
 // children in REVERSE of the order they must be processed in.
 // Never fails on a name: an unresolvable one becomes VarRef::Unbound.
 pub fn resolve(arena: &Arena, root: ExprRef) -> Resolved {
-    let mut vars: SecondaryMap<ExprRef, Option<VarRef>> = SecondaryMap::new();
+    let mut found: Vec<(ExprRef, VarRef)> = Vec::new();
     let mut scopes: Vec<Vec<String>> = Vec::new();
     let mut work = vec![Work::Visit(root)];
     while let Some(item) = work.pop() {
@@ -77,10 +82,22 @@ pub fn resolve(arena: &Arena, root: ExprRef) -> Resolved {
             Work::Pop => {
                 scopes.pop();
             }
-            Work::Visit(id) => visit(arena, id, &scopes, &mut vars, &mut work),
+            Work::Visit(id) => visit(arena, id, &scopes, &mut found, &mut work),
         }
     }
-    Resolved { vars }
+    let base = found.iter().map(|(id, _)| id.index()).min().unwrap_or(0);
+    let end = found.iter().map(|(id, _)| id.index() + 1).max().unwrap_or(0);
+    let mut vars = vec![None; end.saturating_sub(base)];
+    for (id, r) in found {
+        let slot = &mut vars[id.index() - base];
+        match *slot {
+            Some(prev) if prev != r => {
+                panic!("resolver: {id} reached under conflicting scopes ({prev:?} vs {r:?})")
+            }
+            _ => *slot = Some(r),
+        }
+    }
+    Resolved { base, vars }
 }
 
 // A name spelled `#builtin` (never lexable) is a synthesized reference to a
@@ -129,20 +146,13 @@ fn visit(
     arena: &Arena,
     id: ExprRef,
     scopes: &[Vec<String>],
-    vars: &mut SecondaryMap<ExprRef, Option<VarRef>>,
+    found: &mut Vec<(ExprRef, VarRef)>,
     work: &mut Vec<Work>,
 ) {
     match &arena[id] {
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) => {}
-        Expr::Var(name) => {
-            let r = lookup(scopes, name);
-            match vars[id] {
-                Some(prev) if prev != r => {
-                    panic!("resolver: {id} reached under conflicting scopes ({prev:?} vs {r:?})")
-                }
-                _ => vars[id] = Some(r),
-            }
-        }
+        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::TypeLit(_) => {}
+        // A node shared under two scopes is caught when the table is built.
+        Expr::Var(name) => found.push((id, lookup(scopes, name))),
         Expr::Tuple(items) | Expr::ListLit(items) => {
             for i in items.iter().rev() {
                 work.push(Work::Visit(*i));
@@ -422,5 +432,25 @@ mod tests {
         let l2 = arena.push(Expr::Lambda("a".into(), None, inner)); // a -> (1,0)
         let root = arena.push(Expr::Tuple(vec![l1, l2]));
         resolve(&arena, root);
+    }
+
+    // The table covers only the Var nodes the walk met, so resolving a small
+    // subtree late in a big arena (an annotation, machine::eval_type) costs
+    // the subtree, not the arena prefix.
+    #[test]
+    fn the_table_spans_only_the_resolved_subtree() {
+        let mut arena = Arena::new();
+        for i in 0..10_000 {
+            arena.push(Expr::Int(i));
+        }
+        let f = arena.push(Expr::Var("#List".into()));
+        let x = arena.push(Expr::Var("#Int".into()));
+        let app = arena.push(Expr::App(f, x));
+        let resolved = resolve(&arena, app);
+        assert_eq!(resolved.vars.len(), 2);
+        let list = PRELUDE.iter().position(|(n, _)| *n == "List").unwrap() as u32;
+        assert_eq!(resolved.get(f), Some(VarRef::Prelude(list)));
+        assert_eq!(resolved.get(ExprRef::new(0)), None);
+        assert_eq!(resolved.get(app), None);
     }
 }
