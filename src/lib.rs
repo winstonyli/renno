@@ -6527,6 +6527,8 @@ mod tests {
             "let x: Dyn = [1, 2, 3] in let y: Vec(n) = x in 0",
             "let f = fun v: Vec(n) -> v in let x: Dyn = [1, 2] in let y = f(x) in 0",
             "let f = fun v: Vec(n + 1) -> v in let x: Dyn = [1, 2] in let y = f(x) in 0",
+            // a union alternative too
+            "let x: Dyn = [1] in let y: Vec(n) | Int = x in 0",
         ];
         for src in deferred {
             assert_eq!(obligations_after_checking(src), 1, "{src}");
@@ -6538,8 +6540,6 @@ mod tests {
             "let a: Vec(n) = [1, 2] in let x: Dyn = [1, 2] in let y: Vec(n) = x in 0",
             // n is the parameter's length (a witness)
             "let f = fun v: Vec(n) -> let r: Dyn = [1] in let q: Vec(n) = r in 0 in 0",
-            // a union target is out of scope: unchanged, no obligation
-            "let x: Dyn = [1] in let y: Vec(n) | Int = x in 0",
         ];
         for src in checked_at_the_crossing {
             assert_eq!(obligations_after_checking(src), 0, "{src}");
@@ -6615,6 +6615,9 @@ mod tests {
         let accepted = [
             ("let x: Dyn = [1, 2, 3] in let y: Vec(n) = x in len(y)", 3),
             ("let x: Dyn = [] in let y: Vec(n) = x in len(y)", 0),
+            // a union alternative's n is unconstrained the same way
+            ("let x: Dyn = [1] in let y: Vec(n) | Int = x in 0", 0),
+            ("let x: Dyn = [1, 2] in let y: Vec(n) | Bool = x in 7", 7),
         ];
         for (src, want) in accepted {
             assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
@@ -6627,8 +6630,8 @@ mod tests {
             ("let x: Dyn = [1, 2] in let y: Vec(n) = x in let z: Vec(n) = x in 0", "index variable n has no runtime value"),
             // a compound index over an unbound variable (no equation solving)
             ("let f = fun v: Vec(n + 1) -> v in let x: Dyn = [1, 2] in len(f(x))", "has no runtime value"),
-            // a union alternative is out of scope: unchanged
-            ("let x: Dyn = [1] in let y: Vec(n) | Int = x in 0", "has no runtime value"),
+            // two union crossings sharing n
+            ("let x: Dyn = [1] in let y: Vec(n) | Int = x in let z: Vec(n) | Int = x in 0", "index variable n has no runtime value"),
         ];
         for (src, want) in rejected {
             let err = run_source(src).unwrap_err();

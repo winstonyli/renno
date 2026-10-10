@@ -1476,10 +1476,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
             Type::List(_) => {
                 let tmp = fresh_index_name("__check_tmp");
                 let tmp_ref = arena.push(Expr::Var(tmp.clone()));
-                let (cond, len_eq) = build_indexed_shape_cond(arena, tmp_ref, index, env);
-                if env.defer {
-                    record_obligation(len_eq, index, env);
-                }
+                let cond = build_indexed_shape_cond(arena, tmp_ref, index, env);
                 let fail = build_type_error(arena, tmp_ref, to, env);
                 let if_expr = arena.push(Expr::If(cond, tmp_ref, fail));
                 arena.push(Expr::Let(tmp, None, e, if_expr))
@@ -1625,7 +1622,7 @@ fn runtime_index(e: &IndexExpr, infer: &InferCtx, witness_vars: &[&str], by_alia
     }
 }
 
-// Records an obligation for a crossing outside a union when its index has a
+// Records an obligation for a crossing (a union alternative's too) when its index has a
 // variable index_var_to_expr cannot give a runtime value (the check built
 // for it holds that clean failure until resolved). Every witness in scope
 // is marked used: the resolved check may read any of them, and their alias
@@ -1696,9 +1693,8 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
 // What the runtime-check builders (build_boundary_check and friends) need:
 // the type registry and index state (InferCtx, as of where the check is
 // spliced); `local` holds witnesses bound inside synthesized code
-// (wrap_fun_contract). `defer` is false inside a union target: a Vec(n)
-// alternative whose n has no runtime value keeps failing the whole check, so
-// it records no obligation.
+// (wrap_fun_contract). `defer` is false inside a cast's synthesized body
+// (build_cast, cast_up), which records no obligations.
 struct CheckEnv<'a> {
     infer: &'a InferCtx,
     local: Vec<&'a IndexWitness>,
@@ -1807,16 +1803,20 @@ fn index_var_to_expr(arena: &mut Arena, name: &str, env: &CheckEnv) -> ExprRef {
 // build_boundary_check wrap it in its let/if skeleton (evaluating
 // `value_ref` exactly once) while build_shape_predicate uses it directly as
 // its own bare predicate (no let-binding, callers may OR several of these
-// together). Also returns the `len(value) == <index>` node, which a
-// deferred obligation patches in place (resolve_obligations).
-fn build_indexed_shape_cond(arena: &mut Arena, value_ref: ExprRef, index: &IndexExpr, env: &CheckEnv) -> (ExprRef, ExprRef) {
+// together). With `env.defer` it records an obligation on its
+// `len(value) == <index>` node (record_obligation), which resolve_obligations
+// patches in place; a union alternative's compare is deferred the same way.
+fn build_indexed_shape_cond(arena: &mut Arena, value_ref: ExprRef, index: &IndexExpr, env: &CheckEnv) -> ExprRef {
     let is_list = build_probe(arena, value_ref, Shape::plain(Test::List), &Type::List(Rc::new(Type::Dyn)), env);
     let len_var = prelude_var(arena, "len");
     let len_call = arena.push(Expr::App(len_var, value_ref));
     let index_expr = index_expr_to_expr(arena, index, env);
     let len_eq = arena.push(Expr::BinOp(BinOp::Eq, len_call, index_expr));
+    if env.defer {
+        record_obligation(len_eq, index, env);
+    }
     let false_lit = arena.push(Expr::Bool(false));
-    (arena.push(Expr::If(is_list, len_eq, false_lit)), len_eq)
+    arena.push(Expr::If(is_list, len_eq, false_lit))
 }
 
 // The union check for a union a single Check can't express (shape_of is
@@ -1839,7 +1839,6 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, v
         Type::Union(alts) => alts.clone(),
         _ => unreachable!("build_union_check is only ever called with a Union target"),
     };
-    let env = &CheckEnv { infer: env.infer, local: env.local.clone(), defer: false, repeatable: env.repeatable, span: env.span };
     let tmp = fresh_index_name("__check_tmp");
     let tmp_ref = arena.push(Expr::Var(tmp.clone()));
     let mut result = build_type_error(arena, tmp_ref, to, env);
@@ -1998,7 +1997,7 @@ fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, env: 
         // index-refinement) is a later phase's own concern -- nothing before
         // this phase can construct one yet -- so it delegates to the shape.
         Type::Indexed(wrapped, index) => match wrapped.as_ref() {
-            Type::List(_) => build_indexed_shape_cond(arena, value_ref, index, env).0,
+            Type::List(_) => build_indexed_shape_cond(arena, value_ref, index, env),
             other => build_shape_predicate(arena, value_ref, other, env, visiting),
         },
         // `if pred1 then true else if pred2 then true else ... false`,
