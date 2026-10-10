@@ -57,6 +57,20 @@ pub fn run_source(src: &str) -> Result<Outcome, String> {
         .unwrap_or_else(|_| Err("internal error: interpreter worker thread panicked".to_string()))
 }
 
+// A deliberate run-time error (util::RunError) reports as is; any other panic is an
+// interpreter bug and says so.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(e) = payload.downcast_ref::<util::RunError>() {
+        return e.0.clone();
+    }
+    let text = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no panic message available".to_string());
+    format!("internal error (please report): {text}")
+}
+
 fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
     let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src)?;
     let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).map_err(|e| e.1.format_error(src, &e.0))?;
@@ -71,11 +85,7 @@ fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
         // exact culprit" caveat); no span at all (Perform/Apply's own
         // frame processing panicking before any Eval ever ran) just
         // leaves the bare message.
-        let msg = payload
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "runtime error (no panic message available)".to_string());
+        let msg = panic_message(&*payload);
         match machine::current_span() {
             Some(span) => span.format_error(src, &msg),
             None => msg,
@@ -86,6 +96,24 @@ fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_message_tells_run_errors_from_interpreter_bugs() {
+        assert_eq!(panic_message(&util::RunError("division by zero".to_string())), "division by zero");
+        assert_eq!(panic_message(&"index out of range"), "internal error (please report): index out of range");
+        assert_eq!(panic_message(&String::from("boom")), "internal error (please report): boom");
+    }
+
+    // Runs `f` and asserts it fails with a RunError whose message contains `expected`.
+    fn expect_run_error(expected: &str, f: impl FnOnce()) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(()) => panic!("expected a run-time error containing {expected:?}, but it ran"),
+            Err(p) => match p.downcast_ref::<util::RunError>() {
+                Some(e) => assert!(e.0.contains(expected), "run-time error {:?} lacks {expected:?}", e.0),
+                None => panic!("not a RunError: an interpreter panic"),
+            },
+        }
+    }
 
     // Raw parse+run, no typecheck -- for tests exercising parser/machine
     // semantics (multi-shot, deep/shallow, arithmetic) independent of the
@@ -163,8 +191,8 @@ mod tests {
     // Same shape, no deep(...) -- shallow (the MakeHandler default) is
     // consumed by the first occurrence; the second escapes unhandled.
     #[test]
-    #[should_panic(expected = "unhandled effect: choose")]
     fn parses_and_runs_shallow_handler_panic() {
+        expect_run_error("unhandled effect: choose", || {
         let src = r#"
             handle
               let x = perform choose(0) in
@@ -173,6 +201,7 @@ mod tests {
             with handler choose(p, resume) -> resume(1)
         "#;
         run_untyped(src);
+        });
     }
 
     #[test]
@@ -237,9 +266,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "division by zero")]
     fn division_by_zero_panics() {
+        expect_run_error("division by zero", || {
         run_untyped("5 / 0");
+        });
     }
 
     #[test]
@@ -262,9 +292,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "modulo by zero")]
     fn modulo_by_zero_panics() {
+        expect_run_error("modulo by zero", || {
         run_untyped("5 % 0");
+        });
     }
 
     // --- floats ---
@@ -313,12 +344,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "division by zero")]
     fn float_division_by_zero_panics_same_as_int() {
+        expect_run_error("division by zero", || {
         // Deliberately NOT IEEE754 inf/NaN -- renno's "0 divisor is
         // always a hard error" story stays uniform across both numeric
         // types instead of quietly diverging for Float.
         run_untyped("1.0 / 0.0");
+        });
     }
 
     #[test]
@@ -640,8 +672,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = ":: expects a list on the right")]
     fn cons_onto_non_list_panics_at_runtime_for_dyn_sourced_values() {
+        expect_run_error(":: expects a list on the right", || {
         // `perform choose(0)` is Dyn -- passes static checking (Dyn is
         // consistent with List(Dyn)), but the handler resumes with a
         // bare Int, which fails at apply_binop instead.
@@ -649,6 +681,7 @@ mod tests {
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).expect("Dyn-sourced value should not be statically rejected");
         machine::run(&arena, elaborated, Env::prelude(), &spans);
+        });
     }
 
     #[test]
@@ -787,11 +820,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "refinement violated")]
     fn refinement_on_dyn_sourced_value_runtime_check_fails() {
+        expect_run_error("refinement violated", || {
         let src = "handle (let n: Int where 0 < n = perform choose(0) in n + 1) \
                     with handler choose(p, resume) -> resume(-5)";
         run_untyped(src);
+        });
     }
 
     #[test]
@@ -803,10 +837,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "refinement violated")]
     fn refinement_on_lambda_parameter_fails_at_runtime() {
+        expect_run_error("refinement violated", || {
         let src = "let f = fun n: Int where 0 < n -> n * 2 in f(-3)";
         run_untyped(src);
+        });
     }
 
     // --- boolean operators (&&, ||, !) ---
@@ -896,13 +931,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "handler was invoked")]
     fn and_does_not_short_circuit_when_lhs_is_true() {
+        expect_run_error("handler was invoked", || {
         // Sanity check for the two tests above: confirms the handler
         // WOULD fire (and this test methodology is actually meaningful)
         // when the RHS really is reached.
         let src = "handle (true && perform choose(0)) with handler choose(p, resume) -> fail(\"handler was invoked!\")";
         run_untyped(src);
+        });
     }
 
     #[test]
@@ -948,8 +984,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unhandled effect: log")]
     fn effect_inside_map_callback_cannot_reach_an_outer_handler() {
+        expect_run_error("unhandled effect: log", || {
         // Documented limitation: map/fold call their callback via
         // machine::apply, which seeds a FRESH continuation -- an effect
         // performed inside the callback can never reach a `handle` that
@@ -958,6 +994,7 @@ mod tests {
         // not something this feature attempts to fix.
         let src = "handle map(fun x -> perform log(x))([1, 2, 3]) with handler log(p, resume) -> resume(p)";
         run_untyped(src);
+        });
     }
 
     #[test]
@@ -967,15 +1004,17 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "index out of bounds")]
     fn get_out_of_bounds_panics() {
+        expect_run_error("index out of bounds", || {
         run_untyped("get([10, 20, 30])(3)");
+        });
     }
 
     #[test]
-    #[should_panic(expected = "index out of bounds")]
     fn get_negative_index_panics() {
+        expect_run_error("index out of bounds", || {
         run_untyped("get([10, 20, 30])(0 - 1)");
+        });
     }
 
     #[test]
@@ -1126,9 +1165,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "match failed: no pattern matched the value")]
     fn match_with_no_matching_arm_panics() {
+        expect_run_error("match failed: no pattern matched the value", || {
         run_untyped(r#"match 5 | 1 -> "x""#);
+        });
     }
 
     #[test]
@@ -2466,8 +2506,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unhandled effect: choose")]
     fn without_row_annotation_same_program_only_fails_at_runtime() {
+        expect_run_error("unhandled effect: choose", || {
         // Same shape, `f`'s row bare Dyn instead of `{e}` -- calling it
         // collapses the whole expression's row to Dyn (today's ordinary
         // higher-order fallback), so typecheck can't catch this; it only
@@ -2479,6 +2519,7 @@ mod tests {
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).expect("should typecheck (falls back to Dyn)");
         machine::run(&arena, elaborated, Env::prelude(), &spans);
+        });
     }
 
     #[test]
@@ -2620,8 +2661,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "type error: expected Int, found Bool")]
     fn dyn_argument_fails_runtime_check_when_value_mismatches() {
+        expect_run_error("type error: expected Int, found Bool", || {
         // Same shape, but the handler resumes with a Bool -- the inserted
         // Check catches the mismatch at the effect/typed-code boundary.
         let src = r#"
@@ -2634,6 +2675,7 @@ mod tests {
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         machine::run(&arena, elaborated, Env::prelude(), &spans);
+        });
     }
 
     #[test]

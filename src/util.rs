@@ -14,3 +14,26 @@
 pub fn find_field<'a, T>(fields: &'a [(String, T)], name: &str) -> Option<&'a T> {
     fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
 }
+
+// The payload of every deliberate run-time error (a type error, division by zero,
+// an unhandled effect...). run_source tells it apart from any other panic, which
+// is an interpreter bug and reported as an internal error.
+pub struct RunError(pub String);
+
+#[macro_export]
+macro_rules! run_error {
+    ($($arg:tt)*) => {
+        ::std::panic::panic_any($crate::util::RunError(format!($($arg)*)))
+    };
+}
+
+// Keeps the default panic message for an interpreter bug and drops it for a RunError,
+// which run_source reports on its own. Process-global: the binary installs it, not the library.
+pub fn quiet_run_errors() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !info.payload().is::<RunError>() {
+            default(info);
+        }
+    }));
+}

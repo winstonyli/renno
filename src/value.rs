@@ -199,28 +199,28 @@ impl Value {
     pub fn as_int(&self) -> i64 {
         match self {
             Value::Int(n) => *n,
-            _ => panic!("expected int"),
+            _ => crate::run_error!("expected int"),
         }
     }
 
     pub fn as_float(&self) -> f64 {
         match self {
             Value::Float(x) => *x,
-            _ => panic!("expected float"),
+            _ => crate::run_error!("expected float"),
         }
     }
 
     pub fn as_bool(&self) -> bool {
         match self {
             Value::Bool(b) => *b,
-            _ => panic!("expected bool"),
+            _ => crate::run_error!("expected bool"),
         }
     }
 
     pub fn as_str(&self) -> &str {
         match self {
             Value::Str(s) => s,
-            _ => panic!("expected string"),
+            _ => crate::run_error!("expected string"),
         }
     }
 
@@ -317,14 +317,14 @@ impl Outcome {
     pub fn as_int(&self) -> i64 {
         match self {
             Outcome::Int(n) => *n,
-            _ => panic!("expected int"),
+            _ => crate::run_error!("expected int"),
         }
     }
 
     pub fn as_bool(&self) -> bool {
         match self {
             Outcome::Bool(b) => *b,
-            _ => panic!("expected bool"),
+            _ => crate::run_error!("expected bool"),
         }
     }
 }

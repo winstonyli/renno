@@ -107,6 +107,7 @@ fn run_and_print(src: &str) {
 }
 
 fn main() {
+    renno::util::quiet_run_errors();
     match std::env::args().nth(1) {
         Some(path) => run_file(&path),
         None => repl(),

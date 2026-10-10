@@ -180,7 +180,7 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                         // Lazy, at evaluation time -- CURRENT_SPAN was set at
                         // the top of this Eval step, so the message keeps its
                         // source location exactly as before the resolver.
-                        Some(VarRef::Unbound) => panic!("unbound variable: {name}"),
+                        Some(VarRef::Unbound) => crate::run_error!("unbound variable: {name}"),
                         None => panic!("internal: variable `{name}` was never resolved"),
                     });
                 }
@@ -324,7 +324,7 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                 }
                                 _ => {
                                     set_current_span(callee_span);
-                                    panic!("attempt to call a non-function value")
+                                    crate::run_error!("attempt to call a non-function value")
                                 }
                             }
                         }
@@ -336,7 +336,7 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                     cont = Cont::cons(Frame::HandlerMark(data), cont);
                                     control = Control::Eval(body, env);
                                 }
-                                _ => panic!("handle: expected a handler value"),
+                                _ => crate::run_error!("handle: expected a handler value"),
                             }
                         }
                         Frame::LetBody { body, env } => {
@@ -454,7 +454,7 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                     let mut path = Vec::new();
                                     let found = explain(&spec.test, &spec.defs, &value, &mut path);
                                     let at = if path.is_empty() { String::new() } else { format!(" at {}", path_text(&path)) };
-                                    panic!("type error: expected {}, found {}{at}", spec.to, found.type_name())
+                                    crate::run_error!("type error: expected {}, found {}{at}", spec.to, found.type_name())
                                 }
                             });
                         }
@@ -817,7 +817,7 @@ fn as_num_at(v: &Value, span: Option<Span>) -> Num {
         Value::Float(x) => Num::Float(*x),
         _ => {
             set_current_span(span);
-            panic!("type error: expected Int | Float, found {}", v.type_name())
+            crate::run_error!("type error: expected Int | Float, found {}", v.type_name())
         }
     }
 }
@@ -868,7 +868,7 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
             (Num::Int(a), Num::Int(b)) => {
                 if b == 0 {
                     set_current_span(r_span);
-                    panic!("division by zero");
+                    crate::run_error!("division by zero");
                 }
                 Value::Int(a / b)
             }
@@ -876,7 +876,7 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
                 let b = b.as_f64();
                 if b == 0.0 {
                     set_current_span(r_span);
-                    panic!("division by zero");
+                    crate::run_error!("division by zero");
                 }
                 Value::Float(a.as_f64() / b)
             }
@@ -885,7 +885,7 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
             (Num::Int(a), Num::Int(b)) => {
                 if b == 0 {
                     set_current_span(r_span);
-                    panic!("modulo by zero");
+                    crate::run_error!("modulo by zero");
                 }
                 Value::Int(a % b)
             }
@@ -893,7 +893,7 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
                 let b = b.as_f64();
                 if b == 0.0 {
                     set_current_span(r_span);
-                    panic!("modulo by zero");
+                    crate::run_error!("modulo by zero");
                 }
                 Value::Float(a.as_f64() % b)
             }
@@ -922,7 +922,7 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
                     (true, false) => r_span,
                     _ => combine_spans(l_span, r_span),
                 });
-                panic!("++ expects two strings or two lists")
+                crate::run_error!("++ expects two strings or two lists")
             }
         },
         BinOp::Cons => match &rhs {
@@ -934,7 +934,7 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
             }
             _ => {
                 set_current_span(r_span);
-                panic!(":: expects a list on the right")
+                crate::run_error!(":: expects a list on the right")
             }
         },
     }
@@ -960,16 +960,16 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             Some(Value::Handler(data)) => {
                 Value::Handler(Rc::new(HandlerData { deep: b == Builtin::Deep, ..(*data).clone() }))
             }
-            _ => panic!("deep/shallow expect a handler value"),
+            _ => crate::run_error!("deep/shallow expect a handler value"),
         },
         Builtin::Len => match args.pop() {
             Some(Value::Str(s)) => Value::Int(s.chars().count() as i64),
             Some(Value::List(items)) => Value::Int(items.len() as i64),
-            _ => panic!("len expects a string or list"),
+            _ => crate::run_error!("len expects a string or list"),
         },
         Builtin::Fail => match args.pop() {
-            Some(Value::Str(s)) => panic!("{s}"),
-            _ => panic!("fail expects a string message"),
+            Some(Value::Str(s)) => crate::run_error!("{s}"),
+            _ => crate::run_error!("fail expects a string message"),
         },
         Builtin::Get => {
             let (i, list) = (args.pop(), args.pop());
@@ -978,10 +978,10 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                     let idx = usize::try_from(idx).ok().filter(|&idx| idx < items.len());
                     match idx {
                         Some(idx) => items[idx].clone(),
-                        None => panic!("get: index out of bounds"),
+                        None => crate::run_error!("get: index out of bounds"),
                     }
                 }
-                _ => panic!("get expects a list and an int"),
+                _ => crate::run_error!("get expects a list and an int"),
             }
         }
         Builtin::IsInt => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Int, &[], &v))),
@@ -1004,9 +1004,9 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             match (record, name) {
                 (Some(Value::Record(fields)), Some(Value::Str(name))) => match find_field(&fields, &name) {
                     Some(v) => v.clone(),
-                    None => panic!("no field named `{name}`"),
+                    None => crate::run_error!("no field named `{name}`"),
                 },
-                _ => panic!("get_field expects a record and a string"),
+                _ => crate::run_error!("get_field expects a record and a string"),
             }
         }
         Builtin::IsFun => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Fun, &[], &v))),
@@ -1017,11 +1017,11 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 println!("{v}");
                 v
             }
-            None => panic!("print expects one argument"),
+            None => crate::run_error!("print expects one argument"),
         },
         Builtin::ToStr => match args.pop() {
             Some(v) => Value::Str(Rc::from(v.to_string())),
-            None => panic!("to_str expects one argument"),
+            None => crate::run_error!("to_str expects one argument"),
         },
         Builtin::Map => {
             let (list, f) = (args.pop(), args.pop());
@@ -1031,7 +1031,7 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                         items.iter().map(|v| apply(arena, f.clone(), v.clone(), spans, resolved)).collect();
                     Value::List(Rc::new(mapped))
                 }
-                _ => panic!("map expects a function and a list"),
+                _ => crate::run_error!("map expects a function and a list"),
             }
         }
         Builtin::Fold => {
@@ -1047,7 +1047,7 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                     }
                     acc
                 }
-                _ => panic!("fold expects a function, an initial value, and a list"),
+                _ => crate::run_error!("fold expects a function, an initial value, and a list"),
             }
         }
         Builtin::Filter => {
@@ -1061,7 +1061,7 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                         .collect();
                     Value::List(Rc::new(filtered))
                 }
-                _ => panic!("filter expects a function and a list"),
+                _ => crate::run_error!("filter expects a function and a list"),
             }
         }
         Builtin::Reverse => match args.pop() {
@@ -1070,7 +1070,7 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 items.reverse();
                 Value::List(Rc::new(items))
             }
-            _ => panic!("reverse expects a list"),
+            _ => crate::run_error!("reverse expects a list"),
         },
         Builtin::Sort => {
             let (list, cmp) = (args.pop(), args.pop());
@@ -1089,14 +1089,14 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                     });
                     Value::List(Rc::new(items))
                 }
-                _ => panic!("sort expects a comparator and a list"),
+                _ => crate::run_error!("sort expects a comparator and a list"),
             }
         }
         Builtin::Range => {
             let (end, start) = (args.pop(), args.pop());
             match (start, end) {
                 (Some(Value::Int(start)), Some(Value::Int(end))) => Value::List(Rc::new((start..end).map(Value::Int).collect())),
-                _ => panic!("range expects two ints"),
+                _ => crate::run_error!("range expects two ints"),
             }
         }
         Builtin::Join => {
@@ -1107,12 +1107,12 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                         .iter()
                         .map(|v| match v {
                             Value::Str(s) => &**s,
-                            _ => panic!("join expects a list of strings"),
+                            _ => crate::run_error!("join expects a list of strings"),
                         })
                         .collect();
                     Value::Str(Rc::from(strs.join(&*sep)))
                 }
-                _ => panic!("join expects a list and a string"),
+                _ => crate::run_error!("join expects a list and a string"),
             }
         }
     }
@@ -1170,7 +1170,7 @@ fn dispatch_arm_outcome(
             Cont::cons(Frame::MatchGuard { arms, idx, outer_env, guard_env: guard_env.clone(), value }, rest),
             Control::Eval(guard, guard_env),
         ),
-        None => panic!("match failed: no pattern matched the value"),
+        None => crate::run_error!("match failed: no pattern matched the value"),
     }
 }
 
@@ -1274,7 +1274,7 @@ fn perform(cont: &mut Cont, effect: &str, payload: Value) -> Control {
 
     loop {
         match &*node.0 {
-            ContNode::Nil => panic!("unhandled effect: {effect}"),
+            ContNode::Nil => crate::run_error!("unhandled effect: {effect}"),
             ContNode::Frame(frame, rest) => {
                 if let Frame::HandlerMark(data) = frame {
                     if data.effect == effect {
