@@ -513,7 +513,7 @@ fn leaf(t: &Test, v: &Value) -> Option<bool> {
             matches!(v, Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..))
         }
         Test::Token(id) => matches!(v, Value::Token(t) if t == id),
-        Test::ListOf(_) | Test::TupleOf(_) | Test::RecordOf(_) | Test::Ref(_) | Test::Or(_) => return None,
+        Test::ListOf(_) | Test::ListLen(..) | Test::TupleOf(_) | Test::RecordOf(_) | Test::Ref(_) | Test::Or(_) => return None,
     })
 }
 
@@ -641,6 +641,16 @@ fn walk<'t, 'a, const TRACK: bool>(test: &'t Test, defs: &'t [Test], v: &'a Valu
                         }
                     }
                     // Reversed, so the stack pops them in element order.
+                    for (i, x) in items.iter().enumerate().rev() {
+                        let n = child::<TRACK>(nodes, node, Label::Element(i));
+                        work.push(Step::Test(element, x, n));
+                    }
+                }
+                Test::ListLen(element, len) => {
+                    let Value::List(items) = v else { break 'step here };
+                    if items.len() != *len {
+                        break 'step here;
+                    }
                     for (i, x) in items.iter().enumerate().rev() {
                         let n = child::<TRACK>(nodes, node, Label::Element(i));
                         work.push(Step::Test(element, x, n));
@@ -1405,6 +1415,7 @@ mod tests {
     fn holds_recursive(test: &Test, defs: &[Test], v: &Value) -> bool {
         match test {
             Test::ListOf(t) => matches!(v, Value::List(items) if items.iter().all(|x| holds_recursive(t, defs, x))),
+            Test::ListLen(t, n) => matches!(v, Value::List(items) if items.len() == *n && items.iter().all(|x| holds_recursive(t, defs, x))),
             Test::TupleOf(ts) => matches!(v, Value::List(items) if items.len() == ts.len() && items.iter().zip(ts).all(|(x, t)| holds_recursive(t, defs, x))),
             Test::RecordOf(fs) => matches!(v, Value::Record(fields) if fs.iter().all(|(n, t)| find_field(fields, n).is_some_and(|x| holds_recursive(t, defs, x)))),
             Test::Ref(i) => holds_recursive(&defs[*i], defs, v),
@@ -1416,7 +1427,8 @@ mod tests {
     fn explain_recursive<'a>(test: &Test, defs: &[Test], v: &'a Value, path: &mut Vec<String>) -> &'a Value {
         match (test, v) {
             (Test::Ref(i), _) => explain_recursive(&defs[*i], defs, v, path),
-            (Test::ListOf(t), Value::List(items)) => match items.iter().position(|x| !holds_recursive(t, defs, x)) {
+            (Test::ListLen(_, n), Value::List(items)) if items.len() != *n => v,
+            (Test::ListOf(t), Value::List(items)) | (Test::ListLen(t, _), Value::List(items)) => match items.iter().position(|x| !holds_recursive(t, defs, x)) {
                 Some(i) => {
                     path.push(format!("element {i}"));
                     explain_recursive(t, defs, &items[i], path)
@@ -1479,7 +1491,8 @@ mod tests {
             3 => Test::Str,
             4 if refs && r.below(2) == 0 => Test::Ref(r.below(2)),
             4 => Test::Float,
-            5 | 6 => Test::ListOf(Box::new(random_test(r, depth - 1, true))),
+            5 => Test::ListOf(Box::new(random_test(r, depth - 1, true))),
+            6 => Test::ListLen(Box::new(random_test(r, depth - 1, true)), r.below(4)),
             7 => Test::TupleOf((0..r.below(4)).map(|_| random_test(r, depth - 1, true)).collect()),
             8 => Test::RecordOf((0..r.below(4)).map(|i| (NAMES[i].to_string(), random_test(r, depth - 1, true))).collect()),
             _ => Test::Or((0..r.below(4)).map(|_| random_test(r, depth - 1, refs)).collect()),

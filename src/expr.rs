@@ -124,6 +124,8 @@ pub enum Test {
     Token(u64),
     // A list every element of which passes.
     ListOf(Box<Test>),
+    // A list of exactly this many elements, each passing (a Vec(k) with a literal k).
+    ListLen(Box<Test>, usize),
     // A list of exactly this many elements, position i passing tests[i].
     TupleOf(Vec<Test>),
     // A record with at least these fields, each field's value passing its

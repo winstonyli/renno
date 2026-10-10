@@ -1445,6 +1445,8 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
         // Fun's return type, which is Dyn for `Dyn -> Dyn` (and nested
         // builders reach it through tuple/union alternatives).
         Type::Dyn | Type::Var(_) => e,
+        // A literal length (and every nested position) is one native test.
+        Type::Indexed(w, _) if matches!(**w, Type::List(_)) && shape_of(to, env).is_some() => build_shape_check(arena, e, to, env),
         // is-a-list-then-len-equals-the-index, checked against the index
         // EXPRESSION (not a fixed arity literal), so this keeps the let/if
         // skeleton: binding `e` once is what keeps it evaluated exactly
@@ -1861,9 +1863,9 @@ struct Defs {
 }
 
 // `ty` as one native Shape, or None when it can't be one: a Vec(n) length
-// compare needs the index expression evaluated in the environment
-// (build_indexed_shape_cond), so it -- and any union or Named alias reaching
-// one at the top -- stays desugared.
+// compare with a non-literal index needs the index expression evaluated in the
+// environment (build_indexed_shape_cond), so it -- and any union or Named alias
+// reaching one at the top -- stays desugared.
 fn shape_of(ty: &Type, env: &CheckEnv) -> Option<Shape> {
     let mut defs = Defs::default();
     let test = shape_test(ty, env, &mut defs, &HashSet::new())?;
@@ -1873,7 +1875,8 @@ fn shape_of(ty: &Type, env: &CheckEnv) -> Option<Shape> {
 
 // The deep test for `ty`: what the value must be, element by element
 // (function-free types; a Fun position is only a callability tag, and a
-// Vec(n) inside a container is left unchecked as `Any`). `unguarded` holds
+// Vec(n) inside a container is checked as its list when n has no literal
+// value). `unguarded` holds
 // the Named aliases unfolded since the last container: meeting one again
 // there would loop without consuming the value, so it is `Never` (making
 // `type A = Int | A` behave as plain Int). Past a container, a Named alias
@@ -1881,7 +1884,10 @@ fn shape_of(ty: &Type, env: &CheckEnv) -> Option<Shape> {
 // alias terminates because the value does. An unregistered Named is `Any`
 // ("no information here").
 fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &HashSet<String>) -> Option<Test> {
-    let element = |t: &Type, defs: &mut Defs| shape_test(t, env, defs, &HashSet::new()).unwrap_or(Test::Any);
+    // An element's length with no literal value is not checked; its shape is (strip_indexed).
+    let element = |t: &Type, defs: &mut Defs| {
+        shape_test(t, env, defs, &HashSet::new()).or_else(|| shape_test(&strip_indexed(t), env, defs, &HashSet::new())).unwrap_or(Test::Any)
+    };
     Some(match ty {
         Type::Dyn | Type::Var(_) => Test::Any,
         Type::Int => Test::Int,
@@ -1923,9 +1929,14 @@ fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &HashSet<St
                 }
             },
         },
-        Type::Indexed(wrapped, _) => match wrapped.as_ref() {
-            Type::List(_) => return None,
-            other => shape_test(other, env, defs, unguarded)?,
+        // A literal length is a native test; any other index a desugared compare (build_indexed_shape_cond).
+        Type::Indexed(wrapped, index) => match (wrapped.as_ref(), env.infer.resolve_index_deep(index)) {
+            (Type::List(el), IndexExpr::Lit(k)) => match usize::try_from(k) {
+                Ok(k) => Test::ListLen(Box::new(element(el, defs)), k),
+                Err(_) => Test::Never,
+            },
+            (Type::List(_), _) => return None,
+            (other, _) => shape_test(other, env, defs, unguarded)?,
         },
     })
 }

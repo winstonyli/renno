@@ -7240,11 +7240,18 @@ mod tests {
 
     #[test]
     fn a_vec_n_index_check_stays_desugared_but_tests_natively() {
-        let src = "let d: Dyn = [1, 2] in let y: Vec(2) = d in 1";
+        // A variable index is compared in the environment: desugared, with a native list probe.
+        let src = "let f = fun v: Vec(n) -> let d: Dyn = [1, 2] in let y: Vec(n) = d in 1 in f([1, 2])";
         let (arena, root) = elaborated_tree(src);
         assert!(has_let_named(&arena, root, "__check_tmp#"));
         assert!(tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(_, s) if s.test == expr::Test::List && s.mode == expr::CheckMode::Probe)));
         assert!(!calls_a_check_predicate(src));
+        // A literal length is one native test.
+        let lit = "let d: Dyn = [1, 2] in let y: Vec(2) = d in 1";
+        assert!(has_assert_check(lit, expr::Test::ListLen(Box::new(expr::Test::Any), 2)));
+        let (arena, root) = elaborated_tree(lit);
+        assert!(!has_let_named(&arena, root, "__check_tmp#"));
+        assert_clean_rejection("let d: Dyn = [1, 2, 3] in let y: Vec(2) = d in 1", "type error: expected [Dyn](2), found List");
     }
 
     #[test]
@@ -7822,12 +7829,17 @@ mod tests {
     }
 
     #[test]
-    fn deep_checks_leave_vec_n_and_functions_in_containers_alone() {
-        // parked (fun-to-dyn spec §7): Vec(n) inside a container is not length-checked...
-        assert_eq!(run_source("let d: Dyn = [[1, 2], [3]] in let xs: [Vec(2)] = d in len(xs)").unwrap().as_int(), 2);
-        // an alias whose body reaches Vec(n) becomes Any as a whole inside a container
+    fn deep_checks_check_a_literal_vec_length_but_only_tag_a_function_in_a_container() {
+        // A literal Vec(k) inside a container is length-checked natively...
+        rejects("let d: Dyn = [[1, 2], [3]] in let xs: [Vec(2)] = d in len(xs)", "type error: expected [[Dyn](2)], found List at element 1");
+        assert_eq!(run_source("let d: Dyn = [[1, 2], [3, 4]] in let xs: [Vec(2)] = d in len(xs)").unwrap().as_int(), 2);
+        // ...through an alias too (a pair is a Vec(2), so this one passes)...
         let alias = "type A = (Int, [A]) | Vec(2) in let d: Dyn = (1, [[1, 2, 3]]) in let a: A = d in 1";
         assert_eq!(run_source(alias).unwrap().as_int(), 1);
+        rejects("type A = (Int, [A]) | Vec(3) in let d: Dyn = (1, [[1, 2]]) in let a: A = d in 1", "at element 1, element 0");
+        // ...but a nested Vec(n) with a variable n is not (parked: needs the length in the environment).
+        let var = "let f = fun v: Vec(n) -> let d: Dyn = [[1, 2], [3]] in let xs: [Vec(n)] = d in len(xs) in f([1, 2])";
+        assert_eq!(run_source(var).unwrap().as_int(), 2);
         // ...and a function inside a container is only a callability tag.
         assert_eq!(run_source("let d: Dyn = [fun x -> x] in let fs: [(Int -> Int)] = d in len(fs)").unwrap().as_int(), 1);
         rejects("let d: Dyn = [3] in let fs: [(Int -> Int)] = d in len(fs)", "at element 0");
