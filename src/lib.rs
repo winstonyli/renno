@@ -3899,25 +3899,23 @@ g(len)").unwrap_err();
         use index_expr::IndexExpr;
         let src = r#"
             type List = (Int, List) | Bool in
-            let _x: List(2) = (1, (2, false)) in
+            let _x: Indexed(List, 2) = (1, (2, false)) in
             5
         "#;
-        let (arena, _spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let (arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
         // Scoped to the parser change alone: inspect the parsed annotation
         // directly rather than running typecheck (Task 6 -- not yet
         // implemented -- owns whether a value can actually be CONSTRUCTED
         // against this type).
-        // The annotation is an expression now; alias indexing parses to a TypeLit.
+        // The annotation is a call of the prelude's Indexed; it evaluates to
+        // the alias at index 2.
         let Expr::Let(_, Some(ann), ..) = &arena[root] else { panic!("expected an annotated Let, got {:?}", arena[root]) };
-        match &arena[*ann] {
-            Expr::TypeLit(t) => match t.as_ref() {
-                Type::Indexed(wrapped, idx) => {
-                    assert!(matches!(wrapped.as_ref(), Type::Named(_)), "expected the wrapped type to be Type::Named, got {wrapped:?}");
-                    assert_eq!(**idx, IndexExpr::Lit(2));
-                }
-                other => panic!("expected an Indexed(Named(_), 2) annotation, got {other:?}"),
-            },
-            other => panic!("expected a TypeLit annotation, got {other:?}"),
+        match machine::eval_type(&arena, *ann, &spans) {
+            Ok(Type::Indexed(wrapped, idx)) => {
+                assert!(matches!(wrapped.as_ref(), Type::Named(_)), "expected the wrapped type to be Type::Named, got {wrapped:?}");
+                assert_eq!(*idx, IndexExpr::Lit(2));
+            }
+            other => panic!("expected an Indexed(Named(_), 2) annotation, got {other:?}"),
         }
         assert_eq!(named_types.len(), 1);
     }
@@ -3995,7 +3993,8 @@ g(len)").unwrap_err();
     }
 
     // An annotation is an expression: sugar is parsed into calls to the
-    // prelude's type constructors, spelled `#Int`, `#List`, ...
+    // prelude's type constructors, spelled `#List`, ..., and a name the user
+    // wrote stays a plain variable.
     #[test]
     fn an_annotation_is_parsed_as_type_constructor_calls() {
         use expr::Expr;
@@ -4003,12 +4002,12 @@ g(len)").unwrap_err();
         let Expr::Let(_, Some(ann), ..) = &arena[root] else { panic!("expected an annotated Let, got {:?}", arena[root]) };
         let Expr::App(f, a) = &arena[*ann] else { panic!("expected a call, got {:?}", arena[*ann]) };
         assert!(matches!(&arena[*f], Expr::Var(n) if n == "#List"), "{:?}", arena[*f]);
-        assert!(matches!(&arena[*a], Expr::Var(n) if n == "#Int"), "{:?}", arena[*a]);
+        assert!(matches!(&arena[*a], Expr::Var(n) if n == "Int"), "{:?}", arena[*a]);
     }
 
-    // Stage A desugars annotations to `#Int`, ..., which a user binding cannot
-    // capture, so shadowing a type name changes nothing (Stage B flips this,
-    // spec section 4).
+    // A name in an annotation is a plain variable, but until typecheck
+    // evaluates annotations in the binder's scope (Stage B, Task 3) it
+    // resolves in the prelude alone, so shadowing a type name changes nothing.
     #[test]
     fn a_value_named_like_a_type_does_not_change_annotations_yet() {
         assert_eq!(run_source("let Int = 5 in let x: Int = 3 in x + Int").unwrap().as_int(), 8);
@@ -4031,6 +4030,26 @@ g(len)").unwrap_err();
         assert_eq!(ok("List(Int) == List(Int)"), "true");
         assert_eq!(ok("List(Int) == List(Str)"), "false");
         assert_eq!(ok("Union((Int, Str)) == Union((Str, Int))"), "false");
+    }
+
+    // `Indexed(T, n)` replaces the old alias indexing `T(n)`, and `Name(arg)`
+    // in an annotation is ordinary application (spec section 9.1).
+    #[test]
+    fn indexed_replaces_alias_indexing_and_a_call_is_application() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        assert_eq!(ok("type L = Bool | (Int, L) in let x: Indexed(L, 2) = (1, (2, false)) in 0"), "0");
+        assert_eq!(ok("let xs: List(Int) = [1] in xs"), "[1]");
+        // The arguments are parsed as types, so `(Int, Str)` inside a call in
+        // an annotation is the tuple type, not a tuple of two types.
+        assert_eq!(ok("let p: Tuple(Int, Str) = (1, \"a\") in p"), "[1, a]");
+        let err = run_source("let p: Tuple((Int, Str)) = (1, \"a\") in p").unwrap_err();
+        assert!(err.contains("Tuple cannot take a Type"), "{err}");
+        let err = run_source("type Pair = (Int, Int) in let x: Pair(3) = (1, 2) in x").unwrap_err();
+        assert!(err.contains("attempt to call a non-function value"), "{err}");
+        let err = run_source("let x: Nope = 1 in x").unwrap_err();
+        assert!(err.contains("unbound variable: Nope"), "{err}");
+        let err = run_source("type Indexed = Int in 0").unwrap_err();
+        assert!(err.contains("cannot redefine builtin type Indexed as an alias"), "{err}");
     }
 
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain
@@ -6156,7 +6175,7 @@ g(len)").unwrap_err();
         // what this test actually exercises (Case B step construction).
         let src = r#"
             type List = (Int, List) | Bool in
-            let f: (Int -> List(1)) = fun n -> (n, false) in
+            let f: (Int -> Indexed(List, 1)) = fun n -> (n, false) in
             match f(9)
             | (h, t) -> h
             | true -> 0
@@ -6171,7 +6190,7 @@ g(len)").unwrap_err();
     fn tuple_checked_against_case_b_indexed_rejects_wrong_arity() {
         let src = r#"
             type List = (Int, List) | Bool in
-            let f: (Int -> List(1)) = fun n -> (n, n, false) in
+            let f: (Int -> Indexed(List, 1)) = fun n -> (n, n, false) in
             f(9)
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
@@ -6193,7 +6212,7 @@ g(len)").unwrap_err();
     fn base_case_construction_against_case_b_indexed_unifies_index_to_zero() {
         let src = r#"
             type List = (Int, List) | Bool in
-            let f: (Int -> List(0)) = fun n -> false in
+            let f: (Int -> Indexed(List, 0)) = fun n -> false in
             f(9)
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
@@ -6221,13 +6240,13 @@ g(len)").unwrap_err();
         // (construction) and Task 3 (LetRec) all together.
         let src = r#"
             type List = (Int, List) | Bool in
-            let rec same_length: (List(n) -> List(n)) = fun v ->
+            let rec same_length: (Indexed(List, n) -> Indexed(List, n)) = fun v ->
                 match v
                 | (h, t) -> (h, same_length(t))
                 | false -> false
                 | true -> false
             in
-            let v0: List(2) = (1, (2, false)) in
+            let v0: Indexed(List, 2) = (1, (2, false)) in
             match same_length(v0)
             | (h, t) -> h
             | false -> 0
@@ -6264,8 +6283,8 @@ g(len)").unwrap_err();
         // confirms `w`'s type is still T(2).
         let src = r#"
             type T = Dyn | (Int, T) in
-            let v: T(2) = (1, (2, 5)) in
-            let w: T(2) = v in
+            let v: Indexed(T, 2) = (1, (2, 5)) in
+            let w: Indexed(T, 2) = v in
             0
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
@@ -6287,7 +6306,7 @@ g(len)").unwrap_err();
         let src = r#"
             type T = Vec(3) | (Int, T) in
             let v: Vec(3) = [1, 2, 3] in
-            let b: T(0) = v in
+            let b: Indexed(T, 0) = v in
             0
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
@@ -6374,20 +6393,20 @@ g(len)").unwrap_err();
 
     #[test]
     fn indexing_a_non_indexable_alias_reports_it_is_not_indexable() {
-        let err = run_source("type Pair = (Int, Int) in let x: Pair(3) = (1, 2) in x").unwrap_err();
+        let err = run_source("type Pair = (Int, Int) in let x: Indexed(Pair, 3) = (1, 2) in x").unwrap_err();
         assert!(err.contains("(Int, Int) is not an indexable type"), "unexpected message: {err}");
     }
 
     #[test]
     fn step_shaped_tuple_through_a_let_keeps_its_index() {
         let t = "type T = Dyn | (Int, T) in\n";
-        assert!(run_source(&format!("{t}let p = (1, 5) in let w: T(1) = p in 0")).is_ok());
-        assert!(run_source(&format!("{t}let p = (1, (2, 5)) in let w: T(2) = p in 0")).is_ok());
-        assert!(run_source(&format!("{t}let p = (1, 5) in let w: T(0) = p in 0")).is_ok());
-        assert!(run_source(&format!("{t}let p = (1, 5) in let w: T(2) = p in 0")).is_err());
+        assert!(run_source(&format!("{t}let p = (1, 5) in let w: Indexed(T, 1) = p in 0")).is_ok());
+        assert!(run_source(&format!("{t}let p = (1, (2, 5)) in let w: Indexed(T, 2) = p in 0")).is_ok());
+        assert!(run_source(&format!("{t}let p = (1, 5) in let w: Indexed(T, 0) = p in 0")).is_ok());
+        assert!(run_source(&format!("{t}let p = (1, 5) in let w: Indexed(T, 2) = p in 0")).is_err());
         // Dyn base alternative: the inner (2, 5) is a valid T(0).
-        assert!(run_source(&format!("{t}let p = (1, (2, 5)) in let w: T(1) = p in 0")).is_ok());
-        assert!(run_source(&format!("{t}let p = (true, 5) in let w: T(1) = p in 0")).is_err());
+        assert!(run_source(&format!("{t}let p = (1, (2, 5)) in let w: Indexed(T, 1) = p in 0")).is_ok());
+        assert!(run_source(&format!("{t}let p = (true, 5) in let w: Indexed(T, 1) = p in 0")).is_err());
     }
 
     #[test]
@@ -8231,10 +8250,10 @@ g(len)").unwrap_err();
     #[test]
     fn dyn_into_an_indexed_alias_is_checked_against_the_alias() {
         // The index is dropped (no runtime length for an alias); the alias shape is not.
-        let err = run_source("type N = (Int, N) | Bool in let d: Dyn = 5 in let x: N(1) = d in x").unwrap_err();
+        let err = run_source("type N = (Int, N) | Bool in let d: Dyn = 5 in let x: Indexed(N, 1) = d in x").unwrap_err();
         // Verified text: a run-time check, not a static mismatch.
         assert!(err.contains("type error: expected (Int, N) | Bool, found Int"), "unexpected message: {err}");
-        assert_eq!(run_source("type N = (Int, N) | Bool in let d: Dyn = true in let x: N(1) = d in 1").unwrap().as_int(), 1);
+        assert_eq!(run_source("type N = (Int, N) | Bool in let d: Dyn = true in let x: Indexed(N, 1) = d in 1").unwrap().as_int(), 1);
     }
 
     #[test]

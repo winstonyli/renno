@@ -449,8 +449,10 @@ impl<'a> Parser<'a> {
     //
     // Every type form below builds an EXPRESSION (spec 2026-10-10 types-as-
     // values, section 3): sugar desugars into calls to the prelude's type
-    // constructors, spelled `#Int`, `#List`, ... so no user binding can
-    // capture them. typecheck evaluates the result with machine::eval_type.
+    // constructors, spelled `#List`, `#Fun`, ... so no user binding can
+    // capture them. A name the user writes is a plain variable, resolved in the
+    // binder's scope, and `Name(arg)` is an ordinary call. typecheck evaluates
+    // the result with annotation_type.
     fn opt_annotation(&mut self) -> Result<Option<ExprRef>, String> {
         if matches!(self.peek(), Some(Token::Colon)) {
             self.bump();
@@ -579,57 +581,83 @@ impl<'a> Parser<'a> {
                 let record = self.push_spanned(Expr::Record(Rc::new(fields)), span);
                 Ok(self.type_call("Record", record, start))
             }
-            // A capitalized name: either one of the four builtin type
-            // names (Int/Bool/Str/Dyn -- plain Idents, not reserved
-            // keywords, so they stay available as ordinary variable names
-            // everywhere outside a type position) or a reference to a
-            // `type Name = ... in` alias (Parser::type_aliases) currently
-            // in scope -- fully resolved right here, not deferred. Unlike
-            // `data`'s own former bare-Data(name) fallback, an unknown
-            // name is a static error immediately: there's no "maybe it
-            // resolves later" story left once every type must be a
-            // builtin, a Token/Tuple/Union, or a named alias.
-            Some(Token::Ident(name)) if name.chars().next().is_some_and(char::is_uppercase) => {
-                if name == "Vec" && matches!(self.peek(), Some(Token::LParen)) {
-                    self.bump(); // consume '('
-                    let index = self.parse_index_expr()?;
-                    self.expect(&Token::RParen)?;
-                    // A TypeLit, not a #Vec call: the index may name a
-                    // variable, which has no value here (spec section 4,
-                    // Stage C).
-                    let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index));
-                    return Ok(self.type_lit(ty, start));
-                }
-                // Case B syntax generalization (design spec 2026-09-20
-                // sec 3): the SAME indexing syntax works for any other
-                // alias currently in scope -- no eligibility check here,
-                // that's Phase 4's existing pattern-matching-side
-                // qualifying_named_alternatives, unchanged. Zero syntax
-                // conflicts: nothing in this grammar expects '(' right
-                // after a bare alias reference, since parse_type's own
-                // Ident arm otherwise returns immediately once resolved.
-                if matches!(self.peek(), Some(Token::LParen)) {
-                    if let Some(resolved) = self.type_aliases.get(&name) {
-                        let resolved_clone = resolved.clone();
-                        self.bump();
-                        let index = self.parse_index_expr()?;
-                        self.expect(&Token::RParen)?;
-                        return Ok(self.type_lit(Type::Indexed(Rc::new(resolved_clone), Rc::new(index)), start));
-                    }
-                }
-                if Self::builtin_type(&name).is_some() {
-                    return Ok(self.type_ctor(&name, start));
-                }
-                match self.type_aliases.get(&name) {
+            // `Vec(n)`: a TypeLit, not a #Vec call, because the index may
+            // name a variable, which has no value here (spec section 4,
+            // Stage C).
+            Some(Token::Ident(name)) if name == "Vec" && matches!(self.peek(), Some(Token::LParen)) => {
+                self.bump();
+                let index = self.parse_index_expr()?;
+                self.expect(&Token::RParen)?;
+                Ok(self.type_lit(Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index)), start))
+            }
+            // `Indexed(T, n)`: T at index n (spec section 9.1; it replaces the
+            // old alias indexing `T(n)`). The index travels as `Vec(n)`, a
+            // TypeLit, for the same reason as above: `#Indexed((T, Vec(n)))`.
+            Some(Token::Ident(name)) if name == "Indexed" && matches!(self.peek(), Some(Token::LParen)) => {
+                self.bump();
+                let wrapped = self.parse_union_type()?;
+                self.expect(&Token::Comma)?;
+                let index_start = self.span_at().start;
+                let index = self.parse_index_expr()?;
+                let carrier = self.type_lit(Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index)), index_start);
+                self.expect(&Token::RParen)?;
+                Ok(self.type_call_items("Indexed", vec![wrapped, carrier], start))
+            }
+            // A name. A `type` alias in scope is substituted right here (its
+            // right-hand side was evaluated where it was defined); any other
+            // name is an ordinary variable, resolved lexically when typecheck
+            // evaluates the annotation, so `let Int = 5` changes what `Int`
+            // means (spec section 9.3). `F(A)` applies it (spec section 9.1).
+            Some(Token::Ident(name)) => {
+                let head = match self.type_aliases.get(&name) {
                     Some(ty) => {
                         let ty = ty.clone();
-                        Ok(self.type_lit(ty, start))
+                        self.type_lit(ty, start)
                     }
-                    None => Err(self.err_at(self.span_before(), format!("unknown type: {name}"))),
-                }
+                    None => {
+                        let span = Span { start, end: self.span_before().end };
+                        self.push_spanned(Expr::Var(name), span)
+                    }
+                };
+                self.type_apps(head, start)
+            }
+            // An Int is a value an applied type function may take (`Rep(2)`).
+            Some(Token::Int(n)) => {
+                let span = Span { start, end: self.span_before().end };
+                Ok(self.push_spanned(Expr::Int(n), span))
             }
             other => Err(self.err_at(self.span_before(), format!("expected a type, found {other:?}"))),
         }
+    }
+
+    // `head(args)(args)...` in a type: each call passes one argument, a tuple
+    // when there is a comma, like `f(a, b)` in an expression. The items are
+    // types, so the sugar works inside: `Pair([Int])`.
+    fn type_apps(&mut self, mut head: ExprRef, start: usize) -> Result<ExprRef, String> {
+        while matches!(self.peek(), Some(Token::LParen)) {
+            self.bump();
+            let args_start = self.span_before().start;
+            let mut items = vec![self.parse_union_type()?];
+            let mut tuple = false;
+            while matches!(self.peek(), Some(Token::Comma)) {
+                self.bump();
+                tuple = true;
+                if matches!(self.peek(), Some(Token::RParen)) {
+                    break;
+                }
+                items.push(self.parse_union_type()?);
+            }
+            self.expect(&Token::RParen)?;
+            let arg = if tuple {
+                let span = Span { start: args_start, end: self.span_before().end };
+                self.push_spanned(Expr::Tuple(items), span)
+            } else {
+                items.pop().expect("one item")
+            };
+            let span = Span { start, end: self.span_before().end };
+            head = self.push_spanned(Expr::App(head, arg), span);
+        }
+        Ok(head)
     }
 
     // Index-expression grammar only: Var | Lit | + | - | * -- see the
@@ -683,13 +711,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // The five builtin type names. Not reserved lexer keywords (unlike
-    // If/Let/Fun/...) since they're only ever meaningful inside a type
-    // position -- resolved contextually right here instead, which is what
-    // keeps them available as ordinary identifiers (`let Int = 5 in ...`)
-    // everywhere else. Shared between parse_type's own lookup and the
-    // `type Name = ...` alias binder's collision guard just below, so the
-    // two can't drift out of sync.
+    // The five builtin type names, which a `type Name = ...` alias may not
+    // redefine (the binder's collision guard below). In an annotation they
+    // are ordinary prelude variables.
     fn builtin_type(name: &str) -> Option<Type> {
         match name {
             "Int" => Some(Type::Int),
@@ -1140,22 +1164,14 @@ impl<'a> Parser<'a> {
                     self.bump();
                     saw_type_alias = true;
                     let name = self.ident()?;
-                    if Self::builtin_type(&name).is_some() || name == "Vec" {
-                        // Int/Bool/Str/Dyn resolve contextually in
-                        // parse_type rather than being reserved lexer
-                        // keywords (see builtin_type's own doc comment) --
-                        // that frees them as plain variable names, but an
-                        // alias silently shadowing one would mean a later
-                        // `Int` in type position resolves to the OLD
-                        // builtin no matter what this alias says (parse_
-                        // type checks builtin_type before type_aliases),
-                        // silently discarding the alias. Reject it here
-                        // instead of leaving that footgun undiagnosed.
-                        // `Vec` gets the same treatment even though it's
-                        // not a `builtin_type`: parse_type's `Vec(` check
-                        // (above) runs before the type_aliases lookup too,
-                        // so a `Vec` alias would be silently discarded the
-                        // same way whenever parens follow it.
+                    if Self::builtin_type(&name).is_some() || name == "Vec" || name == "Indexed" {
+                        // An alias may not redefine a builtin type name.
+                        // parse_type's `Vec(` and `Indexed(` arms run before
+                        // the type_aliases lookup, so an alias of either
+                        // would be silently discarded whenever parens follow
+                        // it. Int/Float/Bool/Str/Dyn stay rejected as before
+                        // (a type `let` can rebind them; `type` itself goes
+                        // in Stage D of spec 2026-10-10 types-as-values).
                         return Err(self.err_at(
                             self.span_before(),
                             format!("cannot redefine builtin type {name} as an alias"),
