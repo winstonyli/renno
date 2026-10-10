@@ -100,13 +100,16 @@ pub enum Pure {
 
 // The step budget of one check-time evaluation (spec section 5). Measured
 // 2026-10-10: every corpus and example annotation takes at most 9 steps; the
-// largest in the lib tests takes 7628 (a union of 120 tuples). Stage A's
-// annotations always finish, so the budget only has to be far above that.
+// largest in the lib tests takes 7628 (a union of 120 tuples). A million steps
+// take 70-90 ms in a release build: the wait before a divergent type
+// function's annotation is reported.
 pub const ANNOTATION_FUEL: u64 = 1_000_000;
 
 // The check-mode entry into the machine's step loop (spec section 1): evaluates
-// `expr` with no enclosing scope, no effects and at most `fuel` steps. It never
-// prints, and it leaves CURRENT_SPAN as it found it.
+// `expr` in the prelude alone, no effects and at most `fuel` steps. The checker
+// supplies an annotation's scope by wrapping it in copies of the definitions it
+// names (typecheck's annotation_type). It never prints, and it leaves
+// CURRENT_SPAN as it found it.
 pub fn eval_pure(arena: &Arena, expr: ExprRef, spans: &SpanMap, fuel: u64) -> Pure {
     let resolved = resolve(arena, expr);
     let saved_span = current_span();
@@ -123,9 +126,8 @@ pub fn eval_pure(arena: &Arena, expr: ExprRef, spans: &SpanMap, fuel: u64) -> Pu
     }
 }
 
-// An annotation's Type: eval_pure, which must finish with a type value. Every
-// annotation the parser builds is closed, so in Stage A only a hand-built tree
-// reaches the Err arms (Stage C turns Stuck into a run-time residual).
+// An annotation's Type: eval_pure, which must finish with a type value (Stage C
+// turns Stuck into a run-time residual).
 pub fn eval_type(arena: &Arena, ann: ExprRef, spans: &SpanMap) -> Result<Type, String> {
     if let Expr::TypeLit(t) = &arena[ann] {
         return Ok((**t).clone());

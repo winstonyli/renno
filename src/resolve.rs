@@ -72,18 +72,7 @@ enum Work {
 // children in REVERSE of the order they must be processed in.
 // Never fails on a name: an unresolvable one becomes VarRef::Unbound.
 pub fn resolve(arena: &Arena, root: ExprRef) -> Resolved {
-    let mut found: Vec<(ExprRef, VarRef)> = Vec::new();
-    let mut scopes: Vec<Vec<String>> = Vec::new();
-    let mut work = vec![Work::Visit(root)];
-    while let Some(item) = work.pop() {
-        match item {
-            Work::Push(names) => scopes.push(names),
-            Work::Pop => {
-                scopes.pop();
-            }
-            Work::Visit(id) => visit(arena, id, &scopes, &mut found, &mut work),
-        }
-    }
+    let found = walk(arena, root);
     let base = found.iter().map(|(id, _)| id.index()).min().unwrap_or(0);
     let end = found.iter().map(|(id, _)| id.index() + 1).max().unwrap_or(0);
     let mut vars = vec![None; end.saturating_sub(base)];
@@ -97,6 +86,37 @@ pub fn resolve(arena: &Arena, root: ExprRef) -> Resolved {
         }
     }
     Resolved { base, vars }
+}
+
+// The names `root` uses but does not bind (a prelude name counts as free; a
+// synthesized `#name` does not), each once, in first-use order. typecheck
+// looks these up to find the `let`s an annotation depends on.
+pub fn free_vars(arena: &Arena, root: ExprRef) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (id, r) in walk(arena, root) {
+        let Expr::Var(name) = &arena[id] else { unreachable!("only Var nodes are resolved") };
+        if !matches!(r, VarRef::Local { .. }) && !name.starts_with('#') && !out.contains(name) {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+// Every Var node under `root` with where it lives, in visit order.
+fn walk(arena: &Arena, root: ExprRef) -> Vec<(ExprRef, VarRef)> {
+    let mut found: Vec<(ExprRef, VarRef)> = Vec::new();
+    let mut scopes: Vec<Vec<String>> = Vec::new();
+    let mut work = vec![Work::Visit(root)];
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Push(names) => scopes.push(names),
+            Work::Pop => {
+                scopes.pop();
+            }
+            Work::Visit(id) => visit(arena, id, &scopes, &mut found, &mut work),
+        }
+    }
+    found
 }
 
 // A name spelled `#builtin` (never lexable) is a synthesized reference to a
@@ -290,6 +310,18 @@ mod tests {
 
     fn local(hops: u32, slot: u32) -> VarRef {
         VarRef::Local { hops, slot }
+    }
+
+    #[test]
+    fn free_vars_lists_the_names_a_tree_does_not_bind() {
+        let free = |src: &str| {
+            let (arena, _spans, root) = crate::parser::parse(src).expect("parse failed");
+            free_vars(&arena, root)
+        };
+        assert_eq!(free("fun a -> Tuple((a, b, a, Int, b))"), vec!["Tuple", "b", "Int"]);
+        assert_eq!(free("let x = y in x"), vec!["y"]);
+        assert_eq!(free("let rec f = fun n -> f(g(n)) in f"), vec!["g"]);
+        assert_eq!(free("match p | (h, t) -> h"), vec!["p"]);
     }
 
     #[test]

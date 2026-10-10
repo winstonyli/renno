@@ -70,12 +70,35 @@ pub(crate) struct Scheme {
     // IndexExpr::Var name per reference via fresh_index_name.
     index_vars: Vec<String>,
     ty: Type,
+    // A `let`/`let rec` binder's definition, which an annotation naming it
+    // evaluates (CheckDef). None for a binder whose value exists only at run
+    // time: a parameter, a pattern variable, a handler's payload or resume.
+    def: Option<Rc<CheckDef>>,
 }
 
 impl Scheme {
     fn mono(ty: Type) -> Scheme {
-        Scheme { row_vars: Vec::new(), type_vars: Vec::new(), index_vars: Vec::new(), ty }
+        Scheme { row_vars: Vec::new(), type_vars: Vec::new(), index_vars: Vec::new(), ty, def: None }
     }
+}
+
+// What a check-time evaluation needs to re-run a `let`-bound name (spec
+// section 1, type lets): the binder's right-hand side as the parser built it,
+// and the scope it was checked in. An annotation that names the binder is
+// evaluated inside a copy of the binders it depends on (annotation_type).
+pub(crate) struct CheckDef {
+    // Creation order. Every definition one annotation depends on lies on one
+    // scope chain, where a later binder has a larger seq.
+    seq: u64,
+    node: DefNode,
+    // The scope before the binder: where the right-hand side's names resolve.
+    ctx: Ctx,
+}
+
+enum DefNode {
+    Let(String, ExprRef),
+    // A `let rec` group: the original bindings.
+    Group(Rc<Vec<(String, Option<ExprRef>, ExprRef)>>),
 }
 
 // pub(crate), not private, only because this project's own test
@@ -158,6 +181,13 @@ pub(crate) struct InferCtx {
     // unify_trial (a failed trial must not leak flags); propagated by
     // `lookup` and `unify`.
     dyn_sunk: HashSet<String>,
+    // Every name some binder in the arena binds (check_with_named_types). A
+    // name in an annotation that no binder has can only be a prelude name or
+    // unbound, so annotation_type skips the scope walk for it: without this,
+    // `Int` in each of n annotations would walk a scope n deep.
+    bound_names: HashSet<String>,
+    // The next CheckDef::seq.
+    def_seq: u64,
 }
 
 impl InferCtx {
@@ -174,7 +204,14 @@ impl InferCtx {
             repeatable_depth: 0,
             named_types,
             dyn_sunk: HashSet::new(),
+            bound_names: HashSet::new(),
+            def_seq: 0,
         }
+    }
+
+    fn new_def(&mut self, node: DefNode, ctx: &Ctx) -> Rc<CheckDef> {
+        self.def_seq += 1;
+        Rc::new(CheckDef { seq: self.def_seq, node, ctx: ctx.clone() })
     }
 
     // Flags `ty` as reaching a Dyn sink if it is (still) a bare type variable.
@@ -748,11 +785,16 @@ pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // own unit test exercises directly, bypassing the separate Expr::App
 // coerce() gap a source-level `identity_vec(3)(va)` call would hit.
 pub(crate) fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &InferCtx) -> Ctx {
+    extend_defined(ctx, name, ty, infer, None)
+}
+
+// extend_generalized for a binder with a definition annotations can evaluate.
+fn extend_defined(ctx: &Ctx, name: &str, ty: Type, infer: &InferCtx, def: Option<Rc<CheckDef>>) -> Ctx {
     let ty = infer.resolve_deep(&ty);
     let row_vars = generalizable_row_vars(ctx, &ty);
     let type_vars = generalizable_type_vars(ctx, &ty, infer);
     let index_vars = generalizable_index_vars(ctx, &ty, infer);
-    ctx.bind(name, Scheme { row_vars, type_vars, index_vars, ty })
+    ctx.bind(name, Scheme { row_vars, type_vars, index_vars, ty, def })
 }
 
 // Row-variable names free in `ty` that are actually safe to generalize
@@ -3031,9 +3073,61 @@ fn missing_case(patterns: &[&Pattern], scrut_ty: &Type) -> Option<String> {
 // is never discharged, and stays silent (deferring to today's runtime
 // panic) whenever it can't prove either way.
 // A binder's annotation is an expression (spec 2026-10-10 types-as-values):
-// its Type is what it evaluates to. An error is reported at the annotation.
-fn annotation_type(arena: &Arena, ann: ExprRef, spans: &SpanMap) -> Result<Type, TypeError> {
-    crate::machine::eval_type(arena, ann, spans).map_err(|msg| TypeError(msg, spans[ann]))
+// its Type is what it evaluates to in the binder's scope `ctx`. An error is
+// reported at the annotation.
+fn annotation_type(arena: &mut Arena, ann: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &InferCtx) -> Result<Type, TypeError> {
+    if let Expr::TypeLit(t) = &arena[ann] {
+        return Ok((**t).clone());
+    }
+    let err = |msg: String| TypeError(msg, spans[ann]);
+    let defs = definitions_used(arena, ann, &[], ctx, infer).map_err(err)?;
+    let root = wrap_in_definitions(arena, ann, &defs);
+    crate::machine::eval_type(arena, root, spans).map_err(err)
+}
+
+// The definitions `root` (resolved in `ctx`, with `skip` bound around it)
+// depends on, directly or through other definitions, oldest first. A name
+// bound to a value that exists only at run time is an error (spec section 2's
+// stuck rule; Stage C turns it into a run-time residual).
+fn definitions_used(arena: &Arena, root: ExprRef, skip: &[String], ctx: &Ctx, infer: &InferCtx) -> Result<Vec<Rc<CheckDef>>, String> {
+    let mut defs: Vec<Rc<CheckDef>> = Vec::new();
+    let mut work: Vec<(ExprRef, Vec<String>, Ctx)> = vec![(root, skip.to_vec(), ctx.clone())];
+    while let Some((root, skip, ctx)) = work.pop() {
+        for name in crate::resolve::free_vars(arena, root) {
+            if skip.contains(&name) || !infer.bound_names.contains(&name) {
+                continue;
+            }
+            let Some(scheme) = ctx.get(&name) else { continue };
+            let Some(def) = scheme.def else {
+                return Err(format!("an annotation cannot use `{name}`: its value is not known at check time"));
+            };
+            if defs.iter().any(|d| Rc::ptr_eq(d, &def)) {
+                continue;
+            }
+            match &def.node {
+                DefNode::Let(_, rhs) => work.push((*rhs, Vec::new(), def.ctx.clone())),
+                DefNode::Group(bindings) => {
+                    let names: Vec<String> = bindings.iter().map(|(n, _, _)| n.clone()).collect();
+                    for (_, _, v) in bindings.iter() {
+                        work.push((*v, names.clone(), def.ctx.clone()));
+                    }
+                }
+            }
+            defs.push(def);
+        }
+    }
+    defs.sort_by_key(|d| d.seq);
+    Ok(defs)
+}
+
+// `root` inside a copy of `defs`' binders, oldest outermost: the same nearest
+// binder for every name as in the program, since all of them lie on one scope
+// chain. One evaluation then resolves the whole tree.
+fn wrap_in_definitions(arena: &mut Arena, root: ExprRef, defs: &[Rc<CheckDef>]) -> ExprRef {
+    defs.iter().rev().fold(root, |inner, def| match &def.node {
+        DefNode::Let(name, rhs) => arena.push(Expr::Let(name.clone(), None, *rhs, inner)),
+        DefNode::Group(bindings) => arena.push(Expr::LetRec(bindings.clone(), inner)),
+    })
 }
 
 // The annotation slot typecheck re-emits for a binder whose type it knows.
@@ -3081,7 +3175,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // entry point: `let f: A -> Vec(n) = fn(x) = <body>`
                     // now checks <body> against Vec(n) directly.
                     Some(ann) => {
-                        let (t, renames) = open_signature(&annotation_type(arena, ann, spans)?, infer);
+                        let (t, renames) = open_signature(&annotation_type(arena, ann, &cur_ctx, spans, infer)?, infer);
                         let (val_row, val4) = check_against_rigid(arena, val, &t, &renames, &cur_ctx, spans, infer)?;
                         (t, val_row, val4)
                     }
@@ -3090,7 +3184,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         (val_ty, val_row, val2)
                     }
                 };
-                cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone(), infer);
+                let def = infer.new_def(DefNode::Let(var.clone(), val), &cur_ctx);
+                cur_ctx = extend_defined(&cur_ctx, &var, bound_ty.clone(), infer, Some(def));
                 pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3 });
                 cur_expr = body;
             }
@@ -3114,7 +3209,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 let mut opened: Vec<Option<(Type, Renames)>> = Vec::with_capacity(bindings.len());
                 for (_, ann, _) in bindings.iter() {
                     opened.push(match ann {
-                        Some(ann) => Some(open_signature(&annotation_type(arena, *ann, spans)?, infer)),
+                        Some(ann) => Some(open_signature(&annotation_type(arena, *ann, &cur_ctx, spans, infer)?, infer)),
                         None => None,
                     });
                 }
@@ -3151,15 +3246,16 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     };
                     elaborated.push((name.clone(), bound_ty, val_row, val3));
                 }
+                let def = infer.new_def(DefNode::Group(bindings.clone()), &cur_ctx);
                 for (name, bound_ty, _, _) in elaborated.iter() {
-                    cur_ctx = extend_generalized(&cur_ctx, name, bound_ty.clone(), infer);
+                    cur_ctx = extend_defined(&cur_ctx, name, bound_ty.clone(), infer, Some(def.clone()));
                 }
                 pending.push(PendingElab::LetRec { bindings: elaborated });
                 cur_expr = body;
             }
             Expr::Lambda(param, ann, body) => {
                 let ann = match ann {
-                    Some(ann) => Some(scoped_annotation(&annotation_type(arena, ann, spans)?, infer)),
+                    Some(ann) => Some(scoped_annotation(&annotation_type(arena, ann, &cur_ctx, spans, infer)?, infer)),
                     None => None,
                 };
                 // The one place `cur_mode` actually changes: if the
@@ -3529,7 +3625,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         // comment.
         Expr::Token(id) => Ok((Type::Token(id), EffectRow::pure(), expr)),
         // A type value is Dyn to the checker, like the prelude's type names
-        // (Stage A has no type of types). The parser only puts one in an
+        // (there is no type of types yet). The parser only puts one in an
         // annotation slot, which is never elaborated as a value.
         Expr::TypeLit(_) => Ok((Type::Dyn, EffectRow::pure(), expr)),
         Expr::Var(name) => Ok((lookup(ctx, &name, infer), EffectRow::pure(), expr)),
@@ -4430,6 +4526,23 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     }
 }
 
+// Every name a binder in `arena` binds (InferCtx::bound_names).
+fn binder_names(arena: &Arena) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for (_, e) in arena.iter() {
+        match e {
+            Expr::Let(var, ..) | Expr::Lambda(var, ..) => {
+                names.insert(var.clone());
+            }
+            Expr::LetRec(bindings, _) => names.extend(bindings.iter().map(|(n, _, _)| n.clone())),
+            Expr::MakeHandler { payload_var, resume_var, .. } => names.extend([payload_var.clone(), resume_var.clone()]),
+            Expr::Match(_, arms) => names.extend(arms.iter().flat_map(|(p, _, _)| crate::resolve::pattern_vars(p))),
+            _ => {}
+        }
+    }
+    names
+}
+
 // Delegates to check_with_named_types with an empty registry -- kept as
 // a separate signature (rather than adding a 4th parameter to every
 // caller) so the many existing callers that never use self-referential
@@ -4450,6 +4563,7 @@ pub fn check(arena: &mut Arena, root: ExprRef, spans: &SpanMap) -> Result<ExprRe
 // (lib.rs's own run_source_on_this_thread) can support the feature.
 pub fn check_with_named_types(arena: &mut Arena, root: ExprRef, spans: &SpanMap, named_types: HashMap<String, Type>) -> Result<ExprRef, TypeError> {
     let mut infer = InferCtx::new(named_types);
+    infer.bound_names = binder_names(arena);
     let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), spans, &mut infer)?;
     resolve_pendings(arena, &infer);
     resolve_obligations(arena, &infer);

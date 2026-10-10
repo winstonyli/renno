@@ -4005,12 +4005,16 @@ g(len)").unwrap_err();
         assert!(matches!(&arena[*a], Expr::Var(n) if n == "Int"), "{:?}", arena[*a]);
     }
 
-    // A name in an annotation is a plain variable, but until typecheck
-    // evaluates annotations in the binder's scope (Stage B, Task 3) it
-    // resolves in the prelude alone, so shadowing a type name changes nothing.
+    // A name in an annotation resolves lexically (spec section 9.3): a value
+    // named like a type makes an annotation naming it an error, with no
+    // fallback to the prelude type. The sugar names the prelude's
+    // constructors (`#List`), so it does not change.
     #[test]
-    fn a_value_named_like_a_type_does_not_change_annotations_yet() {
-        assert_eq!(run_source("let Int = 5 in let x: Int = 3 in x + Int").unwrap().as_int(), 8);
+    fn a_value_named_like_a_type_makes_its_annotations_an_error() {
+        let err = run_source("let Int = 5 in let x: Int = 3 in x + Int").unwrap_err();
+        assert!(err.contains("annotation did not evaluate to a type, found Int"), "{err}");
+        let err = run_source("let Int = 5 in fun x: Int -> x").unwrap_err();
+        assert!(err.contains("annotation did not evaluate to a type, found Int"), "{err}");
         assert_eq!(run_source("let List = 2 in let xs: [Int] = [1] in len(xs) + List").unwrap().as_int(), 3);
     }
 
@@ -4050,6 +4054,76 @@ g(len)").unwrap_err();
         assert!(err.contains("unbound variable: Nope"), "{err}");
         let err = run_source("type Indexed = Int in 0").unwrap_err();
         assert!(err.contains("cannot redefine builtin type Indexed as an alias"), "{err}");
+    }
+
+    // Stage B: a `let` whose value is a type names it in annotations, in the
+    // binder's scope, under lambdas, handlers and `let rec`.
+    #[test]
+    fn a_type_let_names_its_type_in_annotations() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        assert_eq!(ok("let T = List(Int) in let x: T = [1, 2] in len(x)"), "2");
+        assert_eq!(ok("let T = Int in let U = List(T) in let T = Bool in let x: (U, T) = ([1], true) in x"), "[[1], true]");
+        assert_eq!(ok("let t = Int in let x: t = 3 in x"), "3");
+        assert_eq!(ok("let T = Int in (fun x: T -> x)(3)"), "3");
+        assert_eq!(ok("let T = Int in let x: [T] = [3] in x"), "[3]");
+        assert_eq!(ok("let T = Int in let x: T | Bool = 3 in x"), "3");
+        assert_eq!(ok("let T = Int in let n: T where n > 0 = 5 in n"), "5");
+        assert_eq!(ok("let T = Int in let rec f: (T -> T) = fun n -> n in f(3)"), "3");
+        assert_eq!(ok("let rec f = fun n -> let T = Int in let x: T = n in x in f(3)"), "3");
+        assert_eq!(ok("handle (let T = Int in let x: T = perform ask(1) in x) with handler ask(p, k) -> k(5)"), "5");
+        assert_eq!(ok("let T = List(Int) in let x: T = [1] in (to_str(T), x)"), "[[Int], [1]]");
+        let err = run_source("let T = List(Int) in let x: T = [true] in x").unwrap_err();
+        assert!(err.contains("expected [Int], found [Bool]"), "{err}");
+        let err = run_source("let T = Int in (fun x: T -> x)(true)").unwrap_err();
+        assert!(err.contains("expected Int, found Bool"), "{err}");
+    }
+
+    // A name bound to a value that exists only at run time (a parameter, a
+    // pattern variable, a handler's payload) cannot be evaluated at check
+    // time: a static error in Stage B (Stage C makes it a run-time residual).
+    #[test]
+    fn an_annotation_cannot_use_a_run_time_value() {
+        let msg = |name: &str| format!("an annotation cannot use `{name}`: its value is not known at check time");
+        for (src, name) in [
+            ("fun Int -> let x: Int = 3 in x", "Int"),
+            ("let f = fun y -> let T = List(y) in let x: T = [1] in x in f(Int)", "y"),
+            ("match Int | t -> let x: t = 3 in x", "t"),
+            ("handle (perform ask(1)) with handler ask(p, k) -> let x: p = 1 in k(x)", "p"),
+        ] {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains(&msg(name)), "{src}: {err}");
+        }
+        let err = run_source("let T = (perform ask(1)) in let x: T = 1 in x").unwrap_err();
+        assert!(err.contains("an annotation cannot perform an effect"), "{err}");
+    }
+
+    // `Name(arg)` in an annotation is ordinary application (spec section 9.1).
+    #[test]
+    fn a_parameterized_alias_is_a_function_from_types_to_types() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        let pair = "let Pair = fun a -> Tuple((a, a)) in ";
+        assert_eq!(ok(&format!("{pair}let p: Pair(Int) = (1, 2) in p")), "[1, 2]");
+        assert_eq!(ok(&format!("{pair}let p: Pair([Int]) = ([1], [2]) in p")), "[[1], [2]]");
+        assert_eq!(ok(&format!("{pair}to_str(Pair(Int))")), "(Int, Int)");
+        let err = run_source(&format!("{pair}let p: Pair(Int) = (1, true) in p")).unwrap_err();
+        assert!(err.contains("expected (Int, Int), found (Int, Bool)"), "{err}");
+        assert_eq!(ok("let F = fun a -> fun b -> Tuple((a, b)) in let p: F(Int)(Str) = (1, \"x\") in p"), "[1, x]");
+        assert_eq!(ok("let P = fun a -> fun b -> Tuple((a, b)) in let Q = P(Int) in let x: Q(Str) = (1, \"a\") in x"), "[1, a]");
+        assert_eq!(ok("let M = fun kv -> Tuple(kv) in let m: M(Str, Int) = (\"a\", 1) in m"), "[a, 1]");
+        // Recursion through a type function: `let rec` of a function, evaluated at check time.
+        let rep = "let rec Rep = fun n -> if n == 0 then Int else List(Rep(n - 1)) in ";
+        assert_eq!(ok(&format!("{rep}let x: Rep(2) = [[1]] in x")), "[[1]]");
+        let err = run_source(&format!("{rep}let x: Rep(2) = [1] in x")).unwrap_err();
+        assert!(err.contains("expected [[Int]], found [Int]"), "{err}");
+    }
+
+    // A token's type comes from the token (spec section 9.4): only code
+    // holding the brand can name it.
+    #[test]
+    fn type_of_a_token_names_its_brand_in_annotations() {
+        assert_eq!(run_source("let B = opaque in let mk = fun x -> (B, x) in let v: (TypeOf(B), Int) = mk(1) in 0").unwrap().as_int(), 0);
+        let err = run_source("let B = opaque in let C = opaque in let v: (TypeOf(B), Int) = (C, 1) in 0").unwrap_err();
+        assert!(err.contains("type mismatch"), "{err}");
     }
 
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain
