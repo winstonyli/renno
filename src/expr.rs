@@ -273,14 +273,16 @@ pub enum Expr {
     // expression yet: a `type` alias, or an index (`Vec(n)`, `T(n + 1)`);
     // typecheck writes one for every annotation it re-emits.
     TypeLit(Rc<Type>),
-    // param annotation is optional -- None means Dyn. The typechecker fills
-    // this in (or leaves it) when elaborating; the parser fills it in only
-    // when the source has an explicit `: Type` annotation.
-    Lambda(String, Option<Type>, ExprRef),
+    // The annotation slots (param, `let`, `let rec`) hold an EXPRESSION
+    // (machine::eval_pure turns it into a Type at check time); None means
+    // Dyn. The parser fills one in only when the source has an explicit
+    // `: Type` annotation, desugared into calls to the prelude type
+    // constructors; the typechecker re-emits every binder with a TypeLit.
+    Lambda(String, Option<ExprRef>, ExprRef),
     App(ExprRef, ExprRef),
     // Plain, non-recursive `let var = val in body` -- `var` is NOT in
     // scope while `val` is being evaluated. See LetRec for `let rec`.
-    Let(String, Option<Type>, ExprRef, ExprRef),
+    Let(String, Option<ExprRef>, ExprRef, ExprRef),
     // `let rec f = val_f [and g = val_g ...] in body` -- one or more
     // SIMULTANEOUSLY recursive bindings, each visible to every other
     // one's value (and its own), not just sequentially in scope like Let.
@@ -297,7 +299,7 @@ pub enum Expr {
     // Frame::LetRecBody fallback). A single binding (`let rec f = ... in
     // ...`, no `and`) is just the length-1 case of the direct-group form --
     // no separate representation for plain self-recursion.
-    LetRec(Rc<Vec<(String, Option<Type>, ExprRef)>>, ExprRef),
+    LetRec(Rc<Vec<(String, Option<ExprRef>, ExprRef)>>, ExprRef),
     BinOp(BinOp, ExprRef, ExprRef),
     // cond must evaluate to Bool.
     If(ExprRef, ExprRef, ExprRef),
@@ -335,7 +337,7 @@ pub enum Expr {
 }
 
 impl Expr {
-    // Appends this node's direct sub-expressions to `out`.
+    // Appends this node's direct sub-expressions to `out`, annotations included.
     pub fn children(&self, out: &mut Vec<ExprRef>) {
         match self {
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::TypeLit(_) => {}
@@ -344,13 +346,24 @@ impl Expr {
                 out.extend(&spec.lens);
             }
             Expr::Len(term) => term.witnesses(out),
-            Expr::FieldAccess(e, _) | Expr::Lambda(_, _, e) | Expr::Perform(_, e) => out.push(*e),
+            Expr::FieldAccess(e, _) | Expr::Perform(_, e) => out.push(*e),
+            Expr::Lambda(_, ann, body) => {
+                out.extend(*ann);
+                out.push(*body);
+            }
             Expr::MakeHandler { body, .. } => out.push(*body),
             Expr::Tuple(items) | Expr::ListLit(items) => out.extend(items),
             Expr::Record(fields) => out.extend(fields.iter().map(|(_, v)| *v)),
-            Expr::App(a, b) | Expr::BinOp(_, a, b) | Expr::Let(_, _, a, b) => out.extend([*a, *b]),
+            Expr::App(a, b) | Expr::BinOp(_, a, b) => out.extend([*a, *b]),
+            Expr::Let(_, ann, val, body) => {
+                out.extend(*ann);
+                out.extend([*val, *body]);
+            }
             Expr::LetRec(bindings, body) => {
-                out.extend(bindings.iter().map(|(_, _, v)| *v));
+                for (_, ann, v) in bindings.iter() {
+                    out.extend(*ann);
+                    out.push(*v);
+                }
                 out.push(*body);
             }
             Expr::If(c, t, e) => out.extend([*c, *t, *e]),

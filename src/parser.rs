@@ -5,7 +5,7 @@ use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
 use crate::index_expr::IndexExpr;
 use crate::lexer::{tokenize, Token};
 use crate::span::Span;
-use crate::types::{EffectRow, Type};
+use crate::types::Type;
 use crate::util::find_field;
 
 // Delegates to parse_with_named_types and drops the registry -- kept as
@@ -71,7 +71,8 @@ pub fn parse_type_string(src: &str) -> Result<Type, String> {
         type_aliases: HashMap::new(),
         named_types: HashMap::new(),
     };
-    p.parse_fun_type()
+    let ty = p.parse_fun_type()?;
+    crate::machine::eval_type(&p.arena, ty, &p.expr_spans)
 }
 
 struct Parser<'a> {
@@ -183,16 +184,16 @@ enum PendingBinder {
     // Not supported on `let rec` (see the `rec` check where `where` is
     // parsed) -- proving would need to reason about a recursive value,
     // which is well past what desugar_refinement's tiny evaluator attempts.
-    Let { var: String, ann: Option<Type>, val: ExprRef, where_pred: Option<ExprRef> },
+    Let { var: String, ann: Option<ExprRef>, val: ExprRef, where_pred: Option<ExprRef> },
     // `let rec f = val_f [and g = val_g ...] in ...` -- one or more
     // simultaneously-recursive bindings folding back into a single
     // Expr::LetRec (never Expr::Let, which is never recursive).
-    LetRec { bindings: Vec<(String, Option<Type>, ExprRef)> },
+    LetRec { bindings: Vec<(String, Option<ExprRef>, ExprRef)> },
     // `where_pred` here is NEVER proven statically, even when `val` looks
     // like a literal at some call site -- a Lambda parameter's value is
     // whatever the CALLER passes, unknown at definition time, so this
     // always becomes a real runtime check.
-    Fun { param: String, ann: Option<Type>, where_pred: Option<ExprRef> },
+    Fun { param: String, ann: Option<ExprRef>, where_pred: Option<ExprRef> },
 }
 
 // A tiny, deliberately narrow compile-time evaluator for `where` refinement
@@ -445,7 +446,12 @@ impl<'a> Parser<'a> {
     // `|` too, or `fun x: A | B -> body` would ambiguously let `B`'s
     // alternative reach for the arrow the same way a bare function type
     // would.
-    fn opt_annotation(&mut self) -> Result<Option<Type>, String> {
+    //
+    // Every type form below builds an EXPRESSION (spec 2026-10-10 types-as-
+    // values, section 3): sugar desugars into calls to the prelude's type
+    // constructors, spelled `#Int`, `#List`, ... so no user binding can
+    // capture them. typecheck evaluates the result with machine::eval_type.
+    fn opt_annotation(&mut self) -> Result<Option<ExprRef>, String> {
         if matches!(self.peek(), Some(Token::Colon)) {
             self.bump();
             Ok(Some(self.parse_type_atom_union()?))
@@ -454,13 +460,40 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // `#name` as an expression, spanning from `start` to the last token read.
+    fn type_ctor(&mut self, name: &str, start: usize) -> ExprRef {
+        let span = Span { start, end: self.span_before().end };
+        self.push_spanned(Expr::Var(format!("#{name}")), span)
+    }
+
+    // `#name(arg)`.
+    fn type_call(&mut self, name: &str, arg: ExprRef, start: usize) -> ExprRef {
+        let ctor = self.type_ctor(name, start);
+        let span = Span { start, end: self.span_before().end };
+        self.push_spanned(Expr::App(ctor, arg), span)
+    }
+
+    // `#name((items...))`: Tuple, Union and Fun take one tuple argument.
+    fn type_call_items(&mut self, name: &str, items: Vec<ExprRef>, start: usize) -> ExprRef {
+        let span = Span { start, end: self.span_before().end };
+        let tuple = self.push_spanned(Expr::Tuple(items), span);
+        self.type_call(name, tuple, start)
+    }
+
+    // A type that is already known (an alias, `Vec(n)`): no evaluation left to do.
+    fn type_lit(&mut self, ty: Type, start: usize) -> ExprRef {
+        let span = Span { start, end: self.span_before().end };
+        self.push_spanned(Expr::TypeLit(Rc::new(ty)), span)
+    }
+
     // type_atom_union := type ("|" type)*  -- parse_type's own ATOM level
     // (no "->"), unioned. Used where a trailing "->" must NOT be consumed
     // as part of the type (opt_annotation -- see its own doc comment); a
     // function type still needs explicit parens there, same as before
     // union types existed, and now so does a function type as one union
     // alternative (`fun x: (A -> B) | C -> body`).
-    fn parse_type_atom_union(&mut self) -> Result<Type, String> {
+    fn parse_type_atom_union(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
         let first = self.parse_type()?;
         if !matches!(self.peek(), Some(Token::Pipe)) {
             return Ok(first);
@@ -470,7 +503,7 @@ impl<'a> Parser<'a> {
             self.bump();
             alts.push(self.parse_type()?);
         }
-        Ok(Type::Union(Rc::new(alts)))
+        Ok(self.type_call_items("Union", alts, start))
     }
 
     // union_type := fun_type ("|" fun_type)*  (left-associative in surface
@@ -482,7 +515,8 @@ impl<'a> Parser<'a> {
     // (unlike opt_annotation -- see parse_type_atom_union): inside `[...]`/
     // `(...)`, and a `type` alias's own RHS (terminated by `in`, not `->`/
     // `=`).
-    fn parse_union_type(&mut self) -> Result<Type, String> {
+    fn parse_union_type(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
         let first = self.parse_fun_type()?;
         if !matches!(self.peek(), Some(Token::Pipe)) {
             return Ok(first);
@@ -492,7 +526,7 @@ impl<'a> Parser<'a> {
             self.bump();
             alts.push(self.parse_fun_type()?);
         }
-        Ok(Type::Union(Rc::new(alts)))
+        Ok(self.type_call_items("Union", alts, start))
     }
 
     // Bare, atom-only: "Int" | "Bool" | "Str" | "Dyn" | "[" fun_type "]" |
@@ -504,12 +538,13 @@ impl<'a> Parser<'a> {
     // disambiguate: `fun f: (Int -> Int) -> ...`. "[" / "]" don't have that
     // ambiguity (nothing else starts with "["), so a list element type can
     // freely be a function type without extra parens: `[Int -> Int]`.
-    fn parse_type(&mut self) -> Result<Type, String> {
+    fn parse_type(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
         match self.bump() {
             Some(Token::LBracket) => {
                 let elem = self.parse_fun_type()?;
                 self.expect(&Token::RBracket)?;
-                Ok(Type::List(Rc::new(elem)))
+                Ok(self.type_call("List", elem, start))
             }
             // `(T)` stays ordinary grouping; `(T, T, ...)` (a comma
             // present) is a tuple TYPE -- Type::Tuple, matching Expr::
@@ -528,7 +563,7 @@ impl<'a> Parser<'a> {
                         items.push(self.parse_union_type()?);
                     }
                     self.expect(&Token::RParen)?;
-                    Ok(Type::Tuple(Rc::new(items)))
+                    Ok(self.type_call_items("Tuple", items, start))
                 } else {
                     self.expect(&Token::RParen)?;
                     Ok(first)
@@ -540,7 +575,9 @@ impl<'a> Parser<'a> {
             // no value to pun with) and why the result comes back sorted.
             Some(Token::LBrace) => {
                 let fields = self.parse_record_fields(Self::parse_union_type, None)?;
-                Ok(Type::Record(Rc::new(fields)))
+                let span = Span { start, end: self.span_before().end };
+                let record = self.push_spanned(Expr::Record(Rc::new(fields)), span);
+                Ok(self.type_call("Record", record, start))
             }
             // A capitalized name: either one of the four builtin type
             // names (Int/Bool/Str/Dyn -- plain Idents, not reserved
@@ -557,7 +594,11 @@ impl<'a> Parser<'a> {
                     self.bump(); // consume '('
                     let index = self.parse_index_expr()?;
                     self.expect(&Token::RParen)?;
-                    return Ok(Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index)));
+                    // A TypeLit, not a #Vec call: the index may name a
+                    // variable, which has no value here (spec section 4,
+                    // Stage C).
+                    let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index));
+                    return Ok(self.type_lit(ty, start));
                 }
                 // Case B syntax generalization (design spec 2026-09-20
                 // sec 3): the SAME indexing syntax works for any other
@@ -573,15 +614,18 @@ impl<'a> Parser<'a> {
                         self.bump();
                         let index = self.parse_index_expr()?;
                         self.expect(&Token::RParen)?;
-                        return Ok(Type::Indexed(Rc::new(resolved_clone), Rc::new(index)));
+                        return Ok(self.type_lit(Type::Indexed(Rc::new(resolved_clone), Rc::new(index)), start));
                     }
                 }
-                match Self::builtin_type(&name) {
-                    Some(ty) => Ok(ty),
-                    None => match self.type_aliases.get(&name) {
-                        Some(ty) => Ok(ty.clone()),
-                        None => Err(self.err_at(self.span_before(), format!("unknown type: {name}"))),
-                    },
+                if Self::builtin_type(&name).is_some() {
+                    return Ok(self.type_ctor(&name, start));
+                }
+                match self.type_aliases.get(&name) {
+                    Some(ty) => {
+                        let ty = ty.clone();
+                        Ok(self.type_lit(ty, start))
+                    }
+                    None => Err(self.err_at(self.span_before(), format!("unknown type: {name}"))),
                 }
             }
             other => Err(self.err_at(self.span_before(), format!("expected a type, found {other:?}"))),
@@ -685,20 +729,28 @@ impl<'a> Parser<'a> {
     // recursive parse_fun_type -> parse_type call below -- which is
     // exactly how a record type (`-> {x: Int}`) reaches parse_type's own
     // LBrace arm rather than being swallowed as a malformed row variable.
-    fn parse_fun_type(&mut self) -> Result<Type, String> {
+    // `A -> B` is `#Fun((A, B))`; `A ->{e} B` is `#Fun((A, "e", B))`.
+    fn parse_fun_type(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
         let atom = self.parse_type()?;
         if matches!(self.peek(), Some(Token::Arrow)) {
             self.bump();
             let row = if matches!(self.peek(), Some(Token::LBrace)) && self.peek_is_row_var() {
                 self.bump();
+                let row_start = self.span_at().start;
                 let name = self.ident()?;
+                let row = self.push_spanned(Expr::Str(name), Span { start: row_start, end: self.span_before().end });
                 self.expect(&Token::RBrace)?;
-                EffectRow::Var(name)
+                Some(row)
             } else {
-                EffectRow::Dyn
+                None
             };
             let ret = self.parse_fun_type()?;
-            Ok(Type::Fun(Rc::new(atom), row, Rc::new(ret)))
+            let items = match row {
+                Some(row) => vec![atom, row, ret],
+                None => vec![atom, ret],
+            };
+            Ok(self.type_call_items("Fun", items, start))
         } else {
             Ok(atom)
         }
@@ -1123,7 +1175,16 @@ impl<'a> Parser<'a> {
                     let previous = self.type_aliases.get(&name).cloned();
                     let fresh_id = fresh_named_type_id(&name);
                     self.type_aliases.insert(name.clone(), Type::Named(fresh_id.clone()));
-                    let ty = self.parse_union_type()?;
+                    let rhs_start = self.span_at().start;
+                    let rhs = self.parse_union_type()?;
+                    // The alias stands for the type its right-hand side
+                    // evaluates to (spec section 3: a type alias is a let
+                    // of a type value). Every name in it is a #constructor
+                    // or an already-evaluated alias, so this always finishes.
+                    let ty = match crate::machine::eval_type(&self.arena, rhs, &self.expr_spans) {
+                        Ok(ty) => ty,
+                        Err(msg) => return Err(self.err_at(Span { start: rhs_start, end: self.span_before().end }, msg)),
+                    };
                     self.expect(&Token::In)?;
                     // Did the RHS actually reference itself? If not,
                     // this is an ordinary, non-recursive alias --

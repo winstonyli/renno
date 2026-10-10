@@ -2,7 +2,6 @@ use cranelift_entity::EntityRef;
 
 use crate::env::PRELUDE;
 use crate::expr::{Arena, Expr, ExprRef, Pattern};
-use crate::types::Type;
 
 // Where a variable lives at runtime, decided statically. See the spec's
 // scope table (the env-frames design spec, §2): `hops` counts runtime frames outward from the innermost
@@ -138,7 +137,7 @@ fn scoped(work: &mut Vec<Work>, names: Vec<String>, child: ExprRef) {
 // [names…] for the body) iff this holds, and machine.rs's Expr::LetRec arm
 // builds the RecClosure group iff this holds -- sharing this function is
 // what keeps the two from drifting apart.
-pub fn is_direct_group(arena: &Arena, bindings: &[(String, Option<Type>, ExprRef)]) -> bool {
+pub fn is_direct_group(arena: &Arena, bindings: &[(String, Option<ExprRef>, ExprRef)]) -> bool {
     bindings.iter().all(|(_, _, v)| matches!(arena[*v], Expr::Lambda(..)))
 }
 
@@ -254,7 +253,7 @@ mod tests {
     use crate::env::PRELUDE;
     use crate::expr::{Arena, Expr};
 
-    fn let_rec_bindings(src: &str) -> (Arena, Vec<(String, Option<crate::types::Type>, crate::expr::ExprRef)>) {
+    fn let_rec_bindings(src: &str) -> (Arena, Vec<(String, Option<crate::expr::ExprRef>, crate::expr::ExprRef)>) {
         let (arena, _s, root) = crate::parser::parse(src).unwrap();
         let Expr::LetRec(bindings, _) = &arena[root] else { panic!("expected LetRec") };
         let bindings = bindings.as_ref().clone();

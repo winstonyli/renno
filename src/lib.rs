@@ -3907,12 +3907,17 @@ g(len)").unwrap_err();
         // directly rather than running typecheck (Task 6 -- not yet
         // implemented -- owns whether a value can actually be CONSTRUCTED
         // against this type).
-        match &arena[root] {
-            Expr::Let(_, Some(Type::Indexed(wrapped, idx)), ..) => {
-                assert!(matches!(wrapped.as_ref(), Type::Named(_)), "expected the wrapped type to be Type::Named, got {wrapped:?}");
-                assert_eq!(**idx, IndexExpr::Lit(2));
-            }
-            other => panic!("expected a Let with an Indexed(Named(_), 2) annotation, got {other:?}"),
+        // The annotation is an expression now; alias indexing parses to a TypeLit.
+        let Expr::Let(_, Some(ann), ..) = &arena[root] else { panic!("expected an annotated Let, got {:?}", arena[root]) };
+        match &arena[*ann] {
+            Expr::TypeLit(t) => match t.as_ref() {
+                Type::Indexed(wrapped, idx) => {
+                    assert!(matches!(wrapped.as_ref(), Type::Named(_)), "expected the wrapped type to be Type::Named, got {wrapped:?}");
+                    assert_eq!(**idx, IndexExpr::Lit(2));
+                }
+                other => panic!("expected an Indexed(Named(_), 2) annotation, got {other:?}"),
+            },
+            other => panic!("expected a TypeLit annotation, got {other:?}"),
         }
         assert_eq!(named_types.len(), 1);
     }
@@ -3987,6 +3992,27 @@ g(len)").unwrap_err();
         assert_eq!(run_source("let t = Tuple((Int, Bool)) in t").unwrap().to_string(), "(Int, Bool)");
         let err = run_source("List(1)").unwrap_err();
         assert!(err.contains("List cannot take a Int"), "{err}");
+    }
+
+    // An annotation is an expression: sugar is parsed into calls to the
+    // prelude's type constructors, spelled `#Int`, `#List`, ...
+    #[test]
+    fn an_annotation_is_parsed_as_type_constructor_calls() {
+        use expr::Expr;
+        let (arena, _spans, root) = parser::parse("let x: [Int] = [1] in x").unwrap();
+        let Expr::Let(_, Some(ann), ..) = &arena[root] else { panic!("expected an annotated Let, got {:?}", arena[root]) };
+        let Expr::App(f, a) = &arena[*ann] else { panic!("expected a call, got {:?}", arena[*ann]) };
+        assert!(matches!(&arena[*f], Expr::Var(n) if n == "#List"), "{:?}", arena[*f]);
+        assert!(matches!(&arena[*a], Expr::Var(n) if n == "#Int"), "{:?}", arena[*a]);
+    }
+
+    // Stage A desugars annotations to `#Int`, ..., which a user binding cannot
+    // capture, so shadowing a type name changes nothing (Stage B flips this,
+    // spec section 4).
+    #[test]
+    fn a_value_named_like_a_type_does_not_change_annotations_yet() {
+        assert_eq!(run_source("let Int = 5 in let x: Int = 3 in x + Int").unwrap().as_int(), 8);
+        assert_eq!(run_source("let List = 2 in let xs: [Int] = [1] in len(xs) + List").unwrap().as_int(), 3);
     }
 
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain

@@ -1382,7 +1382,8 @@ fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env
     let (a_target, b_target) = cast_targets(to, env.infer);
     let up_body = cast_up(arena, body, b, &b_target, env, true);
     if relate_cast(&a_target, a, env.infer) == Rel::Proven {
-        return arena.push(Expr::Lambda(param, Some(a_target), up_body));
+        let ann = type_lit(arena, a_target);
+        return arena.push(Expr::Lambda(param, Some(ann), up_body));
     }
     // The incoming value arrives under a fresh name and is checked outside the
     // user's parameter scope, so a parameter of the same name cannot capture
@@ -1391,7 +1392,8 @@ fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env
     let ca_ref = arena.push(Expr::Var(ca.clone()));
     let checked = build_boundary_check(arena, ca_ref, &erase_open_indexed(a, env), env, &HashSet::new());
     let body = arena.push(Expr::Let(param, None, checked, up_body));
-    arena.push(Expr::Lambda(ca, Some(a_target), body))
+    let ann = type_lit(arena, a_target);
+    arena.push(Expr::Lambda(ca, Some(ann), body))
 }
 
 // UP for a literal's body: a Lambda body is rebuilt in turn (through a witness
@@ -1470,7 +1472,8 @@ fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Check
         Some(w) => w.bind(arena, &ca, result),
         None => result,
     };
-    let lambda = arena.push(Expr::Lambda(ca, Some(a_target), body));
+    let ann = type_lit(arena, a_target);
+    let lambda = arena.push(Expr::Lambda(ca, Some(ann), body));
     arena.push(Expr::Let(cf, None, e, lambda))
 }
 
@@ -2100,7 +2103,8 @@ fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: 
         Some(w) if w.used.get() => w.bind(arena, &arg_var, checked_call),
         _ => checked_call,
     };
-    let lambda = arena.push(Expr::Lambda(arg_var, Some((*param_ty).clone()), checked_call));
+    let ann = type_lit(arena, (*param_ty).clone());
+    let lambda = arena.push(Expr::Lambda(arg_var, Some(ann), checked_call));
     arena.push(Expr::Let(fn_var, None, e, lambda))
 }
 
@@ -3026,6 +3030,17 @@ fn missing_case(patterns: &[&Pattern], scrut_ty: &Type) -> Option<String> {
 // sound: check() below rejects a program only when it can prove an effect
 // is never discharged, and stays silent (deferring to today's runtime
 // panic) whenever it can't prove either way.
+// A binder's annotation is an expression (spec 2026-10-10 types-as-values):
+// its Type is what it evaluates to. An error is reported at the annotation.
+fn annotation_type(arena: &Arena, ann: ExprRef, spans: &SpanMap) -> Result<Type, TypeError> {
+    crate::machine::eval_type(arena, ann, spans).map_err(|msg| TypeError(msg, spans[ann]))
+}
+
+// The annotation slot typecheck re-emits for a binder whose type it knows.
+fn type_lit(arena: &mut Arena, ty: Type) -> ExprRef {
+    arena.push(Expr::TypeLit(Rc::new(ty)))
+}
+
 fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx, mode: Mode) -> Result<(Type, EffectRow, ExprRef), TypeError> {
     // Peels off a run of leading `let`/`fun` prefixes iteratively -- a
     // match per iteration, not a recursive call -- so a long chain of
@@ -3065,8 +3080,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // inferred type after the fact. This is Phase 3's real
                     // entry point: `let f: A -> Vec(n) = fn(x) = <body>`
                     // now checks <body> against Vec(n) directly.
-                    Some(t) => {
-                        let (t, renames) = open_signature(&t, infer);
+                    Some(ann) => {
+                        let (t, renames) = open_signature(&annotation_type(arena, ann, spans)?, infer);
                         let (val_row, val4) = check_against_rigid(arena, val, &t, &renames, &cur_ctx, spans, infer)?;
                         (t, val_row, val4)
                     }
@@ -3096,8 +3111,13 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 let mut val_ctx = cur_ctx.clone();
                 // Each annotation opened once (open_signature), so the
                 // pre-binding below and the value check share its renames.
-                let opened: Vec<Option<(Type, Renames)>> =
-                    bindings.iter().map(|(_, ann, _)| ann.as_ref().map(|t| open_signature(t, infer))).collect();
+                let mut opened: Vec<Option<(Type, Renames)>> = Vec::with_capacity(bindings.len());
+                for (_, ann, _) in bindings.iter() {
+                    opened.push(match ann {
+                        Some(ann) => Some(open_signature(&annotation_type(arena, *ann, spans)?, infer)),
+                        None => None,
+                    });
+                }
                 for ((name, _, _), ann) in bindings.iter().zip(&opened) {
                     let ann = ann.as_ref().map(|(t, _)| t);
                     val_ctx = match ann {
@@ -3138,7 +3158,10 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 cur_expr = body;
             }
             Expr::Lambda(param, ann, body) => {
-                let ann = ann.map(|t| scoped_annotation(&t, infer));
+                let ann = match ann {
+                    Some(ann) => Some(scoped_annotation(&annotation_type(arena, ann, spans)?, infer)),
+                    None => None,
+                };
                 // The one place `cur_mode` actually changes: if the
                 // caller already knows this Lambda must have type
                 // Fun(param_ty, _, ret_ty) -- e.g. it's the value of a
@@ -3337,7 +3360,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // Matches the original Let arm: body's type propagates
                 // through unchanged, row is the union of val's and body's.
                 result_row = EffectRow::union(&val_row, &result_row);
-                result_expr = arena.push(Expr::Let(var, Some(bound_ty), val, result_expr));
+                let ann = type_lit(arena, bound_ty);
+                result_expr = arena.push(Expr::Let(var, Some(ann), val, result_expr));
             }
             PendingElab::LetRec { bindings } => {
                 // Matches the original LetRec arm: body's type propagates
@@ -3346,8 +3370,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 for (_, _, val_row, _) in &bindings {
                     result_row = EffectRow::union(val_row, &result_row);
                 }
-                let group: Vec<(String, Option<Type>, ExprRef)> =
-                    bindings.into_iter().map(|(name, ty, _, val)| (name, Some(ty), val)).collect();
+                let group: Vec<(String, Option<ExprRef>, ExprRef)> =
+                    bindings.into_iter().map(|(name, ty, _, val)| (name, Some(type_lit(arena, ty)), val)).collect();
                 result_expr = arena.push(Expr::LetRec(Rc::new(group), result_expr));
             }
             PendingElab::Fun { param, param_ty, witness } => {
@@ -3363,7 +3387,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         result_expr = w.bind(arena, &param, result_expr);
                     }
                 }
-                result_expr = arena.push(Expr::Lambda(param, Some(param_ty), result_expr));
+                let ann = type_lit(arena, param_ty);
+                result_expr = arena.push(Expr::Lambda(param, Some(ann), result_expr));
             }
         }
     }
