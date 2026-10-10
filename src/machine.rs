@@ -316,10 +316,12 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                                     control = Control::Apply(value);
                                 }
                                 Value::Builtin(b) => {
+                                    set_current_span(callee_span);
                                     control = Control::Apply(collect_builtin_arg(arena, b, Vec::new(), value, spans, resolved));
                                 }
                                 Value::PartialBuiltin(b, prev_args) => {
                                     let args = (*prev_args).clone();
+                                    set_current_span(callee_span);
                                     control = Control::Apply(collect_builtin_arg(arena, b, args, value, spans, resolved));
                                 }
                                 _ => {

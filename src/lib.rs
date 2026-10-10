@@ -72,8 +72,9 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
-    let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src)?;
+    let (mut arena, mut spans, root, named_types) = parser::parse_with_named_types(src)?;
     let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).map_err(|e| e.1.format_error(src, &e.0))?;
+    expr::fill_synthesized_spans(&arena, elaborated, &mut spans);
     std::panic::catch_unwind(|| machine::run(&arena, elaborated, Env::prelude(), &spans)).map_err(|payload| {
         // Recover the panic's own message (downcast_ref covers both a
         // string-literal `panic!("...")` and a `panic!("{}", format!(...))`
@@ -2412,6 +2413,49 @@ mod tests {
         let err = run_source(src).unwrap_err();
         assert!(err.starts_with("line 1, column 22:"), "unexpected message: {err}");
         assert!(err.contains("unbound variable: m"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn builtin_argument_panic_blames_the_callee_not_the_argument() {
+        // `len` reached through a Dyn callee: the argument `5` is the last expression evaluated,
+        // but the error is about the call, so the caret sits on the callee `f`. The elaborated
+        // callee node is synthesized (a Check), so this needs fill_synthesized_spans.
+        let err = run_source("let f: Dyn = len in
+let r = f(5) in
+r + 1").unwrap_err();
+        assert!(err.starts_with("line 2, column 9:"), "unexpected message: {err}");
+        assert!(err.contains("len expects a string or list"), "unexpected message: {err}");
+        // Passed as an argument, `len` is called through the wrapper built at the call site, so
+        // the blame is that site's `len`, not an unlocated fallback.
+        let err = run_source("let g = fun f -> f(5) in
+g(len)").unwrap_err();
+        assert!(err.starts_with("line 2, column 3:"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn fill_synthesized_spans_covers_every_node_with_the_children_hull() {
+        use crate::expr::{fill_synthesized_spans, Arena, Expr, SpanMap};
+        use crate::span::Span;
+        let mut arena = Arena::new();
+        let mut spans = SpanMap::new();
+        let f = arena.push(Expr::Var("f".into()));
+        spans.push(Span { start: 8, end: 9 });
+        let five = arena.push(Expr::Int(5));
+        spans.push(Span { start: 10, end: 11 });
+        // Synthesized after parsing: a Check around `f`, a spanless leaf, and the App over both.
+        let spec = std::rc::Rc::new(crate::expr::CheckSpec { test: crate::expr::Test::Fun, defs: vec![], mode: crate::expr::CheckMode::Assert, to: String::new(), span: None });
+        let check = arena.push(Expr::Check(f, spec));
+        let leaf = arena.push(Expr::Bool(true));
+        let pair = arena.push(Expr::Tuple(vec![check, five]));
+        let both = arena.push(Expr::If(leaf, pair, pair));
+        let _dead = arena.push(Expr::Int(0));
+        fill_synthesized_spans(&arena, both, &mut spans);
+        assert_eq!(spans.len(), arena.len());
+        assert_eq!(spans[f], Span { start: 8, end: 9 }, "parser-built entries are unchanged");
+        assert_eq!(spans[check], Span { start: 8, end: 9 });
+        assert_eq!(spans[pair], Span { start: 8, end: 11 });
+        assert_eq!(spans[both], Span { start: 8, end: 11 });
+        assert_eq!(spans[leaf], Span { start: 8, end: 11 }, "a spanless leaf takes its parent's span");
     }
 
     #[test]

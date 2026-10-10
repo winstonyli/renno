@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use cranelift_entity::{entity_impl, PrimaryMap};
+use cranelift_entity::{entity_impl, EntityRef, PrimaryMap};
 
 use crate::span::Span;
 use crate::types::Type;
@@ -275,4 +275,72 @@ pub enum Expr {
     // check in parser.rs for why (multi-shot resume replaying match-arm
     // selection itself).
     Match(ExprRef, Rc<Vec<(Pattern, Option<ExprRef>, ExprRef)>>),
+}
+
+impl Expr {
+    // Appends this node's direct sub-expressions to `out`.
+    pub fn children(&self, out: &mut Vec<ExprRef>) {
+        match self {
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => {}
+            Expr::Check(e, _) | Expr::FieldAccess(e, _) | Expr::Lambda(_, _, e) | Expr::Perform(_, e) => out.push(*e),
+            Expr::MakeHandler { body, .. } => out.push(*body),
+            Expr::Tuple(items) | Expr::ListLit(items) => out.extend(items),
+            Expr::Record(fields) => out.extend(fields.iter().map(|(_, v)| *v)),
+            Expr::App(a, b) | Expr::BinOp(_, a, b) | Expr::Let(_, _, a, b) => out.extend([*a, *b]),
+            Expr::LetRec(bindings, body) => {
+                out.extend(bindings.iter().map(|(_, _, v)| *v));
+                out.push(*body);
+            }
+            Expr::If(c, t, e) => out.extend([*c, *t, *e]),
+            Expr::Handle { body, handler } => out.extend([*body, *handler]),
+            Expr::Match(scrutinee, arms) => {
+                out.push(*scrutinee);
+                for (_, guard, body) in arms.iter() {
+                    out.extend(*guard);
+                    out.push(*body);
+                }
+            }
+        }
+    }
+}
+
+// Gives every node typecheck synthesized (index >= spans.len()) the span of its children's
+// hull, so spans.get(n) is Some for every node of the elaborated tree rooted at `root`. A
+// synthesized leaf takes its parent's span; a node unreachable from `root` takes the root's.
+// Parser-built entries are never changed.
+pub fn fill_synthesized_spans(arena: &Arena, root: ExprRef, spans: &mut SpanMap) {
+    let (original, total) = (spans.len(), arena.len());
+    let mut span: Vec<Option<Span>> = (0..total).map(|i| spans.get(ExprRef::new(i)).copied()).collect();
+    let mut visited = vec![false; total];
+    let mut order = Vec::new(); // post-order: children before parents
+    let mut stack = vec![(root, false)];
+    let mut kids = Vec::new();
+    while let Some((n, expanded)) = stack.pop() {
+        if expanded {
+            order.push(n);
+            if span[n.index()].is_none() {
+                kids.clear();
+                arena[n].children(&mut kids);
+                span[n.index()] = kids.iter().filter_map(|k| span[k.index()]).reduce(|a, b| Span { start: a.start.min(b.start), end: a.end.max(b.end) });
+            }
+        } else if !std::mem::replace(&mut visited[n.index()], true) {
+            stack.push((n, true));
+            kids.clear();
+            arena[n].children(&mut kids);
+            stack.extend(kids.iter().map(|k| (*k, false)));
+        }
+    }
+    for &n in order.iter().rev() {
+        let Some(parent) = span[n.index()] else { continue };
+        kids.clear();
+        arena[n].children(&mut kids);
+        for k in &kids {
+            span[k.index()].get_or_insert(parent);
+        }
+    }
+    let fallback = span[root.index()].unwrap_or(Span { start: 0, end: 0 });
+    for s in &span[original..] {
+        spans.push(s.unwrap_or(fallback));
+    }
+    debug_assert_eq!(spans.len(), total);
 }
