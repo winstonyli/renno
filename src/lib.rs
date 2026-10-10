@@ -4196,6 +4196,19 @@ g(len)").unwrap_err();
         assert!(run_source(src).unwrap_err().contains("expected Int, found Bool"));
     }
 
+    // A check-time evaluation that meets `.field` (which only elaboration
+    // lowers) is stuck, not a panic: a let rec value falls back to run time,
+    // an annotation reports it.
+    #[test]
+    fn check_time_evaluation_is_stuck_on_field_access() {
+        assert_eq!(run_source("let get = fun r -> r.a in let rec v = get({a: 1}) in v").unwrap(), Outcome::Int(1));
+        assert_eq!(run_source("let p = {x: 1, y: 2} in let rec s = (fun q -> q.x + q.y)(p) in s").unwrap(), Outcome::Int(3));
+        for src in ["let F = fun r -> r.a in let x: F({a: Int}) = 1 in x", "let r = {a: Int} in let T = r.a in let x: T = 1 in x"] {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains("an annotation cannot read a record field at check time"), "{src}: {err}");
+        }
+    }
+
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain
     // parser::parse + machine::run with NO typecheck::check pass at all,
     // so a plain `: T` annotation (unlike a `where` refinement, which the

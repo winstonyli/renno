@@ -87,6 +87,9 @@ pub enum Stuck {
     Effect,
     // A builtin outside the pure fragment (`print`, `map`, ...).
     Builtin,
+    // A node the parser emits but only typecheck lowers (`.field`, which
+    // elaboration turns into a get_field call): eval_pure runs parsed trees.
+    Unelaborated,
 }
 
 // What eval_pure produced.
@@ -138,6 +141,7 @@ pub fn eval_type(arena: &Arena, ann: ExprRef, spans: &SpanMap) -> Result<Type, S
         Pure::Stuck(Stuck::Fuel) => Err(format!("annotation did not finish within {ANNOTATION_FUEL} steps")),
         Pure::Stuck(Stuck::Effect) => Err("an annotation cannot perform an effect".to_string()),
         Pure::Stuck(Stuck::Builtin) => Err("an annotation can only call the type constructors".to_string()),
+        Pure::Stuck(Stuck::Unelaborated) => Err("an annotation cannot read a record field at check time".to_string()),
         Pure::Error(msg) => Err(msg),
     }
 }
@@ -252,10 +256,16 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                 // time it gets here, but machine::run itself has no such
                 // guarantee for a tree that reached it directly (e.g.
                 // lib.rs's run_untyped) -- `.field` access simply isn't
-                // supported on that untyped path.
-                Expr::FieldAccess(..) => unreachable!(
-                    "Expr::FieldAccess reached machine::run directly -- `.field` needs typecheck::check first, see its own doc comment"
-                ),
+                // supported on that untyped path. eval_pure runs parsed
+                // trees, so in check mode it is stuck, not a bug.
+                Expr::FieldAccess(..) => {
+                    if PURE {
+                        return Err(Stuck::Unelaborated);
+                    }
+                    unreachable!(
+                        "Expr::FieldAccess reached machine::run directly -- `.field` needs typecheck::check first, see its own doc comment"
+                    )
+                }
                 Expr::ListLit(items) => {
                     if items.is_empty() {
                         control = Control::Apply(Value::List(Rc::new(Vec::new())));
