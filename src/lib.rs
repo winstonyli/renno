@@ -4209,6 +4209,15 @@ g(len)").unwrap_err();
         }
     }
 
+    // A let rec that is not a group of direct `fun`s evaluates its values in
+    // the outer scope (machine.rs's LetRec fallback); an annotation after it
+    // reads it the same way.
+    #[test]
+    fn annotations_read_a_non_recursive_let_rec_like_the_run_time() {
+        assert_eq!(run_source("let T = Int in let rec T = (fun u -> u)(T) and k = 5 in let y: T = 1 in y").unwrap(), Outcome::Int(1));
+        assert_eq!(run_source("let Int = Bool in let rec Int = (fun u -> u)(Int) and k = 5 in let y: Int = true in y").unwrap(), Outcome::Bool(true));
+    }
+
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain
     // parser::parse + machine::run with NO typecheck::check pass at all,
     // so a plain `: T` annotation (unlike a `where` refinement, which the

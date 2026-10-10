@@ -3186,7 +3186,14 @@ fn definitions_used(arena: &Arena, root: ExprRef, skip: &[String], ctx: &Ctx, in
             match &def.node {
                 DefNode::Let(_, rhs) => work.push((*rhs, Vec::new(), def.ctx.clone())),
                 DefNode::Group(bindings) => {
-                    let names: Vec<String> = bindings.iter().map(|(n, _, _)| n.clone()).collect();
+                    // Only a group of direct `fun`s is recursive; any other
+                    // group's values see the outer scope (machine.rs's
+                    // LetRec fallback). A type group's values are TypeLits.
+                    let names: Vec<String> = if crate::resolve::is_direct_group(arena, bindings) {
+                        bindings.iter().map(|(n, _, _)| n.clone()).collect()
+                    } else {
+                        Vec::new()
+                    };
                     for (_, _, v) in bindings.iter() {
                         work.push((*v, names.clone(), def.ctx.clone()));
                     }
