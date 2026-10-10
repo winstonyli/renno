@@ -88,6 +88,16 @@ pub fn apply(arena: &Arena, func: Value, arg: Value, spans: &SpanMap, resolved: 
 
 fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap, resolved: &Resolved) -> Value {
     loop {
+        // A list or record literal's accumulator frame that only this evaluation holds is
+        // moved, not cloned, so building n elements is O(n). A frame a captured
+        // continuation shares falls through to the cloning arms below.
+        if matches!(control, Control::Apply(_))
+            && let Some((frame, rest)) = cont.take_unshared_elems()
+        {
+            let Control::Apply(value) = control else { unreachable!() };
+            (control, cont) = advance_elems(frame, rest, value);
+            continue;
+        }
         match control {
             Control::Eval(expr, env) => {
                 // `spans` covers every node the PARSER produced, but the
@@ -406,10 +416,8 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                             cont = rest;
                             control = Control::Eval(if value.as_bool() { then_ } else { else_ }, env);
                         }
-                        // Vec clones here are O(remaining/done length) per
-                        // element -- fine for typical list-literal sizes;
-                        // a large literal would make this O(n^2) overall.
-                        // Worth an index-based rewrite if that ever matters.
+                        // The shared case only (a captured continuation holds this frame, so it
+                        // keeps its own copy): the unshared one is advance_elems.
                         Frame::ListElems { remaining, done, env } => {
                             let (mut remaining, mut done, env) = (remaining.clone(), done.clone(), env.clone());
                             done.push(value);
@@ -493,6 +501,31 @@ fn run_loop(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap
                 control = perform(&mut cont, &effect, payload);
             }
         }
+    }
+}
+
+// The ListElems or RecordElems frame `frame` (popped, with `rest` below it) receives the
+// value of its next element. Same step as the borrowing arms in run_loop, on owned data.
+fn advance_elems(frame: Frame, rest: Cont, value: Value) -> (Control, Cont) {
+    match frame {
+        Frame::ListElems { mut remaining, mut done, env } => {
+            done.push(value);
+            match remaining.pop() {
+                Some(next) => (Control::Eval(next, env.clone()), Cont::cons(Frame::ListElems { remaining, done, env }, rest)),
+                None => (Control::Apply(Value::List(Rc::new(done))), rest),
+            }
+        }
+        Frame::RecordElems { names, mut remaining, mut done, env } => {
+            done.push(value);
+            match remaining.pop() {
+                Some(next) => (Control::Eval(next, env.clone()), Cont::cons(Frame::RecordElems { names, remaining, done, env }, rest)),
+                None => {
+                    let fields = names.iter().cloned().zip(done).collect();
+                    (Control::Apply(Value::Record(Rc::new(fields))), rest)
+                }
+            }
+        }
+        _ => unreachable!("internal: take_unshared_elems returns only elems frames"),
     }
 }
 

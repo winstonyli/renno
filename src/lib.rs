@@ -8322,4 +8322,15 @@ g(len)").unwrap_err();
         // A Dyn argument is still checked at run time.
         assert_clean_rejection("let f = fun x -> let n: Int = x in n in let d: Dyn = true in f(d)", BAD_INT);
     }
+
+    #[test]
+    fn a_large_literal_builds_in_linear_time_and_a_shared_one_stays_correct() {
+        // 100k elements: the accumulator frame is moved, not cloned, so this is O(n) (the
+        // cloning version took minutes). A literal whose frame a resumed continuation
+        // shares must still keep its own copy of the elements done so far.
+        let big = (0..100_000).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        assert_eq!(run_source(&format!("len([{big}])")).unwrap().to_string(), "100000");
+        let src = "handle [perform c(0), perform c(0)] with deep(handler c(p, resume) -> resume(1) ++ resume(2))";
+        assert_eq!(run_source(src).unwrap().to_string(), "[1, 1, 1, 2, 2, 1, 2, 2]");
+    }
 }

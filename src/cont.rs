@@ -98,6 +98,21 @@ impl Cont {
         Cont(Rc::new(ContNode::Frame(frame, rest)))
     }
 
+    // The top frame and the rest, moved out, when the top frame is a ListElems or
+    // RecordElems that nothing else holds (the single-shot case); None otherwise,
+    // in particular when a captured continuation shares it and must keep its own
+    // copy. Lets those frames pass their accumulated elements on without cloning
+    // them, so a literal of n elements costs O(n), not O(n^2).
+    pub fn take_unshared_elems(&mut self) -> Option<(Frame, Cont)> {
+        if !matches!(&*self.0, ContNode::Frame(Frame::ListElems { .. } | Frame::RecordElems { .. }, _)) || Rc::strong_count(&self.0) != 1 {
+            return None;
+        }
+        match Rc::try_unwrap(std::mem::replace(&mut self.0, Rc::new(ContNode::Nil))) {
+            Ok(ContNode::Frame(frame, rest)) => Some((frame, rest)),
+            _ => unreachable!("internal: an unshared elems frame is a uniquely owned Frame node"),
+        }
+    }
+
     // Fold `frames` onto `tail`, frames[0] ending up closest to the top
     // (the next one popped). Shared by `append` below and by
     // `machine::perform`, which captures frames while searching for a
