@@ -323,31 +323,12 @@ impl<'a> Parser<'a> {
     // analysis -- upgrade only if a real guard is rejected by this in
     // practice.
     fn contains_perform(arena: &Arena, e: ExprRef) -> bool {
-        match &arena[e] {
-            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) => false,
-            Expr::Perform(_, _) => true,
-            Expr::Tuple(items) | Expr::ListLit(items) => items.iter().any(|i| Self::contains_perform(arena, *i)),
-            Expr::Record(fields) => fields.iter().any(|(_, v)| Self::contains_perform(arena, *v)),
-            Expr::FieldAccess(target, _) | Expr::Check(target, _) => Self::contains_perform(arena, *target),
-            Expr::Lambda(_, _, body) => Self::contains_perform(arena, *body),
-            Expr::App(f, a) => Self::contains_perform(arena, *f) || Self::contains_perform(arena, *a),
-            Expr::Let(_, _, val, body) => Self::contains_perform(arena, *val) || Self::contains_perform(arena, *body),
-            Expr::LetRec(bindings, body) => {
-                bindings.iter().any(|(_, _, v)| Self::contains_perform(arena, *v)) || Self::contains_perform(arena, *body)
-            }
-            Expr::BinOp(_, l, r) => Self::contains_perform(arena, *l) || Self::contains_perform(arena, *r),
-            Expr::If(c, t, e) => {
-                Self::contains_perform(arena, *c) || Self::contains_perform(arena, *t) || Self::contains_perform(arena, *e)
-            }
-            Expr::Handle { body, handler } => Self::contains_perform(arena, *body) || Self::contains_perform(arena, *handler),
-            Expr::MakeHandler { body, .. } => Self::contains_perform(arena, *body),
-            Expr::Match(scrutinee, arms) => {
-                Self::contains_perform(arena, *scrutinee)
-                    || arms.iter().any(|(_, guard, body)| {
-                        guard.is_some_and(|g| Self::contains_perform(arena, g)) || Self::contains_perform(arena, *body)
-                    })
-            }
+        if matches!(arena[e], Expr::Perform(..)) {
+            return true;
         }
+        let mut kids = Vec::new();
+        arena[e].children(&mut kids);
+        kids.into_iter().any(|k| Self::contains_perform(arena, k))
     }
 
     // The only way an Expr node should ever be added to the arena --
