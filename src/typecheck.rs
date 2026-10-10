@@ -1596,7 +1596,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
 
 // A runtime value for an index variable: `hidden` is a variable bound by
 // synthesized code to the list itself (a Lambda's parameter, or a
-// contract's argument); a check reads `len(hidden)` at the check site, so
+// contract's argument); a check reads the length of `hidden` (a Len::Witness slot) when it is entered, so
 // the entry path evaluates nothing (an untyped caller passing a non-list
 // is unaffected unless a check actually runs). `used` records whether any
 // check read it, so the binder is only emitted when needed.
