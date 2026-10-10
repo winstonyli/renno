@@ -2723,6 +2723,22 @@ mod tests {
         assert!(run_source(miss).unwrap_err().contains("unhandled effect: op"));
     }
 
+    #[test]
+    fn handler_clause_effects_join_the_handle_row() {
+        // The clause performs `log`, which nothing handles: rejected statically, so even a
+        // branch that never runs is an error.
+        let e5 = "if false then handle (perform op(1)) with handler op(p, resume) -> perform log(p) else 1";
+        assert!(run_source(e5).unwrap_err().contains("unhandled effect: log"));
+        // An outer handler discharges the clause's effect.
+        let ok = "handle (handle (perform op(1)) with handler op(p, resume) -> resume(perform log(p))) with handler log(q, k) -> k(7)";
+        assert_eq!(run_source(ok).unwrap(), Outcome::Int(7));
+        // `resume` carries the body's other effects (log), so calling it needs the outer handler too.
+        let resumed = "handle (handle (let a = perform log(0) in perform op(a)) with handler op(p, resume) -> resume(p)) with handler log(q, k) -> k(5)";
+        assert_eq!(run_source(resumed).unwrap(), Outcome::Int(5));
+        let leak = "if false then handle (let a = perform log(0) in perform op(a)) with handler op(p, resume) -> resume(p) else 1";
+        assert!(run_source(leak).unwrap_err().contains("unhandled effect: log"));
+    }
+
     // --- closed effect-row typing ---
 
     #[test]

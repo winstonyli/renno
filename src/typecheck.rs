@@ -134,6 +134,10 @@ pub(crate) struct InferCtx {
     obligations: RefCell<Vec<Obligation>>,
     // Casts deferred to the end of inference (Pending).
     pendings: RefCell<Vec<Pending>>,
+    // Set by Handle just before it elaborates a syntactic handler: the row the clause'"'"'s `resume`
+    // has (the body'"'"'s row without the handled effect). The MakeHandler arm takes it; None (a
+    // handler met anywhere else) types `resume` as Dyn and discards the clause'"'"'s row.
+    resume_row: Option<EffectRow>,
     // How many function bodies (Lambda, handler clause) enclose the point
     // being elaborated: code inside one can run any number of times.
     repeatable_depth: usize,
@@ -166,6 +170,7 @@ impl InferCtx {
             index_witness: Vec::new(),
             obligations: RefCell::new(Vec::new()),
             pendings: RefCell::new(Vec::new()),
+            resume_row: None,
             repeatable_depth: 0,
             named_types,
             dyn_sunk: HashSet::new(),
@@ -4146,7 +4151,11 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
 
         Expr::Handle { body, handler } => {
             let (_, body_row, body2) = elaborate(arena, body, ctx, spans, infer)?;
-            let (handler_ty, handler_row, handler2) = elaborate(arena, handler, ctx, spans, infer)?;
+            let discharged = discharged_effect(arena, handler);
+            infer.resume_row = discharged.as_ref().map(|effect| body_row.remove(effect));
+            let handler_result = elaborate(arena, handler, ctx, spans, infer);
+            infer.resume_row = None;
+            let (handler_ty, handler_row, handler2) = handler_result?;
             // types.rs has no Type::Handler -- but every handler-producing
             // expression (MakeHandler, or deep(...)/shallow(...) applied
             // to one, or a var bound from either) synthesizes Dyn by this
@@ -4163,7 +4172,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // Discharge the effect this handler catches, if we can
             // statically tell which one that is. An unknown handler (a
             // variable, a parameter) may catch anything: the row becomes Dyn.
-            let row = match discharged_effect(arena, handler) {
+            let row = match discharged {
                 Some(effect) => body_row.remove(&effect),
                 None => EffectRow::Dyn,
             };
@@ -4463,18 +4472,24 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             Ok((final_ty, row, arena.push(Expr::Match(scrutinee2, Rc::new(new_arms)))))
         }
 
-        // Constructing the handler value is pure -- the clause body's own
-        // effects (including what `resume` re-enters) aren't modeled here;
-        // see the doc comment on `elaborate_mode`.
+        // Constructing the handler value is pure. The clause body is typed as a function of the
+        // row its `resume` has: Handle supplies it (resume_row) when it can see the clause, and
+        // the clause's own row then joins the handle's row. Anywhere else `resume` is Dyn and the
+        // clause's row is discarded.
         Expr::MakeHandler { effect, payload_var, resume_var, body } => {
-            let inner_ctx = extend(&extend(ctx, &payload_var, Type::Dyn), &resume_var, Type::Dyn);
+            let resume_row = infer.resume_row.take();
+            let resume_ty = match &resume_row {
+                Some(row) => Type::Fun(Rc::new(Type::Dyn), row.clone(), Rc::new(Type::Dyn)),
+                None => Type::Dyn,
+            };
+            let inner_ctx = extend(&extend(ctx, &payload_var, Type::Dyn), &resume_var, resume_ty);
             infer.repeatable_depth += 1;
             let body_result = elaborate(arena, body, &inner_ctx, spans, infer);
             infer.repeatable_depth -= 1;
-            let (_, _, body2) = body_result?;
+            let (_, clause_row, body2) = body_result?;
             Ok((
                 Type::Dyn,
-                EffectRow::pure(),
+                if resume_row.is_some() { clause_row } else { EffectRow::pure() },
                 arena.push(Expr::MakeHandler { effect, payload_var, resume_var, body: body2 }),
             ))
         }
