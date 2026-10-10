@@ -108,8 +108,9 @@ struct Parser<'a> {
 // fresh_type_name already use (a monotonic counter appended to a base
 // name), just its own separate counter and its own separate namespace:
 // this mechanism exists purely at parse time, before InferCtx (which
-// owns the OTHER two) is even constructed.
-fn fresh_named_type_id(base: &str) -> String {
+// owns the OTHER two) is even constructed. typecheck mints a `let rec`
+// type group's ids here too, so the two can never collide.
+pub(crate) fn fresh_named_type_id(base: &str) -> String {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("{base}#{n}")
@@ -121,8 +122,9 @@ fn fresh_named_type_id(base: &str) -> String {
 // shape of typecheck.rs's own free_row_vars/free_type_vars_resolved --
 // a plain structural walk, terminating because `ty` here is always a
 // FRESH parse result, never something already containing a completed
-// recursive reference of its own).
-fn contains_named(ty: &Type, id: &str) -> bool {
+// recursive reference of its own). typecheck's recursive_type_group asks
+// the same question of a `let rec` type group's results.
+pub(crate) fn contains_named(ty: &Type, id: &str) -> bool {
     match ty {
         Type::Named(n) => n == id,
         Type::List(elem) => contains_named(elem, id),

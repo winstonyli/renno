@@ -93,12 +93,68 @@ pub(crate) struct CheckDef {
     node: DefNode,
     // The scope before the binder: where the right-hand side's names resolve.
     ctx: Ctx,
+    // An annotation's evaluation used this definition and finished, so its
+    // right-hand side is pure and terminates.
+    proven: Cell<bool>,
+    // The binder or its right-hand side carries an annotation, which the
+    // check-time evaluation ignores.
+    annotated: bool,
+    // Proved by an evaluation in which no definition was annotated: every
+    // run-time check in the elaborated value then guards an operation that
+    // evaluation performed itself (a call of a Dyn callee, say), so none can fail.
+    vouched: Cell<bool>,
+    // Something named the binder at value position (lookup).
+    used: Cell<bool>,
 }
 
 enum DefNode {
     Let(String, ExprRef),
-    // A `let rec` group: the original bindings.
+    // A `let rec` group: the original bindings, or TypeLits for a recursive type.
     Group(Rc<Vec<(String, Option<ExprRef>, ExprRef)>>),
+}
+
+impl CheckDef {
+    // A `let` the run time does not need: an annotation proved its value, no
+    // value-position reference reads it, and no run-time check in its
+    // elaborated value can fail where the check-time evaluation succeeded. A
+    // check that came from an annotation can: the evaluation ignores annotations.
+    fn erasable(&self, arena: &Arena, vals: &[ExprRef], infer: &InferCtx) -> bool {
+        self.proven.get() && !self.used.get() && (self.vouched.get() || !vals.iter().any(|v| has_check(arena, *v, infer)))
+    }
+}
+
+// Does the parsed tree at `root` carry an annotation anywhere?
+fn has_annotation(arena: &Arena, root: ExprRef) -> bool {
+    let mut work = vec![root];
+    let mut kids = Vec::new();
+    while let Some(n) = work.pop() {
+        match &arena[n] {
+            Expr::Lambda(_, Some(_), _) | Expr::Let(_, Some(_), ..) => return true,
+            Expr::LetRec(bindings, _) if bindings.iter().any(|(_, a, _)| a.is_some()) => return true,
+            _ => {}
+        }
+        kids.clear();
+        arena[n].children(&mut kids);
+        work.extend(&kids);
+    }
+    false
+}
+
+// Does the elaborated tree at `root` hold a run-time check: a Check node, or a
+// cast slot resolve_pendings has yet to fill?
+fn has_check(arena: &Arena, root: ExprRef, infer: &InferCtx) -> bool {
+    let slots: HashSet<ExprRef> = infer.pendings.borrow().iter().map(|p| p.slot).collect();
+    let mut work = vec![root];
+    let mut kids = Vec::new();
+    while let Some(n) = work.pop() {
+        if matches!(arena[n], Expr::Check(..)) || slots.contains(&n) {
+            return true;
+        }
+        kids.clear();
+        arena[n].children(&mut kids);
+        work.extend(&kids);
+    }
+    false
 }
 
 // pub(crate), not private, only because this project's own test
@@ -169,9 +225,8 @@ pub(crate) struct InferCtx {
     // once at construction) -- consulted on demand by
     // build_boundary_check/build_shape_predicate/pattern_could_match
     // whenever they encounter a Type::Named reference, to unfold it
-    // exactly one level. Never mutated after construction -- this
-    // registry is a static, parse-time-complete fact about the
-    // program, unlike `subst`.
+    // exactly one level. A recursive `let rec` type group adds its ids
+    // when it is checked (recursive_type_group), before any use of them.
     named_types: HashMap<String, Type>,
     // Names of type variables whose value reaches a Dyn sink (the argument of
     // a Dyn callee, a Perform payload) while the variable is still unbound
@@ -209,9 +264,17 @@ impl InferCtx {
         }
     }
 
-    fn new_def(&mut self, node: DefNode, ctx: &Ctx) -> Rc<CheckDef> {
+    fn new_def(&mut self, node: DefNode, annotated: bool, ctx: &Ctx) -> Rc<CheckDef> {
         self.def_seq += 1;
-        Rc::new(CheckDef { seq: self.def_seq, node, ctx: ctx.clone() })
+        Rc::new(CheckDef {
+            seq: self.def_seq,
+            node,
+            ctx: ctx.clone(),
+            proven: Cell::new(false),
+            annotated,
+            vouched: Cell::new(false),
+            used: Cell::new(false),
+        })
     }
 
     // Flags `ty` as reaching a Dyn sink if it is (still) a bare type variable.
@@ -688,7 +751,11 @@ fn forget_index(ty: &Type) -> Type {
 pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
     // Unbound at typecheck time: don't error here, machine::run's own
     // `unbound variable` panic at runtime is the right place for that.
-    match ctx.get(name) {
+    let scheme = ctx.get(name);
+    if let Some(def) = scheme.as_ref().and_then(|s| s.def.as_ref()) {
+        def.used.set(true);
+    }
+    match scheme {
         None => Type::Dyn,
         Some(scheme) if scheme.row_vars.is_empty() && scheme.type_vars.is_empty() && scheme.index_vars.is_empty() => scheme.ty,
         Some(scheme) => {
@@ -2191,11 +2258,12 @@ pub(crate) enum Mode<'a> {
 // folded back into nested Let/Lambda nodes (and their types/rows) in
 // reverse, in the exact shape their original per-node match arms produced.
 enum PendingElab {
-    Let { var: String, bound_ty: Type, val_row: EffectRow, val: ExprRef },
+    // `def` decides whether the binding is emitted at all (CheckDef::erasable).
+    Let { var: String, bound_ty: Type, val_row: EffectRow, val: ExprRef, def: Rc<CheckDef> },
     // One `let rec` group's elaborated bindings (each carrying its own
     // inferred/annotated type, row, and elaborated value), folding back
     // into a single Expr::LetRec.
-    LetRec { bindings: Vec<(String, Type, EffectRow, ExprRef)> },
+    LetRec { bindings: Vec<(String, Type, EffectRow, ExprRef)>, def: Rc<CheckDef> },
     // `witness`: this Lambda pushed an infer.index_witness entry (its
     // parameter is Vec(n)), popped when the frame unwinds.
     Fun { param: String, param_ty: Type, witness: bool },
@@ -3082,7 +3150,18 @@ fn annotation_type(arena: &mut Arena, ann: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     let err = |msg: String| TypeError(msg, spans[ann]);
     let defs = definitions_used(arena, ann, &[], ctx, infer).map_err(err)?;
     let root = wrap_in_definitions(arena, ann, &defs);
-    crate::machine::eval_type(arena, root, spans).map_err(err)
+    let ty = crate::machine::eval_type(arena, root, spans).map_err(err)?;
+    mark_proven(&defs);
+    Ok(ty)
+}
+
+// `defs` took part in an evaluation that finished (CheckDef::proven, vouched).
+fn mark_proven(defs: &[Rc<CheckDef>]) {
+    let vouched = !defs.iter().any(|d| d.annotated);
+    for def in defs {
+        def.proven.set(true);
+        def.vouched.set(def.vouched.get() || vouched);
+    }
 }
 
 // The definitions `root` (resolved in `ctx`, with `skip` bound around it)
@@ -3128,6 +3207,50 @@ fn wrap_in_definitions(arena: &mut Arena, root: ExprRef, defs: &[Rc<CheckDef>]) 
         DefNode::Let(name, rhs) => arena.push(Expr::Let(name.clone(), None, *rhs, inner)),
         DefNode::Group(bindings) => arena.push(Expr::LetRec(bindings.clone(), inner)),
     })
+}
+
+// A `let rec` group whose values are type constructor applications is a
+// recursive type (spec section 1): each name is a fresh Named leaf while the
+// values are evaluated, and a name whose leaf occurs in the results is
+// registered in named_types. None when some value does not evaluate to a type
+// at check time: the group is then an ordinary `let rec`.
+fn recursive_type_group(
+    arena: &mut Arena,
+    bindings: &[(String, Option<ExprRef>, ExprRef)],
+    ctx: &Ctx,
+    spans: &SpanMap,
+    infer: &mut InferCtx,
+) -> Result<Option<Vec<Type>>, TypeError> {
+    if !bindings.iter().all(|(_, ann, v)| ann.is_none() && matches!(arena[*v], Expr::App(..))) {
+        return Ok(None);
+    }
+    let names: Vec<String> = bindings.iter().map(|(n, _, _)| n.clone()).collect();
+    let ids: Vec<String> = names.iter().map(|n| crate::parser::fresh_named_type_id(n)).collect();
+    let mut results = Vec::with_capacity(bindings.len());
+    for (_, _, v) in bindings {
+        let Ok(defs) = definitions_used(arena, *v, &names, ctx, infer) else { return Ok(None) };
+        let leaves = names.iter().zip(&ids).rev().fold(*v, |inner, (name, id)| {
+            let leaf = type_lit(arena, Type::Named(id.clone()));
+            arena.push(Expr::Let(name.clone(), None, leaf, inner))
+        });
+        let root = wrap_in_definitions(arena, leaves, &defs);
+        let Ok(ty) = crate::machine::eval_type(arena, root, spans) else { return Ok(None) };
+        mark_proven(&defs);
+        results.push(ty);
+    }
+    let mut values = Vec::with_capacity(results.len());
+    for ((ty, id), (_, _, v)) in results.iter().zip(&ids).zip(bindings) {
+        if matches!(ty, Type::Named(n) if ids.contains(n)) {
+            return Err(TypeError("a recursive type must be built by a type constructor".to_string(), spans[*v]));
+        }
+        if results.iter().any(|r| crate::parser::contains_named(r, id)) {
+            infer.named_types.insert(id.clone(), ty.clone());
+            values.push(Type::Named(id.clone()));
+        } else {
+            values.push(ty.clone());
+        }
+    }
+    Ok(Some(values))
 }
 
 // The annotation slot typecheck re-emits for a binder whose type it knows.
@@ -3184,9 +3307,9 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         (val_ty, val_row, val2)
                     }
                 };
-                let def = infer.new_def(DefNode::Let(var.clone(), val), &cur_ctx);
-                cur_ctx = extend_defined(&cur_ctx, &var, bound_ty.clone(), infer, Some(def));
-                pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3 });
+                let def = infer.new_def(DefNode::Let(var.clone(), val), ann.is_some() || has_annotation(arena, val), &cur_ctx);
+                cur_ctx = extend_defined(&cur_ctx, &var, bound_ty.clone(), infer, Some(def.clone()));
+                pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3, def });
                 cur_expr = body;
             }
             // Every binding needs to resolve to its own (eventual) type
@@ -3203,6 +3326,23 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // just g's annotation-or-Dyn) would wrongly depend on
             // which one happens to come first in the `and` chain.
             Expr::LetRec(bindings, body) => {
+                // A recursive type: each value is replaced by the type it
+                // built, and the names are type values (Dyn) for the body.
+                if let Some(values) = recursive_type_group(arena, &bindings, &cur_ctx, spans, infer)? {
+                    let lits: Vec<(String, Option<ExprRef>, ExprRef)> =
+                        bindings.iter().zip(values).map(|((name, _, _), ty)| (name.clone(), None, type_lit(arena, ty))).collect();
+                    let def = infer.new_def(DefNode::Group(Rc::new(lits.clone())), false, &cur_ctx);
+                    def.proven.set(true);
+                    def.vouched.set(true);
+                    let mut elaborated = Vec::with_capacity(lits.len());
+                    for (name, _, lit) in lits {
+                        cur_ctx = extend_defined(&cur_ctx, &name, Type::Dyn, infer, Some(def.clone()));
+                        elaborated.push((name, Type::Dyn, EffectRow::pure(), lit));
+                    }
+                    pending.push(PendingElab::LetRec { bindings: elaborated, def });
+                    cur_expr = body;
+                    continue;
+                }
                 let mut val_ctx = cur_ctx.clone();
                 // Each annotation opened once (open_signature), so the
                 // pre-binding below and the value check share its renames.
@@ -3246,11 +3386,12 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     };
                     elaborated.push((name.clone(), bound_ty, val_row, val3));
                 }
-                let def = infer.new_def(DefNode::Group(bindings.clone()), &cur_ctx);
+                let annotated = bindings.iter().any(|(_, a, v)| a.is_some() || has_annotation(arena, *v));
+                let def = infer.new_def(DefNode::Group(bindings.clone()), annotated, &cur_ctx);
                 for (name, bound_ty, _, _) in elaborated.iter() {
                     cur_ctx = extend_defined(&cur_ctx, name, bound_ty.clone(), infer, Some(def.clone()));
                 }
-                pending.push(PendingElab::LetRec { bindings: elaborated });
+                pending.push(PendingElab::LetRec { bindings: elaborated, def });
                 cur_expr = body;
             }
             Expr::Lambda(param, ann, body) => {
@@ -3452,19 +3593,27 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
 
     for frame in pending.into_iter().rev() {
         match frame {
-            PendingElab::Let { var, bound_ty, val_row, val } => {
+            PendingElab::Let { var, bound_ty, val_row, val, def } => {
                 // Matches the original Let arm: body's type propagates
                 // through unchanged, row is the union of val's and body's.
                 result_row = EffectRow::union(&val_row, &result_row);
+                // A type let only annotations read is dead at run time.
+                if def.erasable(arena, &[val], infer) {
+                    continue;
+                }
                 let ann = type_lit(arena, bound_ty);
                 result_expr = arena.push(Expr::Let(var, Some(ann), val, result_expr));
             }
-            PendingElab::LetRec { bindings } => {
+            PendingElab::LetRec { bindings, def } => {
                 // Matches the original LetRec arm: body's type propagates
                 // through unchanged, row is the union of every binding's
                 // plus body's.
                 for (_, _, val_row, _) in &bindings {
                     result_row = EffectRow::union(val_row, &result_row);
+                }
+                let vals: Vec<ExprRef> = bindings.iter().map(|(_, _, _, v)| *v).collect();
+                if def.erasable(arena, &vals, infer) {
+                    continue;
                 }
                 let group: Vec<(String, Option<ExprRef>, ExprRef)> =
                     bindings.into_iter().map(|(name, ty, _, val)| (name, Some(type_lit(arena, ty)), val)).collect();

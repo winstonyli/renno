@@ -4126,6 +4126,76 @@ g(len)").unwrap_err();
         assert!(err.contains("type mismatch"), "{err}");
     }
 
+    // A `let rec` whose values are type constructor applications is a
+    // recursive type (spec section 1): a Named leaf in named_types, like a
+    // self-referential `type` alias.
+    #[test]
+    fn a_let_rec_of_type_constructors_is_a_recursive_type() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        let l = "let rec L = Union((Tuple((Int, L)), Bool)) in ";
+        assert_eq!(ok(&format!("{l}let l: L = (1, (2, true)) in l")), "[1, [2, true]]");
+        let err = run_source(&format!("{l}let l: L = (1, (2, 3)) in l")).unwrap_err();
+        assert!(err.contains("expected L, found (Int, (Int, Int))"), "{err}");
+        let err = run_source(&format!("{l}let d: Dyn = (1, (2, 3)) in let l: L = d in l")).unwrap_err();
+        assert!(err.contains("expected (Int, L) | Bool, found Int at element 1, element 1"), "{err}");
+        assert_eq!(ok(&format!("{l}let d: Dyn = (1, (2, true)) in let l: L = d in l")), "[1, [2, true]]");
+        assert_eq!(ok(&format!("{l}to_str(L)")), "L");
+        assert_eq!(ok(&format!("{l}let rec len: (L -> Int) = fun t -> match t | (h, r) -> 1 + len(r) | _ -> 0 in len((1, (2, true)))")), "2");
+        assert_eq!(ok("let rec A = Union((Tuple((Int, B)), Bool)) and B = Tuple((Str, A)) in let a: A = (1, (\"x\", true)) in a"), "[1, [x, true]]");
+        assert_eq!(ok("let E = Int in let rec L = Union((Tuple((E, L)), Bool)) in let l: L = (1, true) in l"), "[1, true]");
+        // No self-reference: just the type.
+        assert_eq!(ok("let rec T = List(Int) in let x: T = [1] in to_str(T)"), "[Int]");
+        let err = run_source("let rec T = (fun x -> x)(T) in 1").unwrap_err();
+        assert!(err.contains("a recursive type must be built by a type constructor"), "{err}");
+        // Not a type at check time: an ordinary `let rec`, as before.
+        assert_eq!(ok("let rec x = len([1]) in x"), "1");
+        // `==` compares a recursive type by its Named id (spec section 9.2).
+        let m = "let rec M = Union((Tuple((Int, M)), Bool)) in ";
+        assert_eq!(ok(&format!("{l}{m}L == L")), "true");
+        assert_eq!(ok(&format!("{l}{m}L == M")), "false");
+        // Indexed applies to it like to a `type` alias.
+        let b = "let rec B = Union((Bool, Tuple((Int, B)))) in ";
+        assert_eq!(ok(&format!("{b}let x: Indexed(B, 2) = (1, (2, false)) in 0")), "0");
+        let err = run_source(&format!("{b}let x: Indexed(B, 2) = (1, false) in 0")).unwrap_err();
+        assert!(err.contains("does not unify with index 0"), "{err}");
+    }
+
+    // A type let only annotations read is dead at run time and not emitted
+    // (spec section 1); one read as a value, or not proved at check time, stays.
+    #[test]
+    fn a_type_let_only_annotations_read_is_erased() {
+        use expr::Expr;
+        let binds = |src: &str, name: &str| {
+            let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+            let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+            tree_any(&arena, elaborated, &|e| match e {
+                Expr::Let(v, ..) => v == name,
+                Expr::LetRec(bindings, _) => bindings.iter().any(|(v, _, _)| v == name),
+                _ => false,
+            })
+        };
+        assert!(!binds("let T = List(Int) in let x: T = [1] in x", "T"));
+        assert!(!binds("let T = Int in let U = List(T) in let x: U = [1] in x", "U"));
+        assert!(!binds("let rec L = Union((Tuple((Int, L)), Bool)) in let l: L = (1, true) in l", "L"));
+        assert!(!binds("let rec Rep = fun n -> if n == 0 then Int else List(Rep(n - 1)) in let x: Rep(1) = [1] in x", "Rep"));
+        // Read as a value: kept.
+        assert!(binds("let T = List(Int) in let x: T = [1] in (to_str(T), x)", "T"));
+        assert!(binds("let rec L = Union((Tuple((Int, L)), Bool)) in to_str(L)", "L"));
+        // T's value is read by U's, which is kept, so T is kept too.
+        assert!(binds("let T = Int in let U = List(T) in let x: U = [1] in (x, U)", "T"));
+        // Never evaluated at check time: kept, and fails at run time as before.
+        assert!(binds("let T = List(1) in 0", "T"));
+        assert!(run_source("let T = List(1) in 0").unwrap_err().contains("List cannot take a Int"));
+        // Its value holds a run-time check the check-time evaluation skipped: kept.
+        let src = "let T = (let d: Dyn = true in let i: Int = d in Int) in let x: T = 3 in x";
+        assert!(binds(src, "T"));
+        assert!(run_source(src).unwrap_err().contains("expected Int, found Bool"));
+        // The same through another definition's annotation.
+        let src = "let g = fun x: Int -> Int in let d: Dyn = true in let T = g(d) in let x: T = 3 in x";
+        assert!(binds(src, "T"));
+        assert!(run_source(src).unwrap_err().contains("expected Int, found Bool"));
+    }
+
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain
     // parser::parse + machine::run with NO typecheck::check pass at all,
     // so a plain `: T` annotation (unlike a `where` refinement, which the
