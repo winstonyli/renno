@@ -11,13 +11,27 @@ pub enum IndexExpr {
 }
 
 impl std::fmt::Display for IndexExpr {
+    // Parenthesizes by precedence (a sum or difference under `*`, a sum or difference on the
+    // right of `-`), and shows a variable by its surface name: the part before the first `#`
+    // is what the user wrote, the rest is checker bookkeeping (as for Type::Named).
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fn operand(e: &IndexExpr, wrap: bool, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            if wrap { write!(f, "({e})") } else { write!(f, "{e}") }
+        }
+        let sum = |e: &IndexExpr| matches!(e, IndexExpr::Add(..) | IndexExpr::Sub(..));
         match self {
-            IndexExpr::Var(name) => write!(f, "{name}"),
+            IndexExpr::Var(name) => write!(f, "{}", name.split('#').next().unwrap_or(name)),
             IndexExpr::Lit(n) => write!(f, "{n}"),
             IndexExpr::Add(a, b) => write!(f, "{a} + {b}"),
-            IndexExpr::Sub(a, b) => write!(f, "{a} - {b}"),
-            IndexExpr::Mul(a, b) => write!(f, "{a} * {b}"),
+            IndexExpr::Sub(a, b) => {
+                write!(f, "{a} - ")?;
+                operand(b, sum(b), f)
+            }
+            IndexExpr::Mul(a, b) => {
+                operand(a, sum(a), f)?;
+                write!(f, " * ")?;
+                operand(b, sum(b), f)
+            }
         }
     }
 }
@@ -238,4 +252,19 @@ mod tests {
             big = mul(big.clone(), big.clone()); }
         assert_eq!(index_exprs_compare(&big, &big), None);
         assert!(!index_exprs_equal(&big, &big)); }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::IndexExpr::*;
+    use std::rc::Rc;
+
+    #[test]
+    fn display_parenthesizes_by_precedence_and_hides_gensym_suffixes() {
+        let m = Rc::new(Var("m#1".into()));
+        let m1 = Rc::new(Add(m.clone(), Rc::new(Lit(1))));
+        assert_eq!(Mul(m1.clone(), m1.clone()).to_string(), "(m + 1) * (m + 1)");
+        assert_eq!(Sub(m.clone(), m1).to_string(), "m - (m + 1)");
+        assert_eq!(Add(m.clone(), Rc::new(Mul(m.clone(), m))).to_string(), "m + m * m");
+    }
 }

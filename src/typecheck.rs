@@ -356,7 +356,7 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
                 return match index_exprs_compare(&a, &b) {
                     Some(IndexCmp::Equal) => Rel::Proven,
                     None => undecided(),
-                    Some(_) => refuted(format!("index variable {name} is fixed by the signature and cannot equal {other}")),
+                    Some(_) => refuted(format!("index variable {} is fixed by the signature and cannot equal {other}", IndexExpr::Var(name.clone()))),
                 };
             }
             if occurs_in_index(name, other, infer) {
@@ -364,7 +364,7 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
                 return match index_exprs_compare(&a, &b) {
                     Some(IndexCmp::Equal) => Rel::Proven,
                     None => undecided(),
-                    Some(_) => refuted(format!("infinite index expression: {name} occurs in {other}")),
+                    Some(_) => refuted(format!("infinite index expression: {} occurs in {other}", IndexExpr::Var(name.clone()))),
                 };
             }
             infer.index_subst.insert(name.clone(), other.clone());
