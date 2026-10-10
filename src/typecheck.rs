@@ -4024,7 +4024,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             };
             f_ty = unfolded.unwrap_or(f_ty);
             // A callee whose parameter type mentions an Indexed type
-            // (`Vec(n)`, `T(n)`, bare or nested in a tuple/list) gets its argument CHECKED against it, so a
+            // (`Vec(n)`, `Indexed(T, n)`, bare or nested in a tuple/list) gets its argument CHECKED against it, so a
             // list/tuple literal argument can satisfy the index -- Synth
             // alone gives a plain un-indexed List/Tuple that never can.
             // Deliberately limited to such parameters, and to ones with no

@@ -533,8 +533,9 @@ impl<'a> Parser<'a> {
         Ok(self.type_call_items("Union", alts, start))
     }
 
-    // Bare, atom-only: "Int" | "Bool" | "Str" | "Dyn" | "[" fun_type "]" |
-    // "(" fun_type ")". Deliberately does NOT chain "->" at this level --
+    // Bare, atom-only: a name or call (`T`, `F(A)`), `Vec(n)`,
+    // `Indexed(T, n)`, an Int, "[" fun_type "]", "(" fun_type ")" or a
+    // record type. Deliberately does NOT chain "->" at this level --
     // an annotation site (`fun x: T ->`, `let x: T =`) is always
     // immediately followed by its own "->"/"=" token, so a bare trailing
     // arrow here would be ambiguous between "this type continues" and "the
@@ -716,15 +717,8 @@ impl<'a> Parser<'a> {
     // The five builtin type names, which a `type Name = ...` alias may not
     // redefine (the binder's collision guard below). In an annotation they
     // are ordinary prelude variables.
-    fn builtin_type(name: &str) -> Option<Type> {
-        match name {
-            "Int" => Some(Type::Int),
-            "Float" => Some(Type::Float),
-            "Bool" => Some(Type::Bool),
-            "Str" => Some(Type::Str),
-            "Dyn" => Some(Type::Dyn),
-            _ => None,
-        }
+    fn is_builtin_type(name: &str) -> bool {
+        matches!(name, "Int" | "Float" | "Bool" | "Str" | "Dyn")
     }
 
     // True iff the tokens right after the CURRENT position (not yet
@@ -1166,7 +1160,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     saw_type_alias = true;
                     let name = self.ident()?;
-                    if Self::builtin_type(&name).is_some() || name == "Vec" || name == "Indexed" {
+                    if Self::is_builtin_type(&name) || name == "Vec" || name == "Indexed" {
                         // An alias may not redefine a builtin type name.
                         // parse_type's `Vec(` and `Indexed(` arms run before
                         // the type_aliases lookup, so an alias of either
