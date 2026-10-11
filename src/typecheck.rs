@@ -3235,36 +3235,37 @@ fn wrap_in_definitions(arena: &mut Arena, root: ExprRef, defs: &[Rc<CheckDef>]) 
 // recursive type (spec section 1): each name is a fresh Named leaf while the
 // values are evaluated, and a name whose leaf occurs in the results is
 // registered in named_types. None when some value does not evaluate to a type
-// at check time: the group is then an ordinary `let rec`.
+// at check time, or evaluates to a bare name of the group (`T = (fun u ->
+// u)(T)` builds no type): the group is then an ordinary `let rec`.
 fn recursive_type_group(
     arena: &mut Arena,
     bindings: &[(String, Option<ExprRef>, ExprRef)],
     ctx: &Ctx,
     spans: &SpanMap,
     infer: &mut InferCtx,
-) -> Result<Option<Vec<Type>>, TypeError> {
+) -> Option<Vec<Type>> {
     if !bindings.iter().all(|(_, ann, v)| ann.is_none() && matches!(arena[*v], Expr::App(..))) {
-        return Ok(None);
+        return None;
     }
     let names: Vec<String> = bindings.iter().map(|(n, _, _)| n.clone()).collect();
     let ids: Vec<String> = names.iter().map(|n| crate::parser::fresh_named_type_id(n)).collect();
     let mut results = Vec::with_capacity(bindings.len());
     for (_, _, v) in bindings {
-        let Ok(defs) = definitions_used(arena, *v, &names, ctx, infer) else { return Ok(None) };
+        let defs = definitions_used(arena, *v, &names, ctx, infer).ok()?;
         let leaves = names.iter().zip(&ids).rev().fold(*v, |inner, (name, id)| {
             let leaf = type_lit(arena, Type::Named(id.clone()));
             arena.push(Expr::Let(name.clone(), None, leaf, inner))
         });
         let root = wrap_in_definitions(arena, leaves, &defs);
-        let Ok(ty) = crate::machine::eval_type(arena, root, spans) else { return Ok(None) };
+        let ty = crate::machine::eval_type(arena, root, spans).ok()?;
+        if matches!(&ty, Type::Named(n) if ids.contains(n)) {
+            return None;
+        }
         mark_proven(arena, &defs, spans, infer);
         results.push(ty);
     }
     let mut values = Vec::with_capacity(results.len());
-    for ((ty, id), (_, _, v)) in results.iter().zip(&ids).zip(bindings) {
-        if matches!(ty, Type::Named(n) if ids.contains(n)) {
-            return Err(TypeError("a recursive type must be built by a type constructor".to_string(), spans[*v]));
-        }
+    for (ty, id) in results.iter().zip(&ids) {
         if results.iter().any(|r| crate::parser::contains_named(r, id)) {
             infer.named_types.insert(id.clone(), ty.clone());
             values.push(Type::Named(id.clone()));
@@ -3272,7 +3273,7 @@ fn recursive_type_group(
             values.push(ty.clone());
         }
     }
-    Ok(Some(values))
+    Some(values)
 }
 
 // The annotation slot typecheck re-emits for a binder whose type it knows.
@@ -3350,7 +3351,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             Expr::LetRec(bindings, body) => {
                 // A recursive type: the names are type values (Dyn), each
                 // bound to the type its value built.
-                if let Some(types) = recursive_type_group(arena, &bindings, &cur_ctx, spans, infer)? {
+                if let Some(types) = recursive_type_group(arena, &bindings, &cur_ctx, spans, infer) {
                     let lits: Rc<Vec<(String, Option<ExprRef>, ExprRef)>> = Rc::new(
                         bindings.iter().zip(&types).map(|((name, _, _), ty)| (name.clone(), None, type_lit(arena, ty.clone()))).collect(),
                     );

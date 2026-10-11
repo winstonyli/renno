@@ -4158,8 +4158,11 @@ g(len)").unwrap_err();
         assert_eq!(ok("let E = Int in let rec L = Union((Tuple((E, L)), Bool)) in let l: L = (1, true) in l"), "[1, true]");
         // No self-reference: just the type.
         assert_eq!(ok("let rec T = List(Int) in let x: T = [1] in to_str(T)"), "[Int]");
+        // A bare name of the group builds no type: an ordinary `let rec`,
+        // whose value sees the outer scope.
+        assert_eq!(ok("let T = Int in let rec T = (fun u -> u)(T) in to_str(T)"), "Int");
         let err = run_source("let rec T = (fun x -> x)(T) in 1").unwrap_err();
-        assert!(err.contains("a recursive type must be built by a type constructor"), "{err}");
+        assert!(err.contains("unbound variable: T"), "{err}");
         // Not a type at check time: an ordinary `let rec`, as before.
         assert_eq!(ok("let rec x = len([1]) in x"), "1");
         // `==` compares a recursive type by its Named id (spec section 9.2).
