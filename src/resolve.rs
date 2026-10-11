@@ -182,7 +182,8 @@ fn visit(
                 work.push(Work::Visit(*v));
             }
         }
-        Expr::FieldAccess(target, _) => work.push(Work::Visit(*target)),
+        // A kept annotation runs in the scope of the binder it annotates.
+        Expr::FieldAccess(target, _) | Expr::Annot(target, _) => work.push(Work::Visit(*target)),
         // A Check's length slots are evaluated in the Check's own scope,
         // on entry, before the target value exists.
         Expr::Check(target, spec) => {

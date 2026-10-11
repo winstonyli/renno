@@ -210,12 +210,55 @@ pub enum Len {
     NoValue(Rc<str>),
 }
 
+// What the check-time evaluation of a kept annotation found (spec 11.2).
+#[derive(Debug)]
+pub enum AnnotKind {
+    // It finished with this type. Unless the checker erases the site, the
+    // run time confirms it: a definition it ran, or the elaborated
+    // annotation, holds a check that could fail.
+    Confirm(Rc<Type>),
+    // It ran out of fuel: reaching the site is the fuel error.
+    Diverged,
+}
+
+#[derive(Debug)]
+pub struct AnnotSpec {
+    pub kind: AnnotKind,
+    // A Confirm site that has evaluated once: later executions yield its type.
+    pub done: std::cell::Cell<bool>,
+    // The checker found the site cannot fail and removes it (typecheck's
+    // settle_erasure); never read at run time.
+    pub erased: std::cell::Cell<bool>,
+    // The annotation's source span, which an evaluation failure blames.
+    pub span: Span,
+    // How many times the annotation was evaluated (the Confirm-once test).
+    #[cfg(test)]
+    pub evals: std::cell::Cell<u32>,
+}
+
+impl AnnotSpec {
+    pub fn new(kind: AnnotKind, span: Span) -> AnnotSpec {
+        AnnotSpec {
+            kind,
+            done: std::cell::Cell::new(false),
+            erased: std::cell::Cell::new(false),
+            span,
+            #[cfg(test)]
+            evals: std::cell::Cell::new(0),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     // `e` tested natively against `spec` -- evaluates `e` once, no effects,
     // no env frame. Typecheck-synthesized only (a Dyn-boundary check);
     // never written by the parser.
     Check(ExprRef, Rc<CheckSpec>),
+    // A kept annotation's value (spec 11.2): the elaborated annotation,
+    // evaluated in check mode to a Value::Type. Typecheck binds it to an
+    // unlexable name just before the annotated binder.
+    Annot(ExprRef, Rc<AnnotSpec>),
     // A Check's length slot (CheckSpec::lens). Typecheck-synthesized only and
     // never evaluated on its own: the owning Check reads it on entry.
     Len(LenExpr),
@@ -347,7 +390,7 @@ impl Expr {
                 out.extend(&spec.lens);
             }
             Expr::Len(term) => term.witnesses(out),
-            Expr::FieldAccess(e, _) | Expr::Perform(_, e) => out.push(*e),
+            Expr::FieldAccess(e, _) | Expr::Perform(_, e) | Expr::Annot(e, _) => out.push(*e),
             Expr::Lambda(_, ann, body) => {
                 out.extend(*ann);
                 out.push(*body);

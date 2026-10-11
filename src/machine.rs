@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::{Env, PRELUDE};
-use crate::expr::{Arena, BinOp, CheckMode, Expr, ExprRef, Len, LenExpr, Pattern, SpanMap, Test};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, Expr, ExprRef, Len, LenExpr, Pattern, SpanMap, Test};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::resolve::{is_direct_group, resolve, Resolved, VarRef};
@@ -129,21 +129,49 @@ pub fn eval_pure(arena: &Arena, expr: ExprRef, spans: &SpanMap, fuel: u64) -> Pu
     }
 }
 
-// An annotation's Type: eval_pure, which must finish with a type value (Stage C
-// turns Stuck into a run-time residual).
+// An annotation's Type: eval_pure, which must finish with a type value.
 pub fn eval_type(arena: &Arena, ann: ExprRef, spans: &SpanMap) -> Result<Type, String> {
     if let Expr::TypeLit(t) = &arena[ann] {
         return Ok((**t).clone());
     }
-    match eval_pure(arena, ann, spans, ANNOTATION_FUEL) {
-        Pure::Done(Value::Type(t)) => Ok((*t).clone()),
+    pure_type(eval_pure(arena, ann, spans, ANNOTATION_FUEL)).map(|t| (*t).clone())
+}
+
+// An annotation evaluation's type, or the message for why it has none. Check
+// time (eval_type, typecheck's annotation_type) and run time (an
+// Expr::Annot) report the same words.
+pub fn pure_type(outcome: Pure) -> Result<Rc<Type>, String> {
+    match outcome {
+        Pure::Done(Value::Type(t)) => Ok(t),
         Pure::Done(v) => Err(format!("annotation did not evaluate to a type, found {}", v.type_name())),
-        Pure::Stuck(Stuck::Fuel) => Err(format!("annotation did not finish within {ANNOTATION_FUEL} steps")),
+        Pure::Stuck(Stuck::Fuel) => Err(format!("annotation did not terminate within {ANNOTATION_FUEL} steps")),
         Pure::Stuck(Stuck::Effect) => Err("an annotation cannot perform an effect".to_string()),
         Pure::Stuck(Stuck::Builtin) => Err("an annotation can only call the type constructors".to_string()),
-        Pure::Stuck(Stuck::Unelaborated) => Err("an annotation cannot read a record field at check time".to_string()),
+        Pure::Stuck(Stuck::Unelaborated) => Err("an annotation cannot read a record field".to_string()),
         Pure::Error(msg) => Err(msg),
     }
+}
+
+// A kept annotation's evaluation has finished (spec 11.3): its type, or the
+// run-time error at the annotation. A Confirm site checks the type against
+// the check-time one, then skips later evaluations.
+fn annotation_value(spec: &AnnotSpec, outcome: Result<Value, Stuck>) -> Rc<Type> {
+    let outcome = match outcome {
+        Ok(v) => Pure::Done(v),
+        Err(why) => Pure::Stuck(why),
+    };
+    let t = pure_type(outcome).unwrap_or_else(|msg| {
+        set_current_span(Some(spec.span));
+        crate::run_error!("{msg}")
+    });
+    if let AnnotKind::Confirm(expected) = &spec.kind {
+        if *t != **expected {
+            set_current_span(Some(spec.span));
+            crate::run_error!("annotation evaluated to {t} at run time but {expected} at check time")
+        }
+        spec.done.set(true);
+    }
+    t
 }
 
 // Calls a renno function VALUE from native Rust code (used by fold/map's
@@ -208,6 +236,29 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                     cont = Cont::cons(Frame::Check { spec: spec.clone(), lens }, cont);
                     control = Control::Eval(*operand, env);
                 }
+                Expr::Annot(ann, spec) => match &spec.kind {
+                    AnnotKind::Confirm(t) if spec.done.get() => control = Control::Apply(Value::Type(t.clone())),
+                    // The check-time evaluation ran out of fuel, and the run
+                    // time's budget is the same (spec 12.1).
+                    AnnotKind::Diverged if PURE => return Err(Stuck::Fuel),
+                    AnnotKind::Diverged => control = Control::Apply(Value::Type(annotation_value(spec, Err(Stuck::Fuel)))),
+                    _ => {
+                        #[cfg(test)]
+                        spec.evals.set(spec.evals.get() + 1);
+                        if PURE {
+                            // Already in check mode (a type function's body):
+                            // the same loop and budget evaluate it.
+                            cont = Cont::cons(Frame::Annot { spec: spec.clone() }, cont);
+                            control = Control::Eval(*ann, env);
+                        } else {
+                            // One nested check-mode loop: no continuation
+                            // spans it, since `perform` is stuck before one
+                            // is captured.
+                            let outcome = run_loop::<true>(arena, Control::Eval(*ann, env), Cont::nil(), spans, resolved, ANNOTATION_FUEL);
+                            control = Control::Apply(Value::Type(annotation_value(spec, outcome)));
+                        }
+                    }
+                },
                 Expr::Len(_) => unreachable!("an Expr::Len slot is read by its Check, never evaluated"),
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
                 Expr::Float(x) => control = Control::Apply(Value::Float(*x)),
@@ -584,6 +635,11 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                             let probe = spec.mode == CheckMode::Probe;
                             cont = rest;
                             control = Control::Apply(if probe { Value::Bool(holds) } else { value });
+                        }
+                        Frame::Annot { spec } => {
+                            let t = annotation_value(spec, Ok(value));
+                            cont = rest;
+                            control = Control::Apply(Value::Type(t));
                         }
                         Frame::PerformPayload { effect } => {
                             let effect = effect.clone();

@@ -3830,7 +3830,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     let node = arena[expr].clone();
     match node {
         // Emitted by elaboration itself (Dyn-boundary checks), never parsed.
-        Expr::Check(..) | Expr::Len(_) => unreachable!("Expr::Check and Expr::Len are typecheck output, never elaboration input"),
+        Expr::Check(..) | Expr::Len(_) | Expr::Annot(..) => unreachable!("Expr::Check, Expr::Len and Expr::Annot are typecheck output, never elaboration input"),
         Expr::Int(_) => Ok((Type::Int, EffectRow::pure(), expr)),
         Expr::Float(_) => Ok((Type::Float, EffectRow::pure(), expr)),
         Expr::Bool(_) => Ok((Type::Bool, EffectRow::pure(), expr)),

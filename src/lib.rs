@@ -75,7 +75,8 @@ fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
     let (mut arena, mut spans, root, named_types) = parser::parse_with_named_types(src)?;
     let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).map_err(|e| e.1.format_error(src, &e.0))?;
     expr::fill_synthesized_spans(&arena, elaborated, &mut spans);
-    std::panic::catch_unwind(|| machine::run(&arena, elaborated, Env::prelude(), &spans)).map_err(|payload| {
+    // Unwind-safe in fact: the arena (whose annotation nodes hold a Cell) is dropped after a panic.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| machine::run(&arena, elaborated, Env::prelude(), &spans))).map_err(|payload| {
         // Recover the panic's own message (downcast_ref covers both a
         // string-literal `panic!("...")` and a `panic!("{}", format!(...))`
         // -- the only two shapes this interpreter ever panics with) instead
@@ -148,7 +149,7 @@ mod tests {
                 Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::TypeLit(_) => false,
                 Expr::Check(e, spec) => go(e) || spec.lens.iter().any(go),
                 Expr::Len(_) => false,
-                Expr::FieldAccess(e, _) | Expr::Perform(_, e) => go(e),
+                Expr::FieldAccess(e, _) | Expr::Perform(_, e) | Expr::Annot(e, _) => go(e),
                 Expr::ListLit(items) | Expr::Tuple(items) => items.iter().any(go),
                 Expr::Lambda(_, _, body) | Expr::MakeHandler { body, .. } => go(body),
                 Expr::App(a, b) | Expr::BinOp(_, a, b) | Expr::Let(_, _, a, b) | Expr::Handle { body: a, handler: b } => go(a) || go(b),
@@ -4256,7 +4257,7 @@ g(len)").unwrap_err();
         assert_eq!(run_source("let p = {x: 1, y: 2} in let rec s = (fun q -> q.x + q.y)(p) in s").unwrap(), Outcome::Int(3));
         for src in ["let F = fun r -> r.a in let x: F({a: Int}) = 1 in x", "let r = {a: Int} in let T = r.a in let x: T = 1 in x"] {
             let err = run_source(src).unwrap_err();
-            assert!(err.contains("an annotation cannot read a record field at check time"), "{src}: {err}");
+            assert!(err.contains("an annotation cannot read a record field"), "{src}: {err}");
         }
     }
 
@@ -7362,7 +7363,7 @@ g(len)").unwrap_err();
         let mut go = |r: &expr::ExprRef| let_rec_groups_direct(arena, *r, out);
         match &arena[root] {
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::Len(_) | Expr::TypeLit(_) => {}
-            Expr::Check(operand, _) => go(operand),
+            Expr::Check(operand, _) | Expr::Annot(operand, _) => go(operand),
             Expr::ListLit(items) | Expr::Tuple(items) => items.iter().for_each(go),
             Expr::Lambda(_, _, body) => go(body),
             Expr::App(f, a) => {
