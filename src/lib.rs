@@ -4202,6 +4202,10 @@ g(len)").unwrap_err();
                    and g = fun x -> (let T = F(1) in let y: T = [x] in y) in g(1)";
         let err = run_source(src).unwrap_err();
         assert!(err.contains("expected Int, found Bool"), "{err}");
+        // A call through a shadowing group's fresh name is typed against that group, not the outer
+        // function: the outer parameter's Int check cannot be skipped.
+        let err = run_source("let f = fun n: Int -> n in let rec f = fun s -> s ++ \"a\" and y = f(\"b\") in y").unwrap_err();
+        assert!(err.contains("type mismatch: expected Int, found Str"), "{err}");
     }
 
     // `Vec(` and `Indexed(` in an annotation are built in, like the sugar

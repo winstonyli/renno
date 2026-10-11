@@ -857,7 +857,7 @@ pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // `let f_ty = infer.resolve(&f_ty);`). resolve_deep leaves EffectRow
 // untouched (it only walks Type positions), so this doesn't affect
 // row-variable generalization at all.
-// pub(crate) for the same test-access reason as Ctx/unify_index_expr
+// pub(crate): the production binder (let, let rec, lambda) and, for the same test-access reason as Ctx/unify_index_expr
 // above -- extend_generalized/lookup together are what this task's
 // own unit test exercises directly, bypassing the separate Expr::App
 // coerce() gap a source-level `identity_vec(3)(va)` call would hit.
@@ -3338,7 +3338,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // itself -- type-checks precisely rather than falling back to
             // Dyn. That's only possible where a type is already known,
             // i.e. annotated -- an unannotated binding still works (that
-            // one reference is just Dyn, like any other unbound-at-this-
+            // one reference is just a fresh type variable, like any other unbound-at-this-
             // point lookup), it's just not precisely typed. All values
             // are elaborated against this SAME pre-bound context (not a
             // progressively-updated one): they're simultaneous, not
