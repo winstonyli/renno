@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::{Env, PRELUDE};
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, Expr, ExprRef, Len, LenExpr, Pattern, SpanMap, Test};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, Expr, ExprRef, Len, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::resolve::{is_direct_group, resolve, Resolved, VarRef};
@@ -87,9 +87,9 @@ pub enum Stuck {
     Effect,
     // A builtin outside the pure fragment (`print`, `map`, ...).
     Builtin,
-    // A node the parser emits but only typecheck lowers (`.field`, which
-    // elaboration turns into a get_field call): eval_pure runs parsed trees.
-    Unelaborated,
+    // A record field read: `.field` in a parsed tree (eval_pure), or the
+    // get_field call elaboration lowers it to (a run-time annotation).
+    Field,
 }
 
 // What eval_pure produced.
@@ -147,7 +147,7 @@ pub fn pure_type(outcome: Pure) -> Result<Rc<Type>, String> {
         Pure::Stuck(Stuck::Fuel) => Err(format!("annotation did not terminate within {ANNOTATION_FUEL} steps")),
         Pure::Stuck(Stuck::Effect) => Err("an annotation cannot perform an effect".to_string()),
         Pure::Stuck(Stuck::Builtin) => Err("an annotation can only call the type constructors".to_string()),
-        Pure::Stuck(Stuck::Unelaborated) => Err("an annotation cannot read a record field".to_string()),
+        Pure::Stuck(Stuck::Field) => Err("an annotation cannot read a record field".to_string()),
         Pure::Error(msg) => Err(msg),
     }
 }
@@ -259,6 +259,23 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                         }
                     }
                 },
+                Expr::Residual(operand, ty, spec) => {
+                    let t = match resolved.get(*ty) {
+                        Some(VarRef::Local { hops, slot }) => match env.get(hops, slot) {
+                            Value::Type(t) => t,
+                            other => panic!("internal: a residual's type variable holds {}", other.type_name()),
+                        },
+                        other => panic!("internal: a residual's type variable resolved to {other:?}"),
+                    };
+                    if let Some(lowered) = residual_check(spec, t) {
+                        // The table's slots read the env the operand is
+                        // evaluated in, as a Check's do.
+                        let table: Vec<Len> = spec.lens.iter().map(|slot| eval_slot(arena, *slot, &env, resolved)).collect();
+                        let lens = lowered.slots.iter().map(|index| to_len(index_len(index, &spec.index_names, &table))).collect();
+                        cont = Cont::cons(Frame::Check { spec: lowered.check.clone(), lens }, cont);
+                    }
+                    control = Control::Eval(*operand, env);
+                }
                 Expr::Len(_) => unreachable!("an Expr::Len slot is read by its Check, never evaluated"),
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
                 Expr::Float(x) => control = Control::Apply(Value::Float(*x)),
@@ -311,7 +328,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                 // trees, so in check mode it is stuck, not a bug.
                 Expr::FieldAccess(..) => {
                     if PURE {
-                        return Err(Stuck::Unelaborated);
+                        return Err(Stuck::Field);
                     }
                     unreachable!(
                         "Expr::FieldAccess reached machine::run directly -- `.field` needs typecheck::check first, see its own doc comment"
@@ -484,7 +501,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                                 }
                                 Value::Builtin(b) => {
                                     if PURE && !matches!(b, Builtin::Ty(_)) {
-                                        return Err(Stuck::Builtin);
+                                        return Err(if matches!(b, Builtin::GetField) { Stuck::Field } else { Stuck::Builtin });
                                     }
                                     set_current_span(callee_span);
                                     control = Control::Apply(collect_builtin_arg(arena, b, Vec::new(), value, spans, resolved));
@@ -729,21 +746,29 @@ fn leaf(t: &Test, v: &Value) -> Option<bool> {
 // A Check's length slot under `env`: the Expr::Len node's term, evaluated.
 fn eval_slot(arena: &Arena, slot: ExprRef, env: &Env, resolved: &Resolved) -> Len {
     let Expr::Len(term) = &arena[slot] else { panic!("internal: a Check's length slot is not an Expr::Len") };
-    match eval_len(term, env, resolved) {
+    to_len(eval_len(term, env, resolved))
+}
+
+// A length term's value as a slot holds it.
+fn to_len(n: Result<i64, Len>) -> Len {
+    match n {
         Ok(n) => usize::try_from(n).map_or(Len::Never, Len::Exact),
         Err(len) => len,
     }
 }
 
+// `op` on two length values: the first non-integer operand, left to right,
+// wins, and an overflow is Never.
+fn len_arith(a: Result<i64, Len>, b: impl FnOnce() -> Result<i64, Len>, op: fn(i64, i64) -> Option<i64>) -> Result<i64, Len> {
+    op(a?, b()?).ok_or(Len::Never)
+}
+
 // A length term's integer value, or (Err) the slot value it reduces to
 // instead. Total: a witness that is not a list is NoValue and an overflow is
 // Never, so evaluating a slot never panics whatever an untyped caller passed;
-// only the test decides. The first non-integer operand, left to right, wins.
+// only the test decides.
 fn eval_len(term: &LenExpr, env: &Env, resolved: &Resolved) -> Result<i64, Len> {
-    let arith = |a: &LenExpr, b: &LenExpr, op: fn(i64, i64) -> Option<i64>| {
-        let (a, b) = (eval_len(a, env, resolved)?, eval_len(b, env, resolved)?);
-        op(a, b).ok_or(Len::Never)
-    };
+    let arith = |a: &LenExpr, b: &LenExpr, op| len_arith(eval_len(a, env, resolved), || eval_len(b, env, resolved), op);
     match term {
         LenExpr::Lit(n) => Ok(*n),
         LenExpr::Witness(var, name) => match resolved.get(*var) {
@@ -759,6 +784,44 @@ fn eval_len(term: &LenExpr, env: &Env, resolved: &Resolved) -> Result<i64, Len> 
         LenExpr::Any => Err(Len::Any),
         LenExpr::NoValue(name) => Err(Len::NoValue(name.clone())),
     }
+}
+
+// An index in a run-time type, valued from an Unknown site's table: each
+// variable the annotation's text writes has its slot's value (`names[i]` is
+// `table[i]`'s); any other variable came with a type value built elsewhere
+// and matches any length (spec 11.4).
+fn index_len(index: &IndexExpr, names: &[String], table: &[Len]) -> Result<i64, Len> {
+    let arith = |a: &IndexExpr, b: &IndexExpr, op| len_arith(index_len(a, names, table), || index_len(b, names, table), op);
+    match index {
+        IndexExpr::Var(name) => match names.iter().position(|n| n == name).map(|i| &table[i]) {
+            Some(Len::Exact(k)) => i64::try_from(*k).map_err(|_| Len::Never),
+            Some(other) => Err(other.clone()),
+            None => Err(Len::Any),
+        },
+        IndexExpr::Lit(n) => Ok(*n),
+        IndexExpr::Add(a, b) => arith(a, b, i64::checked_add),
+        IndexExpr::Sub(a, b) => arith(a, b, i64::checked_sub),
+        IndexExpr::Mul(a, b) => arith(a, b, i64::checked_mul),
+    }
+}
+
+// An Unknown site's check against type value `t` (None: nothing to check),
+// lowered once while the same value keeps coming back (spec 11.5). A type
+// that cannot be lowered is the run-time error at the site.
+fn residual_check(spec: &ResidualSpec, t: Rc<Type>) -> Option<Rc<Lowered>> {
+    let mut memo = spec.memo.borrow_mut();
+    if let Some((seen, lowered)) = memo.as_ref()
+        && Rc::ptr_eq(seen, &t)
+    {
+        return lowered.clone();
+    }
+    let named = spec.named.get().expect("internal: the registry is set when checking finishes");
+    let lowered = crate::typecheck::lower_residual(&t, named, spec.span).unwrap_or_else(|msg| {
+        set_current_span(Some(spec.span));
+        crate::run_error!("{msg}")
+    });
+    *memo = Some((t, lowered.clone()));
+    lowered
 }
 
 enum Step<'t, 'a> {

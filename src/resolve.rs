@@ -192,6 +192,14 @@ fn visit(
                 work.push(Work::Visit(*slot));
             }
         }
+        // So are a Residual's, and the variable holding its type.
+        Expr::Residual(target, ty, spec) => {
+            work.push(Work::Visit(*target));
+            work.push(Work::Visit(*ty));
+            for slot in spec.lens.iter().rev() {
+                work.push(Work::Visit(*slot));
+            }
+        }
         Expr::Len(term) => {
             let mut witnesses = Vec::new();
             term.witnesses(&mut witnesses);

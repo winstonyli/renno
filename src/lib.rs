@@ -4087,22 +4087,137 @@ g(len)").unwrap_err();
     }
 
     // A name bound to a value that exists only at run time (a parameter, a
-    // pattern variable, a handler's payload) cannot be evaluated at check
-    // time: a static error in Stage B (Stage C makes it a run-time residual).
+    // pattern variable, a handler's payload) makes the annotation an Unknown
+    // site (spec 11.2): the binder is typed Dyn, and the run time checks it
+    // against the annotation's value.
     #[test]
-    fn an_annotation_cannot_use_a_run_time_value() {
-        let msg = |name: &str| format!("an annotation cannot use `{name}`: its value is not known at check time");
-        for (src, name) in [
-            ("fun Int -> let x: Int = 3 in x", "Int"),
-            ("let f = fun y -> let T = List(y) in let x: T = [1] in x in f(Int)", "y"),
-            ("match Int | t -> let x: t = 3 in x", "t"),
-            ("handle (perform ask(1)) with handler ask(p, k) -> let x: p = 1 in k(x)", "p"),
+    fn an_annotation_naming_a_run_time_value_is_checked_at_run_time() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        for (src, want) in [
+            ("(fun Int -> let x: Int = 3 in x)(Int)", "3"),
+            ("let f = fun y -> let T = List(y) in let x: T = [1] in x in f(Int)", "[1]"),
+            ("match Int | t -> let x: t = 3 in x", "3"),
+            ("handle (perform ask(Int)) with handler ask(p, k) -> let x: p = 1 in k(x)", "1"),
+            ("let f = fun T -> fun x: T -> x in f(Dyn)(true)", "true"),
+            ("let F = fun r -> r.t in let g = fun r -> (let x: F(r) = 1 in x) in 0", "0"),
+            // The annotation names the outer `T`; the parameter shadows it only in the body.
+            ("(fun T -> fun T: T -> T)(Int)(1)", "1"),
+        ] {
+            assert_eq!(ok(src), want, "{src}");
+        }
+        for (src, want) in [
+            ("(fun Int -> let x: Int = 3 in x)(Str)", "column 26: type error: expected Str, found Int"),
+            ("let f = fun y -> let T = List(y) in let x: T = [1] in x in f(Bool)", "column 48: type error: expected [Bool], found Int at element 0"),
+            ("match Str | t -> let x: t = 3 in x", "column 29: type error: expected Str, found Int"),
+            ("handle (perform ask(1)) with handler ask(p, k) -> let x: p = 1 in k(x)", "column 58: annotation did not evaluate to a type, found Int"),
+            // A parameter's check blames its annotation.
+            ("let f = fun T -> fun x: {a: T} -> x.a in f(Int)({a: true})", "column 25: type error: expected {a: Int}, found Bool at field a"),
+            ("let f = fun T -> fun x: T -> x in f(5)(1)", "column 25: annotation did not evaluate to a type, found Int"),
+            // A parameter's annotation runs when its closure is created, before any call.
+            ("let f = fun T -> fun x: T -> x in let g = f(5) in 0", "column 25: annotation did not evaluate to a type, found Int"),
+            ("(fun T -> fun T: T -> T)(Int)(true)", "column 18: type error: expected Int, found Bool"),
+            // The pattern `Int` binds a variable, here to 1.
+            ("match 1 | Int -> let x: Int = 3 in x", "column 25: annotation did not evaluate to a type, found Int"),
+            // Only the run time reaches the field read, so it is a run-time error.
+            ("let F = fun r -> r.t in (fun r -> let x: F(r) = 1 in x)({t: Int})", "column 42: an annotation cannot read a record field"),
         ] {
             let err = run_source(src).unwrap_err();
-            assert!(err.contains(&msg(name)), "{src}: {err}");
+            assert!(err.contains(want), "{src}: {err}");
         }
         let err = run_source("let T = (perform ask(1)) in let x: T = 1 in x").unwrap_err();
         assert!(err.contains("an annotation cannot perform an effect"), "{err}");
+    }
+
+    // An Unknown site's check reports what the static check of the same type
+    // reports (one lowering, typecheck::boundary and shape_of): a list's
+    // element, a record's field, a recursive type's unfolding.
+    #[test]
+    fn an_unknown_site_fails_with_the_static_message() {
+        let l = "let rec L = Union((Tuple((Int, L)), Bool)) in ";
+        // Each type as an annotation writes it, and as a value.
+        for (ty, as_value, value) in [
+            ("Int", "Int", "true"),
+            ("List(Int)", "List(Int)", "[1, true]"),
+            ("{a: Int}", "Record({a: Int})", "{a: true}"),
+            ("L", "L", "(1, (2, 3))"),
+            ("Vec(2)", "Vec(2)", "[1]"),
+        ] {
+            let fixed = run_source(&format!("{l}let d: Dyn = {value} in let x: {ty} = d in x")).unwrap_err();
+            let unknown = run_source(&format!("{l}let f = fun T -> let d: Dyn = {value} in let x: T = d in x in f({as_value})")).unwrap_err();
+            let message = |e: &str| e.lines().next().and_then(|l| l.split_once("type error")).map(|(_, m)| m.to_string()).unwrap_or_else(|| panic!("{e}"));
+            assert_eq!(message(&unknown), message(&fixed), "{ty}");
+        }
+    }
+
+    // An Unknown site's annotation is evaluated every time the site runs
+    // (spec 11.5): a let's on each pass, a parameter's when its closure is
+    // created, a recursive group's parameter on each call. A resumed
+    // continuation re-runs the site with whatever type it now holds.
+    #[test]
+    fn an_unknown_site_evaluates_its_annotation_each_time() {
+        for (src, want, evals) in [
+            ("let f = fun T -> let rec go = fun i -> if i == 0 then 0 else (let y: T = i in go(i - 1)) in go(3) in f(Int)", "0", 3),
+            ("let f = fun T -> fun x: T -> x in let h = f(Int) in h(1) + h(2)", "3", 1),
+            ("let f = fun T -> let rec g = fun x: T -> (if x == 0 then 0 else g(x - 1)) in g(2) in f(Int)", "0", 3),
+            ("handle (let f = fun T -> fun x: T -> x in f(perform ask(0))(1) + 1) with handler ask(p, k) -> k(Int) + k(Int)", "4", 2),
+        ] {
+            assert_eq!(annotation_evals(src), (want.to_string(), vec![evals]), "{src}");
+        }
+        let err = run_source("handle (let f = fun T -> fun x: T -> x in f(perform ask(0))(1) + 1) with handler ask(p, k) -> k(Int) + k(Str)").unwrap_err();
+        assert!(err.contains("type error: expected Str, found Int"), "{err}");
+    }
+
+    // An Unknown site reads names in the binder's scope, as a static one does:
+    // a later or inner binding of the same name changes nothing.
+    #[test]
+    fn an_unknown_site_reads_the_binders_scope() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        assert_eq!(ok("let f = fun T -> let T = Str in fun x: T -> x in f(Int)(\"a\")"), "a");
+        assert_eq!(ok("let f = fun T -> fun x: T -> let T = Str in x in f(Int)(1)"), "1");
+        let err = run_source("let f = fun T -> fun T -> fun x: T -> x in f(1)(Int)(true)").unwrap_err();
+        assert!(err.contains("column 34: type error: expected Int, found Bool"), "{err}");
+        let err = run_source("let f = fun T -> fun x: T -> (fun x -> x)(x) in f(Int)(true)").unwrap_err();
+        assert!(err.contains("column 25: type error: expected Int, found Bool"), "{err}");
+    }
+
+    // A length in an Unknown site's type is read from the binder's scope, as
+    // a static check's is (spec 11.4); one the annotation introduces matches
+    // any length.
+    #[test]
+    fn an_unknown_site_checks_lengths_in_scope() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        let g = "let g = fun T -> fun v: Vec(n) -> let w: Indexed(List(T), n) = ";
+        assert_eq!(ok(&format!("{g}[1, 5] in w in g(Int)([1, 2])")), "[1, 5]");
+        let err = run_source(&format!("{g}[1] in w in g(Int)([1, 2])")).unwrap_err();
+        assert!(err.contains("type error: expected [Int](n), found List"), "{err}");
+        assert_eq!(ok("let g = fun T -> let w: Indexed(List(T), m) = [1] in w in g(Int)"), "[1]");
+    }
+
+    // `TypeOf(b)` with `b` a parameter is an Unknown site like any other: the
+    // run time checks against the token type `b` holds (spec 11.11).
+    #[test]
+    fn an_unknown_site_checks_a_run_time_token() {
+        let f = "let B = opaque in let C = opaque in let f = fun b -> fun v: TypeOf(b) -> v in ";
+        assert!(run_source(&format!("{f}f(B)(B)")).is_ok());
+        let err = run_source(&format!("{f}f(B)(C)")).unwrap_err();
+        assert!(err.contains("column 61: type error: expected Token, found Token"), "{err}");
+    }
+
+    // C2 lowers only function-free types; a type that needs a per-call
+    // contract is a run-time error at the site until C3.
+    #[test]
+    fn a_function_typed_unknown_site_is_not_supported_yet() {
+        let msg = "function-typed residuals are not supported yet";
+        for src in [
+            "let f = fun T -> fun x: T -> x in f(Fun((Int, Int)))(fun y -> y)",
+            "let f = fun T -> fun x: T -> x in f(Union((Int, Fun((Int, Int)))))(1)",
+            "let f = fun T -> let rec g: T = fun x -> x in g in f(Fun((Int, Int)))(3)",
+        ] {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains(msg), "{src}: {err}");
+        }
+        // A function inside a container is only a callability test, as statically.
+        assert_eq!(run_source("let f = fun T -> fun x: List(T) -> len(x) in f(Fun((Int, Int)))([fun y -> y])").unwrap().to_string(), "1");
     }
 
     // `Name(arg)` in an annotation is ordinary application (spec section 9.1).
@@ -4182,8 +4297,9 @@ g(len)").unwrap_err();
         assert_eq!(ok("let T = Int in let rec T = (fun u -> List(Int))(0) and x = (let y: T = 1 in y) in x"), "1");
         let err = run_source("let rec T = (fun u -> List(Int))(0) and x = (let y: T = [1] in y) in x").unwrap_err();
         assert!(err.contains("unbound variable: T"), "{err}");
-        let err = run_source("(fun T -> let rec T = (fun u -> u)(T) and x = (let y: T = 1 in y) in x)(Int)").unwrap_err();
-        assert!(err.contains("an annotation cannot use `T`: its value is not known at check time"), "{err}");
+        assert_eq!(ok("(fun T -> let rec T = (fun u -> u)(T) and x = (let y: T = 1 in y) in x)(Int)"), "1");
+        let err = run_source("(fun T -> let rec T = (fun u -> u)(T) and x = (let y: T = 1 in y) in x)(Str)").unwrap_err();
+        assert!(err.contains("column 59: type error: expected Str, found Int"), "{err}");
         // The outer binding a value reads is kept, and a value is typed against it.
         assert_eq!(ok("let T = Int in let y: T = 1 in let rec T = (fun u -> u)(T) and k = 5 in to_str(T)"), "Int");
         let err = run_source("let x = true in let rec x = 1 and y = x + 1 in y").unwrap_err();
@@ -4318,7 +4434,7 @@ g(len)").unwrap_err();
         for (name, src) in programs {
             let (mut arena, spans, root, named_types) = parser::parse_with_named_types(&src).unwrap();
             let Ok(elaborated) = typecheck::check_with_named_types(&mut arena, root, &spans, named_types) else { continue };
-            assert!(!tree_any(&arena, elaborated, &|e| matches!(e, expr::Expr::Annot(..))), "{name}");
+            assert!(!tree_any(&arena, elaborated, &|e| matches!(e, expr::Expr::Annot(..) | expr::Expr::Residual(..))), "{name}");
         }
     }
 

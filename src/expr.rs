@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use cranelift_entity::{entity_impl, EntityRef, PrimaryMap};
 
 use crate::span::Span;
+use crate::index_expr::IndexExpr;
 use crate::types::Type;
 
 // AST nodes live in a flat arena instead of being individually
@@ -219,6 +221,39 @@ pub enum AnnotKind {
     Confirm(Rc<Type>),
     // It ran out of fuel: reaching the site is the fuel error.
     Diverged,
+    // It names a value only the run time has: the run time evaluates it
+    // every time the site is reached, and an Expr::Residual checks the
+    // binder against the result.
+    Unknown,
+}
+
+// An Unknown site's check (spec 11.2): Expr::Residual tests its operand
+// against the type its `ty` variable holds, lowered at run time
+// (typecheck::lower_residual) with today's run-time check messages.
+#[derive(Debug)]
+pub struct ResidualSpec {
+    // The index variable names the annotation's text writes, and for each
+    // the Expr::Len slot holding its run-time value (spec 11.4).
+    pub index_names: Vec<String>,
+    pub lens: Vec<ExprRef>,
+    // The recursive types' bodies, set when checking finishes.
+    pub named: Rc<std::cell::OnceCell<HashMap<String, Type>>>,
+    pub memo: std::cell::RefCell<Option<LoweredType>>,
+    // The source span a failure blames.
+    pub span: Span,
+}
+
+// The type an Unknown site lowered last, and its check (None: nothing to
+// check). Reused while the same type comes back; holding the Rc keeps its
+// address from being reused by another type.
+pub type LoweredType = (Rc<Type>, Option<Rc<Lowered>>);
+
+// A run-time type as a native check: a Check spec (its `lens` unused), and
+// for each length slot its test reads, the index whose value fills it.
+#[derive(Debug)]
+pub struct Lowered {
+    pub check: Rc<CheckSpec>,
+    pub slots: Vec<IndexExpr>,
 }
 
 #[derive(Debug)]
@@ -259,6 +294,10 @@ pub enum Expr {
     // evaluated in check mode to a Value::Type. Typecheck binds it to an
     // unlexable name just before the annotated binder.
     Annot(ExprRef, Rc<AnnotSpec>),
+    // An Unknown site's check (spec 11.2): the operand tested against the
+    // type value the second node (a variable bound to the site's Annot)
+    // holds. Typecheck-synthesized only.
+    Residual(ExprRef, ExprRef, Rc<ResidualSpec>),
     // A Check's length slot (CheckSpec::lens). Typecheck-synthesized only and
     // never evaluated on its own: the owning Check reads it on entry.
     Len(LenExpr),
@@ -390,6 +429,10 @@ impl Expr {
                 out.extend(&spec.lens);
             }
             Expr::Len(term) => term.witnesses(out),
+            Expr::Residual(e, ty, spec) => {
+                out.extend([*e, *ty]);
+                out.extend(&spec.lens);
+            }
             Expr::FieldAccess(e, _) | Expr::Perform(_, e) | Expr::Annot(e, _) => out.push(*e),
             Expr::Lambda(_, ann, body) => {
                 out.extend(*ann);
