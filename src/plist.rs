@@ -23,22 +23,22 @@ impl<T: Clone> PList<T> {
     }
 
     pub fn get(&self, name: &str) -> Option<T> {
-        let mut node = self.clone();
+        let mut node: &PNode<T> = &self.0;
         loop {
-            match &*node.0 {
+            match node {
                 PNode::Empty => return None,
                 PNode::Bind(n, v, parent) => {
                     if n == name {
                         return Some(v.clone());
                     }
-                    node = parent.clone();
+                    node = &parent.0;
                 }
             }
         }
     }
 
     // Visits every value currently bound, innermost (most recent) first --
-    // same iterative Rc-clone walk as `get`, just without stopping at a
+    // same iterative walk as `get` (borrowing, no Rc clone per hop), just without stopping at a
     // name match. Used by typecheck::free_row_vars_in_ctx to scan the
     // WHOLE visible scope chain; kept iterative for the same reason `get`
     // and the custom Drop impl below are: a chain built from a long
@@ -50,13 +50,13 @@ impl<T: Clone> PList<T> {
     // worth knowing before reusing this against a much deeper PList<T> in a
     // hot path: add a variant that lets `f` signal "stop" first.
     pub fn for_each(&self, mut f: impl FnMut(&T)) {
-        let mut node = self.clone();
+        let mut node: &PNode<T> = &self.0;
         loop {
-            match &*node.0 {
+            match node {
                 PNode::Empty => return,
                 PNode::Bind(_, v, parent) => {
                     f(v);
-                    node = parent.clone();
+                    node = &parent.0;
                 }
             }
         }
