@@ -861,12 +861,8 @@ pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // above -- extend_generalized/lookup together are what this task's
 // own unit test exercises directly, bypassing the separate Expr::App
 // coerce() gap a source-level `identity_vec(3)(va)` call would hit.
-pub(crate) fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &InferCtx) -> Ctx {
-    extend_defined(ctx, name, ty, infer, None)
-}
-
-// extend_generalized for a binder with a definition annotations can evaluate.
-fn extend_defined(ctx: &Ctx, name: &str, ty: Type, infer: &InferCtx, def: Option<Rc<CheckDef>>) -> Ctx {
+// `def` is the binder's definition, which an annotation naming it evaluates.
+pub(crate) fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &InferCtx, def: Option<Rc<CheckDef>>) -> Ctx {
     let ty = infer.resolve_deep(&ty);
     let row_vars = generalizable_row_vars(ctx, &ty);
     let type_vars = generalizable_type_vars(ctx, &ty, infer);
@@ -3331,11 +3327,12 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     }
                 };
                 let def = infer.new_def(DefNode::Let(var.clone(), val), vec![val3], &cur_ctx);
-                cur_ctx = extend_defined(&cur_ctx, &var, bound_ty.clone(), infer, Some(def.clone()));
+                cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone(), infer, Some(def.clone()));
                 pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3, def });
                 cur_expr = body;
             }
-            // Every binding needs to resolve to its own (eventual) type
+            // In a recursive group (a group of direct `fun`s), every
+            // binding needs to resolve to its own (eventual) type
             // WHILE elaborating every value in the group (not just its
             // own), so that a reference to any sibling -- including
             // itself -- type-checks precisely rather than falling back to
@@ -3362,7 +3359,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     let inner = infer.new_def(DefNode::Group(lits.clone()), Vec::new(), &cur_ctx);
                     let mut val_ctx = cur_ctx.clone();
                     for (name, _, _) in lits.iter() {
-                        val_ctx = extend_defined(&val_ctx, name, Type::Dyn, infer, Some(inner.clone()));
+                        val_ctx = extend_generalized(&val_ctx, name, Type::Dyn, infer, Some(inner.clone()));
                     }
                     let mut vals = Vec::with_capacity(bindings.len());
                     for (_, _, v) in bindings.iter() {
@@ -3391,13 +3388,25 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     mark_proven(arena, std::slice::from_ref(&def), spans, infer);
                     let mut elaborated = Vec::with_capacity(lits.len());
                     for ((name, _, _), value) in lits.iter().zip(values) {
-                        cur_ctx = extend_defined(&cur_ctx, name, Type::Dyn, infer, Some(def.clone()));
+                        cur_ctx = extend_generalized(&cur_ctx, name, Type::Dyn, infer, Some(def.clone()));
                         elaborated.push((name.clone(), Type::Dyn, EffectRow::pure(), value));
                     }
                     pending.push(PendingElab::LetRec { bindings: elaborated, def });
                     cur_expr = body;
                     continue;
                 }
+                // The values are checked in the scope the run time evaluates
+                // them in (machine.rs's LetRec): a group of direct `fun`s sees
+                // its own names, bound to its closures (a definition of their
+                // own, so an annotation naming one evaluates it); any other
+                // group's values see the outer scope only.
+                let group = crate::resolve::is_direct_group(arena, &bindings).then(|| {
+                    let def = infer.new_def(DefNode::Group(bindings.clone()), Vec::new(), &cur_ctx);
+                    // Its values are not elaborated yet: count them fallible,
+                    // the safe answer for mark_proven.
+                    let _ = def.fallible.set(true);
+                    def
+                });
                 let mut val_ctx = cur_ctx.clone();
                 // Each annotation opened once (open_signature), so the
                 // pre-binding below and the value check share its renames.
@@ -3409,6 +3418,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     });
                 }
                 for ((name, _, _), ann) in bindings.iter().zip(&opened) {
+                    // A non-recursive group binds nothing for its values.
+                    let Some(group) = &group else { break };
                     let ann = ann.as_ref().map(|(t, _)| t);
                     val_ctx = match ann {
                         // Generalized, not plain extend: a fully-given
@@ -3419,8 +3430,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         // gated on an explicit annotation, not new
                         // inference, so this is deliberately narrower
                         // than general HM polymorphic recursion.
-                        Some(ty) => extend_generalized(&val_ctx, name, ty.clone(), infer),
-                        None => extend(&val_ctx, name, infer.fresh_var(name)),
+                        Some(ty) => extend_generalized(&val_ctx, name, ty.clone(), infer, Some(group.clone())),
+                        None => val_ctx.bind(name, Scheme { def: Some(group.clone()), ..Scheme::mono(infer.fresh_var(name)) }),
                     };
                 }
                 let mut elaborated = Vec::with_capacity(bindings.len());
@@ -3444,7 +3455,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 let values = elaborated.iter().map(|(_, _, _, v)| *v).collect();
                 let def = infer.new_def(DefNode::Group(bindings.clone()), values, &cur_ctx);
                 for (name, bound_ty, _, _) in elaborated.iter() {
-                    cur_ctx = extend_defined(&cur_ctx, name, bound_ty.clone(), infer, Some(def.clone()));
+                    cur_ctx = extend_generalized(&cur_ctx, name, bound_ty.clone(), infer, Some(def.clone()));
                 }
                 pending.push(PendingElab::LetRec { bindings: elaborated, def });
                 cur_expr = body;

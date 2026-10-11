@@ -4176,6 +4176,34 @@ g(len)").unwrap_err();
         assert!(err.contains("does not unify with index 0"), "{err}");
     }
 
+    // A `let rec`'s values are checked in the scope the run time evaluates
+    // them in (machine.rs's LetRec): a group of direct `fun`s sees its own
+    // names, bound to its closures; any other group sees the outer scope.
+    // An annotation inside a value reads names the same way.
+    #[test]
+    fn a_let_rec_value_is_checked_in_its_run_time_scope() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        // Not recursive: an annotation reads the outer binding, or none.
+        assert_eq!(ok("let T = Int in let rec T = (fun u -> List(Int))(0) and x = (let y: T = 1 in y) in x"), "1");
+        let err = run_source("let rec T = (fun u -> List(Int))(0) and x = (let y: T = [1] in y) in x").unwrap_err();
+        assert!(err.contains("unbound variable: T"), "{err}");
+        let err = run_source("(fun T -> let rec T = (fun u -> u)(T) and x = (let y: T = 1 in y) in x)(Int)").unwrap_err();
+        assert!(err.contains("an annotation cannot use `T`: its value is not known at check time"), "{err}");
+        // The outer binding a value reads is kept, and a value is typed against it.
+        assert_eq!(ok("let T = Int in let y: T = 1 in let rec T = (fun u -> u)(T) and k = 5 in to_str(T)"), "Int");
+        let err = run_source("let x = true in let rec x = 1 and y = x + 1 in y").unwrap_err();
+        assert!(err.contains("type mismatch: expected Int or Float, found Bool"), "{err}");
+        // Recursive: a member is its closure, which an annotation can call.
+        let err = run_source("let rec f = fun n -> (let y: f = 1 in n) in f(1)").unwrap_err();
+        assert!(err.contains("annotation did not evaluate to a type, found Fun"), "{err}");
+        assert_eq!(ok("let rec F = fun n -> List(Int) and g = fun x -> (let y: F(1) = [x] in y) in g(1)"), "[1]");
+        // A type let that calls a member is kept, so the member's checks run.
+        let src = "let rec F: (Int -> Dyn) = fun n -> (let d: Dyn = true in let i: Int = d in List(Int)) \
+                   and g = fun x -> (let T = F(1) in let y: T = [x] in y) in g(1)";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected Int, found Bool"), "{err}");
+    }
+
     // A type let only annotations read is dead at run time and not emitted
     // (spec section 1); one read as a value, or not proved at check time, stays.
     #[test]
@@ -4704,7 +4732,7 @@ g(len)").unwrap_err();
         );
 
         let mut infer = InferCtx::new(std::collections::HashMap::new());
-        let ctx = extend_generalized(&Ctx::empty(), "identity_vec", identity_vec_ty, &infer);
+        let ctx = extend_generalized(&Ctx::empty(), "identity_vec", identity_vec_ty, &infer, None);
 
         // Extracts the index-variable name inside `Fun(Int, Fun(Vec(idx), Vec(idx)))`.
         fn index_var_name(ty: &Type) -> String {
@@ -4992,7 +5020,7 @@ g(len)").unwrap_err();
         // Int elements: a Dyn-element Vec(n) into [Int] is a real crossing and
         // is checked; this test is about the index-forgetting widening alone.
         let vec_ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
-        let ctx = extend_generalized(&Ctx::empty(), "x", vec_ty, &infer);
+        let ctx = extend_generalized(&Ctx::empty(), "x", vec_ty, &infer, None);
 
         let mut arena = Arena::new();
         let mut spans = SpanMap::new();
@@ -5131,7 +5159,7 @@ g(len)").unwrap_err();
         let mut infer = InferCtx::new(HashMap::new());
         // Int elements: see if_check_mode_accepts_branches_that_only_agree_via_the_expected_type.
         let vec_ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
-        let ctx = extend_generalized(&Ctx::empty(), "v", vec_ty, &infer);
+        let ctx = extend_generalized(&Ctx::empty(), "v", vec_ty, &infer, None);
 
         let mut arena = Arena::new();
         let mut spans = SpanMap::new();
@@ -6600,9 +6628,9 @@ g(len)").unwrap_err();
     // group through the same non-recursive fallback as
     // `let_rec_fallback_binds_non_function_values_for_the_body` above, so
     // `f` is NOT in scope while its own value is elaborated/evaluated.
-    // Typecheck accepts this (LetRec's val_ctx binds every name, including
-    // `f`, with a fresh type var while elaborating each value -- see
-    // typecheck.rs's Expr::LetRec arm), but the runtime resolver does not:
+    // Typecheck accepts this (it checks a non-recursive group's values in
+    // the outer scope too, where an unbound `f` is Dyn -- see typecheck.rs's
+    // Expr::LetRec arm), and the runtime resolver leaves `f` unbound:
     // calling `f` recurses into the `if`'s `fun n -> ... f(n - 1) ...`
     // branch, where `f` was resolved in the OUTER scope and is nowhere
     // bound, so it panics lazily via VarRef::Unbound the same way
