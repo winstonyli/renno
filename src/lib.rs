@@ -4204,6 +4204,18 @@ g(len)").unwrap_err();
         assert!(err.contains("expected Int, found Bool"), "{err}");
     }
 
+    // `Vec(` and `Indexed(` in an annotation are built in, like the sugar
+    // (spec section 1 item 4: the index may name an index variable, which
+    // has no value), so a local binding of either name does not change them.
+    #[test]
+    fn vec_and_indexed_in_an_annotation_ignore_a_local_binding() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        assert_eq!(ok("let Vec = fun n -> Int in let x: Vec(2) = [1, 2] in x"), "[1, 2]");
+        assert_eq!(ok("let Indexed = 5 in let x: Indexed([Int], 2) = [1, 2] in x"), "[1, 2]");
+        // At value position the local binding wins, as for any name.
+        assert_eq!(ok("let Vec = fun n -> Int in to_str(Vec(2))"), "Int");
+    }
+
     // A type let only annotations read is dead at run time and not emitted
     // (spec section 1); one read as a value, or not proved at check time, stays.
     #[test]
