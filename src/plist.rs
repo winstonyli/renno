@@ -1,62 +1,63 @@
+use rpds::HashTrieMap;
 use std::rc::Rc;
 
-// Generic persistent, singly-linked, prepend-only list keyed by name. O(1)
-// extend (an Rc clone), O(depth) lookup (most-recent-binding-wins). Used
-// ONLY by typecheck's Ctx (payload = Type) -- the runtime Env moved to
+// Generic persistent, prepend-only list keyed by name. O(1) extend, and
+// most-recent-binding-wins lookup in O(log n) through a persistent hash map
+// beside the list (a chain of thousands of lets must not make every lookup of
+// an old binder, such as a prelude name, walk the whole chain). The list
+// still holds every binding, shadowed ones included, for `for_each`. Used
+// ONLY by typecheck's Ctx (payload = Scheme) -- the runtime Env moved to
 // frame::Env (per-scope immutable frames, statically resolved lookups); see
 // env.rs and resolve.rs.
-#[derive(Clone)]
-pub struct PList<T>(Rc<PNode<T>>);
+pub struct PList<T> {
+    head: Rc<PNode<T>>,
+    latest: HashTrieMap<String, Rc<T>>,
+}
 
 enum PNode<T> {
     Empty,
-    Bind(String, T, PList<T>),
+    Bind(Rc<T>, PList<T>),
+}
+
+impl<T> Clone for PList<T> {
+    fn clone(&self) -> Self {
+        PList { head: self.head.clone(), latest: self.latest.clone() }
+    }
 }
 
 impl<T: Clone> PList<T> {
     pub fn empty() -> Self {
-        PList(Rc::new(PNode::Empty))
+        PList { head: Rc::new(PNode::Empty), latest: HashTrieMap::new() }
     }
 
     pub fn bind(&self, name: impl Into<String>, value: T) -> Self {
-        PList(Rc::new(PNode::Bind(name.into(), value, self.clone())))
+        let name = name.into();
+        let value = Rc::new(value);
+        PList { head: Rc::new(PNode::Bind(value.clone(), self.clone())), latest: self.latest.insert(name, value) }
     }
 
     pub fn get(&self, name: &str) -> Option<T> {
-        let mut node: &PNode<T> = &self.0;
-        loop {
-            match node {
-                PNode::Empty => return None,
-                PNode::Bind(n, v, parent) => {
-                    if n == name {
-                        return Some(v.clone());
-                    }
-                    node = &parent.0;
-                }
-            }
-        }
+        self.latest.get(name).map(|v| (**v).clone())
     }
 
-    // Visits every value currently bound, innermost (most recent) first --
-    // same iterative walk as `get` (borrowing, no Rc clone per hop), just without stopping at a
-    // name match. Used by typecheck::free_row_vars_in_ctx to scan the
-    // WHOLE visible scope chain; kept iterative for the same reason `get`
-    // and the custom Drop impl below are: a chain built from a long
-    // sequential program must not cost native stack proportional to its
-    // depth. Unlike `get`, there's no early exit -- `f` runs for every
-    // node, unconditionally. Harmless for today's only caller (Ctx, and
-    // even that's short-circuited one level up by
-    // typecheck::generalizable_row_vars before it ever reaches here), but
-    // worth knowing before reusing this against a much deeper PList<T> in a
-    // hot path: add a variant that lets `f` signal "stop" first.
+    // Visits every value currently bound, innermost (most recent) first,
+    // shadowed bindings included -- a borrowing walk of the list, kept
+    // iterative for the same reason the custom Drop impl below is: a chain
+    // built from a long sequential program must not cost native stack
+    // proportional to its depth. Used by typecheck::free_row_vars_in_ctx to
+    // scan the WHOLE visible scope chain; there is no early exit, so `f` runs
+    // for every node. Harmless for today's only caller (even that is
+    // short-circuited one level up by typecheck::generalizable_row_vars before
+    // it reaches here), but worth knowing before reusing this against a much
+    // deeper PList<T> in a hot path.
     pub fn for_each(&self, mut f: impl FnMut(&T)) {
-        let mut node: &PNode<T> = &self.0;
+        let mut node: &PNode<T> = &self.head;
         loop {
             match node {
                 PNode::Empty => return,
-                PNode::Bind(_, v, parent) => {
+                PNode::Bind(v, parent) => {
                     f(v);
-                    node = &parent.0;
+                    node = &parent.head;
                 }
             }
         }
@@ -79,14 +80,14 @@ impl<T: Clone> PList<T> {
 // unwinds something still in use.
 impl<T> Drop for PList<T> {
     fn drop(&mut self) {
-        let mut node = std::mem::replace(&mut self.0, Rc::new(PNode::Empty));
+        let mut node = std::mem::replace(&mut self.head, Rc::new(PNode::Empty));
         loop {
             match Rc::try_unwrap(node) {
                 // `parent` has its own Drop impl (this one, recursively),
                 // so it can't be partially moved out of -- swap its inner
                 // Rc out first. `parent` then wraps Empty and drops
                 // trivially when this match arm ends.
-                Ok(PNode::Bind(_, _, mut parent)) => node = std::mem::replace(&mut parent.0, Rc::new(PNode::Empty)),
+                Ok(PNode::Bind(_, mut parent)) => node = std::mem::replace(&mut parent.head, Rc::new(PNode::Empty)),
                 _ => break,
             }
         }
