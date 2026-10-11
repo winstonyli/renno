@@ -255,7 +255,7 @@ pub(crate) struct InferCtx {
     // whenever they encounter a Type::Named reference, to unfold it
     // exactly one level. A recursive `let rec` type group adds its ids
     // when it is checked (recursive_type_group), before any use of them.
-    named_types: HashMap<String, Type>,
+    named_types: Rc<HashMap<String, Type>>,
     // Names of type variables whose value reaches a Dyn sink (the argument of
     // a Dyn callee, a Perform payload) while the variable is still unbound
     // (spec 2026-10-08-var-passthrough-casts). The Fun-callee App arm casts a
@@ -285,11 +285,11 @@ pub(crate) struct InferCtx {
     splices: Vec<Splice>,
     // The recursive types every Unknown site lowers its run-time type
     // against: named_types as it stands when checking finishes.
-    registry: Rc<OnceCell<HashMap<String, Type>>>,
+    registry: Rc<OnceCell<Rc<HashMap<String, Type>>>>,
 }
 
 impl InferCtx {
-    pub(crate) fn new(named_types: HashMap<String, Type>) -> InferCtx {
+    pub(crate) fn new(named_types: impl Into<Rc<HashMap<String, Type>>>) -> InferCtx {
         InferCtx {
             subst: HashMap::new(),
             index_subst: HashMap::new(),
@@ -300,7 +300,7 @@ impl InferCtx {
             pendings: RefCell::new(Vec::new()),
             resume_row: None,
             repeatable_depth: 0,
-            named_types,
+            named_types: named_types.into(),
             dyn_sunk: HashSet::new(),
             bound_names: HashSet::new(),
             def_seq: 0,
@@ -1772,7 +1772,7 @@ fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut H
 // at check time, with the same failure messages; `named` is the program's
 // recursive types. None: nothing to check. A type needing a per-call
 // contract is not supported yet (C2's interim error).
-pub(crate) fn lower_residual(ty: &Type, named: &HashMap<String, Type>, span: Span) -> Result<Option<Rc<Lowered>>, String> {
+pub(crate) fn lower_residual(ty: &Type, named: &Rc<HashMap<String, Type>>, span: Span) -> Result<Option<Rc<Lowered>>, String> {
     let infer = InferCtx::new(named.clone());
     let env = CheckEnv { defer: false, ..CheckEnv::at(&infer, span) };
     let to = match boundary(ty, named, &mut HashSet::new()) {
@@ -3543,7 +3543,7 @@ fn recursive_type_group(
     let mut values = Vec::with_capacity(results.len());
     for (ty, id) in results.iter().zip(&ids) {
         if results.iter().any(|r| crate::parser::contains_named(r, id)) {
-            infer.named_types.insert(id.clone(), ty.clone());
+            Rc::make_mut(&mut infer.named_types).insert(id.clone(), ty.clone());
             values.push(Type::Named(id.clone()));
         } else {
             values.push(ty.clone());

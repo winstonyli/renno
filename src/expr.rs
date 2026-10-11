@@ -237,7 +237,7 @@ pub struct ResidualSpec {
     pub index_names: Vec<String>,
     pub lens: Vec<ExprRef>,
     // The recursive types' bodies, set when checking finishes.
-    pub named: Rc<std::cell::OnceCell<HashMap<String, Type>>>,
+    pub named: Rc<std::cell::OnceCell<Rc<HashMap<String, Type>>>>,
     pub memo: std::cell::RefCell<Option<LoweredType>>,
     // The source span a failure blames.
     pub span: Span,
