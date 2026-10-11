@@ -142,22 +142,16 @@ mod tests {
     // Does any node of the (elaborated) tree under `root` satisfy `pred`?
     // The one tree walker the shape-asserting tests share.
     fn tree_any(arena: &expr::Arena, root: expr::ExprRef, pred: &dyn Fn(&expr::Expr) -> bool) -> bool {
-        use expr::Expr;
-        let go = |r: &expr::ExprRef| tree_any(arena, *r, pred);
-        pred(&arena[root])
-            || match &arena[root] {
-                Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::TypeLit(_) => false,
-                Expr::Check(e, spec) => go(e) || spec.lens.iter().any(go),
-                Expr::Len(_) => false,
-                Expr::FieldAccess(e, _) | Expr::Perform(_, e) | Expr::Annot(e, _) => go(e),
-                Expr::ListLit(items) | Expr::Tuple(items) => items.iter().any(go),
-                Expr::Lambda(_, _, body) | Expr::MakeHandler { body, .. } => go(body),
-                Expr::App(a, b) | Expr::BinOp(_, a, b) | Expr::Let(_, _, a, b) | Expr::Handle { body: a, handler: b } => go(a) || go(b),
-                Expr::LetRec(bindings, body) => bindings.iter().any(|(_, _, v)| go(v)) || go(body),
-                Expr::If(c, t, e) => go(c) || go(t) || go(e),
-                Expr::Match(s, arms) => go(s) || arms.iter().any(|(_, g, b)| g.as_ref().is_some_and(go) || go(b)),
-                Expr::Record(fields) => fields.iter().any(|(_, v)| go(v)),
+        let (mut work, mut kids) = (vec![root], Vec::new());
+        while let Some(n) = work.pop() {
+            if pred(&arena[n]) {
+                return true;
             }
+            kids.clear();
+            arena[n].children(&mut kids);
+            work.extend(&kids);
+        }
+        false
     }
 
     // Does the elaborated program still bind `name` (a `let` or `let rec`)?
@@ -7496,62 +7490,21 @@ g(len)").unwrap_err();
         assert_eq!(run_source(src).unwrap().as_int(), 100000);
     }
 
-    // Every LetRec in an elaborated tree is still a direct Lambda group
-    // (resolve::is_direct_group); otherwise the recursive name becomes unbound.
-    fn let_rec_groups_direct(arena: &expr::Arena, root: expr::ExprRef, out: &mut Vec<bool>) {
-        use expr::Expr;
-        let mut go = |r: &expr::ExprRef| let_rec_groups_direct(arena, *r, out);
-        match &arena[root] {
-            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::Len(_) | Expr::TypeLit(_) => {}
-            Expr::Check(operand, _) | Expr::Annot(operand, _) => go(operand),
-            Expr::ListLit(items) | Expr::Tuple(items) => items.iter().for_each(go),
-            Expr::Lambda(_, _, body) => go(body),
-            Expr::App(f, a) => {
-                go(f);
-                go(a);
-            }
-            Expr::Let(_, _, val, body) => {
-                go(val);
-                go(body);
-            }
-            Expr::LetRec(bindings, body) => {
-                let direct = resolve::is_direct_group(arena, bindings);
-                bindings.iter().for_each(|(_, _, v)| go(v));
-                go(body);
-                out.push(direct);
-            }
-            Expr::BinOp(_, l, r) => {
-                go(l);
-                go(r);
-            }
-            Expr::If(c, t, e) => {
-                go(c);
-                go(t);
-                go(e);
-            }
-            Expr::Perform(_, p) => go(p),
-            Expr::Handle { body, handler } => {
-                go(body);
-                go(handler);
-            }
-            Expr::MakeHandler { body, .. } => go(body),
-            Expr::Match(s, arms) => {
-                go(s);
-                for (_, g, b) in arms.iter() {
-                    g.iter().for_each(&mut go);
-                    go(b);
-                }
-            }
-            Expr::Record(fields) => fields.iter().for_each(|(_, v)| go(v)),
-            Expr::FieldAccess(..) => unreachable!(),
-        }
-    }
-
+    // For each LetRec in the elaborated tree of `src`: is it still a direct
+    // Lambda group (resolve::is_direct_group)? Otherwise the recursive name
+    // becomes unbound.
     fn elaborated_let_rec_groups(src: &str) -> Vec<bool> {
         let (mut arena, spans, root, named) = parser::parse_with_named_types(src).unwrap();
         let out = typecheck::check_with_named_types(&mut arena, root, &spans, named).unwrap();
-        let mut groups = Vec::new();
-        let_rec_groups_direct(&arena, out, &mut groups);
+        let (mut groups, mut work, mut kids) = (Vec::new(), vec![out], Vec::new());
+        while let Some(n) = work.pop() {
+            if let expr::Expr::LetRec(bindings, _) = &arena[n] {
+                groups.push(resolve::is_direct_group(&arena, bindings));
+            }
+            kids.clear();
+            arena[n].children(&mut kids);
+            work.extend(&kids);
+        }
         groups
     }
 

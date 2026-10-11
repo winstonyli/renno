@@ -1684,67 +1684,82 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
 // Named(id)]) forever -- genuine infinite recursion in THIS function's own
 // call stack during elaboration, not a runtime concern.
 fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
+    let mut visiting = visiting.clone();
+    match boundary(to, &env.infer.named_types, &mut visiting) {
+        Boundary::None => e,
+        Boundary::Shape(to) => build_shape_check(arena, e, to, env),
+        Boundary::Fun(param_ty, ret_ty) => wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone(), env, &visiting),
+        Boundary::Union(to) => build_union_check(arena, e, to, env, &visiting),
+    }
+}
+
+// The kind of check a boundary against a type needs (build_boundary_check's
+// dispatch).
+enum Boundary<'t> {
+    // Nothing to check.
+    None,
+    // One native check of this function-free type (build_shape_check).
+    Shape(&'t Type),
+    // A per-call contract (wrap_fun_contract).
+    Fun(&'t Rc<Type>, &'t Rc<Type>),
+    // A union with a Fun alternative (build_union_check).
+    Union(&'t Type),
+}
+
+// `to` with every alias wrapper and Named alias above its first real shape
+// unfolded, each Named added to `visiting`.
+fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut HashSet<String>) -> Boundary<'t> {
     match to {
-        Type::Int | Type::Float | Type::Bool | Type::Str | Type::List(_) | Type::Token(_) | Type::Tuple(_) | Type::Record(_) => {
-            build_shape_check(arena, e, to, env)
-        }
-        Type::Fun(param_ty, _row, ret_ty) => wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone(), env, visiting),
-        Type::Union(_) if needs_contract(to, env, visiting) => build_union_check(arena, e, to, env, visiting),
-        Type::Union(_) => build_shape_check(arena, e, to, env),
+        Type::Int | Type::Float | Type::Bool | Type::Str | Type::List(_) | Type::Token(_) | Type::Tuple(_) | Type::Record(_) => Boundary::Shape(to),
+        Type::Fun(param_ty, _row, ret_ty) => Boundary::Fun(param_ty, ret_ty),
+        Type::Union(_) if needs_contract(to, named, visiting) => Boundary::Union(to),
+        Type::Union(_) => Boundary::Shape(to),
         // Dyn accepts everything, so a check against it is the identity. Not
         // unreachable: wrap_fun_contract checks a call's result against the
         // Fun's return type, which is Dyn for `Dyn -> Dyn` (and nested
         // builders reach it through tuple/union alternatives).
-        Type::Dyn | Type::Var(_) => e,
+        Type::Dyn | Type::Var(_) => Boundary::None,
         // A list's length, literal or read at run time from a length slot,
         // is part of its one native test.
-        Type::Indexed(w, _) if matches!(**w, Type::List(_)) => build_shape_check(arena, e, to, env),
+        Type::Indexed(w, _) if matches!(**w, Type::List(_)) => Boundary::Shape(to),
         // An alias (or Dyn/Var) wrapper: no runtime length to compare, but the shape is checked.
-        Type::Indexed(wrapped, _) => build_boundary_check(arena, e, wrapped, env, visiting),
-        // Look up what this id unfolds to and build ITS OWN boundary
-        // check, exactly as if `to` had been written directly as that
-        // unfolded shape. A Type::Named nested inside a container of that
-        // shape is checked by the native deep test (shape_of's `Ref`s); one
-        // reached only through a Fun position stays unresolved -- checked
-        // later, lazily, only if something else separately touches that
-        // position.
+        Type::Indexed(wrapped, _) => boundary(wrapped, named, visiting),
+        // Look up what this id unfolds to and check THAT, exactly as if `to`
+        // had been written directly as that unfolded shape. A Type::Named
+        // nested inside a container of that shape is checked by the native
+        // deep test (shape_of's `Ref`s); one reached only through a Fun
+        // position stays unresolved -- checked later, lazily, only if
+        // something else separately touches that position.
         // A missing registry entry IS reachable (not an internal-bug-only
         // case): parser::parse (the original, unchanged signature) builds
         // its own named_types registry but discards it rather than
         // returning it, so a caller pairing plain parse() with plain
         // check() (also unchanged, defaults to an empty registry) hits
-        // this with nothing registered. Degrade the same way this
-        // function's own Type::Var(_) arm above does for "no information
-        // here" -- return `e` unchecked -- rather than panicking.
+        // this with nothing registered. Degrade the same way the
+        // Type::Var(_) arm above does for "no information here" -- nothing
+        // to check -- rather than panicking.
         //
         // If `id` is already an ancestor in THIS unfold chain, stop
-        // instead of unfolding again -- but return `e` unchecked
-        // (matching this function's own Type::Var(_) arm above) rather
-        // than an unconditional failing check. Two different callers reach this
-        // branch, and only ONE of them makes a failure safe: build_union_check's
-        // own use is always gated behind build_shape_predicate's matching
-        // arm, which hard-codes `false` for this exact alternative (see
-        // its doc comment) -- so build_union_check's own `If(pred, checked,
-        // ...)` can never actually select this branch at runtime, and a
-        // failure there was always dead code no matter what sat in it.
-        // wrap_fun_contract's own call (a self-reference in a Fun's
-        // RETURN position, e.g. `type F = Dyn -> F`) is NOT gated by any
-        // predicate -- it's spliced directly into a contract-wrapped
-        // closure's own body, so a failure there ran unconditionally on
-        // EVERY call through that closure, even when the real return
-        // value never needed checking at all. `e` unchecked is correct
-        // for both: harmless where it's dead code anyway, and the right
-        // "checked later, lazily" answer where it actually runs.
-        Type::Named(id) => {
-            if visiting.contains(id) {
-                return e;
-            }
-            let Some(raw) = env.infer.named_types.get(id) else { return e };
-            let mut visiting = visiting.clone();
-            visiting.insert(id.clone());
-            let unfolded = raw.clone();
-            build_boundary_check(arena, e, &unfolded, env, &visiting)
-        }
+        // instead of unfolding again -- but check nothing (matching the
+        // Type::Var(_) arm above) rather than failing unconditionally. Two
+        // different callers reach this branch, and only ONE of them makes a
+        // failure safe: build_union_check's own use is always gated behind
+        // build_shape_predicate's matching arm, which hard-codes `false` for
+        // this exact alternative (see its doc comment) -- so
+        // build_union_check's own `If(pred, checked, ...)` can never actually
+        // select this branch at runtime, and a failure there was always dead
+        // code no matter what sat in it. wrap_fun_contract's own call (a
+        // self-reference in a Fun's RETURN position, e.g. `type F = Dyn ->
+        // F`) is NOT gated by any predicate -- it's spliced directly into a
+        // contract-wrapped closure's own body, so a failure there ran
+        // unconditionally on EVERY call through that closure, even when the
+        // real return value never needed checking at all. No check is
+        // correct for both: harmless where it's dead code anyway, and the
+        // right "checked later, lazily" answer where it actually runs.
+        Type::Named(id) => match named.get(id) {
+            Some(raw) if visiting.insert(id.clone()) => boundary(raw, named, visiting),
+            _ => Boundary::None,
+        },
     }
 }
 
@@ -2006,7 +2021,7 @@ fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, v
     let mut result = build_type_error(arena, tmp_ref, to, env);
     for alt in alts.iter().rev() {
         let pred = build_shape_predicate(arena, tmp_ref, alt, env, visiting);
-        let checked = if needs_contract(alt, env, visiting) { build_boundary_check(arena, tmp_ref, alt, env, visiting) } else { tmp_ref };
+        let checked = if needs_contract(alt, &env.infer.named_types, visiting) { build_boundary_check(arena, tmp_ref, alt, env, visiting) } else { tmp_ref };
         result = arena.push(Expr::If(pred, checked, result));
     }
     arena.push(Expr::Let(tmp, None, e, result))
@@ -2131,13 +2146,11 @@ fn extend_visiting(visiting: &HashSet<String>, id: &str) -> HashSet<String> {
 // Does checking `ty` do more than its shape test -- is a Fun reachable, so a
 // matching value must also get its per-call contract? Decides whether a
 // union check needs build_union_check's pick-then-check order.
-fn needs_contract(ty: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> bool {
+fn needs_contract(ty: &Type, named: &HashMap<String, Type>, visiting: &HashSet<String>) -> bool {
     match ty {
         Type::Fun(..) => true,
-        Type::Union(alts) => alts.iter().any(|alt| needs_contract(alt, env, visiting)),
-        Type::Named(id) if !visiting.contains(id) => {
-            env.infer.named_types.get(id).is_some_and(|raw| needs_contract(raw, env, &extend_visiting(visiting, id)))
-        }
+        Type::Union(alts) => alts.iter().any(|alt| needs_contract(alt, named, visiting)),
+        Type::Named(id) if !visiting.contains(id) => named.get(id).is_some_and(|raw| needs_contract(raw, named, &extend_visiting(visiting, id))),
         _ => false,
     }
 }
