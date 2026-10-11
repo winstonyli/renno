@@ -4221,6 +4221,140 @@ g(len)").unwrap_err();
         assert_eq!(ok("let Vec = fun n -> Int in to_str(Vec(2))"), "Int");
     }
 
+    // Runs `src` and returns its result with, for each kept annotation
+    // (Expr::Annot) in the elaborated tree, how many times it was evaluated.
+    fn annotation_evals(src: &str) -> (String, Vec<u32>) {
+        let (mut arena, mut spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
+        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap_or_else(|e| panic!("{src}: {}", e.0));
+        expr::fill_synthesized_spans(&arena, elaborated, &mut spans);
+        let value = machine::run(&arena, elaborated, Env::prelude(), &spans);
+        let (mut evals, mut work, mut kids) = (Vec::new(), vec![elaborated], Vec::new());
+        while let Some(n) = work.pop() {
+            if let expr::Expr::Annot(_, spec) = &arena[n] {
+                evals.push(spec.evals.get());
+            }
+            kids.clear();
+            arena[n].children(&mut kids);
+            work.extend(&kids);
+        }
+        (Outcome::from(&value).to_string(), evals)
+    }
+
+    // An annotation that names a definition is an anonymous type let before
+    // its binder (spec 11.1): it reads the definition as the let-bound twin
+    // does, so it fails, or is rejected, exactly where the twin is.
+    #[test]
+    fn an_annotation_reads_definitions_like_a_type_let() {
+        let g = "let G = fun a -> (if true then a else 5) in ";
+        for src in [
+            format!("{g}let y: G(Int) = 1 in y"),
+            format!("{g}let T = G(Int) in let y: T = 1 in y"),
+            format!("{g}let rec f: G(Int) = 3 in f"),
+            format!("{g}let rec f = fun x: G(Int) -> x in f(1)"),
+            format!("{g}let f = fun x: G(Int) -> x in 0"),
+            format!("{g}let H = fun b -> List(G(b)) in let y: H(Int) = [1] in y"),
+        ] {
+            let err = run_source(&src).unwrap_err();
+            assert!(err.contains("type error: expected Int, found Type"), "{src}: {err}");
+        }
+        // Elaborated as a value: a call's argument is checked statically.
+        for src in ["let F = fun x: Str -> List(Int) in let y: F(1) = [1] in y", "let F = fun x: Str -> List(Int) in let T = F(1) in let y: T = [1] in y"] {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains("type mismatch: expected Str, found Int"), "{src}: {err}");
+        }
+        // A site the run time confirms is typed by its check-time value.
+        let g = "let G = fun u -> (let d: Dyn = 1 in let i: Int = d in List(Int)) in ";
+        assert_eq!(run_source(&format!("{g}let y: G(0) = [1] in y")).unwrap().to_string(), "[1]");
+        let err = run_source(&format!("{g}let y: G(0) = [true] in y")).unwrap_err();
+        assert!(err.contains("type mismatch: expected [Int], found [Bool]"), "{err}");
+    }
+
+    // A confirmed annotation is evaluated once per site (spec 11.5), however
+    // often the site runs, a resumed continuation included.
+    #[test]
+    fn a_confirm_site_evaluates_its_annotation_once() {
+        let g = "let G = fun u -> (let d: Dyn = 1 in let i: Int = d in List(Int)) in ";
+        for (src, want) in [
+            ("let rec go = fun i -> if i == 0 then 0 else (let y: G(0) = [i] in go(i - 1)) in go(5)", "0"),
+            ("handle (let y: G(0) = [perform choose(0)] in len(y) + 100) with handler choose(p, resume) -> resume(1) + resume(2)", "202"),
+            ("let f = fun x: G(0) -> len(x) in f([1]) + f([2, 3])", "3"),
+            ("let rec f = fun x: G(0) -> (if len(x) == 0 then 0 else f([])) in f([1])", "0"),
+        ] {
+            assert_eq!(annotation_evals(&format!("{g}{src}")), (want.to_string(), vec![1]), "{src}");
+        }
+    }
+
+    // An annotation whose check-time evaluation runs out of fuel is the
+    // run-time fuel error, raised only where the annotation is evaluated:
+    // a parameter's when its closure is created, a recursive group's
+    // parameter on each call.
+    #[test]
+    fn a_divergent_annotation_fails_where_it_is_evaluated() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        let msg = "annotation did not terminate within 1000000 steps";
+        let f = "let rec F = fun x -> F(x) in ";
+        assert_eq!(ok(&format!("{f}let g = fun u -> (let y: F(1) = 2 in y) in 0")), "0");
+        assert_eq!(ok(&format!("{f}let rec g = fun x: F(1) -> x in 7")), "7");
+        let err = run_source(&format!("{f}(fun u -> (let y: F(1) = 2 in y))(0)")).unwrap_err();
+        assert!(err.contains(&format!("column 48: {msg}")), "{err}");
+        for src in [format!("{f}let g = fun y: F(1) -> y in 5"), format!("{f}let rec g = fun x: F(1) -> x in g(7)"), format!("{f}let rec g: F(1) = 3 in 7")] {
+            let err = run_source(&src).unwrap_err();
+            assert!(err.contains(msg), "{src}: {err}");
+        }
+    }
+
+    // An annotation that names no program binder, or only definitions whose
+    // binding cannot fail, leaves no node for the run time (spec 11.1).
+    #[test]
+    fn a_closed_annotation_adds_no_run_time_node() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut programs: Vec<(String, String)> = Vec::new();
+        for sub in ["examples", "corpus"] {
+            for entry in std::fs::read_dir(dir.join(sub)).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "rn") {
+                    programs.push((path.display().to_string(), std::fs::read_to_string(&path).unwrap()));
+                }
+            }
+        }
+        for src in ["let x: [Int] = [1] in x", "fun x: Int -> x", "let T = List(Int) in let x: T = [1] in x", "let P = fun a -> Tuple((a, a)) in let p: P(Int) = (1, 2) in p"] {
+            programs.push((src.to_string(), src.to_string()));
+        }
+        assert!(programs.len() > 4, "no corpus programs found");
+        for (name, src) in programs {
+            let (mut arena, spans, root, named_types) = parser::parse_with_named_types(&src).unwrap();
+            let Ok(elaborated) = typecheck::check_with_named_types(&mut arena, root, &spans, named_types) else { continue };
+            assert!(!tree_any(&arena, elaborated, &|e| matches!(e, expr::Expr::Annot(..))), "{name}");
+        }
+    }
+
+    // Erasure is decided once inference has finished (settle_erasure): `a`
+    // in `fun a -> List(a)` goes to a Dyn parameter through a cast slot that
+    // turns out to need no check, so neither the sites nor L stay, at any
+    // placement, nested sites included.
+    #[test]
+    fn an_erased_site_leaves_no_trace() {
+        let l = "let L = fun a -> List(a) in ";
+        for (src, want) in [
+            ("let p: L(Int) = [1] in p", "[1]"),
+            ("let f = fun x: L(Int) -> x in f([2])", "[2]"),
+            ("let rec f = fun x: L(Int) -> (if len(x) == 0 then 0 else f([])) in f([1])", "0"),
+            ("let rec f: (L(Int) -> Int) = fun x -> len(x) in f([1])", "1"),
+            ("let f: (L(Int) -> L(Int)) = fun x: L(Int) -> x in f([4])", "[4]"),
+        ] {
+            let src = format!("{l}{src}");
+            let (mut arena, spans, root, named_types) = parser::parse_with_named_types(&src).unwrap();
+            let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+            let trace = |e: &expr::Expr| match e {
+                expr::Expr::Annot(..) => true,
+                expr::Expr::Let(n, ..) | expr::Expr::Lambda(n, ..) => n.starts_with("__r") || n == "L",
+                _ => false,
+            };
+            assert!(!tree_any(&arena, elaborated, &trace), "{src}");
+            assert_eq!(run_source(&src).unwrap().to_string(), want, "{src}");
+        }
+    }
+
     // A type let only annotations read is dead at run time and not emitted
     // (spec section 1); one read as a value, or not proved at check time, stays.
     #[test]
@@ -4228,8 +4362,14 @@ g(len)").unwrap_err();
         let binds = elaborated_binds;
         assert!(!binds("let T = List(Int) in let x: T = [1] in x", "T"));
         assert!(!binds("let T = Int in let U = List(T) in let x: U = [1] in x", "U"));
+        // L's body passes `a` to a Dyn parameter through a cast slot, which
+        // needs no check once inference has finished (settle_erasure).
+        assert!(!binds("let L = fun a -> List(a) in let T = L(Int) in let x: T = [5] in x", "T"));
         assert!(!binds("let rec L = Union((Tuple((Int, L)), Bool)) in let l: L = (1, true) in l", "L"));
-        assert!(!binds("let rec Rep = fun n -> if n == 0 then Int else List(Rep(n - 1)) in let x: Rep(1) = [1] in x", "Rep"));
+        assert!(!binds("let rec Rep: (Int -> Dyn) = fun n -> if n == 0 then Int else List(Rep(n - 1)) in let x: Rep(1) = [1] in x", "Rep"));
+        // Unannotated, `n - 1` checks that `n` is a number, which could
+        // fail: the annotation is kept, and so is Rep (as for `let T = Rep(1)`).
+        assert!(binds("let rec Rep = fun n -> if n == 0 then Int else List(Rep(n - 1)) in let x: Rep(1) = [1] in x", "Rep"));
         // Read as a value: kept.
         assert!(binds("let T = List(Int) in let x: T = [1] in (to_str(T), x)", "T"));
         assert!(binds("let rec L = Union((Tuple((Int, L)), Bool)) in to_str(L)", "L"));
@@ -4290,7 +4430,7 @@ g(len)").unwrap_err();
         assert!(elaborated_binds(src, "T"));
         assert!(run_source(src).unwrap_err().contains("expected Int, found Bool"));
         // Only closures or type literals: running them cannot fail.
-        assert!(!elaborated_binds("let rec Rep = fun n -> if n == 0 then Int else List(Rep(n - 1)) in let x: Rep(1) = [1] in x", "Rep"));
+        assert!(!elaborated_binds("let rec Rep: (Int -> Dyn) = fun n -> if n == 0 then Int else List(Rep(n - 1)) in let x: Rep(1) = [1] in x", "Rep"));
         assert!(!elaborated_binds("let Pair = fun a -> Tuple((a, a)) in let x: Pair(Int) = (1, 2) in x", "Pair"));
     }
 
