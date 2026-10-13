@@ -3372,8 +3372,9 @@ fn annotation_type(arena: &mut Arena, ann: ExprRef, blame: Span, ctx: &Ctx, span
 // definitions it reads): an index term is not a value, so it reaches a type
 // value only from a TypeLit. Each gets a length slot read in the binder's
 // scope, as a Check's would be; one nothing here binds is the annotation's
-// own, and matches any length, as at the binder that introduces it
-// statically. The site's contract checks read the same table.
+// own, and matches any length. Unlike the binder that introduces it
+// statically, repeated occurrences do not share it (parked, spec 11.13). The
+// site's contract checks read the same table.
 fn residual_spec(arena: &mut Arena, root: ExprRef, blame: Span, infer: &InferCtx) -> Rc<ResidualSpec> {
     let mut names = BTreeSet::new();
     let (mut work, mut kids) = (vec![root], Vec::new());

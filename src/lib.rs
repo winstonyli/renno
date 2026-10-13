@@ -4415,7 +4415,8 @@ g(len)").unwrap_err();
     // A user `Vec` receives an Int for a literal index and, for a symbolic
     // one, the type Vec(n) (spec ruling 12.4): an index variable is not a
     // value. `Indexed` likewise receives (T, k) or (T, Vec(n)). The index
-    // variable stays one variable through a user Vec, and a closed
+    // variable stays one variable through a let-bound user Vec (a parameter
+    // Vec makes the site a residual: see the next test), and a closed
     // annotation calling the prelude Vec still leaves no run-time node.
     #[test]
     fn a_user_vec_receives_an_int_or_an_indexed_type() {
@@ -4431,6 +4432,23 @@ g(len)").unwrap_err();
         let err = run_source("let Vec = fun n -> n in let f = fun xs: Vec(n) -> fun ys: Vec(n) -> ys in f([1])([2, 3])").unwrap_err();
         assert!(err.contains("column 82: type mismatch: expected [Dyn](1), found [Int](2)"), "{err}");
         assert_eq!(annotation_evals("let T = Int in let f = fun xs: (T, Vec(n)) -> xs in f((1, [2]))"), ("[1, [2]]".to_string(), vec![]));
+        // The tuple `Indexed` passes is blamed from its `(`, like `F(Int, 2)`.
+        let err = run_source("let Indexed = fun p: Int -> Int in let x: Indexed(Int, 2) = 1 in x").unwrap_err();
+        assert!(err.contains("column 50:"), "{err}");
+    }
+
+    // A parameter `Vec` makes `Vec(n)` an Unknown site whose symbolic index is
+    // read from the carrier. An index variable no static binder holds matches
+    // any length, so repeated occurrences do not share it (parked: the closed
+    // annotation would unify them); one a static binder holds is checked.
+    #[test]
+    fn a_parameter_vec_reads_a_symbolic_index_from_the_carrier() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        let err = run_source("(fun Vec -> fun x: Vec(n) -> x)(fun c -> c)(5)").unwrap_err();
+        assert!(err.contains("column 20: type error: expected [Dyn](n), found Int"), "{err}");
+        assert_eq!(ok("(fun Vec -> fun x: Vec(n) -> fun y: Vec(n) -> y)(Vec)([1])([1, 2])"), "[1, 2]");
+        let err = run_source("let f = fun xs: Vec(n) -> fun Vec -> fun ys: Vec(n) -> ys in f([1])(Vec)([1, 2])").unwrap_err();
+        assert!(err.contains("column 46: type error: expected [Dyn](n), found List"), "{err}");
     }
 
     // Runs `src` and returns its result with, for each kept annotation

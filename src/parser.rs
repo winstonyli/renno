@@ -611,13 +611,14 @@ impl<'a> Parser<'a> {
                 let indexed = name == "Indexed";
                 let head_span = Span { start, end: self.span_before().end };
                 let head = self.push_spanned(Expr::Var(name), head_span);
+                let paren_start = self.span_at().start;
                 self.bump();
                 let arg = if indexed {
                     let wrapped = self.parse_union_type()?;
                     self.expect(&Token::Comma)?;
                     let index = self.index_arg()?;
                     self.expect(&Token::RParen)?;
-                    let span = Span { start, end: self.span_before().end };
+                    let span = Span { start: paren_start, end: self.span_before().end };
                     self.push_spanned(Expr::Tuple(vec![wrapped, index]), span)
                 } else {
                     let index = self.index_arg()?;
