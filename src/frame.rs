@@ -47,6 +47,15 @@ impl Env {
         Env(Some(Rc::new(Frame { parent: self.clone(), slots })))
     }
 
+    // The env `hops` frames up.
+    pub fn up(&self, hops: u32) -> Env {
+        let mut env = self;
+        for _ in 0..hops {
+            env = &env.0.as_deref().expect("internal: an env walked past the root frame").parent;
+        }
+        env.clone()
+    }
+
     // Walks `hops` parents (by reference -- no Rc clones on the way) and
     // reads `slot`. A miss here means the resolver and the machine disagree
     // about a scope's layout, which is a bug, never a user error.

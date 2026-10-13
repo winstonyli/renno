@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::{Env, PRELUDE};
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, Expr, ExprRef, Len, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, Len, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test, Then};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::resolve::{is_direct_group, resolve, Resolved, VarRef};
@@ -260,19 +260,13 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                     }
                 },
                 Expr::Residual(operand, ty, spec) => {
-                    let t = match resolved.get(*ty) {
-                        Some(VarRef::Local { hops, slot }) => match env.get(hops, slot) {
-                            Value::Type(t) => t,
-                            other => panic!("internal: a residual's type variable holds {}", other.type_name()),
-                        },
-                        other => panic!("internal: a residual's type variable resolved to {other:?}"),
-                    };
+                    let Value::Type(t) = local(&env, resolved, *ty) else { panic!("internal: a residual's type variable holds no type") };
                     if let Some(lowered) = residual_check(spec, t) {
-                        // The table's slots read the env the operand is
-                        // evaluated in, as a Check's do.
-                        let table: Vec<Len> = spec.lens.iter().map(|slot| eval_slot(arena, *slot, &env, resolved)).collect();
-                        let lens = lowered.slots.iter().map(|index| to_len(index_len(index, &spec.index_names, &table))).collect();
-                        cont = Cont::cons(Frame::Check { spec: lowered.check.clone(), lens }, cont);
+                        let lens = residual_lens(arena, spec, &lowered, &env, resolved);
+                        cont = match lowered.then {
+                            Then::Done => Cont::cons(Frame::Check { spec: lowered.check.clone(), lens }, cont),
+                            _ => Cont::cons(Frame::Contract { lowered, lens, site: spec.clone(), env: env.up(spec.depth) }, cont),
+                        };
                     }
                     control = Control::Eval(*operand, env);
                 }
@@ -635,18 +629,9 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                         Frame::Check { spec, lens } => {
                             let holds = test_holds(&spec.test, &spec.defs, lens, &value);
                             if !holds {
-                                // A length nothing at run time holds, reached
-                                // on a list: that is the failure, in either mode.
-                                if let Some(name) = reached_no_value(&spec.test, &spec.defs, lens, &value) {
-                                    set_current_span(spec.span);
-                                    crate::run_error!("type error: index variable {name} has no runtime value to check a length against")
-                                }
+                                no_value_error(&spec.test, spec, lens, &value);
                                 if spec.mode == CheckMode::Assert {
-                                    set_current_span(spec.span);
-                                    let mut path = Vec::new();
-                                    let found = explain(&spec.test, &spec.defs, lens, &value, &mut path);
-                                    let at = if path.is_empty() { String::new() } else { format!(" at {}", path_text(&path)) };
-                                    crate::run_error!("type error: expected {}, found {}{at}", spec.to, found.type_name())
+                                    check_failed(spec, lens, &value)
                                 }
                             }
                             let probe = spec.mode == CheckMode::Probe;
@@ -657,6 +642,11 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                             let t = annotation_value(spec, Ok(value));
                             cont = rest;
                             control = Control::Apply(Value::Type(t));
+                        }
+                        Frame::Contract { lowered, lens, site, env } => {
+                            let value = contract_value(&lowered.then, &lowered.check, lens, value, site, env);
+                            cont = rest;
+                            control = Control::Apply(value);
                         }
                         Frame::PerformPayload { effect } => {
                             let effect = effect.clone();
@@ -786,16 +776,16 @@ fn eval_len(term: &LenExpr, env: &Env, resolved: &Resolved) -> Result<i64, Len> 
     }
 }
 
-// An index in a run-time type, valued from an Unknown site's table: each
-// variable the annotation's text writes has its slot's value (`names[i]` is
-// `table[i]`'s); any other variable came with a type value built elsewhere
-// and matches any length (spec 11.4).
-fn index_len(index: &IndexExpr, names: &[String], table: &[Len]) -> Result<i64, Len> {
-    let arith = |a: &IndexExpr, b: &IndexExpr, op| len_arith(index_len(a, names, table), || index_len(b, names, table), op);
+// An index in a run-time type, valued by `value`: an Unknown site's table
+// (each variable the annotation's text writes) and a contract's witness. Any
+// other variable came with a type value built elsewhere and matches any
+// length (spec 11.4).
+fn index_len(index: &IndexExpr, value: &impl Fn(&str) -> Option<Len>) -> Result<i64, Len> {
+    let arith = |a: &IndexExpr, b: &IndexExpr, op| len_arith(index_len(a, value), || index_len(b, value), op);
     match index {
-        IndexExpr::Var(name) => match names.iter().position(|n| n == name).map(|i| &table[i]) {
-            Some(Len::Exact(k)) => i64::try_from(*k).map_err(|_| Len::Never),
-            Some(other) => Err(other.clone()),
+        IndexExpr::Var(name) => match value(name) {
+            Some(Len::Exact(k)) => i64::try_from(k).map_err(|_| Len::Never),
+            Some(other) => Err(other),
             None => Err(Len::Any),
         },
         IndexExpr::Lit(n) => Ok(*n),
@@ -805,9 +795,47 @@ fn index_len(index: &IndexExpr, names: &[String], table: &[Len]) -> Result<i64, 
     }
 }
 
-// An Unknown site's check against type value `t` (None: nothing to check),
-// lowered once while the same value keeps coming back (spec 11.5). A type
-// that cannot be lowered is the run-time error at the site.
+// The value of a variable a synthesized node reads (a Residual's type, a
+// contract's witness): always a local.
+fn local(env: &Env, resolved: &Resolved, var: ExprRef) -> Value {
+    match resolved.get(var) {
+        Some(VarRef::Local { hops, slot }) => env.get(hops, slot),
+        other => panic!("internal: a residual's variable resolved to {other:?}"),
+    }
+}
+
+// The values of a lowered type's length slots at an Unknown site, read on
+// entry in `env` as a Check's are: the site's table, and on a contract's
+// result check its witness.
+fn residual_lens(arena: &Arena, spec: &ResidualSpec, lowered: &Lowered, env: &Env, resolved: &Resolved) -> Vec<Len> {
+    if lowered.slots.is_empty() {
+        return Vec::new();
+    }
+    let table: Vec<Len> = spec.lens.iter().map(|slot| eval_slot(arena, *slot, env, resolved)).collect();
+    let witness = spec.witness.and_then(|(param, arg)| witness(local(env, resolved, param), local(env, resolved, arg)));
+    let value = |name: &str| match &witness {
+        Some((n, len)) if n == name => Some(len.clone()),
+        _ => spec.index_names.iter().position(|n| n == name).map(|i| table[i].clone()),
+    };
+    lowered.slots.iter().map(|index| to_len(index_len(index, &value))).collect()
+}
+
+// A contract call's parameter type and argument: when the type is Vec(n),
+// `n` and the argument's length, as typecheck::wrap_fun_contract binds a
+// witness (a non-list has no length; the argument's own check rejects it).
+fn witness(param: Value, arg: Value) -> Option<(String, Len)> {
+    let Value::Type(t) = param else { return None };
+    let Type::Indexed(list, index) = &*t else { return None };
+    let (Type::List(_), IndexExpr::Var(n)) = (&**list, &**index) else { return None };
+    let len = match arg {
+        Value::List(items) => Len::Exact(items.len()),
+        _ => Len::NoValue(n.as_str().into()),
+    };
+    Some((n.clone(), len))
+}
+
+// An Unknown site's checks against type value `t` (None: nothing to check),
+// lowered once while the same value keeps coming back (spec 11.5).
 fn residual_check(spec: &ResidualSpec, t: Rc<Type>) -> Option<Rc<Lowered>> {
     let mut memo = spec.memo.borrow_mut();
     if let Some((seen, lowered)) = memo.as_ref()
@@ -816,12 +844,50 @@ fn residual_check(spec: &ResidualSpec, t: Rc<Type>) -> Option<Rc<Lowered>> {
         return lowered.clone();
     }
     let named = spec.named.get().expect("internal: the registry is set when checking finishes");
-    let lowered = crate::typecheck::lower_residual(&t, named, spec.span).unwrap_or_else(|msg| {
-        set_current_span(Some(spec.span));
-        crate::run_error!("{msg}")
-    });
+    let lowered = crate::typecheck::lower_residual(&t, named, spec.span);
     *memo = Some((t, lowered.clone()));
     lowered
+}
+
+// `value`, given what it still needs beyond `check` (spec 11.6): a function
+// wrapped in the site's contract, which checks every call (closing over the
+// site's env `env`), or for a union with a function alternative, the first
+// alternative that holds.
+fn contract_value(then: &Then, check: &CheckSpec, lens: &[Len], value: Value, site: &ResidualSpec, env: &Env) -> Value {
+    match then {
+        Then::Done => value,
+        Then::Wrap(param, ret) => {
+            let body = *site.contract.get().expect("internal: a residual's contract is built with it");
+            Value::Closure(body, env.push1(value).push1(Value::Type(param.clone())).push1(Value::Type(ret.clone())))
+        }
+        Then::Pick(alternatives) => {
+            for (test, then) in alternatives {
+                if test_holds(test, &check.defs, lens, &value) {
+                    return contract_value(then, check, lens, value, site, env);
+                }
+                no_value_error(test, check, lens, &value);
+            }
+            check_failed(check, lens, &value)
+        }
+    }
+}
+
+// A failing test that reached a length nothing at run time holds, on a list:
+// that is the failure, whatever the check's mode.
+fn no_value_error(test: &Test, spec: &CheckSpec, lens: &[Len], value: &Value) {
+    if let Some(name) = reached_no_value(test, &spec.defs, lens, value) {
+        set_current_span(spec.span);
+        crate::run_error!("type error: index variable {name} has no runtime value to check a length against")
+    }
+}
+
+// A failed Assert check: the innermost offender and the way down to it.
+fn check_failed(spec: &CheckSpec, lens: &[Len], value: &Value) -> ! {
+    set_current_span(spec.span);
+    let mut path = Vec::new();
+    let found = explain(&spec.test, &spec.defs, lens, value, &mut path);
+    let at = if path.is_empty() { String::new() } else { format!(" at {}", path_text(&path)) };
+    crate::run_error!("type error: expected {}, found {}{at}", spec.to, found.type_name())
 }
 
 enum Step<'t, 'a> {

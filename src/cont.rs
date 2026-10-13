@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use crate::env::Env;
-use crate::expr::{AnnotSpec, BinOp, CheckSpec, ExprRef, Len, Pattern};
+use crate::expr::{AnnotSpec, BinOp, CheckSpec, ExprRef, Len, Lowered, Pattern, ResidualSpec};
 use crate::span::Span;
 use crate::value::{HandlerData, Value};
 
@@ -68,6 +68,11 @@ pub enum Frame {
     // The operand of an Expr::Check has just evaluated -- test it against
     // the spec, with the length slots read when the Check was entered.
     Check { spec: Rc<CheckSpec>, lens: Vec<Len> },
+    // The operand of an Unknown site whose type needs a contract (a function,
+    // or a union with a function alternative) has just evaluated:
+    // machine::contract_value checks it and wraps what it still needs, in
+    // the site's env `env`.
+    Contract { lowered: Rc<Lowered>, lens: Vec<Len>, site: Rc<ResidualSpec>, env: Env },
     // A kept annotation reached inside a check-mode evaluation (a type
     // function's body) has just evaluated: machine::annotation_value takes it.
     Annot { spec: Rc<AnnotSpec> },

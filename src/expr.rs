@@ -241,6 +241,20 @@ pub struct ResidualSpec {
     pub memo: std::cell::RefCell<Option<LoweredType>>,
     // The source span a failure blames.
     pub span: Span,
+    // The site's function contract (spec 11.6), `fun f -> fun p -> fun r ->
+    // fun a -> body`, on the site's own check only, so a walk meets it once.
+    pub template: Option<ExprRef>,
+    // Its `body`, shared by the site's checks: a function value checked
+    // against `p -> r` becomes Value::Closure(body, site env + [f, p, r]), so
+    // each call checks its argument against `p` and its result against `r`.
+    pub contract: Rc<std::cell::OnceCell<ExprRef>>,
+    // How many frames this check's env is inside the site's: 0 at the site,
+    // 4 in the contract's body (`f`, `p`, `r`, `a`).
+    pub depth: u32,
+    // On the contract's result check: the variables holding `p` and the
+    // argument. A Vec(n) parameter gives `n` the argument's length there,
+    // the run-time twin of typecheck::wrap_fun_contract's witness.
+    pub witness: Option<(ExprRef, ExprRef)>,
 }
 
 // The type an Unknown site lowered last, and its check (None: nothing to
@@ -248,12 +262,28 @@ pub struct ResidualSpec {
 // address from being reused by another type.
 pub type LoweredType = (Rc<Type>, Option<Rc<Lowered>>);
 
-// A run-time type as a native check: a Check spec (its `lens` unused), and
-// for each length slot its test reads, the index whose value fills it.
+// A run-time type as checks: a native Check spec (its `lens` unused), for
+// each length slot its tests read the index whose value fills it, and what a
+// value passing `check` still needs.
 #[derive(Debug)]
 pub struct Lowered {
     pub check: Rc<CheckSpec>,
     pub slots: Vec<IndexExpr>,
+    pub then: Then,
+}
+
+// What a value needs beyond a Lowered's native test (typecheck::boundary's
+// Fun and Union cases).
+#[derive(Debug)]
+pub enum Then {
+    // Nothing more.
+    Done,
+    // The site's contract, with these parameter and result types.
+    Wrap(Rc<Type>, Rc<Type>),
+    // The first alternative whose test holds (against the Lowered's defs and
+    // slots), then what that alternative needs; none holds: the Lowered's
+    // check fails.
+    Pick(Vec<(Test, Then)>),
 }
 
 #[derive(Debug)]
@@ -432,6 +462,8 @@ impl Expr {
             Expr::Residual(e, ty, spec) => {
                 out.extend([*e, *ty]);
                 out.extend(&spec.lens);
+                out.extend(spec.template);
+                out.extend(spec.witness.iter().flat_map(|(p, a)| [*p, *a]));
             }
             Expr::FieldAccess(e, _) | Expr::Perform(_, e) | Expr::Annot(e, _) => out.push(*e),
             Expr::Lambda(_, ann, body) => {

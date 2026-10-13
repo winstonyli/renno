@@ -4218,21 +4218,62 @@ g(len)").unwrap_err();
         assert_eq!(run_source("let B = opaque in to_str(TypeOf(B))").unwrap().to_string(), "Token#8");
     }
 
-    // C2 lowers only function-free types; a type that needs a per-call
-    // contract is a run-time error at the site until C3.
+    // A function-typed Unknown site wraps its value in the site's contract
+    // (spec 11.6), which checks every call as wrap_fun_contract does: the
+    // argument, callability, and the result (itself wrapped if a function),
+    // blaming the site. A union with a function alternative picks the first
+    // alternative whose shape holds.
     #[test]
-    fn a_function_typed_unknown_site_is_not_supported_yet() {
-        let msg = "function-typed residuals are not supported yet";
-        for src in [
-            "let f = fun T -> fun x: T -> x in f(Fun((Int, Int)))(fun y -> y)",
-            "let f = fun T -> fun x: T -> x in f(Union((Int, Fun((Int, Int)))))(1)",
-            "let f = fun T -> let rec g: T = fun x -> x in g in f(Fun((Int, Int)))(3)",
-        ] {
-            let err = run_source(src).unwrap_err();
-            assert!(err.contains(msg), "{src}: {err}");
-        }
+    fn a_function_typed_unknown_site_checks_each_call() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        let f = "let f = fun T -> fun g: T -> g in ";
+        assert_eq!(ok(&format!("{f}f(Fun((Int, Int)))(fun y -> y)(3)")), "3");
+        assert_eq!(ok(&format!("{f}f(Union((Int, Fun((Int, Int)))))(5)")), "5");
+        assert_eq!(ok("let f = fun T -> let rec g: T = fun x -> x in g in f(Fun((Int, Int)))(3)"), "3");
         // A function inside a container is only a callability test, as statically.
-        assert_eq!(run_source("let f = fun T -> fun x: List(T) -> len(x) in f(Fun((Int, Int)))([fun y -> y])").unwrap().to_string(), "1");
+        assert_eq!(ok("let f = fun T -> fun x: List(T) -> len(x) in f(Fun((Int, Int)))([fun y -> y])"), "1");
+        // Wrapping a non-function succeeds; calling it fails.
+        assert_eq!(ok("let f = fun T -> let d: Dyn = 5 in let g: T = d in 0 in f(Fun((Int, Int)))"), "0");
+        for (src, want) in [
+            (format!("{f}f(Fun((Int, Int)))(fun y -> true)(3)"), "column 25: type error: expected Int, found Bool"),
+            (format!("{f}let h = f(Fun((Int, Int)))(fun x -> x) in let k: Dyn = h in k(true)"), "column 25: type error: expected Int, found Bool"),
+            (format!("{f}f(Fun((Fun((Int, Int)), Int)))(fun k -> k(true))(fun y -> y)"), "column 25: type error: expected Int, found Bool"),
+            (format!("{f}f(Fun((Int, Fun((Int, Bool)))))(fun x -> fun y -> 5)(1)(2)"), "column 25: type error: expected Bool, found Int"),
+            (format!("{f}f(Union((Int, Fun((Int, Int)))))(\"a\")"), "column 25: type error: expected Int | (Int -> Int), found Str"),
+            ("let f = fun T -> let d: Dyn = 5 in let g: T = d in g(1) in f(Fun((Int, Int)))".to_string(), "column 47: type error: expected (Dyn -> Dyn), found Int"),
+            ("let f = fun T -> let rec g: T = fun x -> true in g in f(Fun((Int, Int)))(3)".to_string(), "column 33: type error: expected Int, found Bool"),
+            // The contract reads a length from the site's scope, as the site does.
+            (
+                "let f = fun T -> fun ys: Vec(n) -> let d: Dyn = fun x -> [1] in let g: (T -> Indexed(List(Dyn), n)) = d in g(1) in f(Int)([1, 2])".to_string(),
+                "column 103: type error: expected [Dyn](n), found List",
+            ),
+        ] {
+            let err = run_source(&src).unwrap_err();
+            assert!(err.contains(want), "{src}: {err}");
+        }
+    }
+
+    // A function-typed Unknown site fails with the message the static
+    // contract of the same type gives, including a Vec(n) parameter's length
+    // for the result.
+    #[test]
+    fn a_function_contract_fails_with_the_static_message() {
+        // Each type as written statically, and as an annotation naming `T`
+        // with the value `T` gets.
+        for (ty, unknown_ty, t, value, call) in [
+            ("(Int -> Int)", "T", "Fun((Int, Int))", "fun x -> true", "g(1)"),
+            ("(Int -> Int)", "T", "Fun((Int, Int))", "5", "g(1)"),
+            ("(Int -> Int)", "T", "Fun((Int, Int))", "fun x -> x", "(let h: Dyn = g in h(\"a\"))"),
+            ("(Int -> (Int, Int))", "T", "Fun((Int, Tuple((Int, Int))))", "fun x -> (x, true)", "g(1)"),
+            ("(Vec(n) -> Vec(n))", "(Indexed(List(T), n) -> Indexed(List(T), n))", "Dyn", "fun x -> [1]", "g([1, 2])"),
+            ("(Vec(n) -> Vec(n + 1))", "(Indexed(List(T), n) -> Indexed(List(T), n + 1))", "Dyn", "fun x -> [x]", "g([1, 2])"),
+            ("(Int -> Int) | Bool", "T", "Union((Fun((Int, Int)), Bool))", "5", "g"),
+        ] {
+            let fixed = run_source(&format!("let d: Dyn = {value} in let g: {ty} = d in {call}")).unwrap_err();
+            let unknown = run_source(&format!("let f = fun T -> let d: Dyn = {value} in let g: {unknown_ty} = d in {call} in f({t})")).unwrap_err();
+            let message = |e: &str| e.lines().next().and_then(|l| l.split_once("type error")).map(|(_, m)| m.to_string()).unwrap_or_else(|| panic!("{e}"));
+            assert_eq!(message(&unknown), message(&fixed), "{ty}");
+        }
     }
 
     // `Name(arg)` in an annotation is ordinary application (spec section 9.1).

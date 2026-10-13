@@ -192,12 +192,14 @@ fn visit(
                 work.push(Work::Visit(*slot));
             }
         }
-        // So are a Residual's, and the variable holding its type.
-        Expr::Residual(target, ty, spec) => {
-            work.push(Work::Visit(*target));
-            work.push(Work::Visit(*ty));
-            for slot in spec.lens.iter().rev() {
-                work.push(Work::Visit(*slot));
+        // So are a Residual's, and the variable holding its type. Its
+        // contract template is a lambda chain in the same scope (its checks
+        // read the site's length slots).
+        Expr::Residual(..) => {
+            let mut kids = Vec::new();
+            arena[id].children(&mut kids);
+            for kid in kids.into_iter().rev() {
+                work.push(Work::Visit(kid));
             }
         }
         Expr::Len(term) => {

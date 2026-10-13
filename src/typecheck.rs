@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test, Then};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::plist::PList;
 use crate::span::Span;
@@ -1768,21 +1768,49 @@ fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut H
 }
 
 // An Unknown site's type value, lowered when the run time reaches the site
-// (spec 11.5): the one native check build_boundary_check would build for it
-// at check time, with the same failure messages; `named` is the program's
-// recursive types. None: nothing to check. A type needing a per-call
-// contract is not supported yet (C2's interim error).
-pub(crate) fn lower_residual(ty: &Type, named: &Rc<HashMap<String, Type>>, span: Span) -> Result<Option<Rc<Lowered>>, String> {
+// (spec 11.5): the checks build_boundary_check would build for it at check
+// time, with the same failure messages; `named` is the program's recursive
+// types. None: nothing to check. A function is wrapped in the site's
+// contract (its check passes anything: callability is checked at each call,
+// as wrap_fun_contract's is); a union with a function alternative picks the
+// first alternative whose shape holds, as build_union_check does, and its
+// check is the failure when none does.
+pub(crate) fn lower_residual(ty: &Type, named: &Rc<HashMap<String, Type>>, span: Span) -> Option<Rc<Lowered>> {
     let infer = InferCtx::new(named.clone());
     let env = CheckEnv { defer: false, ..CheckEnv::at(&infer, span) };
-    let to = match boundary(ty, named, &mut HashSet::new()) {
-        Boundary::None => return Ok(None),
-        Boundary::Shape(to) => to,
-        Boundary::Fun(..) | Boundary::Union(_) => return Err("function-typed residuals are not supported yet".to_string()),
+    let mut visiting = HashSet::new();
+    let mut defs = Defs::default();
+    let (test, to, then) = match boundary(ty, named, &mut visiting) {
+        Boundary::None => return None,
+        Boundary::Shape(to) => (shape_test(to, &env, &mut defs, &HashSet::new()), to, Then::Done),
+        Boundary::Fun(param, ret) => (Test::Any, ty, Then::Wrap(param.clone(), ret.clone())),
+        Boundary::Union(to) => (Test::Never, to, pick(to, &env, &mut defs, &visiting)),
     };
-    let shape = shape_of(to, &env);
-    let check = CheckSpec { test: shape.test, defs: shape.defs, lens: Vec::new(), mode: CheckMode::Assert, to: to.to_string(), span: Some(span) };
-    Ok(Some(Rc::new(Lowered { check: Rc::new(check), slots: shape.lens })))
+    let bodies = defs.bodies.into_iter().map(|body| body.expect("every alias body is built before shape_test returns")).collect();
+    let check = CheckSpec { test, defs: bodies, lens: Vec::new(), mode: CheckMode::Assert, to: to.to_string(), span: Some(span) };
+    Some(Rc::new(Lowered { check: Rc::new(check), slots: defs.lens, then }))
+}
+
+// A union's alternatives as lower_residual's Pick: each one's shape test
+// (one already being unfolded above never holds, as in
+// build_shape_predicate) and what a value passing it still needs. Every
+// alternative shares one alias table and one set of length slots.
+fn pick(to: &Type, env: &CheckEnv, defs: &mut Defs, visiting: &HashSet<String>) -> Then {
+    let Type::Union(alts) = to else { unreachable!("pick is only ever called with a Union target") };
+    let pick_one = |alt: &Type, defs: &mut Defs| {
+        let test = match alt {
+            Type::Named(id) if visiting.contains(id) => Test::Never,
+            _ => shape_test(alt, env, defs, &HashSet::new()),
+        };
+        let mut visiting = visiting.clone();
+        let then = match boundary(alt, &env.infer.named_types, &mut visiting) {
+            Boundary::Fun(param, ret) => Then::Wrap(param.clone(), ret.clone()),
+            Boundary::Union(nested) => pick(nested, env, defs, &visiting),
+            Boundary::None | Boundary::Shape(_) => Then::Done,
+        };
+        (test, then)
+    };
+    Then::Pick(alts.iter().map(|alt| pick_one(alt, defs)).collect())
 }
 
 // A runtime value for an index variable: `hidden` is a variable bound by
@@ -3345,7 +3373,7 @@ fn annotation_type(arena: &mut Arena, ann: ExprRef, blame: Span, ctx: &Ctx, span
 // value only from a TypeLit. Each gets a length slot read in the binder's
 // scope, as a Check's would be; one nothing here binds is the annotation's
 // own, and matches any length, as at the binder that introduces it
-// statically.
+// statically. The site's contract checks read the same table.
 fn residual_spec(arena: &mut Arena, root: ExprRef, blame: Span, infer: &InferCtx) -> Rc<ResidualSpec> {
     let mut names = BTreeSet::new();
     let (mut work, mut kids) = (vec![root], Vec::new());
@@ -3357,26 +3385,61 @@ fn residual_spec(arena: &mut Arena, root: ExprRef, blame: Span, infer: &InferCtx
         arena[n].children(&mut kids);
         work.extend(&kids);
     }
-    let env = CheckEnv::at(infer, blame);
-    let mut lens = Vec::with_capacity(names.len());
-    for name in &names {
-        let var = infer.index_rename.get(name).unwrap_or(name);
-        let index = IndexExpr::Var(var.clone());
-        let bound = infer.index_witness.iter().any(|w| w.var == *var) || infer.index_subst.contains_key(var) || infer.rigid_index.contains(var);
-        let term = if bound { index_len_term(arena, &index, &env) } else { LenExpr::Any };
-        let slot = arena.push(Expr::Len(term));
-        if bound {
-            record_obligation(slot, &index, &env);
+    let names: Vec<String> = names.into_iter().collect();
+    let contract = Rc::new(OnceCell::new());
+    // A check of the site, `depth` frames inside its contract.
+    let check = |arena: &mut Arena, depth: u32, template| {
+        let env = CheckEnv { repeatable: depth > 0, ..CheckEnv::at(infer, blame) };
+        let mut lens = Vec::with_capacity(names.len());
+        for name in &names {
+            let var = infer.index_rename.get(name).unwrap_or(name);
+            let index = IndexExpr::Var(var.clone());
+            let bound = infer.index_witness.iter().any(|w| w.var == *var) || infer.index_subst.contains_key(var) || infer.rigid_index.contains(var);
+            let term = if bound { index_len_term(arena, &index, &env) } else { LenExpr::Any };
+            let slot = arena.push(Expr::Len(term));
+            if bound {
+                record_obligation(slot, &index, &env);
+            }
+            lens.push(slot);
         }
-        lens.push(slot);
-    }
-    Rc::new(ResidualSpec {
-        index_names: names.into_iter().collect(),
-        lens,
-        named: infer.registry.clone(),
-        memo: RefCell::new(None),
-        span: blame,
-    })
+        ResidualSpec {
+            index_names: names.clone(),
+            lens,
+            named: infer.registry.clone(),
+            memo: RefCell::new(None),
+            span: blame,
+            template,
+            contract: contract.clone(),
+            depth,
+            witness: None,
+        }
+    };
+    let template = contract_template(arena, blame, infer, &contract, &|arena, depth| check(arena, depth, None));
+    Rc::new(check(arena, 0, Some(template)))
+}
+
+// An Unknown site's function contract (spec 11.6), the run-time twin of
+// wrap_fun_contract: `fun f -> fun p -> fun r -> fun a -> body`, where
+// `body` checks `a` against the type `p` holds, calls `f` (failing, as there,
+// if it is not callable) and checks the result against `r`, all blaming the
+// site. It sits in the site's scope, so its checks read the site's length
+// table: machine::contract_value enters `body` with the site's env plus `f`,
+// `p` and `r`, and `contract` is set to it. `check` builds one of its checks,
+// given its depth.
+fn contract_template(arena: &mut Arena, blame: Span, infer: &InferCtx, contract: &OnceCell<ExprRef>, check: &dyn Fn(&mut Arena, u32) -> ResidualSpec) -> ExprRef {
+    let [f, p, r, a] = ["__contract_fn", "__contract_param", "__contract_ret", "__contract_arg"].map(fresh_index_name);
+    // The body's checks run 4 frames inside the site's env: `f`, `p`, `r`, `a`.
+    let depth = 4;
+    let mut var = |name: &str| arena.push(Expr::Var(name.to_string()));
+    let (f_ref, a_ref, p_ref, r_ref, wp_ref, wa_ref) = (var(&f), var(&a), var(&p), var(&r), var(&p), var(&a));
+    let checked_fn = build_shape_check(arena, f_ref, &any_fun(), &CheckEnv::at(infer, blame));
+    let arg_check = check(arena, depth);
+    let checked_arg = arena.push(Expr::Residual(a_ref, p_ref, Rc::new(arg_check)));
+    let call = arena.push(Expr::App(checked_fn, checked_arg));
+    let result_check = ResidualSpec { witness: Some((wp_ref, wa_ref)), ..check(arena, depth) };
+    let body = arena.push(Expr::Residual(call, r_ref, Rc::new(result_check)));
+    contract.set(body).expect("internal: a site's contract is built once");
+    [a, r, p, f].into_iter().fold(body, |inner, name| arena.push(Expr::Lambda(name, None, inner)))
 }
 
 // A check-time evaluation that finished, replayed by settle_erasure.
