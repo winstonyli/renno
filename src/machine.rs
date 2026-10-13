@@ -1560,6 +1560,13 @@ fn construct_type(ctor: TypeCtor, arg: Value) -> Type {
         (TypeCtor::Vec, Value::Int(n)) if n >= 0 => {
             Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Lit(n)))
         }
+        // An indexed type gives its index: an annotation passes a symbolic
+        // `Vec(n)` as the type Vec(n), since an index variable is not a value
+        // (spec 11.8, 12.4). Any other type gets the generic message.
+        (TypeCtor::Vec, Value::Type(t)) => match &*t {
+            Type::Indexed(_, index) => Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), index.clone()),
+            _ => crate::run_error!("Vec cannot take a Type"),
+        },
         // (T, k) is T at index k; (T, Vec(n)) takes the index n, which is
         // how the parser passes a symbolic `Indexed(T, n)`.
         (TypeCtor::Indexed, Value::List(items)) => match &items[..] {

@@ -136,11 +136,12 @@ pub enum TypeCtor {
     Union,
     // (A, B) -> (A -> B); (A, "e", B) -> (A ->{e} B), the row variable by name.
     Fun,
-    // A non-negative Int k -> Vec(k). A symbolic index (`Vec(n)`) is not a
-    // value: the parser keeps it as an Expr::TypeLit.
+    // A non-negative Int k -> Vec(k); an indexed type -> Vec at its index.
+    // A symbolic index (`Vec(n)`) is not a value, so an annotation passes it
+    // as the type Vec(n), an Expr::TypeLit.
     Vec,
-    // (T, k) or (T, an indexed type) -> T at that index. The parser passes
-    // `Indexed(T, n)` as (T, Vec(n)), so the index may name a variable.
+    // (T, k) or (T, an indexed type) -> T at that index. An annotation passes
+    // `Indexed(T, n)` as (T, Vec(n)) when n is symbolic, so it may name a variable.
     Indexed,
     // A token (the value of an `opaque`) -> the singleton type of that brand.
     // Only code holding the token can name its type.

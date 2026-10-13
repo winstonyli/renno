@@ -4032,6 +4032,11 @@ g(len)").unwrap_err();
     fn type_values_index_brand_and_compare() {
         let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
         assert_eq!(ok("to_str(Indexed(List(Int), 2))"), "[Int](2)");
+        // Vec takes an Int or an indexed type's index (spec 11.8).
+        assert_eq!(ok("to_str(Vec(Vec(3)))"), "[Dyn](3)");
+        assert_eq!(ok("to_str(Vec(Indexed(Int, 2)))"), "[Dyn](2)");
+        let err = run_source("Vec(List(Int))").unwrap_err();
+        assert!(err.contains("Vec cannot take a Type"), "{err}");
         let err = run_source("Indexed(List(Int), true)").unwrap_err();
         assert!(err.contains("Indexed expects (type, index)"), "{err}");
         assert_eq!(ok("let B = opaque in TypeOf(B) == TypeOf(B)"), "true");
@@ -4201,6 +4206,14 @@ g(len)").unwrap_err();
         assert!(run_source(&format!("{f}f(B)(B)")).is_ok());
         let err = run_source(&format!("{f}f(B)(C)")).unwrap_err();
         assert!(err.contains("column 61: type error: expected Token#8, found Token#26"), "{err}");
+        // A pattern variable, a handler's payload, and a token type in a list.
+        let two = "let B = opaque in let C = opaque in ";
+        let err = run_source(&format!("{two}match (B, 1) | (b, _) -> (let x: TypeOf(b) = C in x)")).unwrap_err();
+        assert!(err.contains("column 82: type error: expected Token#8, found Token#26"), "{err}");
+        let err = run_source(&format!("{two}handle perform get(B) with handler get(p, k) -> (let x: TypeOf(p) = C in x)")).unwrap_err();
+        assert!(err.contains("column 105: type error: expected Token#8, found Token#26"), "{err}");
+        let err = run_source(&format!("{f}f(B)([B, C])").replace("v: TypeOf(b)", "v: [TypeOf(b)]")).unwrap_err();
+        assert!(err.contains("column 61: type error: expected [Token#8], found Token#26 at element 1"), "{err}");
     }
 
     // A token type prints its brand, the `opaque`'s source offset (spec
