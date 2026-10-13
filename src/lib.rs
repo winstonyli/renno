@@ -4388,16 +4388,49 @@ g(len)").unwrap_err();
         assert!(err.contains("type mismatch: expected Int, found Str"), "{err}");
     }
 
-    // `Vec(` and `Indexed(` in an annotation are built in, like the sugar
-    // (spec section 1 item 4: the index may name an index variable, which
-    // has no value), so a local binding of either name does not change them.
+    // `Vec(` and `Indexed(` in an annotation call whatever `Vec` and
+    // `Indexed` are in scope (spec 11.8), like any other name: a local
+    // binding changes them, statically or, for a parameter, at run time.
     #[test]
-    fn vec_and_indexed_in_an_annotation_ignore_a_local_binding() {
+    fn vec_and_indexed_in_an_annotation_follow_a_local_binding() {
         let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
-        assert_eq!(ok("let Vec = fun n -> Int in let x: Vec(2) = [1, 2] in x"), "[1, 2]");
-        assert_eq!(ok("let Indexed = 5 in let x: Indexed([Int], 2) = [1, 2] in x"), "[1, 2]");
+        let err = run_source("let Vec = fun n -> Int in let x: Vec(2) = [1, 2] in x").unwrap_err();
+        assert!(err.contains("column 43: type mismatch: expected Int, found [Int]"), "{err}");
+        assert_eq!(ok("let Vec = fun n -> Int in let x: Vec(2) = 5 in x"), "5");
+        let err = run_source("let Indexed = 5 in let x: Indexed([Int], 2) = [1, 2] in x").unwrap_err();
+        assert!(err.contains("column 27: cannot call a value of type Int"), "{err}");
+        let err = run_source("match 1 | Vec -> let x: Vec(2) = [1, 2] in x").unwrap_err();
+        assert!(err.contains("column 25: cannot call a value of type Int"), "{err}");
+        // A parameter named Vec makes the annotation a run-time one.
+        let f = "(fun Vec -> fun x: Vec(3) -> x)";
+        assert_eq!(ok(&format!("{f}(fun k -> Int)(5)")), "5");
+        let err = run_source(&format!("{f}(fun k -> Int)([1, 2])")).unwrap_err();
+        assert!(err.contains("column 20: type error: expected Int, found List"), "{err}");
+        let err = run_source(&format!("{f}(Vec)([1, 2])")).unwrap_err();
+        assert!(err.contains("column 20: type error: expected [Dyn](3), found List"), "{err}");
         // At value position the local binding wins, as for any name.
         assert_eq!(ok("let Vec = fun n -> Int in to_str(Vec(2))"), "Int");
+    }
+
+    // A user `Vec` receives an Int for a literal index and, for a symbolic
+    // one, the type Vec(n) (spec ruling 12.4): an index variable is not a
+    // value. `Indexed` likewise receives (T, k) or (T, Vec(n)). The index
+    // variable stays one variable through a user Vec, and a closed
+    // annotation calling the prelude Vec still leaves no run-time node.
+    #[test]
+    fn a_user_vec_receives_an_int_or_an_indexed_type() {
+        let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        let err = run_source("let Vec = fun k -> List(k) in let x: Vec(2) = [1] in x").unwrap_err();
+        assert!(err.contains("column 38: List cannot take a Int"), "{err}");
+        let err = run_source("let Vec = fun k -> List(k) in let x: Vec(n) = [1] in x").unwrap_err();
+        assert!(err.contains("column 48: type mismatch: expected [Dyn](n), found Int"), "{err}");
+        let err = run_source("let Indexed = fun p -> Tuple(p) in let x: Indexed(Int, 2) = (1, 2) in x").unwrap_err();
+        assert!(err.contains("column 43: Tuple expects types, found a Int"), "{err}");
+        assert_eq!(ok("let Indexed = fun p -> Tuple(p) in let x: Indexed(Int, n) = (1, [2]) in x"), "[1, [2]]");
+        assert_eq!(ok("let Vec = fun n -> Int in let f = fun xs: Vec(n) -> xs in f(1)"), "1");
+        let err = run_source("let Vec = fun n -> n in let f = fun xs: Vec(n) -> fun ys: Vec(n) -> ys in f([1])([2, 3])").unwrap_err();
+        assert!(err.contains("column 82: type mismatch: expected [Dyn](1), found [Int](2)"), "{err}");
+        assert_eq!(annotation_evals("let T = Int in let f = fun xs: (T, Vec(n)) -> xs in f((1, [2]))"), ("[1, [2]]".to_string(), vec![]));
     }
 
     // Runs `src` and returns its result with, for each kept annotation

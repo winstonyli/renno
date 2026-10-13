@@ -382,8 +382,8 @@ pub enum Expr {
     Var(String),
     // A type value as a literal (it evaluates to Value::Type). The parser
     // writes one where an annotation names something that is not an
-    // expression yet: a `type` alias, or an index (`Vec(n)`, also the index
-    // of `Indexed(T, n + 1)`);
+    // expression yet: a `type` alias, or a symbolic index (the `n` of
+    // `Vec(n)` or `Indexed(T, n + 1)`, passed as the type Vec(n));
     // typecheck writes one for every annotation it re-emits.
     TypeLit(Rc<Type>),
     // The annotation slots (param, `let`, `let rec`) hold an EXPRESSION

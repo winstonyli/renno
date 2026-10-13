@@ -38,7 +38,8 @@ pub static PRELUDE: &[(&str, Builtin)] = &[
     ("range", Builtin::Range),
     ("join", Builtin::Join),
     // The type constructors: an annotation is desugared into calls to these
-    // (as `#Int`, `#List`, ..., which no user binding can capture).
+    // (as `#List`, `#Fun`, ..., which no user binding can capture); `Vec(`
+    // and `Indexed(` call the names in scope (spec 11.8).
     ("Int", Builtin::Ty(TypeCtor::Int)),
     ("Float", Builtin::Ty(TypeCtor::Float)),
     ("Bool", Builtin::Ty(TypeCtor::Bool)),

@@ -453,7 +453,8 @@ impl<'a> Parser<'a> {
     // values, section 3): sugar desugars into calls to the prelude's type
     // constructors, spelled `#List`, `#Fun`, ... so no user binding can
     // capture them. A name the user writes is a plain variable, resolved in the
-    // binder's scope, and `Name(arg)` is an ordinary call. typecheck evaluates
+    // binder's scope, and `Name(arg)` is an ordinary call (`Vec(e)` and
+    // `Indexed(T, e)` too, see parse_type). typecheck evaluates
     // the result with annotation_type.
     fn opt_annotation(&mut self) -> Result<Option<ExprRef>, String> {
         if matches!(self.peek(), Some(Token::Colon)) {
@@ -484,10 +485,26 @@ impl<'a> Parser<'a> {
         self.type_call(name, tuple, start)
     }
 
-    // A type that is already known (an alias, `Vec(n)`): no evaluation left to do.
+    // A type that is already known (an alias, a symbolic index): no evaluation left to do.
     fn type_lit(&mut self, ty: Type, start: usize) -> ExprRef {
         let span = Span { start, end: self.span_before().end };
         self.push_spanned(Expr::TypeLit(Rc::new(ty)), span)
+    }
+
+    // The index of `Vec(e)` or `Indexed(T, e)` as the argument passed: an Int
+    // for a literal, else the type Vec(e), a TypeLit, since an index variable
+    // has no value (spec ruling 12.4). The prelude Vec and Indexed take the
+    // index from either.
+    fn index_arg(&mut self) -> Result<ExprRef, String> {
+        let start = self.span_at().start;
+        let index = self.parse_index_expr()?;
+        Ok(match index {
+            IndexExpr::Lit(k) => {
+                let span = Span { start, end: self.span_before().end };
+                self.push_spanned(Expr::Int(k), span)
+            }
+            index => self.type_lit(Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index)), start),
+        })
     }
 
     // type_atom_union := type ("|" type)*  -- parse_type's own ATOM level
@@ -584,27 +601,31 @@ impl<'a> Parser<'a> {
                 let record = self.push_spanned(Expr::Record(Rc::new(fields)), span);
                 Ok(self.type_call("Record", record, start))
             }
-            // `Vec(n)`: a TypeLit, not a #Vec call, because the index may
-            // name a variable, which has no value here (spec section 4,
-            // Stage C).
-            Some(Token::Ident(name)) if name == "Vec" && matches!(self.peek(), Some(Token::LParen)) => {
+            // `Vec(e)` and `Indexed(T, e)` (T at index e, spec section 9.1)
+            // call whatever `Vec` and `Indexed` are in scope, like any name
+            // (spec 11.8), so a local binding of either changes them. The
+            // index language stays built in: the index is parsed here and
+            // passed as an argument (index_arg). Matched before the alias
+            // lookup; `type` may not define either name.
+            Some(Token::Ident(name)) if (name == "Vec" || name == "Indexed") && matches!(self.peek(), Some(Token::LParen)) => {
+                let indexed = name == "Indexed";
+                let head_span = Span { start, end: self.span_before().end };
+                let head = self.push_spanned(Expr::Var(name), head_span);
                 self.bump();
-                let index = self.parse_index_expr()?;
-                self.expect(&Token::RParen)?;
-                Ok(self.type_lit(Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index)), start))
-            }
-            // `Indexed(T, n)`: T at index n (spec section 9.1; it replaces the
-            // old alias indexing `T(n)`). The index travels as `Vec(n)`, a
-            // TypeLit, for the same reason as above: `#Indexed((T, Vec(n)))`.
-            Some(Token::Ident(name)) if name == "Indexed" && matches!(self.peek(), Some(Token::LParen)) => {
-                self.bump();
-                let wrapped = self.parse_union_type()?;
-                self.expect(&Token::Comma)?;
-                let index_start = self.span_at().start;
-                let index = self.parse_index_expr()?;
-                let carrier = self.type_lit(Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index)), index_start);
-                self.expect(&Token::RParen)?;
-                Ok(self.type_call_items("Indexed", vec![wrapped, carrier], start))
+                let arg = if indexed {
+                    let wrapped = self.parse_union_type()?;
+                    self.expect(&Token::Comma)?;
+                    let index = self.index_arg()?;
+                    self.expect(&Token::RParen)?;
+                    let span = Span { start, end: self.span_before().end };
+                    self.push_spanned(Expr::Tuple(vec![wrapped, index]), span)
+                } else {
+                    let index = self.index_arg()?;
+                    self.expect(&Token::RParen)?;
+                    index
+                };
+                let span = Span { start, end: self.span_before().end };
+                Ok(self.push_spanned(Expr::App(head, arg), span))
             }
             // A name. A `type` alias in scope is substituted right here (its
             // right-hand side was evaluated where it was defined); any other
