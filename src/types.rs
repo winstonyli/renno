@@ -365,8 +365,10 @@ impl fmt::Display for Type {
             // (unannotated-row) Fun type exactly as before this existed.
             Type::Fun(a, EffectRow::Dyn, b) => write!(f, "({a} -> {b})"),
             Type::Fun(a, row, b) => write!(f, "({a} ->{row} {b})"),
-            // Id never printed -- opaque means opaque.
-            Type::Token(_) => write!(f, "Token"),
+            // The brand (the `opaque`'s source offset), so two token types
+            // read differently in a message (spec 12.6); Value::type_name
+            // names a token value the same way.
+            Type::Token(id) => write!(f, "Token#{id}"),
             Type::Tuple(items) => {
                 write!(f, "(")?;
                 for (i, t) in items.iter().enumerate() {

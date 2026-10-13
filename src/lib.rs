@@ -4200,7 +4200,22 @@ g(len)").unwrap_err();
         let f = "let B = opaque in let C = opaque in let f = fun b -> fun v: TypeOf(b) -> v in ";
         assert!(run_source(&format!("{f}f(B)(B)")).is_ok());
         let err = run_source(&format!("{f}f(B)(C)")).unwrap_err();
-        assert!(err.contains("column 61: type error: expected Token, found Token"), "{err}");
+        assert!(err.contains("column 61: type error: expected Token#8, found Token#26"), "{err}");
+    }
+
+    // A token type prints its brand, the `opaque`'s source offset (spec
+    // 12.6), so a message about two tokens tells them apart: statically, at
+    // run time, and when a type value is printed.
+    #[test]
+    fn a_token_type_prints_its_brand() {
+        let two = "let B = opaque in let C = opaque in ";
+        let err = run_source(&format!("{two}let x: TypeOf(B) = C in x")).unwrap_err();
+        assert!(err.contains("type mismatch: expected Token#8, found Token#26"), "{err}");
+        let err = run_source(&format!("{two}let d: Dyn = C in let x: TypeOf(B) = d in x")).unwrap_err();
+        assert!(err.contains("type error: expected Token#8, found Token#26"), "{err}");
+        let err = run_source("let B = opaque in let d: Dyn = B in let x: Int = d in x").unwrap_err();
+        assert!(err.contains("type error: expected Int, found Token#8"), "{err}");
+        assert_eq!(run_source("let B = opaque in to_str(TypeOf(B))").unwrap().to_string(), "Token#8");
     }
 
     // C2 lowers only function-free types; a type that needs a per-call

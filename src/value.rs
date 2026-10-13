@@ -295,19 +295,21 @@ impl Value {
         }
     }
 
-    pub fn type_name(&self) -> &'static str {
-        match self {
+    // A message's name for the value's kind. A token's names its brand, as
+    // its type does (Type::Token's Display), so two tokens' names differ.
+    pub fn type_name(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(match self {
             Value::Int(_) => "Int",
             Value::Float(_) => "Float",
             Value::Bool(_) => "Bool",
             Value::Str(_) => "Str",
-            Value::Token(_) => "Token",
+            Value::Token(id) => return std::borrow::Cow::Owned(format!("Token#{id}")),
             Value::List(_) => "List",
             Value::Record(_) => "Record",
             Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => "Fun",
             Value::Handler(_) => "Handler",
             Value::Type(_) => "Type",
-        }
+        })
     }
 }
 
