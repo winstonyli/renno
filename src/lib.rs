@@ -3443,6 +3443,156 @@ g(len)").unwrap_err();
         assert_eq!(format!("{ty}"), "List");
     }
 
+    // Test helpers for recursive (Rec) types: `bound0` is a reference to member 0 of the group being built.
+    fn rec_bound(depth: u32, member: u32) -> types::Type {
+        types::Type::RecVar(types::RecVar::Bound { depth, member })
+    }
+    fn rec_group(names: &[&str], bodies: Vec<types::Type>) -> types::RecRef {
+        types::RecRef(std::rc::Rc::new(types::RecGroup::new(names.iter().map(|n| std::rc::Rc::from(*n)).collect(), bodies)))
+    }
+    fn rec_tup(items: Vec<types::Type>) -> types::Type {
+        types::Type::Tuple(std::rc::Rc::new(items))
+    }
+    fn rec_uni(items: Vec<types::Type>) -> types::Type {
+        types::Type::Union(std::rc::Rc::new(items))
+    }
+    // L = (Int, L) | Bool
+    fn rec_list() -> types::RecRef {
+        rec_group(&["L"], vec![rec_uni(vec![rec_tup(vec![types::Type::Int, rec_bound(0, 0)]), types::Type::Bool])])
+    }
+    fn rec_free(id: u64, name: &str) -> types::Type {
+        types::Type::RecVar(types::RecVar::Free { id, name: std::rc::Rc::from(name) })
+    }
+
+    #[test]
+    fn rec_unfold_substitutes_the_group_and_shares_it() {
+        use std::rc::Rc;
+        use types::{unfold, Type};
+        // L = (Int, L) | (Int, Str)
+        let g = rec_group(&["L"], vec![rec_uni(vec![rec_tup(vec![Type::Int, rec_bound(0, 0)]), rec_tup(vec![Type::Int, Type::Str])])]);
+        let Type::Union(old) = &g.0.bodies[0] else { panic!("a union body") };
+        let Type::Union(new) = unfold(&g, 0) else { panic!("unfolds to a union") };
+        let Type::Tuple(step) = &new[0] else { panic!("a tuple step") };
+        let Type::Rec(h, k) = &step[1] else { panic!("the reference became the group") };
+        assert!(Rc::ptr_eq(&h.0, &g.0) && *k == 0, "the unfolding shares the group, it does not copy it");
+        let (Type::Tuple(a), Type::Tuple(b)) = (&old[1], &new[1]) else { panic!("a tuple base") };
+        assert!(Rc::ptr_eq(a, b), "a subtree with no reference keeps its Rc");
+    }
+
+    #[test]
+    fn rec_close_builds_mutual_and_nested_groups() {
+        use std::rc::Rc;
+        use types::{close_group, fresh_rec_id, RecVar, Type};
+        let names: Vec<Rc<str>> = vec![Rc::from("A"), Rc::from("B")];
+        let build = || {
+            let ids = [fresh_rec_id(), fresh_rec_id()];
+            // A = (Int, B), B = Bool | A
+            let a = rec_tup(vec![Type::Int, rec_free(ids[1], "B")]);
+            let b = rec_uni(vec![Type::Bool, rec_free(ids[0], "A")]);
+            close_group(&names, &ids, &[Some(a), Some(b)]).expect("a contractive group closes")
+        };
+        let out = build();
+        let (Some(Type::Rec(g, 0)), Some(Type::Rec(h, 1))) = (&out[0], &out[1]) else { panic!("both members became Rec: {out:?}") };
+        assert!(Rc::ptr_eq(&g.0, &h.0));
+        assert_eq!(g.0.bodies[0], rec_tup(vec![Type::Int, rec_bound(0, 1)]));
+        assert_eq!(g.0.bodies[1], rec_uni(vec![Type::Bool, rec_bound(0, 0)]));
+        let again = build();
+        assert_eq!(out, again, "two independent builds are equal");
+        let Some(Type::Rec(g2, _)) = &again[0] else { panic!() };
+        assert!(!Rc::ptr_eq(&g.0, &g2.0), "but they are distinct allocations");
+        // A nested group R over the outer placeholder A: R's body reaches A one group out.
+        let (a_id, r_id) = (fresh_rec_id(), fresh_rec_id());
+        let r_body = Type::List(Rc::new(rec_tup(vec![rec_free(r_id, "R"), rec_free(a_id, "A")])));
+        let inner = close_group(&[Rc::from("R")], &[r_id], &[Some(r_body)]).unwrap().remove(0).unwrap();
+        let outer = close_group(&[Rc::from("A")], &[a_id], &[Some(rec_tup(vec![Type::Int, inner]))]).unwrap().remove(0).unwrap();
+        let Type::Rec(og, 0) = &outer else { panic!("{outer:?}") };
+        let Type::Tuple(items) = &og.0.bodies[0] else { panic!() };
+        let Type::Rec(ig, 0) = &items[1] else { panic!() };
+        let Type::List(e) = &ig.0.bodies[0] else { panic!() };
+        assert_eq!(**e, rec_tup(vec![Type::RecVar(RecVar::Bound { depth: 0, member: 0 }), Type::RecVar(RecVar::Bound { depth: 1, member: 0 })]));
+    }
+
+    #[test]
+    fn rec_close_leaves_unreferenced_members_plain() {
+        use std::rc::Rc;
+        use types::{close_group, fresh_rec_id, Type};
+        let names: Vec<Rc<str>> = ["T", "P", "L", "N"].iter().map(|n| Rc::from(*n)).collect();
+        let ids: Vec<u64> = (0..4).map(|_| fresh_rec_id()).collect();
+        let t = Type::List(Rc::new(Type::Int));
+        let p = rec_tup(vec![rec_free(ids[2], "L"), rec_free(ids[2], "L")]);
+        let l = rec_uni(vec![Type::Int, Type::List(Rc::new(rec_free(ids[2], "L")))]);
+        let out = close_group(&names, &ids, &[Some(t.clone()), Some(p), Some(l), None]).unwrap();
+        assert_eq!(out[0], Some(t), "an unreferenced member keeps its type");
+        let Some(Type::Rec(g, 0)) = &out[2] else { panic!("{:?}", out[2]) };
+        assert_eq!(g.0.names.len(), 1, "only the referenced member is in the group");
+        assert_eq!(out[1], Some(rec_tup(vec![Type::Rec(g.clone(), 0), Type::Rec(g.clone(), 0)])));
+        assert_eq!(out[3], None, "an unreferenced non-type is kept as it is");
+    }
+
+    #[test]
+    fn rec_close_rejects_bare_and_noncontractive_members() {
+        use std::rc::Rc;
+        use types::{close_group, fresh_rec_id, CloseError, RecGroup, RecRef, Type};
+        let a = fresh_rec_id();
+        let an: [Rc<str>; 1] = [Rc::from("A")];
+        assert_eq!(close_group(&an, &[a], &[Some(rec_free(a, "A"))]), Err((0, CloseError::Bare)));
+        let (x, y) = (fresh_rec_id(), fresh_rec_id());
+        let names: [Rc<str>; 2] = [Rc::from("A"), Rc::from("B")];
+        let r = close_group(&names, &[x, y], &[Some(Type::List(Rc::new(rec_free(y, "B")))), None]);
+        assert_eq!(r, Err((1, CloseError::NotAType)));
+        // A = X, X = A where X is an inner group: unfolding A loops without reaching a constructor.
+        let gx = RecRef(Rc::new(RecGroup::new(vec![Rc::from("X")], vec![rec_free(a, "A")])));
+        assert_eq!(close_group(&an, &[a], &[Some(Type::Rec(gx, 0))]), Err((0, CloseError::Bare)));
+    }
+
+    #[test]
+    fn rec_types_are_equal_up_to_names() {
+        use types::Type;
+        let mk = |name: &str, leaf: Type| Type::Rec(rec_group(&[name], vec![rec_tup(vec![leaf, rec_bound(0, 0)])]), 0);
+        assert_eq!(mk("A", Type::Int), mk("B", Type::Int), "E1: member names are not part of the type");
+        assert_ne!(mk("A", Type::Int), mk("A", Type::Str));
+        assert_eq!(rec_free(1, "x"), rec_free(1, "x"));
+        assert_ne!(rec_free(1, "x"), rec_free(2, "x"), "a placeholder compares by id");
+    }
+
+    #[test]
+    fn rec_type_displays_its_member_name_only() {
+        use types::{unfold, Type};
+        let g = rec_list();
+        assert_eq!(Type::Rec(g.clone(), 0).to_string(), "L");
+        assert_eq!(unfold(&g, 0).to_string(), "(Int, L) | Bool");
+    }
+
+    #[test]
+    fn consistent_rejects_a_rec_type_against_its_unfolding() {
+        use types::{consistent, unfold, Type};
+        let g = rec_list();
+        let (r, u) = (Type::Rec(g.clone(), 0), unfold(&g, 0));
+        assert!(!consistent(&r, &u) && !consistent(&u, &r), "a Rec type is only consistent with an equal Rec type");
+        assert!(consistent(&r, &Type::Rec(rec_list(), 0)));
+    }
+
+    #[test]
+    fn rec_walkers_rename_variables_inside_bodies() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{subst_type, vars_in, TyVar};
+        use std::{collections::HashMap, rc::Rc};
+        use types::Type;
+        let indexed = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".into())));
+        let g = rec_group(&["L"], vec![rec_tup(vec![Type::Var("a".into()), indexed, rec_bound(0, 0)])]);
+        let ty = Type::Rec(g, 0);
+        let vars = vars_in(&ty);
+        assert!(vars.contains(&TyVar::Type("a".into())) && vars.contains(&TyVar::Index("n".into())), "{vars:?}");
+        let (rows, types_, idx) = (HashMap::new(), HashMap::from([("a".to_string(), Type::Int)]), HashMap::from([("n".to_string(), IndexExpr::Lit(2))]));
+        let renamed = subst_type(&ty, &rows, &types_, &idx);
+        let Type::Rec(h, 0) = &renamed else { panic!("{renamed:?}") };
+        assert!(vars_in(&renamed).is_empty(), "both variables were replaced inside the body");
+        assert!(matches!(&h.0.bodies[0], Type::Tuple(items) if items[0] == Type::Int && items[2] == rec_bound(0, 0)));
+        let plain = Type::Rec(rec_list(), 0);
+        let (Type::Rec(p, _), Type::Rec(q, _)) = (&plain, &subst_type(&plain, &rows, &types_, &idx)) else { panic!() };
+        assert!(p.0.plain && Rc::ptr_eq(&p.0, &q.0), "a plain group is shared, not rebuilt");
+    }
+
     #[test]
     fn indexed_type_displays_as_a_wrapped_type_with_its_index() {
         use crate::index_expr::IndexExpr;
@@ -6541,6 +6691,57 @@ g(len)").unwrap_err();
         );
     }
 
+    #[test]
+    fn case_b_refinement_on_a_rec_type() {
+        // The Rec twin of the Named refinement test above: the base alternative's own n=0 hypothesis conflicts with 1.
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{check_against, extend, Ctx, InferCtx};
+        use std::rc::Rc;
+        use types::Type;
+
+        let src = r#"
+            match v
+            | (h, t) -> let x: Dyn = 0 in x
+            | true -> v
+            | false -> v
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let rec = Type::Rec(rec_list(), 0);
+        let mut infer = InferCtx::new();
+        let scrut_ty = Type::Indexed(Rc::new(rec.clone()), Rc::new(IndexExpr::Var("n".to_string())));
+        let ctx = extend(&Ctx::empty(), "v", scrut_ty);
+        let expected = Type::Indexed(Rc::new(rec), Rc::new(IndexExpr::Lit(1)));
+        let result = check_against(&mut arena, root, &expected, &ctx, &spans, &mut infer);
+        assert!(result.is_err(), "expected a real index conflict from the base alternative's n=0 hypothesis, got: {result:?}");
+    }
+
+    #[test]
+    fn case_b_step_retyping_on_a_rec_type() {
+        // The Rec twin of the Named step test above: t is retyped Indexed(L, m) and n = m + 1, so t fits Indexed(L, n - 1).
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{check_against, extend, Ctx, InferCtx};
+        use std::rc::Rc;
+        use types::Type;
+
+        let src = r#"
+            match v
+            | (h, t) -> t
+            | true -> let x: Dyn = 0 in x
+            | false -> let x: Dyn = 0 in x
+        "#;
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let rec = Type::Rec(rec_list(), 0);
+        let mut infer = InferCtx::new();
+        let scrut_ty = Type::Indexed(Rc::new(rec.clone()), Rc::new(IndexExpr::Var("n".to_string())));
+        let ctx = extend(&Ctx::empty(), "v", scrut_ty);
+        let expected = Type::Indexed(
+            Rc::new(rec),
+            Rc::new(IndexExpr::Sub(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)))),
+        );
+        let result = check_against(&mut arena, root, &expected, &ctx, &spans, &mut infer);
+        assert!(result.is_ok(), "expected the step hypothesis to make t fit Indexed(L, n - 1), got: {:?}", result.err());
+    }
+
     // --- Task 3, fix round 1: critical review finding ---
 
     #[test]
@@ -8070,6 +8271,24 @@ g(len)").unwrap_err();
         use std::{collections::HashMap, rc::Rc};
         let f = Type::Named("F".into());
         let named = Rc::new(HashMap::from([("F".to_string(), Type::Fun(Rc::new(Type::Dyn), EffectRow::Dyn, Rc::new(f.clone())))]));
+        let root = expr::Lazy::new(Rc::new(f));
+        let mut level = root.clone();
+        for _ in 0..3 {
+            let lowered = typecheck::lower_conform(&level, &named, None).expect("a function type is checked");
+            let expr::Then::Wrap(_, ret) = &lowered.then else { panic!("a function type wraps in a contract") };
+            assert!(Rc::ptr_eq(ret, &root), "the result's Lazy is F's own, not a fresh link");
+            level = ret.clone();
+        }
+    }
+
+    #[test]
+    fn a_recursive_rec_function_type_lowers_to_one_shared_cyclic_graph() {
+        // The Rec twin of the Named test above: F = Dyn -> F, built as a closed group.
+        use crate::types::{EffectRow, Type};
+        use std::{collections::HashMap, rc::Rc};
+        let g = rec_group(&["F"], vec![Type::Fun(Rc::new(Type::Dyn), EffectRow::Dyn, Rc::new(rec_bound(0, 0)))]);
+        let f = Type::Rec(g, 0);
+        let named = Rc::new(HashMap::new());
         let root = expr::Lazy::new(Rc::new(f));
         let mut level = root.clone();
         for _ in 0..3 {

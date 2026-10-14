@@ -2,7 +2,7 @@
 //! S2 T1 added `Why`/`Undecided`/`relate_cast`; consumers: coerce_check and the unify_fits rescue (T3), coerce_cast (T4).
 use super::{free_index_vars, unify_index_expr, InferCtx};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
-use crate::types::{row_consistent, Type};
+use crate::types::{row_consistent, unfold, RecRef, Type};
 use crate::util::find_field;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -162,11 +162,14 @@ fn or(rels: Vec<Rel>) -> Rel {
 struct Budget {
     left: Cell<u32>,
     unfolding: RefCell<Vec<(Type, String)>>,
+    // The same guard for a Rec target: the source, and the group (kept, so its pointer stays
+    // unique) and member being unfolded.
+    unfolding_rec: RefCell<Vec<(Type, RecRef, usize)>>,
     ignore_rows: bool,
 }
 impl Default for Budget {
     fn default() -> Self {
-        Budget { left: Cell::new(FUEL), unfolding: RefCell::new(Vec::new()), ignore_rows: false }
+        Budget { left: Cell::new(FUEL), unfolding: RefCell::new(Vec::new()), unfolding_rec: RefCell::new(Vec::new()), ignore_rows: false }
     }
 }
 fn loose(t: &Type) -> bool {
@@ -249,6 +252,20 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
             None => Rel::opaque("named: not in registry"),
         },
         (Type::Named(_), _) => Rel::opaque("named: nominal source"),
+        // Equal pairs were proven by `from == to` above. No directional body relating: Amber's
+        // rule without an assumption set is unsound for a contravariant occurrence.
+        (Type::Rec(..), Type::Rec(..)) => Rel::opaque("recursive: different types"),
+        (_, Type::Rec(g, i)) => {
+            let hit = |(f, h, k): &(Type, RecRef, usize)| k == i && std::rc::Rc::ptr_eq(&h.0, &g.0) && *f == from;
+            if fuel.unfolding_rec.borrow().iter().any(hit) {
+                return Rel::refuted("recursive: cyclic unfolding");
+            }
+            fuel.unfolding_rec.borrow_mut().push((from.clone(), g.clone(), *i));
+            let r = go(&from, &unfold(g, *i), infer, fuel, d);
+            fuel.unfolding_rec.borrow_mut().pop();
+            r
+        }
+        (Type::Rec(..), _) => Rel::opaque("recursive source"),
         (Type::Int, Type::Int) | (Type::Float, Type::Float) | (Type::Bool, Type::Bool) | (Type::Str, Type::Str) => Rel::Proven,
         (Type::Token(a), Type::Token(b)) => {
             if a == b { Rel::Proven } else { Rel::refuted("token") }
@@ -505,6 +522,45 @@ mod tests {
         // The depth guard is the backstop for a source that is itself too deep.
         let deep = |leaf: Type| (0..70).fold(leaf, |t, _| list(t));
         assert!(matches!(relate(&deep(Type::Int), &deep(Type::Bool), &infer), Rel::Unknown(Residual::Lazy, Cause::Incomplete)));
+    }
+
+    fn rec_group(bodies: Vec<Type>) -> crate::types::RecRef {
+        use crate::types::{RecGroup, RecRef};
+        RecRef(Rc::new(RecGroup::new(vec![Rc::from("L")], bodies)))
+    }
+    fn bound0() -> Type {
+        Type::RecVar(crate::types::RecVar::Bound { depth: 0, member: 0 })
+    }
+
+    #[test]
+    fn relate_unfolds_a_rec_target() {
+        // The twin of the L#1 cases of relate_table: L = (Int, L) | Bool.
+        let (i, b, d) = (Type::Int, Type::Bool, Type::Dyn);
+        let l = Type::Rec(rec_group(vec![uni(&[tup(&[i.clone(), bound0()]), b.clone()])]), 0);
+        let m = Type::Rec(rec_group(vec![list(bound0())]), 0);
+        let infer = ctx();
+        assert_eq!(relate(&l, &l, &infer), Rel::Proven);
+        assert!(matches!(relate(&m, &l, &infer), Rel::Refuted(_)), "different types are never interchangeable");
+        assert!(matches!(relate(&l, &i, &infer), Rel::Refuted(_)));
+        assert_eq!(relate(&tup(&[i.clone(), b.clone()]), &l, &infer), Rel::Proven, "one level of the literal fits");
+        let two = tup(&[i.clone(), tup(&[i.clone(), i.clone()])]);
+        assert!(matches!(relate(&two, &l, &infer), Rel::Refuted(_)));
+        let got = relate(&d, &l, &infer);
+        assert!(matches!(got, Rel::Unknown(..)) && got.cause() == Some(Cause::Imprecise), "{got:?}");
+    }
+
+    #[test]
+    fn relate_terminates_on_degenerate_rec_types() {
+        // The twin of relate_terminates_on_degenerate_aliases, hand-built (close_group would reject B).
+        let a = Type::Rec(rec_group(vec![uni(&[bound0(), bound0(), Type::Bool])]), 0);
+        let b = Type::Rec(rec_group(vec![bound0()]), 0);
+        let c = Type::Rec(rec_group(vec![uni(&[Type::Int, bound0()])]), 0);
+        let infer = InferCtx::new();
+        assert!(matches!(relate(&Type::Int, &a, &infer), Rel::Refuted(_)));
+        assert!(matches!(relate(&Type::Int, &b, &infer), Rel::Refuted(_)));
+        assert_eq!(relate(&Type::Bool, &a, &infer), Rel::Proven);
+        assert_eq!(relate(&Type::Int, &c, &infer), Rel::Proven);
+        assert!(matches!(relate(&Type::Str, &c, &infer), Rel::Refuted(_)));
     }
 
     #[test]

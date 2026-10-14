@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::index_expr::{index_exprs_equal, IndexExpr};
 use crate::util::find_field;
@@ -78,6 +79,11 @@ pub enum Type {
     // up what a Named id stands for, and only one level at a time -- see
     // their own doc comments.
     Named(String),
+    // Member `usize` of a recursive type group: a closed, finite mu-term (see RecGroup).
+    Rec(RecRef, usize),
+    // A reference inside a group's bodies (Bound), or the placeholder the machine hands a
+    // `let rec` type group's values while it builds them (Free).
+    RecVar(RecVar),
     // Fixed-arity, per-position-typed product -- `(a, b, c)` syntax.
     // Anonymous (no declared name, no registry lookup): consistent_inner
     // compares two Tuple types directly, positionally, with nothing to
@@ -194,6 +200,261 @@ impl EffectRow {
     }
 }
 
+// ---- Recursive types -------------------------------------------------------------------
+//
+// A recursive type is a closed, FINITE mu-term: `Rec(group, i)` is member i of `group`, whose
+// bodies mention the group's members as `RecVar::Bound { depth, member }` (de Bruijn style:
+// depth counts the nested groups between the reference and the group it names). Nothing is
+// cyclic, so the derived Debug/Drop and `==` terminate. `unfold` is the only way to look inside.
+// The machine builds groups where a `let rec` of unannotated calls runs; see close_group.
+
+#[derive(Debug)]
+pub struct RecGroup {
+    pub names: Vec<Rc<str>>,
+    pub bodies: Vec<Type>,
+    // No body mentions (at any depth, nested groups included) a Type::Var, an Indexed, an
+    // EffectRow::Var or a RecVar::Free: a walker that renames variables may return it as is.
+    pub plain: bool,
+    // How many enclosing groups the bodies reach through a Bound (0: closed). Lets `unfold`
+    // skip a nested group that never mentions the group being unfolded.
+    pub escape: u32,
+}
+
+impl RecGroup {
+    pub fn new(names: Vec<Rc<str>>, bodies: Vec<Type>) -> RecGroup {
+        let (mut plain, mut escape) = (true, 0);
+        for body in &bodies {
+            scan(body, 0, &mut plain, &mut escape);
+        }
+        RecGroup { names, bodies, plain, escape }
+    }
+}
+
+// Equality is structural, member names ignored (E1): two separately built `A(Int)` are equal.
+#[derive(Clone, Debug)]
+pub struct RecRef(pub Rc<RecGroup>);
+
+impl PartialEq for RecRef {
+    fn eq(&self, other: &RecRef) -> bool {
+        Rc::ptr_eq(&self.0, &other.0) || self.0.bodies == other.0.bodies
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RecVar {
+    Bound { depth: u32, member: u32 },
+    Free { id: u64, name: Rc<str> },
+}
+
+static REC_ID: AtomicU64 = AtomicU64::new(0);
+
+pub fn fresh_rec_id() -> u64 {
+    REC_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn each_child(t: &Type, f: &mut dyn FnMut(&Type)) {
+    match t {
+        Type::List(e) => f(e),
+        Type::Fun(a, _, b) => {
+            f(a);
+            f(b);
+        }
+        Type::Tuple(items) | Type::Union(items) => items.iter().for_each(f),
+        Type::Record(fields) => fields.iter().for_each(|(_, t)| f(t)),
+        Type::Indexed(w, _) => f(w),
+        _ => {}
+    }
+}
+
+fn scan(t: &Type, nest: u32, plain: &mut bool, escape: &mut u32) {
+    match t {
+        Type::Var(_) | Type::Indexed(..) | Type::Fun(_, EffectRow::Var(_), _) | Type::RecVar(RecVar::Free { .. }) => *plain = false,
+        Type::RecVar(RecVar::Bound { depth, .. }) if *depth > nest => *escape = (*escape).max(*depth - nest),
+        Type::Rec(h, _) => {
+            *plain &= h.0.plain;
+            if h.0.escape > nest + 1 {
+                *escape = (*escape).max(h.0.escape - (nest + 1));
+            }
+        }
+        _ => {}
+    }
+    each_child(t, &mut |c| scan(c, nest, plain, escape));
+}
+
+fn map_vec(items: &[Type], f: &mut dyn FnMut(&Type) -> Option<Type>) -> Option<Vec<Type>> {
+    let mapped: Vec<Option<Type>> = items.iter().map(&mut *f).collect();
+    if mapped.iter().all(Option::is_none) {
+        return None;
+    }
+    Some(mapped.into_iter().zip(items).map(|(m, old)| m.unwrap_or_else(|| old.clone())).collect())
+}
+
+// `t` with `f` applied to every direct child type; None when no child changed (so an
+// unchanged subtree keeps its Rc). Rec and RecVar have no children here: callers own them.
+fn map_children(t: &Type, f: &mut dyn FnMut(&Type) -> Option<Type>) -> Option<Type> {
+    match t {
+        Type::List(e) => f(e).map(|e| Type::List(Rc::new(e))),
+        Type::Fun(a, row, b) => {
+            let (na, nb) = (f(a), f(b));
+            if na.is_none() && nb.is_none() {
+                return None;
+            }
+            Some(Type::Fun(na.map_or_else(|| a.clone(), Rc::new), row.clone(), nb.map_or_else(|| b.clone(), Rc::new)))
+        }
+        Type::Tuple(items) => map_vec(items, f).map(|v| Type::Tuple(Rc::new(v))),
+        Type::Union(items) => map_vec(items, f).map(|v| Type::Union(Rc::new(v))),
+        Type::Record(fields) => {
+            let mapped: Vec<Option<Type>> = fields.iter().map(|(_, t)| f(t)).collect();
+            if mapped.iter().all(Option::is_none) {
+                return None;
+            }
+            Some(Type::Record(Rc::new(
+                mapped.into_iter().zip(fields.iter()).map(|(m, (n, old))| (n.clone(), m.unwrap_or_else(|| old.clone()))).collect(),
+            )))
+        }
+        Type::Indexed(w, i) => f(w).map(|w| Type::Indexed(Rc::new(w), i.clone())),
+        _ => None,
+    }
+}
+
+// The group rebuilt with `f` applied to each body; None when no body changed.
+pub fn map_group(h: &RecRef, k: usize, f: &mut dyn FnMut(&Type) -> Option<Type>) -> Option<Type> {
+    let bodies = map_vec(&h.0.bodies, f)?;
+    Some(Type::Rec(RecRef(Rc::new(RecGroup::new(h.0.names.clone(), bodies))), k))
+}
+
+fn subst_bound(t: &Type, depth: u32, g: &RecRef) -> Option<Type> {
+    match t {
+        Type::RecVar(RecVar::Bound { depth: d, member }) if *d == depth => Some(Type::Rec(g.clone(), *member as usize)),
+        Type::Rec(h, k) => {
+            if h.0.escape <= depth {
+                return None;
+            }
+            map_group(h, *k, &mut |b| subst_bound(b, depth + 1, g))
+        }
+        _ => map_children(t, &mut |c| subst_bound(c, depth, g)),
+    }
+}
+
+// One step into member `i`: its body with every reference to the group replaced by the group
+// itself. Only closed terms are unfolded, so nothing needs shifting. Subtrees that mention no
+// reference are returned as the same Rcs.
+pub fn unfold(g: &RecRef, i: usize) -> Type {
+    subst_bound(&g.0.bodies[i], 0, g).unwrap_or_else(|| g.0.bodies[i].clone())
+}
+
+fn occurs_free(t: &Type, id: u64) -> bool {
+    match t {
+        Type::RecVar(RecVar::Free { id: i, .. }) => *i == id,
+        Type::Rec(h, _) => !h.0.plain && h.0.bodies.iter().any(|b| occurs_free(b, id)),
+        _ => {
+            let mut found = false;
+            each_child(t, &mut |c| found = found || occurs_free(c, id));
+            found
+        }
+    }
+}
+
+// `t` with each Free placeholder `f(id, depth)` answers for replaced; depth counts the groups
+// entered. None when nothing changed. Plain groups hold no placeholder and are skipped.
+fn replace_free(t: &Type, depth: u32, f: &dyn Fn(u64, u32) -> Option<Type>) -> Option<Type> {
+    match t {
+        Type::RecVar(RecVar::Free { id, .. }) => f(*id, depth),
+        Type::Rec(h, k) => {
+            if h.0.plain {
+                return None;
+            }
+            map_group(h, *k, &mut |b| replace_free(b, depth + 1, f))
+        }
+        _ => map_children(t, &mut |c| replace_free(c, depth, f)),
+    }
+}
+
+// The name of the first placeholder `t` still contains (a type the machine built while a
+// group's values were running and that escaped before the group closed).
+pub fn first_free(t: &Type) -> Option<Rc<str>> {
+    match t {
+        Type::RecVar(RecVar::Free { name, .. }) => Some(name.clone()),
+        Type::Rec(h, _) if !h.0.plain => h.0.bodies.iter().find_map(first_free),
+        Type::Rec(..) => None,
+        _ => {
+            let mut found = None;
+            each_child(t, &mut |c| {
+                if found.is_none() {
+                    found = first_free(c);
+                }
+            });
+            found
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CloseError {
+    // The member is a bare reference to a member of its own group, or its unfolding never
+    // reaches a type constructor.
+    Bare,
+    // A member some other member's type mentions is not a type at all.
+    NotAType,
+}
+
+// Closes a `let rec` type group the machine just evaluated. `results[i]` is the value of
+// member i if it is a type (it mentions the group's members as Free placeholders with `ids`),
+// else None. Members some type mentions become a RecGroup, the rest keep their type with the
+// placeholders replaced by the closed members. Err is (member, why).
+pub fn close_group(names: &[Rc<str>], ids: &[u64], results: &[Option<Type>]) -> Result<Vec<Option<Type>>, (usize, CloseError)> {
+    for (i, r) in results.iter().enumerate() {
+        if let Some(Type::RecVar(RecVar::Free { id, .. })) = r
+            && ids.contains(id)
+        {
+            return Err((i, CloseError::Bare));
+        }
+    }
+    let referenced: Vec<usize> =
+        (0..ids.len()).filter(|&j| results.iter().flatten().any(|t| occurs_free(t, ids[j]))).collect();
+    if let Some(&j) = referenced.iter().find(|&&j| results[j].is_none()) {
+        return Err((j, CloseError::NotAType));
+    }
+    if referenced.is_empty() {
+        return Ok(results.to_vec());
+    }
+    let pos = |id: u64| ids.iter().position(|x| *x == id).and_then(|j| referenced.iter().position(|r| *r == j));
+    let bodies: Vec<Type> = referenced
+        .iter()
+        .map(|&j| {
+            let t = results[j].as_ref().expect("checked above");
+            let bound = |id: u64, depth: u32| pos(id).map(|p| Type::RecVar(RecVar::Bound { depth, member: p as u32 }));
+            replace_free(t, 0, &bound).unwrap_or_else(|| t.clone())
+        })
+        .collect();
+    let g = RecRef(Rc::new(RecGroup::new(referenced.iter().map(|&j| names[j].clone()).collect(), bodies)));
+    let closed = |id: u64, _: u32| pos(id).map(|p| Type::Rec(g.clone(), p));
+    let out: Vec<Option<Type>> = results
+        .iter()
+        .enumerate()
+        .map(|(j, r)| {
+            r.as_ref().map(|t| match referenced.iter().position(|m| *m == j) {
+                Some(p) => Type::Rec(g.clone(), p),
+                None => replace_free(t, 0, &closed).unwrap_or_else(|| t.clone()),
+            })
+        })
+        .collect();
+    // Contractive: unfolding a member must reach a type constructor, never loop through members.
+    for (p, &j) in referenced.iter().enumerate() {
+        let mut keep = vec![g.clone()];
+        let mut seen = HashSet::from([(Rc::as_ptr(&g.0), p)]);
+        let mut cur = (g.clone(), p);
+        while let Type::Rec(h, k) = unfold(&cur.0, cur.1) {
+            if !seen.insert((Rc::as_ptr(&h.0), k)) {
+                return Err((j, CloseError::Bare));
+            }
+            keep.push(h.clone());
+            cur = (h, k);
+        }
+    }
+    Ok(out)
+}
+
 // The name the user wrote for an index, row or type variable: the part before the first `#`
 // (the rest is checker bookkeeping). Applied at message time only; stored names stay exact.
 pub(crate) fn surface_name(name: &str) -> &str {
@@ -252,6 +513,8 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         // what it (or any other Named type) unfolds to. Never unfolds
         // the registry -- see Type::Named's own doc comment.
         (Type::Named(a), Type::Named(b)) => a == b,
+        // Structural up to member names (RecRef's own equality); never against its unfolding.
+        (Type::Rec(a, i), Type::Rec(b, j)) => i == j && a == b,
         // Two Indexed types are consistent when their wrapped types are
         // consistent AND their index expressions are equal (§3's SOP
         // normalization) -- both halves required, mirroring how List's
@@ -363,6 +626,11 @@ impl fmt::Display for Type {
             // surface name is always the part before the first "#" --
             // see the id's own construction in parser::atom.
             Type::Named(id) => write!(f, "{}", surface_name(id)),
+            // The member's own name, never its body.
+            Type::Rec(g, i) => write!(f, "{}", g.0.names[*i]),
+            Type::RecVar(RecVar::Free { name, .. }) => write!(f, "{name}"),
+            // Unreachable by construction (a Bound only lives inside a group's bodies).
+            Type::RecVar(RecVar::Bound { depth, member }) => write!(f, "?{depth}.{member}"),
             Type::Bool => write!(f, "Bool"),
             Type::Str => write!(f, "Str"),
             Type::List(elem) => write!(f, "[{elem}]"),

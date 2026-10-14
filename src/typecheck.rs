@@ -10,7 +10,7 @@ use crate::resolve::Resolved;
 use crate::span::Span;
 use crate::value::Value;
 use rpds::{HashTrieMap, HashTrieSet};
-use crate::types::{consistent, row_consistent, EffectRow, Type};
+use crate::types::{consistent, each_child, map_group, row_consistent, unfold, EffectRow, RecGroup, RecRef, RecVar, Type};
 use crate::util::find_field;
 mod relate;
 use self::relate::{relate, relate_cast};
@@ -98,7 +98,12 @@ pub(crate) fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
                 go(wrapped, out);
                 out.extend(free_index_vars(index).into_iter().map(TyVar::Index));
             }
-            Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) => {}
+            Type::Rec(g, _) => {
+                if !g.0.plain {
+                    g.0.bodies.iter().for_each(|b| go(b, out));
+                }
+            }
+            Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) | Type::RecVar(_) => {}
         }
     }
     let mut out = BTreeSet::new();
@@ -622,6 +627,10 @@ impl InferCtx {
             Type::Indexed(wrapped, index) => {
                 Type::Indexed(Rc::new(self.resolve_deep(&wrapped)), Rc::new(self.resolve_index_deep(&index)))
             }
+            // A plain group holds no variable to resolve: shared as is.
+            Type::Rec(g, k) if !g.0.plain => {
+                map_group(&g, k, &mut |b| Some(self.resolve_deep(b))).unwrap_or(Type::Rec(g, k))
+            }
             other => other,
         }
     }
@@ -673,7 +682,8 @@ fn occurs_in(name: &str, ty: &Type, infer: &InferCtx) -> bool {
         // comment) -- it never structurally contains a nested Type, so
         // it can never contain `name` as a free Type::Var either, same
         // as Type::Token right next to it here.
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) => false,
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) | Type::RecVar(_) => false,
+        Type::Rec(g, _) => !g.0.plain && g.0.bodies.iter().any(|b| occurs_in(name, b, infer)),
         // Wraps one nested Type (the index expression is never itself a
         // Type::Var) -- same recurse-into-the-wrapped-type precedent as
         // List's own arm just above.
@@ -821,6 +831,7 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
         // (types.rs) -- never unfolds, never binds a Type::Var as a
         // side effect of comparing two Named ids.
         (Type::Named(a), Type::Named(b)) if a == b => Ok(()),
+        (Type::Rec(a, i), Type::Rec(b, j)) if i == j && a == b => Ok(()),
         (Type::List(a), Type::List(b)) => unify(a, b, infer, span),
         // The wrapped type recurses through unify()'s own Var-binding
         // behavior first (matching Type::Fun's own param-then-return
@@ -1230,7 +1241,7 @@ fn subst_index_expr(e: &IndexExpr, index_subst: &HashMap<String, IndexExpr>) -> 
     }
 }
 
-fn subst_type(ty: &Type, row_subst: &HashMap<String, EffectRow>, type_subst: &HashMap<String, Type>, index_subst: &HashMap<String, IndexExpr>) -> Type {
+pub(crate) fn subst_type(ty: &Type, row_subst: &HashMap<String, EffectRow>, type_subst: &HashMap<String, Type>, index_subst: &HashMap<String, IndexExpr>) -> Type {
     match ty {
         Type::Var(name) => type_subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Indexed(wrapped, index) => Type::Indexed(
@@ -1247,6 +1258,10 @@ fn subst_type(ty: &Type, row_subst: &HashMap<String, EffectRow>, type_subst: &Ha
         Type::Union(alts) => Type::Union(Rc::new(alts.iter().map(|t| subst_type(t, row_subst, type_subst, index_subst)).collect())),
         Type::Record(fields) => {
             Type::Record(Rc::new(fields.iter().map(|(n, t)| (n.clone(), subst_type(t, row_subst, type_subst, index_subst))).collect()))
+        }
+        // A plain group names no variable: shared as is.
+        Type::Rec(g, k) if !g.0.plain => {
+            map_group(g, *k, &mut |b| Some(subst_type(b, row_subst, type_subst, index_subst))).unwrap_or_else(|| ty.clone())
         }
         other => other.clone(),
     }
@@ -1359,6 +1374,7 @@ fn snapshot_type(t: &Type, infer: &InferCtx, witness_vars: &[&str]) -> Type {
         Type::Union(ts) => Type::Union(Rc::new(ts.iter().map(go).collect())),
         Type::Record(fs) => Type::Record(Rc::new(fs.iter().map(|(n, t)| (n.clone(), go(t))).collect())),
         Type::Indexed(w, i) => Type::Indexed(Rc::new(go(&w)), Rc::new(runtime_index(&i, infer, witness_vars, false))),
+        Type::Rec(g, k) if !g.0.plain => map_group(&g, k, &mut |b| Some(go(b))).unwrap_or(Type::Rec(g, k)),
         other => other,
     }
 }
@@ -1425,6 +1441,7 @@ fn refuted_error(from: &Type, to: &Type, why: &Why, named_types: &HashMap<String
         let indexable = match &**wrapped {
             Type::List(_) | Type::Var(_) | Type::Dyn => true,
             Type::Named(id) => qualifying_named_alternatives(id, named_types).is_some(),
+            Type::Rec(g, i) => qualifying_rec_alternatives(g, *i).is_some(),
             _ => false,
         };
         if !indexable {
@@ -1460,6 +1477,7 @@ fn erase_open_indexed(t: &Type, env: &CheckEnv) -> Type {
         Type::Union(ts) => Type::Union(Rc::new(ts.iter().map(go).collect())),
         Type::Record(fs) => Type::Record(Rc::new(fs.iter().map(|(n, t)| (n.clone(), go(t))).collect())),
         Type::Fun(p, r, b) => Type::Fun(Rc::new(go(p)), r.clone(), Rc::new(go(b))),
+        Type::Rec(g, k) if !g.0.plain => map_group(g, *k, &mut |b| Some(go(b))).unwrap_or_else(|| t.clone()),
         other => other.clone(),
     }
 }
@@ -1519,6 +1537,10 @@ fn cast_targets(to: &Type, infer: &InferCtx) -> (Type, Type) {
         Type::Named(id) => match infer.named_types.get(id) {
             Some(raw) if !matches!(raw, Type::Named(_)) => cast_targets(raw, infer),
             _ => (Type::Dyn, Type::Dyn),
+        },
+        Type::Rec(g, i) => match unfold(g, *i) {
+            Type::Rec(..) => (Type::Dyn, Type::Dyn),
+            raw => cast_targets(&raw, infer),
         },
         Type::Union(alts) => {
             let mut funs = alts.iter().filter(|t| matches!(t, Type::Fun(..)));
@@ -1698,26 +1720,28 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
 // the same "type error: expected X, found Y" text, or the "index variable n
 // has no runtime value" text when a length slot had no value.
 fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> ExprRef {
-    match boundary(to, &env.infer.named_types, &mut HashSet::new()) {
+    match boundary(to, &env.infer.named_types, &mut Visiting::default()) {
         Boundary::None => e,
-        Boundary::Shape(shape) => build_shape_check(arena, e, shape, env),
+        Boundary::Shape(shape) => build_shape_check(arena, e, &shape, env),
         Boundary::Fun(..) | Boundary::Union(_) => static_contract(arena, e, to, env),
     }
 }
 
 // The kind of check a boundary against a type needs (build_boundary_check's
 // dispatch, which lower_conform shares).
-enum Boundary<'t> {
+//
+// Owned: a recursive type's unfolding is a temporary, nothing to borrow from.
+enum Boundary {
     // Nothing to check.
     None,
     // One native check of this function-free type (build_shape_check).
-    Shape(&'t Type),
+    Shape(Type),
     // A contract on a callable value: the unfolded Fun type, its parameter
     // and its result.
-    Fun(&'t Type, &'t Rc<Type>, &'t Rc<Type>),
+    Fun(Type, Rc<Type>, Rc<Type>),
     // A union with a Fun alternative: the first alternative that holds is
     // picked, and a Fun one gets its contract.
-    Union(&'t Type),
+    Union(Type),
 }
 
 // A static boundary that needs a contract: `e` checked against `to` by an
@@ -1730,7 +1754,7 @@ fn static_contract(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> 
     let vars: Vec<&str> = env.local.iter().copied().chain(env.infer.index_witness.iter()).map(|w| w.var.as_str()).collect();
     let ty = snapshot_type(to, env.infer, &vars);
     let mut read = BTreeMap::new();
-    checked_index_vars(&ty, env.infer, &mut HashSet::new(), true, false, &mut read);
+    checked_index_vars(&ty, env.infer, &mut Seen::default(), true, false, &mut read);
     let (mut index_names, mut lens) = (Vec::with_capacity(read.len()), Vec::with_capacity(read.len()));
     for (name, repeatable) in read {
         let index = IndexExpr::Var(name.clone());
@@ -1754,7 +1778,16 @@ fn static_contract(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> 
 // variable is bound by each call to its argument's length, not read from the
 // site; a parameter itself is not checked (the site is trusted), and a
 // function inside a container is only a callability tag.
-fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut HashSet<String>, spine: bool, in_contract: bool, out: &mut BTreeMap<String, bool>) {
+// The recursive types it already walked: a global memo, so each is walked once. A Rec is keyed
+// by group pointer and member; the Rc is kept so the pointer stays unique.
+#[derive(Default)]
+struct Seen {
+    named: HashSet<String>,
+    rec: HashSet<(*const RecGroup, usize)>,
+    keep: Vec<RecRef>,
+}
+
+fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool, in_contract: bool, out: &mut BTreeMap<String, bool>) {
     match ty {
         Type::Fun(param, _, ret) if spine => {
             let mut inner = BTreeMap::new();
@@ -1773,9 +1806,15 @@ fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut HashSet<String>, s
         }
         Type::Named(id) => {
             if let Some(raw) = infer.named_types.get(id)
-                && seen.insert(id.clone())
+                && seen.named.insert(id.clone())
             {
                 checked_index_vars(raw, infer, seen, spine, in_contract, out);
+            }
+        }
+        Type::Rec(g, i) => {
+            if seen.rec.insert((Rc::as_ptr(&g.0), *i)) {
+                seen.keep.push(g.clone());
+                checked_index_vars(&unfold(g, *i), infer, seen, spine, in_contract, out);
             }
         }
         Type::Indexed(wrapped, index) => {
@@ -1801,19 +1840,21 @@ fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut HashSet<String>, s
 
 // `to` with every alias wrapper and Named alias above its first real shape
 // unfolded, each Named added to `visiting`.
-fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut HashSet<String>) -> Boundary<'t> {
+fn boundary(to: &Type, named: &HashMap<String, Type>, visiting: &mut Visiting) -> Boundary {
     match to {
-        Type::Int | Type::Float | Type::Bool | Type::Str | Type::List(_) | Type::Token(_) | Type::Tuple(_) | Type::Record(_) => Boundary::Shape(to),
-        Type::Fun(param_ty, _row, ret_ty) => Boundary::Fun(to, param_ty, ret_ty),
-        Type::Union(_) if needs_contract(to, named, visiting) => Boundary::Union(to),
-        Type::Union(_) => Boundary::Shape(to),
+        Type::Int | Type::Float | Type::Bool | Type::Str | Type::List(_) | Type::Token(_) | Type::Tuple(_) | Type::Record(_) => Boundary::Shape(to.clone()),
+        Type::Fun(param_ty, _row, ret_ty) => Boundary::Fun(to.clone(), param_ty.clone(), ret_ty.clone()),
+        Type::Union(_) if needs_contract(to, named, visiting) => Boundary::Union(to.clone()),
+        Type::Union(_) => Boundary::Shape(to.clone()),
         // Dyn accepts everything, so a check against it is the identity. Not
         // unreachable: a contract checks a call's result against the Fun's
         // return type, which is Dyn for `Dyn -> Dyn`.
         Type::Dyn | Type::Var(_) => Boundary::None,
+        // A placeholder never reaches a check (machine::pure_type rejects it).
+        Type::RecVar(_) => Boundary::None,
         // A list's length, literal or read at run time from a length slot,
         // is part of its one native test.
-        Type::Indexed(w, _) if matches!(**w, Type::List(_)) => Boundary::Shape(to),
+        Type::Indexed(w, _) if matches!(**w, Type::List(_)) => Boundary::Shape(to.clone()),
         // An alias (or Dyn/Var) wrapper: no runtime length to compare, but the shape is checked.
         Type::Indexed(wrapped, _) => boundary(wrapped, named, visiting),
         // Look up what this id unfolds to and check THAT, exactly as if `to`
@@ -1835,9 +1876,17 @@ fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut H
         // equal type of the same lowering, Lazy::child), so a self-reference
         // there (`let rec F = Fun(Dyn, F)`) is checked at each call.
         Type::Named(id) => match named.get(id) {
-            Some(raw) if visiting.insert(id.clone()) => boundary(raw, named, visiting),
+            Some(raw) if visiting.named.insert(id.clone()) => boundary(raw, named, visiting),
             _ => Boundary::None,
         },
+        // The same chain-ancestor stop, by group pointer and member.
+        Type::Rec(g, i) => {
+            if visiting.has_rec(g, *i) {
+                return Boundary::None;
+            }
+            visiting.rec.push((g.clone(), *i));
+            boundary(&unfold(g, *i), named, visiting)
+        }
     }
 }
 
@@ -1853,13 +1902,16 @@ pub(crate) fn lower_conform(lazy: &Lazy, named: &Rc<HashMap<String, Type>>, span
     let mut infer = InferCtx::new();
     infer.named_types = named.clone();
     let env = CheckEnv { defer: false, span, ..CheckEnv::new(&infer) };
-    let mut visiting = HashSet::new();
+    let mut visiting = Visiting::default();
     let mut defs = Defs::default();
     let (test, to, then) = match boundary(ty, named, &mut visiting) {
         Boundary::None => return None,
-        Boundary::Shape(to) => (shape_test(to, &env, &mut defs, &HashSet::new()), to, Then::Done),
-        Boundary::Fun(fun_ty, param, ret) => (Test::Fun, fun_ty, Then::Wrap(lazy.child(param.clone()), lazy.child(ret.clone()))),
-        Boundary::Union(to) => (Test::Never, to, pick(lazy, to, &env, &mut defs, &visiting)),
+        Boundary::Shape(to) => (shape_test(&to, &env, &mut defs, &Visiting::default()), to, Then::Done),
+        Boundary::Fun(fun_ty, param, ret) => (Test::Fun, fun_ty, Then::Wrap(lazy.child(param), lazy.child(ret))),
+        Boundary::Union(to) => {
+            let then = pick(lazy, &to, &env, &mut defs, &visiting);
+            (Test::Never, to, then)
+        }
     };
     let bodies = defs.bodies.into_iter().map(|body| body.expect("every alias body is built before shape_test returns")).collect();
     let check = CheckSpec { test, defs: bodies, lens: Vec::new(), to: to.to_string(), span };
@@ -1870,17 +1922,18 @@ pub(crate) fn lower_conform(lazy: &Lazy, named: &Rc<HashMap<String, Type>>, span
 // (one already being unfolded above never holds) and what a value passing it
 // still needs. Every
 // alternative shares one alias table and one set of length slots.
-fn pick(lazy: &Lazy, to: &Type, env: &CheckEnv, defs: &mut Defs, visiting: &HashSet<String>) -> Then {
+fn pick(lazy: &Lazy, to: &Type, env: &CheckEnv, defs: &mut Defs, visiting: &Visiting) -> Then {
     let Type::Union(alts) = to else { unreachable!("pick is only ever called with a Union target") };
     let pick_one = |alt: &Type, defs: &mut Defs| {
         let test = match alt {
-            Type::Named(id) if visiting.contains(id) => Test::Never,
-            _ => shape_test(alt, env, defs, &HashSet::new()),
+            Type::Named(id) if visiting.named.contains(id) => Test::Never,
+            Type::Rec(g, i) if visiting.has_rec(g, *i) => Test::Never,
+            _ => shape_test(alt, env, defs, &Visiting::default()),
         };
         let mut visiting = visiting.clone();
         let then = match boundary(alt, &env.infer.named_types, &mut visiting) {
-            Boundary::Fun(_, param, ret) => Then::Wrap(lazy.child(param.clone()), lazy.child(ret.clone())),
-            Boundary::Union(nested) => pick(lazy, nested, env, defs, &visiting),
+            Boundary::Fun(_, param, ret) => Then::Wrap(lazy.child(param), lazy.child(ret)),
+            Boundary::Union(nested) => pick(lazy, &nested, env, defs, &visiting),
             Boundary::None | Boundary::Shape(_) => Then::Done,
         };
         (test, then)
@@ -2142,6 +2195,10 @@ impl Shape {
 #[derive(Default)]
 struct Defs {
     ids: HashMap<String, usize>,
+    // A Rec's body, by group pointer and member (a global memo: each pointer is unfolded once);
+    // `keep` holds the groups so the pointers stay unique.
+    rec_ids: HashMap<(*const RecGroup, usize), usize>,
+    keep: Vec<RecRef>,
     bodies: Vec<Option<Test>>,
     lens: Vec<IndexExpr>,
 }
@@ -2149,7 +2206,7 @@ struct Defs {
 // `ty` as one native Shape.
 fn shape_of(ty: &Type, env: &CheckEnv) -> Shape {
     let mut defs = Defs::default();
-    let test = shape_test(ty, env, &mut defs, &HashSet::new());
+    let test = shape_test(ty, env, &mut defs, &Visiting::default());
     let bodies = defs.bodies.into_iter().map(|body| body.expect("every alias body is built before shape_test returns")).collect();
     Shape { test, defs: bodies, lens: defs.lens }
 }
@@ -2164,10 +2221,10 @@ fn shape_of(ty: &Type, env: &CheckEnv) -> Shape {
 // becomes one `Ref` into `defs`, whose body is built once, so a recursive
 // alias terminates because the value does. An unregistered Named is `Any`
 // ("no information here").
-fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &HashSet<String>) -> Test {
-    let element = |t: &Type, defs: &mut Defs| shape_test(t, env, defs, &HashSet::new());
+fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &Visiting) -> Test {
+    let element = |t: &Type, defs: &mut Defs| shape_test(t, env, defs, &Visiting::default());
     match ty {
-        Type::Dyn | Type::Var(_) => Test::Any,
+        Type::Dyn | Type::Var(_) | Type::RecVar(_) => Test::Any,
         Type::Int => Test::Int,
         Type::Float => Test::Float,
         Type::Bool => Test::Bool,
@@ -2185,21 +2242,35 @@ fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &HashSet<St
         // comment for why nothing downstream can ever observe them.
         Type::Record(fields) => Test::RecordOf(fields.iter().map(|(name, t)| (name.clone(), element(t, defs))).collect()),
         Type::Union(alts) => Test::Or(alts.iter().map(|alt| shape_test(alt, env, defs, unguarded)).collect()),
-        Type::Named(id) if unguarded.contains(id) => Test::Never,
+        Type::Named(id) if unguarded.named.contains(id) => Test::Never,
         Type::Named(id) => match env.infer.named_types.get(id) {
             None => Test::Any,
-            Some(raw) if !unguarded.is_empty() => shape_test(raw, env, defs, &extend_visiting(unguarded, id)),
+            Some(raw) if !unguarded.is_empty() => shape_test(raw, env, defs, &unguarded.with_named(id)),
             Some(raw) => match defs.ids.get(id) {
                 Some(&i) => Test::Ref(i),
                 None => {
                     let i = defs.bodies.len();
                     defs.bodies.push(None);
                     defs.ids.insert(id.clone(), i);
-                    let body = shape_test(raw, env, defs, &extend_visiting(unguarded, id));
+                    let body = shape_test(raw, env, defs, &unguarded.with_named(id));
                     defs.bodies[i] = Some(body);
                     Test::Ref(i)
                 }
             },
+        },
+        Type::Rec(g, k) if unguarded.has_rec(g, *k) => Test::Never,
+        Type::Rec(g, k) if !unguarded.is_empty() => shape_test(&unfold(g, *k), env, defs, &unguarded.with_rec(g, *k)),
+        Type::Rec(g, k) => match defs.rec_ids.get(&(Rc::as_ptr(&g.0), *k)) {
+            Some(&i) => Test::Ref(i),
+            None => {
+                let i = defs.bodies.len();
+                defs.bodies.push(None);
+                defs.rec_ids.insert((Rc::as_ptr(&g.0), *k), i);
+                defs.keep.push(g.clone());
+                let body = shape_test(&unfold(g, *k), env, defs, &unguarded.with_rec(g, *k));
+                defs.bodies[i] = Some(body);
+                Test::Ref(i)
+            }
         },
         // A literal length is tested as is; any other index is read from a slot.
         Type::Indexed(wrapped, index) => match (wrapped.as_ref(), env.infer.resolve_index_deep(index)) {
@@ -2231,20 +2302,15 @@ fn len_slot(index: &IndexExpr, env: &CheckEnv, defs: &mut Defs) -> usize {
     }
 }
 
-fn extend_visiting(visiting: &HashSet<String>, id: &str) -> HashSet<String> {
-    let mut visiting = visiting.clone();
-    visiting.insert(id.to_string());
-    visiting
-}
-
 // Does checking `ty` do more than its shape test -- is a Fun reachable, so a
 // matching value must also get its per-call contract? Decides whether a
 // union check picks its alternative (Boundary::Union).
-fn needs_contract(ty: &Type, named: &HashMap<String, Type>, visiting: &HashSet<String>) -> bool {
+fn needs_contract(ty: &Type, named: &HashMap<String, Type>, visiting: &Visiting) -> bool {
     match ty {
         Type::Fun(..) => true,
         Type::Union(alts) => alts.iter().any(|alt| needs_contract(alt, named, visiting)),
-        Type::Named(id) if !visiting.contains(id) => named.get(id).is_some_and(|raw| needs_contract(raw, named, &extend_visiting(visiting, id))),
+        Type::Named(id) if !visiting.named.contains(id) => named.get(id).is_some_and(|raw| needs_contract(raw, named, &visiting.with_named(id))),
+        Type::Rec(g, i) if !visiting.has_rec(g, *i) => needs_contract(&unfold(g, *i), named, &visiting.with_rec(g, *i)),
         _ => false,
     }
 }
@@ -2456,6 +2522,45 @@ fn record_field_type(ty: &Type, name: &str) -> Option<Type> {
 // exist in the scrutinee type (recursing into a Union's alternatives,
 // any one of which might supply it), everything else falls back to the
 // ordinary consistent()-based question.
+// The recursive types being unfolded somewhere above a point in a walk (an ancestor chain, not
+// a global memo): Named by id, Rec by group pointer and member (the Rc is kept so the pointer
+// stays unique).
+#[derive(Clone, Default)]
+struct Visiting {
+    named: HashSet<String>,
+    rec: Vec<(RecRef, usize)>,
+}
+
+impl Visiting {
+    fn of(rec: &Type) -> Visiting {
+        match rec {
+            Type::Named(id) => Visiting::default().with_named(id),
+            Type::Rec(g, i) => Visiting::default().with_rec(g, *i),
+            _ => Visiting::default(),
+        }
+    }
+
+    fn with_named(&self, id: &str) -> Visiting {
+        let mut v = self.clone();
+        v.named.insert(id.to_string());
+        v
+    }
+
+    fn with_rec(&self, g: &RecRef, i: usize) -> Visiting {
+        let mut v = self.clone();
+        v.rec.push((g.clone(), i));
+        v
+    }
+
+    fn has_rec(&self, g: &RecRef, i: usize) -> bool {
+        self.rec.iter().any(|(h, k)| *k == i && Rc::ptr_eq(&h.0, &g.0))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.named.is_empty() && self.rec.is_empty()
+    }
+}
+
 // `visiting` is the same ancestor-tracking device `boundary` uses:
 // the set of Type::Named ids currently being unfolded somewhere ABOVE
 // this call in the SAME unfold chain, empty at the one genuine entry
@@ -2468,7 +2573,7 @@ fn record_field_type(ty: &Type, name: &str) -> Option<Type> {
 // alternative (including that same Named(id) again) -- without this,
 // that's genuine infinite recursion in this function's own call stack,
 // not just a runtime concern.
-fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, Type>, visiting: &HashSet<String>) -> bool {
+fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, Type>, visiting: &Visiting) -> bool {
     match (pat, ty) {
         (Pattern::Record(fields), Type::Record(type_fields)) => {
             fields.iter().all(|(name, _)| find_field(type_fields, name).is_some())
@@ -2507,13 +2612,18 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
         // equivalently to plain `Int` for reachability purposes instead
         // of recursing forever.
         (_, Type::Named(id)) => {
-            if visiting.contains(id) {
+            if visiting.named.contains(id) {
                 return false;
             }
             let Some(unfolded) = named_types.get(id) else { return true };
-            let mut visiting = visiting.clone();
-            visiting.insert(id.clone());
-            pattern_could_match(pat, unfolded, named_types, &visiting)
+            pattern_could_match(pat, unfolded, named_types, &visiting.with_named(id))
+        }
+        // The same ancestor-tracking cycle break, by pointer.
+        (_, Type::Rec(g, i)) => {
+            if visiting.has_rec(g, *i) {
+                return false;
+            }
+            pattern_could_match(pat, &unfold(g, *i), named_types, &visiting.with_rec(g, *i))
         }
         // An Indexed-typed scrutinee is, at runtime, just its wrapped
         // type's own value (Vec(n) sugars over this) -- coverage of
@@ -2542,12 +2652,23 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
 // too.
 enum IndexedRefinementTarget {
     List { index_var: String, elem_ty: Rc<Type> },
+    // `rec` is the recursive type the Indexed wraps (a Type::Named or a Type::Rec);
     // `base_alt`/`step_alt` are the two alternatives
-    // `qualifying_named_alternatives` already sorted out -- the SAME
+    // `qualifying_alternatives` already sorted out -- the SAME
     // per-alternative shapes Match's own arm loop re-checks a pattern
     // against via `pattern_could_match` to decide which hypothesis (if
-    // any) that specific arm earns.
-    Named { index_var: String, id: String, base_alt: Rc<Type>, step_alt: Rc<Type> },
+    // any) that specific arm earns. `self_ref` says where the step
+    // alternative mentions `rec`.
+    Rec { index_var: String, rec: Type, base_alt: Rc<Type>, step_alt: Rc<Type>, self_ref: SelfRef },
+}
+
+// Where a step alternative mentions the recursive type being refined: the alternative itself,
+// one bare Tuple item, or somewhere deeper (not recognised: the safe "not applicable").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelfRef {
+    Whole,
+    Item(usize),
+    Deep,
 }
 
 fn indexed_refinement_target(
@@ -2558,17 +2679,73 @@ fn indexed_refinement_target(
     match (resolved_scrut_ty, resolved_index) {
         (Type::Indexed(wrapped, _), Some(IndexExpr::Var(name))) => match &**wrapped {
             Type::List(elem_ty) => Some(IndexedRefinementTarget::List { index_var: name.clone(), elem_ty: elem_ty.clone() }),
-            Type::Named(id) => qualifying_named_alternatives(id, named_types).map(|(base_alt, step_alt)| {
-                IndexedRefinementTarget::Named {
+            rec @ (Type::Named(_) | Type::Rec(..)) => qualifying_alternatives(rec, named_types).map(|(base_alt, step_alt, self_ref)| {
+                IndexedRefinementTarget::Rec {
                     index_var: name.clone(),
-                    id: id.clone(),
+                    rec: rec.clone(),
                     base_alt: Rc::new(base_alt),
                     step_alt: Rc::new(step_alt),
+                    self_ref,
                 }
             }),
             _ => None,
         },
         _ => None,
+    }
+}
+
+// Case B eligibility for either kind of recursive type: (base_alt, step_alt, self_ref), the
+// alternatives unfolded one step.
+fn qualifying_alternatives(rec: &Type, named_types: &HashMap<String, Type>) -> Option<(Type, Type, SelfRef)> {
+    match rec {
+        Type::Named(id) => {
+            let (base, step) = qualifying_named_alternatives(id, named_types)?;
+            let self_ref = match &step {
+                Type::Named(n) if n == id => SelfRef::Whole,
+                Type::Tuple(items) => items.iter().position(|t| matches!(t, Type::Named(n) if n == id)).map_or(SelfRef::Deep, SelfRef::Item),
+                _ => SelfRef::Deep,
+            };
+            Some((base, step, self_ref))
+        }
+        Type::Rec(g, i) => qualifying_rec_alternatives(g, *i),
+        _ => None,
+    }
+}
+
+// qualifying_named_alternatives for member `i` of a group: the raw body is a Union of exactly
+// two alternatives, one mentioning the member not at all and the other exactly once (at any
+// depth, nested groups included). The alternatives come back unfolded; `self_ref` is read off
+// the raw step, where the member is still a Bound.
+fn qualifying_rec_alternatives(g: &RecRef, i: usize) -> Option<(Type, Type, SelfRef)> {
+    let Type::Union(raw) = &g.0.bodies[i] else { return None };
+    let [a, b] = raw.as_slice() else { return None };
+    let (base, step) = match (count_bound(a, 0, i), count_bound(b, 0, i)) {
+        (0, 1) => (0, 1),
+        (1, 0) => (1, 0),
+        _ => return None,
+    };
+    let Type::Union(unfolded) = unfold(g, i) else { return None };
+    let is_self = |t: &Type| matches!(t, Type::RecVar(RecVar::Bound { depth: 0, member }) if *member as usize == i);
+    let self_ref = match &raw[step] {
+        t if is_self(t) => SelfRef::Whole,
+        Type::Tuple(items) => items.iter().position(is_self).map_or(SelfRef::Deep, SelfRef::Item),
+        _ => SelfRef::Deep,
+    };
+    Some((unfolded[base].clone(), unfolded[step].clone(), self_ref))
+}
+
+// How many references to member `member` of the group whose body is being walked does `t`
+// hold? `nest` counts the groups entered since.
+fn count_bound(t: &Type, nest: u32, member: usize) -> usize {
+    match t {
+        Type::RecVar(RecVar::Bound { depth, member: m }) => usize::from(*depth == nest && *m as usize == member),
+        Type::Rec(h, _) if h.0.escape > nest => h.0.bodies.iter().map(|b| count_bound(b, nest + 1, member)).sum(),
+        Type::Rec(..) => 0,
+        _ => {
+            let mut n = 0;
+            each_child(t, &mut |c| n += count_bound(c, nest, member));
+            n
+        }
     }
 }
 
@@ -2607,18 +2784,10 @@ fn qualifying_named_alternatives(id: &str, named_types: &HashMap<String, Type>) 
 // "bare Var tail only" v1 restriction, anything with the self-reference
 // nested deeper (inside a further Tuple/List/Record) returns None, the
 // same safe fallback.
-fn self_ref_pattern<'a>(pat: &'a Pattern, step_alt: &Type, id: &str) -> Option<&'a Pattern> {
-    match step_alt {
-        Type::Named(n) if n == id => Some(pat),
-        Type::Tuple(items) => match pat {
-            Pattern::List(pats) if pats.len() == items.len() => {
-                items.iter().zip(pats.iter()).find_map(|(item_ty, p)| match item_ty {
-                    Type::Named(n) if n == id => Some(p),
-                    _ => None,
-                })
-            }
-            _ => None,
-        },
+fn self_ref_pattern<'a>(pat: &'a Pattern, step_alt: &Type, self_ref: SelfRef) -> Option<&'a Pattern> {
+    match (self_ref, step_alt, pat) {
+        (SelfRef::Whole, _, _) => Some(pat),
+        (SelfRef::Item(k), Type::Tuple(items), Pattern::List(pats)) if pats.len() == items.len() => pats.get(k),
         _ => None,
     }
 }
@@ -2634,9 +2803,9 @@ fn self_ref_pattern<'a>(pat: &'a Pattern, step_alt: &Type, id: &str) -> Option<&
 // an oversight, just unreachable from this function's only call site,
 // which has already matched `step_alt` as a `Type::Tuple` (the
 // step-shaped-literal check) before ever calling this.
-fn self_ref_position(step_alt: &Type, id: &str) -> Option<usize> {
-    match step_alt {
-        Type::Tuple(items) => items.iter().position(|item_ty| matches!(item_ty, Type::Named(n) if n == id)),
+fn self_ref_position(step_alt: &Type, self_ref: SelfRef) -> Option<usize> {
+    match (step_alt, self_ref) {
+        (Type::Tuple(_), SelfRef::Item(k)) => Some(k),
         _ => None,
     }
 }
@@ -2666,10 +2835,9 @@ fn self_ref_position(step_alt: &Type, id: &str) -> Option<usize> {
 // its body against `Indexed(Named(id), n - 1)` failed. Excluding
 // If/Match here, exactly like Tuple's own step-shape exclusion, lets
 // elaborate_node's normal dispatch handle them and fixes it.
-fn case_b_base_candidate(arena: &Arena, cur_expr: ExprRef, expected: &Type, infer: &InferCtx) -> Option<(String, Type, Type, Rc<IndexExpr>)> {
+fn case_b_base_candidate(arena: &Arena, cur_expr: ExprRef, expected: &Type, infer: &InferCtx) -> Option<(Type, Type, SelfRef, Rc<IndexExpr>)> {
     let Type::Indexed(wrapped, idx) = infer.resolve_deep(expected) else { return None };
-    let Type::Named(id) = wrapped.as_ref() else { return None };
-    let (base_alt, step_alt) = qualifying_named_alternatives(id, &infer.named_types)?;
+    let (base_alt, step_alt, self_ref) = qualifying_alternatives(&wrapped, &infer.named_types)?;
     match &arena[cur_expr] {
         Expr::If(..) | Expr::Match(..) => return None,
         Expr::Tuple(items) => {
@@ -2681,7 +2849,7 @@ fn case_b_base_candidate(arena: &Arena, cur_expr: ExprRef, expected: &Type, infe
         }
         _ => {}
     }
-    Some((id.clone(), base_alt, step_alt, idx))
+    Some((base_alt, step_alt, self_ref, idx))
 }
 
 // Does `ty` mention an Indexed type anywhere? Gates pushing an expected
@@ -2722,10 +2890,10 @@ fn const_index(e: &IndexExpr) -> Option<i64> {
 // alternative's; the recursive position is checked against `idx - 1`,
 // recursing while it is itself a tuple and ending at a base value (or
 // Dyn/Var, which carries no information to contradict).
-fn is_step_shaped_tuple(actual: &Type, base_alt: &Type, step_alt: &Type, id: &str, idx: &IndexExpr, infer: &InferCtx) -> bool {
+fn is_step_shaped_tuple(actual: &Type, base_alt: &Type, step_alt: &Type, self_ref: SelfRef, idx: &IndexExpr, infer: &InferCtx) -> bool {
     let (Type::Tuple(items), Type::Tuple(step_items)) = (actual, step_alt) else { return false };
     let Some(k) = const_index(&infer.resolve_index_deep(idx)).filter(|k| *k > 0) else { return false };
-    let Some(rec_pos) = self_ref_position(step_alt, id) else { return false };
+    let Some(rec_pos) = self_ref_position(step_alt, self_ref) else { return false };
     if items.len() != step_items.len() {
         return false;
     }
@@ -2735,7 +2903,7 @@ fn is_step_shaped_tuple(actual: &Type, base_alt: &Type, step_alt: &Type, id: &st
     let tail = infer.resolve_deep(&items[rec_pos]);
     match &tail {
         Type::Dyn | Type::Var(_) => true,
-        Type::Tuple(_) if k > 1 => is_step_shaped_tuple(&tail, base_alt, step_alt, id, &IndexExpr::Lit(k - 1), infer),
+        Type::Tuple(_) if k > 1 => is_step_shaped_tuple(&tail, base_alt, step_alt, self_ref, &IndexExpr::Lit(k - 1), infer),
         _ => k == 1 && !matches!(tail, Type::Indexed(..)) && consistent(&tail, base_alt),
     }
 }
@@ -2752,7 +2920,7 @@ fn bind_fresh_positions(
     pats: &[Pattern],
     infer: &mut InferCtx,
     span: Span,
-    visiting: &HashSet<String>,
+    visiting: &Visiting,
 ) -> Result<Ctx, TypeError> {
     let mut c = ctx.clone();
     for p in pats {
@@ -2775,7 +2943,7 @@ fn bind_fresh_record_fields(
     fields: &[(String, Pattern)],
     infer: &mut InferCtx,
     span: Span,
-    visiting: &HashSet<String>,
+    visiting: &Visiting,
 ) -> Result<Ctx, TypeError> {
     let mut c = ctx.clone();
     for (name, p) in fields {
@@ -2816,7 +2984,7 @@ fn bind_pattern_vars(
     scrutinee_ty: &Type,
     infer: &mut InferCtx,
     span: Span,
-    visiting: &HashSet<String>,
+    visiting: &Visiting,
 ) -> Result<Ctx, TypeError> {
     match pat {
         // Resolve before storing, not just clone: by the time a Pattern::Var
@@ -2924,16 +3092,18 @@ fn bind_pattern_vars(
             // stop and fall back to the safe fresh-vars-per-position
             // behavior instead of unfolding again; otherwise recurse
             // with `id` added to the accumulated set.
+            Type::Rec(g, i) => {
+                if visiting.has_rec(g, *i) {
+                    return bind_fresh_positions(ctx, pats, infer, span, visiting);
+                }
+                bind_pattern_vars(ctx, pat, &unfold(g, *i), infer, span, &visiting.with_rec(g, *i))
+            }
             Type::Named(id) => {
-                if visiting.contains(id) {
+                if visiting.named.contains(id) {
                     return bind_fresh_positions(ctx, pats, infer, span, visiting);
                 }
                 match infer.named_types.get(id).cloned() {
-                    Some(unfolded) => {
-                        let mut visiting = visiting.clone();
-                        visiting.insert(id.clone());
-                        bind_pattern_vars(ctx, pat, &unfolded, infer, span, &visiting)
-                    }
+                    Some(unfolded) => bind_pattern_vars(ctx, pat, &unfolded, infer, span, &visiting.with_named(id)),
                     None => bind_fresh_positions(ctx, pats, infer, span, visiting),
                 }
             }
@@ -3012,16 +3182,18 @@ fn bind_pattern_vars(
             // `infer.fresh_var` per field (the same "zero correlation" gap
             // Task 3 closed for List).
             Type::Indexed(wrapped, _) => bind_pattern_vars(ctx, pat, wrapped, infer, span, visiting),
+            Type::Rec(g, i) => {
+                if visiting.has_rec(g, *i) {
+                    return bind_fresh_record_fields(ctx, fields, infer, span, visiting);
+                }
+                bind_pattern_vars(ctx, pat, &unfold(g, *i), infer, span, &visiting.with_rec(g, *i))
+            }
             Type::Named(id) => {
-                if visiting.contains(id) {
+                if visiting.named.contains(id) {
                     return bind_fresh_record_fields(ctx, fields, infer, span, visiting);
                 }
                 match infer.named_types.get(id).cloned() {
-                    Some(unfolded) => {
-                        let mut visiting = visiting.clone();
-                        visiting.insert(id.clone());
-                        bind_pattern_vars(ctx, pat, &unfolded, infer, span, &visiting)
-                    }
+                    Some(unfolded) => bind_pattern_vars(ctx, pat, &unfolded, infer, span, &visiting.with_named(id)),
                     None => bind_fresh_record_fields(ctx, fields, infer, span, visiting),
                 }
             }
@@ -3745,7 +3917,7 @@ fn count_named(ty: &Type, id: &str) -> usize {
         Type::Fun(param, _row, ret) => count_named(param, id) + count_named(ret, id),
         Type::Tuple(items) | Type::Union(items) => items.iter().map(|t| count_named(t, id)).sum(),
         Type::Record(fields) => fields.iter().map(|(_, t)| count_named(t, id)).sum(),
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Var(_) => 0,
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Var(_) | Type::Rec(..) | Type::RecVar(_) => 0,
         Type::Indexed(wrapped, _) => count_named(wrapped, id),
     }
 }
@@ -4124,7 +4296,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     // rejecting a value that's neither shape.
     let (mut result_ty, mut result_row, mut result_expr) = match cur_mode {
         Mode::Check(expected) => match case_b_base_candidate(arena, cur_expr, expected, infer) {
-            Some((id, base_alt, step_alt, idx)) => {
+            Some((base_alt, step_alt, self_ref, idx)) => {
                 let (actual_ty, row, expr2) = elaborate(arena, cur_expr, &cur_ctx, spans, infer)?;
                 // DEVIATION from the task-6 brief's literal text: the
                 // brief's own condition was bare `consistent(&actual_ty,
@@ -4210,7 +4382,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // Dyn/Var) still unifies index 0 correctly.
                 let actual_is_indexed = matches!(actual_ty, Type::Indexed(..));
                 let base_is_dyn_or_var = matches!(base_alt, Type::Dyn | Type::Var(_));
-                if is_step_shaped_tuple(&actual_ty, &base_alt, &step_alt, &id, &idx, infer) {
+                if is_step_shaped_tuple(&actual_ty, &base_alt, &step_alt, self_ref, &idx, infer) {
                     // Already-synthesized step-shaped Tuple (see the helper).
                     (expected.clone(), row, expr2)
                 } else if !matches!(actual_ty, Type::Dyn | Type::Var(_))
@@ -4467,16 +4639,16 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // arbitrary 2-alternative named union.
             if let Mode::Check(expected) = mode {
                 if let Type::Indexed(wrapped, idx) = infer.resolve_deep(expected) {
-                    if let Type::Named(id) = wrapped.as_ref() {
-                        if let Some((_, step_alt)) = qualifying_named_alternatives(id, &infer.named_types) {
+                    {
+                        if let Some((_, step_alt, self_ref)) = qualifying_alternatives(&wrapped, &infer.named_types) {
                             if let Type::Tuple(step_items) = &step_alt {
                                 if step_items.len() == items.len() {
-                                    if let Some(rec_pos) = self_ref_position(&step_alt, id) {
+                                    if let Some(rec_pos) = self_ref_position(&step_alt, self_ref) {
                                         let mut row = EffectRow::pure();
                                         let mut refs = Vec::with_capacity(items.len());
                                         for (i, item) in items.into_iter().enumerate() {
                                             let (item_row, item2) = if i == rec_pos {
-                                                let rec_expected = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Sub(idx.clone(), Rc::new(IndexExpr::Lit(1)))));
+                                                let rec_expected = Type::Indexed(wrapped.clone(), Rc::new(IndexExpr::Sub(idx.clone(), Rc::new(IndexExpr::Lit(1)))));
                                                 check_against(arena, item, &rec_expected, ctx, spans, infer)?
                                             } else {
                                                 check_against(arena, item, &step_items[i], ctx, spans, infer)?
@@ -4642,6 +4814,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // A callee typed by a (recursive) alias is called through its body, one step.
             let unfolded = match &f_ty {
                 Type::Named(id) => infer.named_types.get(id).filter(|raw| !matches!(raw, Type::Named(_))).cloned(),
+                Type::Rec(g, i) => Some(unfold(g, *i)).filter(|raw| !matches!(raw, Type::Rec(..))),
                 _ => None,
             };
             f_ty = unfolded.unwrap_or(f_ty);
@@ -5080,7 +5253,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // ordinary source: an in-arm `let p: Vec(2) = w in ..` proof
             // used to get wiped by the very next restore).
             let index_key: Option<String> = refinement_target.as_ref().map(|t| match t {
-                IndexedRefinementTarget::List { index_var, .. } | IndexedRefinementTarget::Named { index_var, .. } => index_var.clone(),
+                IndexedRefinementTarget::List { index_var, .. } | IndexedRefinementTarget::Rec { index_var, .. } => index_var.clone(),
             });
             let prior_index_value: Option<Option<IndexExpr>> = index_key.as_ref().map(|k| infer.index_subst.get(k).cloned());
             // Restores `infer.index_subst`'s hypothesis key to its value
@@ -5110,7 +5283,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let mut new_arms = Vec::with_capacity(arms.len());
             let mut arm_tys = Vec::with_capacity(arms.len());
             for (pat, (_, guard, body)) in pats.iter().copied().zip(arms.iter()) {
-                if !pattern_could_match(pat, &scrut_ty, &infer.named_types, &HashSet::new()) {
+                if !pattern_could_match(pat, &scrut_ty, &infer.named_types, &Visiting::default()) {
                     return Err(TypeError(
                         format!(
                             "match: pattern of type {} can never match scrutinee of type {scrut_ty}",
@@ -5150,7 +5323,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // only the hypothesis's own key, leaving everything else
                 // an arm proves intact.
                 restore_index_key(infer, &index_key, &prior_index_value);
-                let mut arm_ctx = bind_pattern_vars(ctx, pat, &scrut_ty, infer, spans[expr], &HashSet::new())?;
+                let mut arm_ctx = bind_pattern_vars(ctx, pat, &scrut_ty, infer, spans[expr], &Visiting::default())?;
                 // Hypothesis injection (spec section 5): base case implies
                 // the scrutinee's own index is 0; step case mints a fresh
                 // index variable, re-types the self-referential
@@ -5194,7 +5367,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                             }
                             _ => {}
                         },
-                        IndexedRefinementTarget::Named { index_var: n_name, id, base_alt, step_alt } => {
+                        IndexedRefinementTarget::Rec { index_var: n_name, rec, base_alt, step_alt, self_ref } => {
                             // `base_alt`/`step_alt` are themselves already-
                             // unfolded alternatives of `id` (see
                             // `qualifying_named_alternatives`), so this
@@ -5210,18 +5383,18 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                             // `qualifying_named_alternatives`'s own
                             // occurrence-count check), just defense in
                             // depth.
-                            let visiting_id = HashSet::from([id.clone()]);
+                            let visiting_id = Visiting::of(rec);
                             let matches_base = pattern_could_match(pat, base_alt, &infer.named_types, &visiting_id);
                             let matches_step = pattern_could_match(pat, step_alt, &infer.named_types, &visiting_id);
                             if matches_base && !matches_step {
                                 infer.index_subst.insert(n_name.clone(), IndexExpr::Lit(0));
                             } else if matches_step && !matches_base {
-                                if let Some(Pattern::Var(self_ref_name)) = self_ref_pattern(pat, step_alt, id) {
+                                if let Some(Pattern::Var(self_ref_name)) = self_ref_pattern(pat, step_alt, *self_ref) {
                                     let m = fresh_index_name("m");
                                     let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
                                     infer.index_subst.insert(n_name.clone(), hypothesis);
                                     infer.rigid_index.insert(m.clone());
-                                    let refined_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var(m)));
+                                    let refined_ty = Type::Indexed(Rc::new(rec.clone()), Rc::new(IndexExpr::Var(m)));
                                     arm_ctx = extend(&arm_ctx, self_ref_name, refined_ty);
                                 }
                                 // The self-referential position is bound
