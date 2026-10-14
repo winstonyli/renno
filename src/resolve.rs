@@ -24,10 +24,12 @@ pub enum VarRef {
 // Dense over the range of Var nodes the walks met, `base..base + vars.len()`,
 // not over the whole arena prefix: a table sized to a late subtree's position
 // would make checking quadratic in the program size. It grows as more subtrees
-// are resolved into it (`resolve_into`): the checker keeps one table for all
+// are resolved into it (`resolve_into`): `eval_pure_in` resolves each
+// evaluation's fresh copy of its root, and the checker keeps one table for all
 // its check-time evaluations, since a closure built in one run is called in a
 // later one, and its body needs an entry whichever run resolved it. A node
-// must be resolved under one layout only.
+// must be resolved under one layout only; that holds because copies are never
+// shared between evaluations.
 #[derive(Default)]
 pub struct Resolved {
     base: usize,

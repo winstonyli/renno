@@ -207,6 +207,9 @@ impl Ctx {
     }
 }
 
+// A direct group or a recursive type group is two definitions (one for its own
+// values, one for the code after it), so it is evaluated at most twice; any
+// other `let` at most once.
 // What a check-time evaluation needs to evaluate a `let`-bound name (spec
 // section 1, type lets): the binder's right-hand side as the parser built it,
 // and the scope it was checked in. The right-hand side is evaluated once, on
@@ -482,7 +485,9 @@ pub(crate) struct InferCtx {
     // Every definition, by CheckDef::idx.
     defs: Vec<Rc<CheckDef>>,
     // Where the variables of every check-time evaluation live. One table for
-    // them all: a closure one evaluation builds is called by a later one.
+    // them all: a closure one evaluation builds is called by a later one. Each
+    // evaluation resolves a fresh copy of its root (eval_pure_in), so a node
+    // is never resolved under two layouts.
     resolved: Resolved,
     // An annotation is being elaborated (annotation_type): a name it reads
     // is not a value-position read, so `lookup` leaves CheckDef::used alone.
@@ -3672,7 +3677,9 @@ fn read_frame(infer: &InferCtx, reads: &[Read]) -> Result<(Vec<String>, Vec<Valu
 }
 
 // Definition `i`'s value: its right-hand side evaluated in a frame of the
-// values of the definitions it reads, with a step budget of its own.
+// values of the definitions it reads, with a step budget of its own. A group's
+// definition builds its `let rec (bindings) in (names)` root here; it runs once
+// per definition, and a direct or recursive-type group is two definitions.
 fn def_value(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx, i: usize) -> DefValue {
     #[cfg(test)]
     DEF_EVALS.with(|c| c.set(c.get() + 1));
@@ -3936,7 +3943,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 let group = crate::resolve::is_direct_group(arena, &bindings).then(|| {
                     let def = infer.new_def(DefNode::Group(bindings.clone()), Vec::new(), &cur_ctx);
                     // Its values are not elaborated yet: count them fallible,
-                    // the safe answer for mark_proven.
+                    // so no evaluation that reads it counts as clean
+                    // (settle_definitions).
                     let _ = def.fallible.set(true);
                     def
                 });
