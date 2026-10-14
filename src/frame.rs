@@ -63,7 +63,7 @@ impl Env {
     }
 }
 
-// Same shape and reason as plist.rs's Drop for PList: the default drop
+// Same shape and reason as cont.rs's Drop for Cont: the default drop
 // recurses through `parent` one frame at a time, which is native stack
 // proportional to the chain (a long sequence of lets builds exactly that).
 // Unwind iteratively via Rc::try_unwrap, stopping the moment some other

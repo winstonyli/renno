@@ -5,9 +5,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
-use crate::plist::PList;
 use crate::span::Span;
-use rpds::HashTrieSet;
+use rpds::{HashTrieMap, HashTrieSet};
 use crate::types::{consistent, row_consistent, EffectRow, Type};
 use crate::util::find_field;
 mod relate;
@@ -24,42 +23,28 @@ pub(crate) use self::relate::{Cause, Rel, Residual, Why};
 #[derive(Debug)]
 pub struct TypeError(pub String, pub Span);
 
-// A binding's type, plus the row-variable, value-type-variable, AND
-// index-variable names generalized over it -- quantified fresh at every
-// use, the way ML/Haskell generalize a `let`-bound type. Row variables
-// only ever come from what the user wrote (an explicit `->{e}`
-// annotation); type variables (`type_vars`) are manufactured by real
-// unification (`unify`, via `InferCtx::fresh_var`) at many sites, never
-// written by a user -- see Type::Var's own doc comment; index variables
-// (`index_vars`) are the same idea one level down, for a name appearing
-// inside a `Type::Indexed`'s own `IndexExpr` rather than as a `Type`
-// itself (manufactured by `unify_index_expr`, via `index_subst`, not
-// `fresh_var` -- a separate namespace, see `InferCtx::index_subst`'s own
-// doc comment). All three stay simple name substitution
-// (extend_generalized computes every set once at the `let`, lookup
-// renames them to fresh names at each reference), not a second
-// unification engine of its own.
+// A binding's type, plus the variables generalized over it -- quantified
+// fresh at every use, the way ML/Haskell generalize a `let`-bound type.
+// Three sorts of variable can be quantified. Row variables only ever come
+// from what the user wrote (an explicit `->{e}` annotation); type variables
+// are manufactured by real unification (`unify`, via `InferCtx::fresh_var`)
+// at many sites, never written by a user -- see Type::Var's own doc comment;
+// index variables are the same idea one level down, for a name appearing
+// inside a `Type::Indexed`'s own `IndexExpr` rather than as a `Type` itself
+// (manufactured by `unify_index_expr`, via `index_subst`, not `fresh_var` --
+// a separate namespace, see `InferCtx::index_subst`'s own doc comment). All
+// three stay simple name substitution (extend_generalized computes the set
+// once at the `let`, lookup renames them to fresh names at each reference),
+// not a second unification engine of its own.
 //
-// None of the three kinds of variable is safe to generalize wherever its
-// own free-variable collector finds it -- see generalizable_row_vars's,
-// generalizable_type_vars's, and generalizable_index_vars's own doc
-// comments for why each needs a ctx-wide "is this still open in an
-// enclosing scope" check.
-//
-// The general rule behind ALL THREE exclusions, stated once here so a
-// future FOURTH kind of variable needing this treatment has one place to
-// read it instead of re-deriving it: generalize(ctx, ty) = freevars(ty)
-// MINUS freevars(ctx) -- never quantify over a name that's still free
-// somewhere still open in the enclosing scope. Applied directly via a
-// ctx-wide scan for each kind (generalizable_row_vars/
-// free_row_vars_in_ctx, generalizable_type_vars/free_type_vars_in_ctx,
-// and generalizable_index_vars/free_index_vars_in_ctx below) -- there is
-// no caller-supplied-list shortcut for any of them (Type::Var's own used
-// to have one, extend_generalized_with_type_vars, back when it had
-// exactly one manufacturing call site; real unification mints it at many,
-// so that shortcut no longer applies -- see the design spec's own "Data
-// model" section).
-#[derive(Clone)]
+// THE RULE, one place for all three sorts (and any future one):
+// generalize(ctx, ty) = freevars(ty) MINUS freevars(ctx) -- never quantify
+// over a name that's still free somewhere still open in the enclosing
+// scope. The mechanism is the `open` set every Ctx carries (see Ctx):
+// `freevars(ctx)` is read from it, not by walking the bindings, so a `let`
+// costs the size of its own type plus the number of variables currently
+// open, however many bindings precede it. Index variables a pending
+// obligation still needs are excluded on top (see `generalizable`).
 pub(crate) struct Scheme {
     // The variables generalized over this binding, of all three sorts,
     // sorted by sort then name. lookup mints a fresh name per reference.
@@ -131,25 +116,37 @@ fn reopen(var: &TyVar, infer: &InferCtx) -> BTreeSet<TyVar> {
     }
 }
 
-// A scope: its bindings, and the variables still open in it, i.e. free in
-// some binding's type and not quantified by that binding. A `let` may
-// quantify only a variable no enclosing scope has open.
+// A scope: the visible bindings, and the variables still open in it, i.e.
+// free in some binding's type and not quantified by that binding. Both are
+// persistent, so extending a scope is cheap and an enclosing scope is
+// untouched: a `let` may quantify only a variable no enclosing scope has
+// open.
+//
+// Constructing and dropping a 50k-binding chain on the default stack is
+// pinned by let_chain_is_o1_stack_construction_and_teardown. A `CheckDef`
+// holds the scope before its binder, so a drop path through defs is the
+// thing to re-check if that test ever overflows.
 #[derive(Clone)]
 pub(crate) struct Ctx {
-    binds: PList<Scheme>,
-    // As written when each binding was added, union-only (a shadowed binding
-    // keeps its variables open, as it did when the whole list was scanned);
-    // open_vars reads the names through the substitution as it stands.
+    // Innermost binding of each name; a shadowed one is no longer reachable.
+    binds: HashTrieMap<String, Rc<Scheme>>,
+    // As written when each binding was added, union-only: a shadowed
+    // binding keeps its variables open (its type may still mention them
+    // through values already built from it). A binding's own quantified
+    // names are not added: the scheme is sealed, since lookup renames them
+    // before any later read. open_vars reads the names
+    // through the substitution as it stands, so a rollback in `unify_trial`
+    // or a match arm's hypotheses cannot leave it stale.
     open: HashTrieSet<TyVar>,
 }
 
 impl Ctx {
     pub(crate) fn empty() -> Ctx {
-        Ctx { binds: PList::empty(), open: HashTrieSet::new() }
+        Ctx { binds: HashTrieMap::new(), open: HashTrieSet::new() }
     }
 
-    fn get(&self, name: &str) -> Option<Scheme> {
-        self.binds.get(name)
+    fn get(&self, name: &str) -> Option<Rc<Scheme>> {
+        self.binds.get(name).cloned()
     }
 
     fn bind(&self, name: &str, scheme: Scheme) -> Ctx {
@@ -159,7 +156,7 @@ impl Ctx {
                 open = open.insert(var);
             }
         }
-        Ctx { binds: self.binds.bind(name, scheme), open }
+        Ctx { binds: self.binds.insert(name.to_string(), Rc::new(scheme)), open }
     }
 
     pub(crate) fn open_vars(&self, infer: &InferCtx) -> BTreeSet<TyVar> {
@@ -278,9 +275,9 @@ fn fallible_check(arena: &Arena, root: ExprRef, spans: &SpanMap, infer: &InferCt
 // through every elaborate()/elaborate_node() call as `&mut InferCtx` --
 // see the design spec's own "Data model" section for the full rationale
 // (functional substitution over union-find). Generalization does NOT
-// live here -- no level counter, no birth-level tracking -- it reuses
-// the ctx-wide technique a concurrent row-variable fix already proved
-// in this codebase (see Task 7); this struct is just a substitution.
+// live here -- no level counter, no birth-level tracking -- it reads the
+// per-scope open-variable set Ctx carries (THE RULE at Scheme); this
+// struct is just a substitution.
 //
 // `unify` is now called unconditionally from Expr::App/BinOp::Cons/If/
 // Match/ListLit (Tasks 4-6), so `subst` and every method below are live
@@ -890,7 +887,7 @@ pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
     }
     match scheme {
         None => Type::Dyn,
-        Some(scheme) if scheme.quantified.is_empty() => scheme.ty,
+        Some(scheme) if scheme.quantified.is_empty() => scheme.ty.clone(),
         Some(scheme) => {
             let names = |sort: fn(&TyVar) -> Option<&String>| -> Vec<String> { scheme.quantified.iter().filter_map(sort).cloned().collect() };
             let row_vars = names(|v| if let TyVar::Row(n) = v { Some(n) } else { None });
@@ -934,36 +931,26 @@ pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
     ctx.bind(name, Scheme::mono(ty))
 }
 
-// `let`-binding: generalizes over both row variables (via the existing
-// generalizable_row_vars, unchanged) and type variables (via
-// generalizable_type_vars) symmetrically -- there is no longer a
-// separate caller-supplied-list variant to keep in sync with this one
-// (that mechanism, extend_generalized_with_type_vars, only worked when
-// Type::Var had exactly one manufacturing call site; real unification
-// mints it at many, so it no longer applies -- see the design spec's own
-// "Data model" section).
+// `let`-binding: generalizes over row, type and index variables alike,
+// by THE RULE stated at Scheme -- the variables of `ty` that no enclosing
+// scope has open (`generalizable`).
 //
-// Row variables: if `ty` mentions any row-variable names (from an
-// explicit `->{e}` annotation somewhere in it), generalize over them so
-// each reference gets its own fresh instantiation -- otherwise two calls
-// to the same row-polymorphic function with different concrete callbacks
-// would wrongly be forced to agree on one row. row_vars auto-derives
-// from free_row_vars(&ty), but only picks up a name if
-// generalizable_row_vars confirms it ISN'T also free somewhere still
-// open in `ctx` -- see that function's own doc comment for why an
-// EffectRow::Var needs this (confirmed reachable: `let f = fun cb: (Dyn
-// ->{e} Dyn) -> let g = cb in g in f(fun y -> perform choose(y))(0)`
-// used to typecheck clean and only panic at runtime -- "e" leaking from
-// cb's still-open annotation into g's generalized scheme, then getting
-// freshly (and wrongly) renamed on every `g` reference, exactly like the
-// Type::Var bug generalizable_type_vars guards against for the type-var
-// side).
+// Why the exclusion matters, e.g. for row variables (confirmed reachable:
+// `let f = fun cb: (Dyn ->{e} Dyn) -> let g = cb in g in f(fun y -> perform
+// choose(y))(0)` used to typecheck clean and only panic at runtime -- "e"
+// leaking from cb's still-open annotation into g's generalized scheme, then
+// getting freshly (and wrongly) renamed on every `g` reference): a
+// parameter's annotation stays open for that parameter's entire body, and a
+// nested `let` that merely mentions the same name (through an alias, a
+// tuple, a record) must not re-generalize it, since the name belongs to the
+// enclosing, not-yet-closed binding. A Type::Var or index variable minted
+// by unification is the same.
 //
 // Resolve deeply before storing, not just for the free-variable scan:
 // unify() can bind one Type::Var to ANOTHER Type::Var (e.g. Cons's own
 // unify(&l_ty, &elem_ty, ...) when both sides are still bare vars),
 // leaving the stored type's own param positions naming the OLD alias
-// rather than the canonical variable generalizable_type_vars actually
+// rather than the canonical variable `generalizable` actually
 // generalizes over. lookup's own instantiation only renames a
 // Type::Var node whose LITERAL name is a generalized one -- an
 // aliased-but-not-literally-renamed position would silently keep
@@ -989,15 +976,6 @@ pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 pub(crate) fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &InferCtx, def: Option<Rc<CheckDef>>) -> Ctx {
     let ty = infer.resolve_deep(&ty);
     let quantified = generalizable(ctx, &ty, infer);
-    if cfg!(debug_assertions) {
-        let old: BTreeSet<TyVar> = generalizable_row_vars(ctx, &ty)
-            .into_iter()
-            .map(TyVar::Row)
-            .chain(generalizable_type_vars(ctx, &ty, infer).into_iter().map(TyVar::Type))
-            .chain(generalizable_index_vars(ctx, &ty, infer).into_iter().map(TyVar::Index))
-            .collect();
-        assert_eq!(old, quantified.iter().cloned().collect::<BTreeSet<_>>(), "open-set generalization differs from the ctx scan for `{name}`: {ty:?}");
-    }
     ctx.bind(name, Scheme { quantified, ty, def })
 }
 
@@ -1017,65 +995,6 @@ fn generalizable(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<TyVar> {
         open.extend(pending_obligation_vars(infer).into_iter().map(TyVar::Index));
     }
     candidates.difference(&open).cloned().collect()
-}
-
-// Row-variable names free in `ty` that are actually safe to generalize
-// over: free_row_vars(ty) MINUS whatever's ALSO free somewhere still open
-// in `ctx`. An EffectRow::Var has no single manufacturing call site --
-// it comes from ANY `->{e}` annotation anywhere currently in scope (a
-// lambda parameter's own annotation, bound via plain `extend`, stays open
-// for that parameter's entire body) -- generalizable_type_vars needs the
-// identical ctx-wide check for the same reason, just for Type::Var
-// instead. A nested `let` that merely happens to mention that same
-// row-var name (most often through a bare alias like `let g = cb in g`,
-// but any value whose type structurally embeds it -- a tuple, a record --
-// works the same way) must not re-generalize over it, for exactly the
-// reason Type::Var's own fix document gives: the name isn't THIS let's own
-// to quantify, it belongs to the enclosing, not-yet-closed binding, and
-// generalizing it anyway disconnects every future reference from that
-// binding's real identity.
-//
-// Skips the ctx walk entirely when `ty` has no row vars at all -- the
-// overwhelmingly common case (most bindings never mention a row-polymorphic
-// annotation), so an ordinary long `let` chain (see
-// deeply_nested_let_chain_does_not_overflow_the_stack) stays O(1) per let
-// instead of paying an O(ctx depth) scan on every single one; only a let
-// whose value's type actually mentions a row variable pays that cost.
-fn generalizable_row_vars(ctx: &Ctx, ty: &Type) -> Vec<String> {
-    let candidates = free_row_vars(ty);
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-    let still_open = free_row_vars_in_ctx(ctx);
-    candidates.difference(&still_open).cloned().collect()
-}
-
-// Every row-variable name free in any type currently bound in `ctx` --
-// generalizable_row_vars's own "still open" set. Walks the whole visible
-// scope chain (PList::for_each, iterative -- see its own doc comment), not
-// just the immediately-enclosing binding: a row var can be several scopes
-// out from the `let` that's about to (maybe) re-capture it. Excludes each
-// visited scheme's OWN `row_vars`: a name that scheme already generalized
-// over is SEALED, not still open -- `lookup` always renames it to a fresh
-// name before it's ever read again (see `lookup`'s own fresh_row_name
-// call), so the literal name surviving inside that scheme's stored `ty` is
-// dead and must not be treated as blocking some unrelated, later `let`
-// that happens to reuse the same letter in its own annotation.
-//
-// ponytail: this is an O(ctx depth) walk, paid once per row-var-carrying
-// `let` (generalizable_row_vars's own short-circuit keeps every OTHER let
-// at O(1)) -- fine at this codebase's scale, but a chain of N sequential
-// row-polymorphic `let`s costs O(N^2) instead of O(N) to typecheck.
-// Upgrade path if that ever matters: thread a cumulative "still open row
-// vars" set incrementally through Ctx itself (unioned in once per `bind`,
-// O(1) amortized) instead of re-walking the whole chain from scratch here.
-fn free_row_vars_in_ctx(ctx: &Ctx) -> BTreeSet<String> {
-    let mut vars = BTreeSet::new();
-    ctx.binds.for_each(|scheme: &Scheme| {
-        let sealed: BTreeSet<String> = scheme.quantified.iter().filter_map(|v| if let TyVar::Row(n) = v { Some(n.clone()) } else { None }).collect();
-        vars.extend(free_row_vars(&scheme.ty).difference(&sealed).cloned());
-    });
-    vars
 }
 
 fn free_row_vars(ty: &Type) -> BTreeSet<String> {
@@ -1178,73 +1097,6 @@ fn collect_index_vars(ty: &Type, resolve: &dyn Fn(&IndexExpr) -> IndexExpr) -> B
         Type::Record(fields) => fields.iter().flat_map(|(_, t)| collect_index_vars(t, resolve)).collect(),
         _ => BTreeSet::new(),
     }
-}
-
-// Type::Var's own analog of free_row_vars_in_ctx: every type-variable
-// name free in any type currently bound in `ctx`, excluding each visited
-// scheme's own (sealed) type_vars -- see free_row_vars_in_ctx's own doc
-// comment for why the exclusion matters (a name a scheme already
-// generalized over is dead, not still open).
-//
-// ponytail: same O(ctx depth) walk, same O(N^2)-on-a-long-chain ceiling
-// free_row_vars_in_ctx already carries a note for -- but paid far more
-// often here: unannotated bindings default to a fresh Type::Var broadly
-// (Task 2), so most `let`s in an ordinary program have a type variable
-// to scan for, unlike a row variable (which only ever comes from an
-// explicit `->{e}` annotation). generalizable_type_vars's own
-// short-circuit below still keeps a variable-free binding at O(1), but
-// that's now the LESS common case. Same upgrade path as
-// free_row_vars_in_ctx: thread a cumulative "still open type vars" set
-// incrementally through Ctx itself instead of re-walking the chain here.
-fn free_type_vars_in_ctx(ctx: &Ctx, infer: &InferCtx) -> BTreeSet<String> {
-    let mut vars = BTreeSet::new();
-    ctx.binds.for_each(|scheme: &Scheme| {
-        let sealed: BTreeSet<String> = scheme.quantified.iter().filter_map(|v| if let TyVar::Type(n) = v { Some(n.clone()) } else { None }).collect();
-        vars.extend(free_type_vars_resolved(&scheme.ty, infer).difference(&sealed).cloned());
-    });
-    vars
-}
-
-// Type::Var's own analog of generalizable_row_vars: free_type_vars_resolved(ty)
-// MINUS whatever's also free somewhere still open in `ctx`. Skips the ctx
-// walk when `ty` has no type vars at all, same short-circuit
-// generalizable_row_vars uses for the same reason (keep the overwhelmingly
-// common case -- a binding whose type mentions no type variable at all --
-// at O(1) instead of paying an O(ctx depth) scan on every single let).
-fn generalizable_type_vars(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<String> {
-    let candidates = free_type_vars_resolved(ty, infer);
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-    let still_open = free_type_vars_in_ctx(ctx, infer);
-    candidates.difference(&still_open).cloned().collect()
-}
-
-// Type::Indexed's own analog of free_type_vars_in_ctx/generalizable_type_vars
-// -- same ctx-wide "still open somewhere enclosing" exclusion, just over
-// index-variable names via free_index_vars_resolved (Task 4) and
-// Scheme.index_vars instead of free_type_vars_resolved/Scheme.type_vars.
-fn free_index_vars_in_ctx(ctx: &Ctx, infer: &InferCtx) -> BTreeSet<String> {
-    let mut vars = BTreeSet::new();
-    ctx.binds.for_each(|scheme: &Scheme| {
-        let sealed: BTreeSet<String> = scheme.quantified.iter().filter_map(|v| if let TyVar::Index(n) = v { Some(n.clone()) } else { None }).collect();
-        vars.extend(free_index_vars_resolved(&scheme.ty, infer).difference(&sealed).cloned());
-    });
-    vars
-}
-
-fn generalizable_index_vars(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<String> {
-    let candidates = free_index_vars_resolved(ty, infer);
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-    let mut still_open = free_index_vars_in_ctx(ctx, infer);
-    // A variable a pending obligation still needs is decided by whoever binds
-    // it later, inside the function containing the crossing. Generalizing it
-    // would give each use a fresh copy and leave the obligation unresolvable
-    // (spec 2026-10-07-dyn-crossing-deferred-length-checks, polymorphism rule).
-    still_open.extend(pending_obligation_vars(infer));
-    candidates.difference(&still_open).cloned().collect()
 }
 
 fn pending_obligation_vars(infer: &InferCtx) -> BTreeSet<String> {
@@ -3549,7 +3401,7 @@ fn definitions_used(arena: &Arena, root: ExprRef, skip: &[String], ctx: &Ctx, in
                 continue;
             }
             let Some(scheme) = ctx.get(&name) else { continue };
-            let Some(def) = scheme.def else {
+            let Some(def) = scheme.def.clone() else {
                 stuck = true;
                 continue;
             };

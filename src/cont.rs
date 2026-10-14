@@ -153,8 +153,7 @@ impl Cont {
     }
 }
 
-// Same shape, same fix as plist.rs's PList<T>: Rust's default Drop for a
-// struct wrapping Rc<ContNode> recurses through `rest` one field-drop at a
+// Rust's default Drop for a struct wrapping Rc<ContNode> recurses through `rest` one field-drop at a
 // time, which is O(depth) native stack for a long continuation chain (many
 // nested lets/binops evaluated in sequence build exactly this shape).
 // Unwind iteratively instead via Rc::try_unwrap, stopping the moment some

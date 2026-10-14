@@ -2,11 +2,11 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use renno::run_source;
 
 // `let x0 = 0 in let x1 = x0 + 1 in ... in x{n-1}`. Exercises both Env's
-// (src/frame.rs) and Ctx's (typecheck's context, src/plist.rs) extend+lookup
+// (src/frame.rs) and Ctx's (typecheck's context) extend+lookup
 // scaling: Env is a persistent chain of per-scope frames with O(1) extend
 // and O(hops) lookup (statically resolved by resolve.rs, so no name
-// comparison at runtime); Ctx is the older Rc-based persistent PList, also
-// O(1) extend. This benchmark is the direct proof that a chain of n
+// comparison at runtime); Ctx is a persistent hash trie plus an open-variable
+// set, with O(log n) extend and lookup. This benchmark is the direct proof that a chain of n
 // bindings costs O(n) end to end, not the O(n^2) the old Vec-cloning Ctx
 // used to cost before that fix.
 //

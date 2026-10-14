@@ -6,7 +6,6 @@ pub mod index_expr;
 pub mod lexer;
 pub mod machine;
 pub mod parser;
-pub mod plist;
 pub mod resolve;
 pub mod span;
 pub mod typecheck;
@@ -2613,8 +2612,8 @@ g(len)").unwrap_err();
         // passthrough inference. Before the fix, this typechecked clean
         // and only panicked at runtime, unlike the alias-free control
         // (next test) which always caught it statically -- see
-        // typecheck::generalizable_row_vars, which now excludes any row
-        // var still free in the enclosing ctx, so both shapes behave
+        // typecheck::generalizable, which now excludes any row
+        // var still open in the enclosing ctx, so both shapes behave
         // identically.
         let src = "let f = fun cb: (Dyn ->{e} Dyn) -> let g = cb in g in \
                     f(fun y -> perform choose(y))(0)";
@@ -2637,12 +2636,11 @@ g(len)").unwrap_err();
 
     #[test]
     fn row_var_not_regeneralized_through_nested_let_record_embedding() {
-        // Same bug, different carrier: generalizable_row_vars's own doc
-        // comment claims a row var reached through ANY structural
-        // embedding (not just a bare alias) is excluded the same way --
-        // this exercises that via a Record field instead of a plain alias,
-        // so a future change to free_row_vars's Record-recursion arm that
-        // regresses this doesn't slip through unnoticed.
+        // Same bug, different carrier: a row var reached through ANY
+        // structural embedding (not just a bare alias) is excluded the
+        // same way -- this exercises that via a Record field instead of a
+        // plain alias, so a future change to vars_in's Record-recursion
+        // arm that regresses this doesn't slip through unnoticed.
         let src = "let f = fun cb: (Dyn ->{e} Dyn) -> let g = {cb: cb} in g.cb in \
                     f(fun y -> perform choose(y))(0)";
         let (mut arena, spans, root) = parser::parse(src).unwrap();
@@ -2867,8 +2865,9 @@ g(len)").unwrap_err();
         // independent native-recursion sources -- all three are now fixed
         // (see the next test for the full breakdown): parser::atom and
         // typecheck::elaborate flatten a Let/Fun chain iteratively instead
-        // of recursing, plist.rs's custom iterative Drop fixes the
-        // typecheck Ctx (and Env) teardown cost, and Expr moved into a
+        // of recursing, frame.rs's custom iterative Drop fixes the
+        // Env teardown cost (typecheck's Ctx is a hash trie, with no
+        // chain to recurse through), and Expr moved into a
         // flat arena (expr.rs) so dropping the whole tree is one Vec
         // drop -- O(n), no recursion -- instead of a recursive walk
         // through nested Rc<Expr> fields. run_source's large-stack thread
@@ -2892,7 +2891,7 @@ g(len)").unwrap_err();
         // AND dropping everything afterward, all on the default stack, at
         // 10x the depth that used to crash a 256 MiB thread. Construction
         // was fixed by chain flattening (parser.rs, typecheck.rs); Ctx/Env
-        // teardown by plist.rs's custom Drop; Expr's own teardown by
+        // teardown by frame.rs's custom Drop (Ctx is a hash trie); Expr's own teardown by
         // moving the AST into a flat arena (expr.rs) instead of a linked
         // Rc<Expr> tree -- dropping the arena is dropping one Vec.
         let n = 50_000;
@@ -2910,15 +2909,13 @@ g(len)").unwrap_err();
 
     #[test]
     fn deep_cont_chain_drops_without_overflowing_the_stack() {
-        // Cont(Rc<ContNode>) has the exact same shape as plist.rs's
-        // PList<T> (a struct wrapping an Rc pointing at "cargo + rest"),
-        // so it has the same recursive-Drop risk: a long enough chain's
-        // default field-by-field Drop recurses through `rest` and can
-        // overflow the stack, independent of how the chain was built.
+        // Cont(Rc<ContNode>) is a struct wrapping an Rc pointing at
+        // "cargo + rest", so it has a recursive-Drop risk: a long enough
+        // chain's default field-by-field Drop recurses through `rest` and
+        // can overflow the stack, independent of how the chain was built.
         // Built directly here (bypassing the parser/machine entirely) to
         // isolate exactly that -- cont.rs's custom iterative Drop
-        // (Rc::try_unwrap-based, same technique as PList's) is what makes
-        // this not crash.
+        // (Rc::try_unwrap-based) is what makes this not crash.
         let n = 50_000usize;
         let mut chain = cont::Cont::nil();
         for _ in 0..n {
@@ -5127,8 +5124,8 @@ g(len)").unwrap_err();
     // different lengths later. With generalization working, each lookup
     // mints its OWN fresh index-variable name (fresh_index_name's
     // `n#<counter>` shape), so the two instantiations disagree on that
-    // name -- the same signal generalizable_type_vars's own fresh
-    // Type::Var per lookup gives for ordinary polymorphism.
+    // name -- the same signal a fresh Type::Var per lookup gives for
+    // ordinary polymorphism.
     #[test]
     fn extend_generalized_and_lookup_mint_a_fresh_index_variable_per_use() {
         use crate::index_expr::IndexExpr;
