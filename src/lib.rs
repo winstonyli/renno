@@ -3619,6 +3619,28 @@ g(len)").unwrap_err();
         assert!(Hc::ptr_eq(a, b), "a subtree with no reference keeps its node");
     }
 
+    // A rebuilder returns the untouched subtrees as the same nodes, and a deep shared DAG
+    // costs one visit per node (a tree walk of this one would not finish).
+    #[test]
+    fn rebuilders_keep_untouched_nodes_and_visit_shared_nodes_once() {
+        use std::collections::HashMap;
+        use types::Type;
+        let mut t = Type::Var("a".into());
+        let mut closed = Type::Int;
+        for _ in 0..60 {
+            t = rec_tup(vec![t.clone(), t]);
+            closed = rec_tup(vec![closed.clone(), closed]);
+        }
+        let none = HashMap::new();
+        let mut by_var = HashMap::new();
+        by_var.insert("a".to_string(), Type::Bool);
+        let (Type::Tuple(c0), Type::Tuple(c1)) = (&closed, &typecheck::subst_type(&closed, &none, &by_var, &HashMap::new())) else { unreachable!() };
+        assert!(Hc::ptr_eq(c0, c1), "no variable in it: the same node");
+        let Type::Tuple(top) = typecheck::subst_type(&t, &none, &by_var, &HashMap::new()) else { unreachable!() };
+        let (Type::Tuple(left), Type::Tuple(right)) = (&top[0], &top[1]) else { unreachable!() };
+        assert!(Hc::ptr_eq(left, right), "both children of a node are one node");
+    }
+
     // Building the same structure twice gives one node; anything that prints or compares
     // differently (a variable's name, a token, a row, an index) is a different node.
     #[test]

@@ -10,7 +10,7 @@ use crate::resolve::{group_kind, GroupKind, Resolved};
 use crate::span::Span;
 use crate::value::Value;
 use rpds::{HashTrieMap, HashTrieSet};
-use crate::types::{consistent, each_child, map_group, row_consistent, unfold, EffectRow, Hc, RecGroup, RecRef, RecVar, Type};
+use crate::types::{consistent, each_child, row_consistent, unfold, EffectRow, Hc, NodeMemo, RecGroup, RecRef, RecVar, Rebuild, Summary, Type};
 use crate::util::find_field;
 mod relate;
 use self::relate::{relate, relate_cast};
@@ -610,25 +610,9 @@ impl InferCtx {
     // own unify() calls succeed (Tasks 5-6), and generalization's own
     // free-variable collection (Task 7).
     pub(crate) fn resolve_deep(&self, ty: &Type) -> Type {
-        match self.resolve(ty) {
-            Type::Fun(param, row, ret) => {
-                Type::Fun(Hc::new(self.resolve_deep(&param)), row, Hc::new(self.resolve_deep(&ret)))
-            }
-            Type::List(elem) => Type::List(Hc::new(self.resolve_deep(&elem))),
-            Type::Tuple(items) => Type::Tuple(Hc::new(items.iter().map(|t| self.resolve_deep(t)).collect())),
-            Type::Union(items) => Type::Union(Hc::new(items.iter().map(|t| self.resolve_deep(t)).collect())),
-            Type::Record(fields) => {
-                Type::Record(Hc::new(fields.iter().map(|(n, t)| (n.clone(), self.resolve_deep(t))).collect()))
-            }
-            Type::Indexed(wrapped, index) => {
-                Type::Indexed(Hc::new(self.resolve_deep(&wrapped)), Rc::new(self.resolve_index_deep(&index)))
-            }
-            // A plain group holds no variable to resolve: shared as is.
-            Type::Rec(g, k) if !g.0.plain => {
-                map_group(&g, k, &mut |b| Some(self.resolve_deep(b))).unwrap_or(Type::Rec(g, k))
-            }
-            other => other,
-        }
+        // Only a bound variable or a bound index can change anything.
+        let relevant = (if self.subst.is_empty() { 0 } else { Summary::VAR }) | (if self.index_subst.is_empty() { 0 } else { Summary::INDEXED });
+        ResolveDeep { infer: self, relevant, memo: NodeMemo::new() }.walk(ty).unwrap_or_else(|| ty.clone())
     }
 
     // IndexExpr's own analog of resolve() -- follows a bound index
@@ -654,6 +638,42 @@ impl InferCtx {
             IndexExpr::Sub(a, b) => IndexExpr::Sub(Rc::new(self.resolve_index_deep(&a)), Rc::new(self.resolve_index_deep(&b))),
             IndexExpr::Mul(a, b) => IndexExpr::Mul(Rc::new(self.resolve_index_deep(&a)), Rc::new(self.resolve_index_deep(&b))),
             other => other,
+        }
+    }
+}
+
+// `InferCtx::resolve_deep` as a walk: a bound variable is followed to its solution and an
+// index through `resolve_index_deep`; everything else is rebuilt only where something changed.
+struct ResolveDeep<'a> {
+    infer: &'a InferCtx,
+    relevant: u8,
+    memo: NodeMemo<Option<Type>>,
+}
+
+impl Rebuild for ResolveDeep<'_> {
+    fn skip(&self, s: Summary) -> bool {
+        !s.any(self.relevant)
+    }
+    fn memo(&mut self) -> &mut NodeMemo<Option<Type>> {
+        &mut self.memo
+    }
+    fn special(&mut self, t: &Type) -> Option<Option<Type>> {
+        match t {
+            Type::Var(_) => {
+                let solved = self.infer.resolve(t);
+                if solved == *t {
+                    return Some(None);
+                }
+                Some(Some(self.walk(&solved).unwrap_or(solved)))
+            }
+            Type::Indexed(wrapped, index) => {
+                let (wrapped2, index2) = (self.walk(wrapped), self.infer.resolve_index_deep(index));
+                if wrapped2.is_none() && index2 == **index {
+                    return Some(None);
+                }
+                Some(Some(Type::Indexed(wrapped2.map_or_else(|| wrapped.clone(), Hc::new), Rc::new(index2))))
+            }
+            _ => None,
         }
     }
 }
@@ -1232,28 +1252,47 @@ fn subst_index_expr(e: &IndexExpr, index_subst: &HashMap<String, IndexExpr>) -> 
 }
 
 pub(crate) fn subst_type(ty: &Type, row_subst: &HashMap<String, EffectRow>, type_subst: &HashMap<String, Type>, index_subst: &HashMap<String, IndexExpr>) -> Type {
-    match ty {
-        Type::Var(name) => type_subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Indexed(wrapped, index) => Type::Indexed(
-            Hc::new(subst_type(wrapped, row_subst, type_subst, index_subst)),
-            Rc::new(subst_index_expr(index, index_subst)),
-        ),
-        Type::Fun(param, row, ret) => Type::Fun(
-            Hc::new(subst_type(param, row_subst, type_subst, index_subst)),
-            resolve_row(row, row_subst),
-            Hc::new(subst_type(ret, row_subst, type_subst, index_subst)),
-        ),
-        Type::List(elem) => Type::List(Hc::new(subst_type(elem, row_subst, type_subst, index_subst))),
-        Type::Tuple(items) => Type::Tuple(Hc::new(items.iter().map(|t| subst_type(t, row_subst, type_subst, index_subst)).collect())),
-        Type::Union(alts) => Type::Union(Hc::new(alts.iter().map(|t| subst_type(t, row_subst, type_subst, index_subst)).collect())),
-        Type::Record(fields) => {
-            Type::Record(Hc::new(fields.iter().map(|(n, t)| (n.clone(), subst_type(t, row_subst, type_subst, index_subst))).collect()))
+    // Only a variable some map names can change anything.
+    let relevant = (if type_subst.is_empty() { 0 } else { Summary::VAR })
+        | (if row_subst.is_empty() { 0 } else { Summary::ROWVAR })
+        | (if index_subst.is_empty() { 0 } else { Summary::INDEXED });
+    SubstType { row_subst, type_subst, index_subst, relevant, memo: NodeMemo::new() }.walk(ty).unwrap_or_else(|| ty.clone())
+}
+
+struct SubstType<'a> {
+    row_subst: &'a HashMap<String, EffectRow>,
+    type_subst: &'a HashMap<String, Type>,
+    index_subst: &'a HashMap<String, IndexExpr>,
+    relevant: u8,
+    memo: NodeMemo<Option<Type>>,
+}
+
+impl Rebuild for SubstType<'_> {
+    fn skip(&self, s: Summary) -> bool {
+        !s.any(self.relevant)
+    }
+    fn memo(&mut self) -> &mut NodeMemo<Option<Type>> {
+        &mut self.memo
+    }
+    fn special(&mut self, t: &Type) -> Option<Option<Type>> {
+        match t {
+            Type::Var(name) => Some(self.type_subst.get(name).cloned()),
+            Type::Indexed(wrapped, index) => {
+                let (wrapped2, index2) = (self.walk(wrapped), subst_index_expr(index, self.index_subst));
+                if wrapped2.is_none() && index2 == **index {
+                    return Some(None);
+                }
+                Some(Some(Type::Indexed(wrapped2.map_or_else(|| wrapped.clone(), Hc::new), Rc::new(index2))))
+            }
+            Type::Fun(param, row, ret) => {
+                let (param2, row2, ret2) = (self.walk(param), resolve_row(row, self.row_subst), self.walk(ret));
+                if param2.is_none() && ret2.is_none() && row2 == *row {
+                    return Some(None);
+                }
+                Some(Some(Type::Fun(param2.map_or_else(|| param.clone(), Hc::new), row2, ret2.map_or_else(|| ret.clone(), Hc::new))))
+            }
+            _ => None,
         }
-        // A plain group names no variable: shared as is.
-        Type::Rec(g, k) if !g.0.plain => {
-            map_group(g, *k, &mut |b| Some(subst_type(b, row_subst, type_subst, index_subst))).unwrap_or_else(|| ty.clone())
-        }
-        other => other.clone(),
     }
 }
 
@@ -1356,16 +1395,40 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
 // through runtime_index (a witnessed variable stays, so a Match hypothesis restored later
 // cannot change what it means).
 fn snapshot_type(t: &Type, infer: &InferCtx, witness_vars: &[&str]) -> Type {
-    let go = |t: &Type| snapshot_type(t, infer, witness_vars);
-    match infer.resolve(t) {
-        Type::Fun(p, r, b) => Type::Fun(Hc::new(go(&p)), r, Hc::new(go(&b))),
-        Type::List(e) => Type::List(Hc::new(go(&e))),
-        Type::Tuple(ts) => Type::Tuple(Hc::new(ts.iter().map(go).collect())),
-        Type::Union(ts) => Type::Union(Hc::new(ts.iter().map(go).collect())),
-        Type::Record(fs) => Type::Record(Hc::new(fs.iter().map(|(n, t)| (n.clone(), go(t))).collect())),
-        Type::Indexed(w, i) => Type::Indexed(Hc::new(go(&w)), Rc::new(runtime_index(&i, infer, witness_vars, false))),
-        Type::Rec(g, k) if !g.0.plain => map_group(&g, k, &mut |b| Some(go(b))).unwrap_or(Type::Rec(g, k)),
-        other => other,
+    Snapshot { infer, witness_vars, memo: NodeMemo::new() }.walk(t).unwrap_or_else(|| t.clone())
+}
+
+struct Snapshot<'a> {
+    infer: &'a InferCtx,
+    witness_vars: &'a [&'a str],
+    memo: NodeMemo<Option<Type>>,
+}
+
+impl Rebuild for Snapshot<'_> {
+    fn skip(&self, s: Summary) -> bool {
+        !s.any(Summary::VAR | Summary::INDEXED)
+    }
+    fn memo(&mut self) -> &mut NodeMemo<Option<Type>> {
+        &mut self.memo
+    }
+    fn special(&mut self, t: &Type) -> Option<Option<Type>> {
+        match t {
+            Type::Var(_) => {
+                let solved = self.infer.resolve(t);
+                if matches!(solved, Type::Var(_)) {
+                    return Some(None);
+                }
+                Some(Some(self.walk(&solved).unwrap_or(solved)))
+            }
+            Type::Indexed(w, i) => {
+                let (w2, i2) = (self.walk(w), runtime_index(i, self.infer, self.witness_vars, false));
+                if w2.is_none() && i2 == **i {
+                    return Some(None);
+                }
+                Some(Some(Type::Indexed(w2.map_or_else(|| w.clone(), Hc::new), Rc::new(i2))))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -1442,13 +1505,25 @@ fn refuted_error(from: &Type, to: &Type, why: &Why, span: Span) -> TypeError {
 }
 // `t` without any Vec(n) index, at every depth.
 fn strip_indexed(t: &Type) -> Type {
-    match t {
-        Type::Indexed(wrapped, _) => strip_indexed(wrapped),
-        Type::List(e) => Type::List(Hc::new(strip_indexed(e))),
-        Type::Tuple(ts) => Type::Tuple(Hc::new(ts.iter().map(strip_indexed).collect())),
-        Type::Union(ts) => Type::Union(Hc::new(ts.iter().map(strip_indexed).collect())),
-        Type::Record(fs) => Type::Record(Hc::new(fs.iter().map(|(n, t)| (n.clone(), strip_indexed(t))).collect())),
-        other => other.clone(),
+    StripIndexed { memo: NodeMemo::new() }.walk(t).unwrap_or_else(|| t.clone())
+}
+
+struct StripIndexed {
+    memo: NodeMemo<Option<Type>>,
+}
+
+impl Rebuild for StripIndexed {
+    fn skip(&self, s: Summary) -> bool {
+        !s.any(Summary::INDEXED)
+    }
+    fn memo(&mut self) -> &mut NodeMemo<Option<Type>> {
+        &mut self.memo
+    }
+    fn special(&mut self, t: &Type) -> Option<Option<Type>> {
+        match t {
+            Type::Indexed(w, _) => Some(Some(self.walk(w).unwrap_or_else(|| (**w).clone()))),
+            _ => None,
+        }
     }
 }
 
@@ -1458,17 +1533,32 @@ fn strip_indexed(t: &Type) -> Type {
 // compare when every variable in it has a value; otherwise the check degrades
 // to is_list only (see build_cast).
 fn erase_open_indexed(t: &Type, env: &CheckEnv) -> Type {
-    let go = |t: &Type| erase_open_indexed(t, env);
-    match t {
-        Type::Indexed(w, i) if index_has_value(i, env) => Type::Indexed(Hc::new(go(w)), i.clone()),
-        Type::Indexed(w, _) => go(w),
-        Type::List(e) => Type::List(Hc::new(go(e))),
-        Type::Tuple(ts) => Type::Tuple(Hc::new(ts.iter().map(go).collect())),
-        Type::Union(ts) => Type::Union(Hc::new(ts.iter().map(go).collect())),
-        Type::Record(fs) => Type::Record(Hc::new(fs.iter().map(|(n, t)| (n.clone(), go(t))).collect())),
-        Type::Fun(p, r, b) => Type::Fun(Hc::new(go(p)), r.clone(), Hc::new(go(b))),
-        Type::Rec(g, k) if !g.0.plain => map_group(g, *k, &mut |b| Some(go(b))).unwrap_or_else(|| t.clone()),
-        other => other.clone(),
+    EraseOpen { env, memo: NodeMemo::new() }.walk(t).unwrap_or_else(|| t.clone())
+}
+
+struct EraseOpen<'a, 'b> {
+    env: &'a CheckEnv<'b>,
+    memo: NodeMemo<Option<Type>>,
+}
+
+impl Rebuild for EraseOpen<'_, '_> {
+    fn skip(&self, s: Summary) -> bool {
+        !s.any(Summary::INDEXED)
+    }
+    fn memo(&mut self) -> &mut NodeMemo<Option<Type>> {
+        &mut self.memo
+    }
+    fn special(&mut self, t: &Type) -> Option<Option<Type>> {
+        match t {
+            Type::Indexed(w, i) => {
+                let w2 = self.walk(w);
+                if !index_has_value(i, self.env) {
+                    return Some(Some(w2.unwrap_or_else(|| (**w).clone())));
+                }
+                Some(w2.map(|w2| Type::Indexed(Hc::new(w2), i.clone())))
+            }
+            _ => None,
+        }
     }
 }
 

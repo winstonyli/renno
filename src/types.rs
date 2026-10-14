@@ -32,6 +32,9 @@ use crate::util::find_field;
 pub struct Summary {
     flags: u8,
     reach: u32,
+    // The tree-expanded node count, saturating: tells a walker whether a node is big enough to
+    // be worth remembering (below MEMO_MIN a walk costs less than the memo lookup).
+    size: u16,
 }
 
 impl Summary {
@@ -47,11 +50,21 @@ impl Summary {
     pub const REC: u8 = 16;
 
     fn of(flags: u8) -> Summary {
-        Summary { flags, reach: 0 }
+        Summary { flags, reach: 0, size: 0 }
     }
 
+    // The children's summaries joined: sizes add.
     fn join(self, other: Summary) -> Summary {
-        Summary { flags: self.flags | other.flags, reach: self.reach.max(other.reach) }
+        Summary { flags: self.flags | other.flags, reach: self.reach.max(other.reach), size: self.size.saturating_add(other.size) }
+    }
+
+    // The summary of a node whose children's summaries are joined into `self`.
+    fn node(self) -> Summary {
+        Summary { size: self.size.saturating_add(1), ..self }
+    }
+
+    pub fn size(self) -> u16 {
+        self.size
     }
 
     // Does any flag in `mask` appear?
@@ -262,19 +275,22 @@ impl Interned for Type {
 
     fn summary(&self) -> Summary {
         match self {
-            Type::Var(_) => Summary::of(Summary::VAR),
-            Type::List(e) => e.summary(),
+            Type::Var(_) => Summary::of(Summary::VAR).node(),
+            Type::List(e) => e.summary().node(),
             Type::Fun(a, row, b) => {
                 let rows = if matches!(row, EffectRow::Var(_)) { Summary::ROWVAR } else { 0 };
-                a.summary().join(b.summary()).join(Summary::of(rows))
+                a.summary().join(b.summary()).join(Summary::of(rows)).node()
             }
-            Type::Tuple(items) | Type::Union(items) => items.summary(),
-            Type::Record(fields) => fields.summary(),
-            Type::Indexed(w, _) => w.summary().join(Summary::of(Summary::INDEXED)),
-            Type::RecVar(RecVar::Free { .. }) => Summary::of(Summary::FREE),
-            Type::RecVar(RecVar::Bound { depth, .. }) => Summary { flags: 0, reach: depth + 1 },
-            Type::Rec(g, _) => Summary { flags: g.0.bodies.summary().flags | Summary::REC, reach: g.0.escape },
-            Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) => Summary::default(),
+            Type::Tuple(items) | Type::Union(items) => items.summary().node(),
+            Type::Record(fields) => fields.summary().node(),
+            Type::Indexed(w, _) => w.summary().join(Summary::of(Summary::INDEXED)).node(),
+            Type::RecVar(RecVar::Free { .. }) => Summary::of(Summary::FREE).node(),
+            Type::RecVar(RecVar::Bound { depth, .. }) => Summary { reach: depth + 1, ..Summary::default() }.node(),
+            Type::Rec(g, _) => {
+                let bodies = g.0.bodies.summary();
+                Summary { flags: bodies.flags | Summary::REC, reach: g.0.escape, size: bodies.size }.node()
+            }
+            Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) => Summary::default().node(),
         }
     }
 
@@ -625,39 +641,149 @@ pub fn map_group(h: &RecRef, k: usize, f: &mut dyn FnMut(&Type) -> Option<Type>)
     Some(Type::Rec(RecRef(Rc::new(RecGroup::new(h.0.names.clone(), bodies))), k))
 }
 
-fn subst_bound(t: &Type, depth: u32, g: &RecRef) -> Option<Type> {
-    match t {
-        Type::RecVar(RecVar::Bound { depth: d, member }) if *d == depth => Some(Type::Rec(g.clone(), *member as usize)),
-        Type::Rec(h, k) => {
-            if h.0.escape <= depth {
-                return None;
-            }
-            map_group(h, *k, &mut |b| subst_bound(b, depth + 1, g))
+// A node's exact identity as a map key: two keys are equal exactly when they are the same node.
+// (`Type` itself has no `Hash`: its `==` ignores a group's member names, a node's identity
+// does not.)
+pub struct ById(pub Type);
+
+impl PartialEq for ById {
+    fn eq(&self, other: &ById) -> bool {
+        self.0.exact_eq(&other.0)
+    }
+}
+
+impl Eq for ById {}
+
+impl Hash for ById {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        let mut node = FxHasher::default();
+        self.0.exact_hash(&mut node);
+        h.write_u64(node.finish());
+    }
+}
+
+// What a walk remembers: its result per node (and per context, for a walk whose answer depends
+// on where the node sits). One memo lives for one walk; the substitution a walk reads may
+// change between walks, so nothing is kept across them.
+pub type NodeMemo<V> = HashMap<(ById, u32), V>;
+
+// A node smaller than this is walked again rather than looked up.
+const MEMO_MIN: u16 = 24;
+
+// A walk that rebuilds a type, returning None where nothing changed. Subtrees the walker says
+// it would not change are skipped in O(1) (`skip`, from the node's summary), and the result for
+// each big enough node is remembered, so the cost is the number of DISTINCT nodes, not the size
+// of the expansion. A walker supplies its own treatment of some nodes (`special`); the rest
+// descend through `map_children`, and a group through its bodies.
+pub trait Rebuild {
+    // True when `s` says the walk would change nothing in such a subtree.
+    fn skip(&self, s: Summary) -> bool;
+    // What else the result depends on besides the node (a nesting depth); part of the memo key.
+    fn context(&self) -> u32 {
+        0
+    }
+    fn memo(&mut self) -> &mut NodeMemo<Option<Type>>;
+    // The walker's own result for `t` (None: descend as usual).
+    fn special(&mut self, _t: &Type) -> Option<Option<Type>> {
+        None
+    }
+
+    fn walk(&mut self, t: &Type) -> Option<Type> {
+        let summary = t.summary();
+        if self.skip(summary) {
+            return None;
         }
-        _ => map_children(t, &mut |c| subst_bound(c, depth, g)),
+        let key = (summary.size >= MEMO_MIN).then(|| (ById(t.clone()), self.context()));
+        if let Some(done) = key.as_ref().and_then(|k| self.memo().get(k)) {
+            return done.clone();
+        }
+        let result = match self.special(t) {
+            Some(result) => result,
+            None => match t {
+                Type::Rec(h, k) => map_group(h, *k, &mut |b| self.walk(b)),
+                _ => map_children(t, &mut |c| self.walk(c)),
+            },
+        };
+        if let Some(key) = key {
+            self.memo().insert(key, result.clone());
+        }
+        result
+    }
+}
+
+// Replaces the references to `g` that sit `depth` groups out by `g` itself.
+struct SubstBound<'a> {
+    g: &'a RecRef,
+    depth: u32,
+    memo: NodeMemo<Option<Type>>,
+}
+
+impl Rebuild for SubstBound<'_> {
+    fn skip(&self, s: Summary) -> bool {
+        s.reach() <= self.depth
+    }
+    fn context(&self) -> u32 {
+        self.depth
+    }
+    fn memo(&mut self) -> &mut NodeMemo<Option<Type>> {
+        &mut self.memo
+    }
+    fn special(&mut self, t: &Type) -> Option<Option<Type>> {
+        match t {
+            Type::RecVar(RecVar::Bound { depth, member }) if *depth == self.depth => Some(Some(Type::Rec(self.g.clone(), *member as usize))),
+            Type::Rec(h, k) => {
+                self.depth += 1;
+                let result = map_group(h, *k, &mut |b| self.walk(b));
+                self.depth -= 1;
+                Some(result)
+            }
+            _ => None,
+        }
     }
 }
 
 // One step into member `i`: its body with every reference to the group replaced by the group
 // itself. Only closed terms are unfolded, so nothing needs shifting. Subtrees that mention no
-// reference are returned as the same Rcs.
+// reference are returned as the same nodes.
 pub fn unfold(g: &RecRef, i: usize) -> Type {
-    subst_bound(&g.0.bodies[i], 0, g).unwrap_or_else(|| g.0.bodies[i].clone())
+    let mut walk = SubstBound { g, depth: 0, memo: NodeMemo::new() };
+    walk.walk(&g.0.bodies[i]).unwrap_or_else(|| g.0.bodies[i].clone())
 }
 
-// `t` with each Free placeholder `f(id, depth)` answers for replaced; depth counts the groups
-// entered. None when nothing changed. Plain groups hold no placeholder and are skipped.
-fn replace_free(t: &Type, depth: u32, f: &dyn Fn(u64, u32) -> Option<Type>) -> Option<Type> {
-    match t {
-        Type::RecVar(RecVar::Free { id, .. }) => f(*id, depth),
-        Type::Rec(h, k) => {
-            if h.0.plain {
-                return None;
-            }
-            map_group(h, *k, &mut |b| replace_free(b, depth + 1, f))
-        }
-        _ => map_children(t, &mut |c| replace_free(c, depth, f)),
+// Replaces each Free placeholder `f(id, depth)` answers for; depth counts the groups entered.
+struct ReplaceFree<'a> {
+    f: &'a dyn Fn(u64, u32) -> Option<Type>,
+    depth: u32,
+    memo: NodeMemo<Option<Type>>,
+}
+
+impl Rebuild for ReplaceFree<'_> {
+    fn skip(&self, s: Summary) -> bool {
+        !s.any(Summary::FREE)
     }
+    fn context(&self) -> u32 {
+        self.depth
+    }
+    fn memo(&mut self) -> &mut NodeMemo<Option<Type>> {
+        &mut self.memo
+    }
+    fn special(&mut self, t: &Type) -> Option<Option<Type>> {
+        match t {
+            Type::RecVar(RecVar::Free { id, .. }) => Some((self.f)(*id, self.depth)),
+            Type::Rec(h, k) => {
+                self.depth += 1;
+                let result = map_group(h, *k, &mut |b| self.walk(b));
+                self.depth -= 1;
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+}
+
+// `t` with each Free placeholder `f(id, depth)` answers for replaced. None when nothing changed.
+fn replace_free(t: &Type, depth: u32, f: &dyn Fn(u64, u32) -> Option<Type>) -> Option<Type> {
+    ReplaceFree { f, depth, memo: NodeMemo::new() }.walk(t)
 }
 
 // The name of the first placeholder `t` still contains (a type the machine built while a
