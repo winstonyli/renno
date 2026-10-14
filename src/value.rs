@@ -4,7 +4,7 @@ use std::rc::Rc;
 use crate::cont::Cont;
 use crate::env::Env;
 use crate::expr::{ExprRef, Lazy, Len, ConformSpec};
-use crate::types::Type;
+use crate::types::{first_free, Type};
 
 // A handler as data: which effect it handles, the clause body, the env it
 // closes over (the body's two binders, payload and resume, are pushed as a
@@ -358,7 +358,12 @@ impl Value {
             Value::Record(_) => "Record",
             Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) | Value::Contract(_) => "Fun",
             Value::Handler(_) => "Handler",
-            Value::Type(_) => "Type",
+            // A group name read inside its own all-calls `let rec` (rule P) is still the
+            // group's placeholder; name it, so a failed check says why it is not a value.
+            Value::Type(t) => match first_free(t) {
+                Some(name) => return std::borrow::Cow::Owned(format!("recursive type placeholder {name} (inside its own `let rec` group)")),
+                None => "Type",
+            },
         })
     }
 }

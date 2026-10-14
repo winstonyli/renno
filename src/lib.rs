@@ -4921,6 +4921,17 @@ g(len)").unwrap_err();
         assert!(run_source(&format!("{f}f(1)")).is_err());
     }
 
+    // Rule P makes an all-calls `let rec` a type group, so a name it shadows is the group's own
+    // placeholder inside its values (main read the outer binding). The failure names that.
+    #[test]
+    fn a_shadowed_name_in_an_all_calls_let_rec_says_it_is_a_placeholder() {
+        let placeholder = "recursive type placeholder n (inside its own `let rec` group)";
+        rejects("let n = 1 in let rec n = (fun x -> x + 1)(n) in n", &format!("expected Int | Float, found {placeholder}"));
+        rejects("let f = fun x -> x in let rec f = (fun g -> g(1))(f) in f", "recursive type placeholder f");
+        // A finished type is still just a Type.
+        rejects("let rec T = Union(Int, T) in T + 1", "expected Int | Float, found Type");
+    }
+
     #[test]
     fn recursive_types_are_compared_structurally() {
         let t = "let rec T = Union(Tuple(Int, T), Bool) in let rec U = Union(Tuple(Int, U), Bool) in ";
