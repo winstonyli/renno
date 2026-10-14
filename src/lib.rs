@@ -3004,6 +3004,41 @@ g(len)").unwrap_err();
         }
     }
 
+    // A `let` nested in another definition is evaluated once, not once per
+    // enclosing evaluation: A, B and F.
+    #[test]
+    fn a_nested_definition_is_evaluated_once() {
+        let src = "let A = Int in let F = fun u -> (let B = A in let y: B = 1 in B) in let x: F(0) = 1 in x";
+        assert_eq!(definitions_evaluated(src), 3);
+        let src = "let A = Int in let rec F = fun n -> (let G = fun v -> A in let y: G(0) = 1 in let z: F(0) = 1 in let w: G(1) = 2 in A) in 0";
+        assert_eq!(definitions_evaluated(src), 3);
+    }
+
+    // Two definitions per group (an early one for the group's own values, a final
+    // one for the code after it): merging them is parked.
+    #[test]
+    fn a_recursive_group_is_evaluated_once_per_definition() {
+        let src = "let rec F = fun n -> if n == 0 then Int else (let z: F(0) = 1 in Int) in let x: F(1) = 1 in x";
+        assert_eq!(definitions_evaluated(src), 2);
+        let src = "let A = Int in let rec L = Union(Tuple(A, L), Bool) in let x: L = true in x";
+        assert_eq!(definitions_evaluated(src), 2);
+    }
+
+    // An annotated alias chain of closures: the annotation reads the whole chain,
+    // each alias is its own definition (n + 1), and each is evaluated once. 50k
+    // took about 76 s in a debug build; the stack claim at 50k is covered by
+    // annotated_type_let_chain_is_o1_stack_construction_and_teardown.
+    #[test]
+    fn annotated_closure_alias_chain_is_o1_stack() {
+        let n = 5_000;
+        let mut src = String::from("let F0 = fun a -> a in ");
+        for i in 1..=n {
+            src.push_str(&format!("let F{i} = F{} in ", i - 1));
+        }
+        src.push_str(&format!("let x: F{n}(Int) = 1 in x"));
+        assert_eq!(definitions_evaluated(&src), n + 1);
+    }
+
     #[test]
     fn copy_tree_makes_new_nodes_that_evaluate_the_same() {
         use crate::expr::{copy_tree, Expr};
