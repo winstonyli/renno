@@ -207,10 +207,12 @@ impl Ctx {
     }
 }
 
-// What a check-time evaluation needs to re-run a `let`-bound name (spec
+// What a check-time evaluation needs to evaluate a `let`-bound name (spec
 // section 1, type lets): the binder's right-hand side as the parser built it,
-// and the scope it was checked in. An annotation that names the binder is
-// evaluated inside a copy of the binders it depends on (annotation_type).
+// and the scope it was checked in. The right-hand side is evaluated once, on
+// first demand, in a frame of the values of the definitions it reads
+// (def_value); an annotation that names the binder runs in a frame of the
+// values of the definitions it reads (annotation_type, eval_annotation).
 pub(crate) struct CheckDef {
     // Its place in InferCtx::defs, which is creation order: a definition reads
     // only names bound before it, so every dependency has a smaller index.
@@ -3292,7 +3294,8 @@ fn bind_site(arena: &mut Arena, infer: &mut InferCtx, site: &Option<Site>, inner
 // out of fuel) and an Unknown site (the annotation names a value only the
 // run time has) are always kept, and type the binder Dyn; a Confirm site is
 // kept only if running it can fail (rule 10.2), which settle_erasure decides
-// once inference has finished. An error is reported at the annotation; an
+// once inference has finished (from the definitions the annotation reads
+// directly; settle_definitions follows the reads). An error is reported at the annotation; an
 // Unknown site's check blames `blame`.
 fn annotation_type(arena: &mut Arena, ann: ExprRef, blame: Span, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<Annotation, TypeError> {
     if let Expr::TypeLit(t) = &arena[ann] {
