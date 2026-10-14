@@ -34,7 +34,8 @@ pub enum VarRef {
 // must be resolved under one layout only. Open nodes (ones that read a binder
 // outside themselves) are copied for each evaluation, so no two evaluations
 // resolve the same one. Closed nodes resolve the same under every layout, so
-// `sharing` finds them once, up front, and evaluations share them (`shares`).
+// `sharing` finds them once, before the first evaluation, and evaluations
+// share them (`shares`).
 #[derive(Default)]
 pub struct Resolved {
     base: usize,

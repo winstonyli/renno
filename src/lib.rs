@@ -2900,6 +2900,19 @@ g(len)").unwrap_err();
         typecheck::DEF_EVALS.with(|c| c.get())
     }
 
+    // The sharing pre-pass runs on a check-time evaluation's first use only: a
+    // program with none (no annotation to evaluate) never runs it.
+    #[test]
+    fn the_sharing_pass_runs_only_when_something_is_evaluated() {
+        let runs = |src: &str| {
+            typecheck::SHARING_RUNS.with(|c| c.set(0));
+            let value = run_source_on_this_thread(src).expect("runs").to_string();
+            (typecheck::SHARING_RUNS.with(|c| c.get()), value)
+        };
+        assert_eq!(runs("let f = fun x -> x + 1 in let g = fun y -> f(y) in g(2)"), (0, "3".to_string()));
+        assert_eq!(runs("let A = Int in let x: A = 1 in let y: A = 2 in x + y"), (1, "3".to_string()));
+    }
+
     // A recursive type function applied afresh on every call rebuilds an equal but
     // not pointer-equal type each time; the site's memo must still hit (the `==` half
     // of conform_lazy), or every call mints a fresh Lazy family.

@@ -487,8 +487,13 @@ pub(crate) struct InferCtx {
     // them all: a closure one evaluation builds is called by a later one. Each
     // evaluation resolves a copy of the open part of its root (eval_pure_in),
     // so a node is never resolved under two layouts; the closed parsed nodes
-    // resolve alike under any, so they are shared (`check` finds them up front).
+    // resolve alike under any, so they are shared (`ensure_sharing` finds them on first use).
     resolved: Resolved,
+    // The parsed root `resolved`'s sharing pass has yet to walk; taken by the
+    // first check-time evaluation, so a program with none never pays for it.
+    // Elaboration only adds nodes until the in-place writes after it, so the
+    // walk sees the parsed tree whenever it runs before them.
+    sharing_root: Option<ExprRef>,
     // An annotation is being elaborated (annotation_type): a name it reads
     // is not a value-position read, so `lookup` leaves CheckDef::used alone.
     in_annotation: bool,
@@ -518,6 +523,7 @@ impl InferCtx {
             bound_names: HashSet::new(),
             defs: Vec::new(),
             resolved: Resolved::default(),
+            sharing_root: None,
             in_annotation: false,
             direct_value: None,
             proofs: Vec::new(),
@@ -3710,6 +3716,7 @@ fn def_value(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx, i: usize)
             arena.push(Expr::LetRec(bindings.clone(), tuple))
         }
     };
+    infer.ensure_sharing(arena);
     match eval_pure_in(arena, root, &names, values, &mut infer.resolved, spans, ANNOTATION_FUEL) {
         Pure::Done(value) => DefValue::Done(value),
         Pure::Stuck(why) => DefValue::Failed { origin: i, why: Failure::Stuck(why) },
@@ -3721,6 +3728,20 @@ fn def_value(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx, i: usize)
 thread_local! {
     // How many definitions def_value has evaluated on this thread.
     pub(crate) static DEF_EVALS: Cell<usize> = const { Cell::new(0) };
+    // How many times the sharing pass has run on this thread.
+    pub(crate) static SHARING_RUNS: Cell<usize> = const { Cell::new(0) };
+}
+
+impl InferCtx {
+    // Runs the sharing pass if no check-time evaluation has needed it yet;
+    // every evaluation calls it before it uses `resolved`.
+    fn ensure_sharing(&mut self, arena: &Arena) {
+        if let Some(root) = self.sharing_root.take() {
+            #[cfg(test)]
+            SHARING_RUNS.with(|c| c.set(c.get() + 1));
+            self.resolved = crate::resolve::sharing(arena, root, &self.bound_names);
+        }
+    }
 }
 
 // What `ann`, which reads `reads` directly, evaluates to at check time: the
@@ -3730,7 +3751,10 @@ fn eval_annotation(arena: &mut Arena, ann: ExprRef, reads: &[Read], spans: &Span
     let roots: Vec<usize> = reads.iter().map(|r| r.def).collect();
     ensure_values(arena, spans, infer, &roots);
     match read_frame(infer, reads) {
-        Ok((names, values)) => eval_pure_in(arena, ann, &names, values, &mut infer.resolved, spans, ANNOTATION_FUEL),
+        Ok((names, values)) => {
+            infer.ensure_sharing(arena);
+            eval_pure_in(arena, ann, &names, values, &mut infer.resolved, spans, ANNOTATION_FUEL)
+        }
         Err((_, why)) => why.into_pure(),
     }
 }
@@ -5273,7 +5297,7 @@ fn binder_names(arena: &Arena) -> HashSet<String> {
 pub fn check(arena: &mut Arena, root: ExprRef, spans: &SpanMap) -> Result<ExprRef, TypeError> {
     let mut infer = InferCtx::new();
     infer.bound_names = binder_names(arena);
-    infer.resolved = crate::resolve::sharing(arena, root, &infer.bound_names);
+    infer.sharing_root = Some(root);
     let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), spans, &mut infer)?;
     resolve_pendings(arena, &infer);
     resolve_obligations(arena, &infer);
