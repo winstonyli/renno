@@ -57,13 +57,12 @@ pub enum Type {
     // definition -- `let rec List = Union(Tuple(Int, List), Bool) in ...` -- rather
     // than the ordinary, fully-expanded structural value every OTHER
     // (non-recursive) type resolves to directly. The string is always
-    // a gensym'd unique id in the shape "Base#N" (see parser::atom's
-    // own `Token::TypeKw` arm), never the bare user-typed name --
-    // aliases in different, unrelated scopes can share a surface name,
-    // and the registry this leaf is looked up in (InferCtx's own
-    // `named_types`, populated once by the parser) has to survive
-    // past the parser's OWN scoped/LIFO-restored `type_aliases`, so it
-    // needs a name that can never collide across scopes.
+    // a gensym'd unique id in the shape "Base#N" (see typecheck's
+    // fresh_named_type_id), never the bare user-typed name --
+    // recursive types in different, unrelated scopes can share a surface
+    // name, and the registry this leaf is looked up in (InferCtx's own
+    // `named_types`, populated by recursive_type_group) outlives those
+    // scopes, so it needs a name that can never collide across them.
     //
     // A lightweight, non-expanding leaf, in the same spirit as
     // Type::Var/Type::Token: a tag consulted on demand, never
@@ -72,7 +71,7 @@ pub enum Type {
     // see their own new arms -- so nothing here ever needs to unfold
     // what this id actually stands for, and no cycle-detection is
     // needed anywhere in this file's own structural recursion, even
-    // though a registry entry for a genuinely recursive alias
+    // though a registry entry for a genuinely recursive type
     // structurally contains this SAME leaf pointing at itself.
     // shape_test/build_boundary_check/pattern_could_match/
     // relate/unify_fits (typecheck.rs) are the consumers that ever look

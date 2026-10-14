@@ -333,14 +333,12 @@ pub(crate) struct InferCtx {
     // How many function bodies (Lambda, handler clause) enclose the point
     // being elaborated: code inside one can run any number of times.
     repeatable_depth: usize,
-    // Every genuinely self-referential type alias this program's own
-    // parse registered (parser::Parser's own `named_types`, handed in
-    // once at construction) -- consulted on demand by
+    // Every recursive type this program defines -- consulted on demand by
     // build_boundary_check/shape_test/pattern_could_match
     // whenever they encounter a Type::Named reference, to unfold it
     // exactly one level. A recursive `let rec` type group adds its ids
     // when it is checked (recursive_type_group), before any use of them.
-    named_types: Rc<HashMap<String, Type>>,
+    pub(crate) named_types: Rc<HashMap<String, Type>>,
     // Names of type variables whose value reaches a Dyn sink (the argument of
     // a Dyn callee, a Perform payload) while the variable is still unbound
     // (spec 2026-10-08-var-passthrough-casts). The Fun-callee App arm casts a
@@ -349,7 +347,7 @@ pub(crate) struct InferCtx {
     // unify_trial (a failed trial must not leak flags); propagated by
     // `lookup` and `unify`.
     dyn_sunk: HashSet<String>,
-    // Every name some binder in the arena binds (check_with_named_types). A
+    // Every name some binder in the arena binds (check). A
     // name in an annotation that no binder has can only be a prelude name or
     // unbound, so annotation_type skips the scope walk for it: without this,
     // `Int` in each of n annotations would walk a scope n deep.
@@ -374,7 +372,7 @@ pub(crate) struct InferCtx {
 }
 
 impl InferCtx {
-    pub(crate) fn new(named_types: impl Into<Rc<HashMap<String, Type>>>) -> InferCtx {
+    pub(crate) fn new() -> InferCtx {
         InferCtx {
             subst: HashMap::new(),
             index_subst: HashMap::new(),
@@ -385,7 +383,7 @@ impl InferCtx {
             pendings: RefCell::new(Vec::new()),
             resume_row: None,
             repeatable_depth: 0,
-            named_types: named_types.into(),
+            named_types: Rc::new(HashMap::new()),
             dyn_sunk: HashSet::new(),
             bound_names: HashSet::new(),
             def_seq: 0,
@@ -1678,12 +1676,9 @@ fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut H
         // deep test (shape_of's `Ref`s); one reached only through a Fun
         // position stays unresolved -- checked later, lazily, only if
         // something else separately touches that position.
-        // A missing registry entry IS reachable (not an internal-bug-only
-        // case): parser::parse (the original, unchanged signature) builds
-        // its own named_types registry but discards it rather than
-        // returning it, so a caller pairing plain parse() with plain
-        // check() (also unchanged, defaults to an empty registry) hits
-        // this with nothing registered. Degrade the same way the
+        // A missing registry entry is not reachable from source:
+        // recursive_type_group registers an id before any use of it. Keep
+        // the permissive fallback anyway, degrading the same way the
         // Type::Var(_) arm above does for "no information here" -- nothing
         // to check -- rather than panicking.
         //
@@ -1709,7 +1704,8 @@ fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut H
 // whose shape holds, and its check is the failure when none does.
 pub(crate) fn lower_conform(lazy: &Lazy, named: &Rc<HashMap<String, Type>>, span: Option<Span>) -> Option<Rc<Lowered>> {
     let ty = &*lazy.ty;
-    let infer = InferCtx::new(named.clone());
+    let mut infer = InferCtx::new();
+    infer.named_types = named.clone();
     let env = CheckEnv { defer: false, span, ..CheckEnv::new(&infer) };
     let mut visiting = HashSet::new();
     let mut defs = Defs::default();
@@ -2348,14 +2344,12 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
         (Pattern::List(_), Type::Dyn | Type::Var(_)) => true,
         // One level only, matching every other consumer of Type::Named
         // in this file: unfold what this id stands for and ask the SAME
-        // question about that shape instead. A missing registry entry IS
-        // reachable (not an internal-bug-only case): a caller pairing
-        // plain parse() with plain check() gets an empty registry even
-        // though parse() itself built one internally (parse()'s own
-        // unchanged signature just discards it) -- see
-        // build_boundary_check's own doc comment. Degrade the same way
-        // this function's own Type::Dyn/Var(_) arms above do for "no
-        // information here" -- answer `true` -- rather than panicking.
+        // question about that shape instead. A missing registry entry is
+        // not reachable from source (recursive_type_group registers an id
+        // before any use of it); keep the permissive fallback, degrading
+        // the same way this function's own Type::Dyn/Var(_) arms above do
+        // for "no information here" -- answer `true` -- rather than
+        // panicking.
         //
         // Ancestor-tracking cycle break, same as `boundary`'s own Named
         // arm: if `id` is already being unfolded somewhere
@@ -2447,7 +2441,7 @@ fn indexed_refinement_target(
 fn qualifying_named_alternatives(id: &str, named_types: &HashMap<String, Type>) -> Option<(Type, Type)> {
     let Type::Union(alts) = named_types.get(id)? else { return None };
     let [a, b] = alts.as_slice() else { return None };
-    match (crate::parser::count_named(a, id), crate::parser::count_named(b, id)) {
+    match (count_named(a, id), count_named(b, id)) {
         (0, 1) => Some((a.clone(), b.clone())),
         (1, 0) => Some((b.clone(), a.clone())),
         _ => None,
@@ -3361,6 +3355,34 @@ fn wrap_in_definitions(arena: &mut Arena, root: ExprRef, defs: &[Rc<CheckDef>]) 
     })
 }
 
+// Mints a globally-unique id for a recursive type's Named leaf: a monotonic
+// counter appended to the binder's name, in its own namespace (typecheck's
+// fresh_row_name/fresh_type_name keep their own counters).
+fn fresh_named_type_id(base: &str) -> String {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{base}#{n}")
+}
+
+// How many Type::Named leaves carrying exactly `id` does `ty` contain? A
+// plain structural walk that never unfolds a Named reference, so it
+// terminates on a finished recursive type. recursive_type_group asks
+// whether the count is nonzero (did the type reference itself?); Case B
+// eligibility (`qualifying_named_alternatives`) needs "exactly once" apart
+// from zero or two-and-more (a binary tree's `Node(Tree, Tree)` step
+// deliberately does not qualify).
+fn count_named(ty: &Type, id: &str) -> usize {
+    match ty {
+        Type::Named(n) => usize::from(n == id),
+        Type::List(elem) => count_named(elem, id),
+        Type::Fun(param, _row, ret) => count_named(param, id) + count_named(ret, id),
+        Type::Tuple(items) | Type::Union(items) => items.iter().map(|t| count_named(t, id)).sum(),
+        Type::Record(fields) => fields.iter().map(|(_, t)| count_named(t, id)).sum(),
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Var(_) => 0,
+        Type::Indexed(wrapped, _) => count_named(wrapped, id),
+    }
+}
+
 // A `let rec` group whose values are type constructor applications is a
 // recursive type (spec section 1): each name is a fresh Named leaf while the
 // values are evaluated, and a name whose leaf occurs in the results is
@@ -3378,7 +3400,7 @@ fn recursive_type_group(
         return None;
     }
     let names: Vec<String> = bindings.iter().map(|(n, _, _)| n.clone()).collect();
-    let ids: Vec<String> = names.iter().map(|n| crate::parser::fresh_named_type_id(n)).collect();
+    let ids: Vec<String> = names.iter().map(|n| fresh_named_type_id(n)).collect();
     let mut results = Vec::with_capacity(bindings.len());
     for (_, _, v) in bindings {
         let (defs, stuck) = definitions_used(arena, *v, &names, ctx, infer);
@@ -3399,7 +3421,7 @@ fn recursive_type_group(
     }
     let mut values = Vec::with_capacity(results.len());
     for (ty, id) in results.iter().zip(&ids) {
-        if results.iter().any(|r| crate::parser::contains_named(r, id)) {
+        if results.iter().any(|r| count_named(r, id) > 0) {
             Rc::make_mut(&mut infer.named_types).insert(id.clone(), ty.clone());
             values.push(Type::Named(id.clone()));
         } else {
@@ -4951,26 +4973,8 @@ fn binder_names(arena: &Arena) -> HashSet<String> {
     names
 }
 
-// Delegates to check_with_named_types with an empty registry -- kept as
-// a separate signature (rather than adding a 4th parameter to every
-// caller) so the many existing callers that never use self-referential
-// type aliases are unaffected. Note this means pairing `check` with
-// plain `parser::parse` on a program using a self-referential type
-// alias hits every Type::Named consumer with nothing registered -- see
-// coerce()'s own doc comment on why that's a real, reachable condition
-// each consumer now degrades gracefully for, rather than an internal bug.
 pub fn check(arena: &mut Arena, root: ExprRef, spans: &SpanMap) -> Result<ExprRef, TypeError> {
-    check_with_named_types(arena, root, spans, HashMap::new())
-}
-
-// Same as `check`, but resolves a Type::Named reference against
-// `named_types` (parser::parse_with_named_types's own registry)
-// instead of an empty one. `check`'s own signature stays untouched --
-// every existing caller that never uses self-referential type aliases
-// is unaffected; this exists so the real production path
-// (lib.rs's own run_source_on_this_thread) can support the feature.
-pub fn check_with_named_types(arena: &mut Arena, root: ExprRef, spans: &SpanMap, named_types: HashMap<String, Type>) -> Result<ExprRef, TypeError> {
-    let mut infer = InferCtx::new(named_types);
+    let mut infer = InferCtx::new();
     infer.bound_names = binder_names(arena);
     let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), spans, &mut infer)?;
     resolve_pendings(arena, &infer);

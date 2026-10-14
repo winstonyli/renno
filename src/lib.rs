@@ -71,8 +71,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
-    let (mut arena, mut spans, root, named_types) = parser::parse_with_named_types(src)?;
-    let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).map_err(|e| e.1.format_error(src, &e.0))?;
+    let (mut arena, mut spans, root) = parser::parse(src)?;
+    let elaborated = typecheck::check(&mut arena, root, &spans).map_err(|e| e.1.format_error(src, &e.0))?;
     expr::fill_synthesized_spans(&arena, elaborated, &mut spans);
     // Unwind-safe in fact: the arena (whose annotation nodes hold a Cell) is dropped after a panic.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| machine::run(&arena, elaborated, Env::prelude(), &spans))).map_err(|payload| {
@@ -152,8 +152,8 @@ mod tests {
     // False when typecheck erased the binding.
     fn elaborated_binds(src: &str, name: &str) -> bool {
         use expr::Expr;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         tree_any(&arena, elaborated, &|e| match e {
             Expr::Let(v, ..) => v == name,
             Expr::LetRec(bindings, _) => bindings.iter().any(|(v, _, _)| v == name),
@@ -3292,15 +3292,14 @@ g(len)").unwrap_err();
         // check at all. Confirmed statically accepted with zero
         // wrapping: if this compiles and runs to completion, relate
         // proved it; a wrong implementation would surface as a
-        // static "type mismatch" error from check_with_named_types
-        // instead.
+        // static "type mismatch" error from check instead.
         let src = r#"
             let rec List = Union(Tuple(Int, List), Bool) in
             let f = fun xs: List -> xs in
             f((1, (2, true)))
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
         // Value has no as_tuple() method -- tuples are Value::List at
         // runtime (see value.rs's own doc comment: "a fixed-arity
@@ -3325,8 +3324,8 @@ g(len)").unwrap_err();
             let g = fun v: Dyn -> f(v) in
             g((1, (2, true)))
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
         // Value has no as_tuple() method -- tuples are Value::List at
         // runtime (see value.rs's own doc comment: "a fixed-arity
@@ -3387,8 +3386,8 @@ g(len)").unwrap_err();
             let g = fun v: Dyn -> f(v) in
             g(1)
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
         assert_eq!(result.as_int(), 1);
     }
@@ -3418,8 +3417,8 @@ g(len)").unwrap_err();
             in
             f((7, true))
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
         assert_eq!(result.as_int(), 7);
     }
@@ -3453,8 +3452,8 @@ g(len)").unwrap_err();
             in
             f(1)
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let result = typecheck::check_with_named_types(&mut arena, root, &spans, named_types);
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let result = typecheck::check(&mut arena, root, &spans);
         let err = result.unwrap_err();
         assert!(err.0.contains("pattern of type [Dyn] can never match scrutinee of type A"), "unexpected message: {}", err.0);
     }
@@ -3529,8 +3528,8 @@ g(len)").unwrap_err();
             let f = fun xs: A -> xs in
             f("wrong")
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let err = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap_err();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("type mismatch"), "unexpected message: {}", err.0);
     }
 
@@ -3548,8 +3547,8 @@ g(len)").unwrap_err();
             let f = fun xs: A -> xs in
             f(5)
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
         assert_eq!(result.as_int(), 5);
     }
@@ -3782,6 +3781,17 @@ g(len)").unwrap_err();
             Err(msg) => assert_eq!(msg, "annotation did not evaluate to a type, found Int"),
             Ok(t) => panic!("1 + 2 is not a type, got {t}"),
         }
+    }
+
+    // `type` is no keyword (Stage D): it is an ordinary name, and the old
+    // `type N = T in e` form is a plain trailing-tokens parse error.
+    #[test]
+    fn type_is_an_ordinary_name() {
+        assert_eq!(run_source("let type = 5 in type").unwrap().as_int(), 5);
+        assert_eq!(run_source("let r = {type: 1} in r.type").unwrap().as_int(), 1);
+        let err = run_source("type MyInt = Int in 1").unwrap_err();
+        assert!(err.starts_with("line 1, column 12: trailing tokens after expression"), "{err}");
+        assert!(run_source("fun type -> type").is_ok());
     }
 
     // The type constructors are ordinary prelude values at value position.
@@ -4133,8 +4143,7 @@ g(len)").unwrap_err();
     }
 
     // A `let rec` whose values are type constructor applications is a
-    // recursive type (spec section 1): a Named leaf in named_types, like a
-    // self-referential `type` alias.
+    // recursive type (spec section 1): a Named leaf in named_types.
     #[test]
     fn a_let_rec_of_type_constructors_is_a_recursive_type() {
         let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
@@ -4162,7 +4171,7 @@ g(len)").unwrap_err();
         let m = "let rec M = Union((Tuple((Int, M)), Bool)) in ";
         assert_eq!(ok(&format!("{l}{m}L == L")), "true");
         assert_eq!(ok(&format!("{l}{m}L == M")), "false");
-        // Indexed applies to it like to a `type` alias.
+        // Indexed applies to it like to any type.
         let b = "let rec B = Union((Bool, Tuple((Int, B)))) in ";
         assert_eq!(ok(&format!("{b}let x: Indexed(B, 2) = (1, (2, false)) in 0")), "0");
         let err = run_source(&format!("{b}let x: Indexed(B, 2) = (1, false) in 0")).unwrap_err();
@@ -4268,8 +4277,8 @@ g(len)").unwrap_err();
     // Runs `src` and returns its result with, for each kept annotation
     // (Expr::Annot) in the elaborated tree, how many times it was evaluated.
     fn annotation_evals(src: &str) -> (String, Vec<u32>) {
-        let (mut arena, mut spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap_or_else(|e| panic!("{src}: {}", e.0));
+        let (mut arena, mut spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap_or_else(|e| panic!("{src}: {}", e.0));
         expr::fill_synthesized_spans(&arena, elaborated, &mut spans);
         let value = machine::run(&arena, elaborated, Env::prelude(), &spans);
         let (mut evals, mut work, mut kids) = (Vec::new(), vec![elaborated], Vec::new());
@@ -4366,8 +4375,8 @@ g(len)").unwrap_err();
         }
         assert!(programs.len() > 4, "no corpus programs found");
         for (name, src) in programs {
-            let (mut arena, spans, root, named_types) = parser::parse_with_named_types(&src).unwrap();
-            let Ok(elaborated) = typecheck::check_with_named_types(&mut arena, root, &spans, named_types) else { continue };
+            let (mut arena, spans, root) = parser::parse(&src).unwrap();
+            let Ok(elaborated) = typecheck::check(&mut arena, root, &spans) else { continue };
             // A static function boundary is a Conform too, over a type literal; an
             // annotation's site holds its type in a variable.
             let site = |e: &expr::Expr| match e {
@@ -4394,8 +4403,8 @@ g(len)").unwrap_err();
             ("let f: (L(Int) -> L(Int)) = fun x: L(Int) -> x in f([4])", "[4]"),
         ] {
             let src = format!("{l}{src}");
-            let (mut arena, spans, root, named_types) = parser::parse_with_named_types(&src).unwrap();
-            let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+            let (mut arena, spans, root) = parser::parse(&src).unwrap();
+            let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
             let trace = |e: &expr::Expr| match e {
                 expr::Expr::Annot(..) => true,
                 expr::Expr::Let(n, ..) | expr::Expr::Lambda(n, ..) => n.starts_with("__r") || n == "L",
@@ -4571,8 +4580,7 @@ g(len)").unwrap_err();
     fn resolve_index_follows_a_bound_index_variable() {
         use crate::index_expr::IndexExpr;
         use crate::typecheck::InferCtx;
-        use std::collections::HashMap;
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
         let resolved = infer.resolve_index(&IndexExpr::Var("n".to_string()));
         assert_eq!(resolved, IndexExpr::Lit(3));
@@ -4582,8 +4590,7 @@ g(len)").unwrap_err();
     fn resolve_index_leaves_an_unbound_variable_alone() {
         use crate::index_expr::IndexExpr;
         use crate::typecheck::InferCtx;
-        use std::collections::HashMap;
-        let infer = InferCtx::new(HashMap::new());
+        let infer = InferCtx::new();
         let resolved = infer.resolve_index(&IndexExpr::Var("n".to_string()));
         assert_eq!(resolved, IndexExpr::Var("n".to_string()));
     }
@@ -4592,9 +4599,8 @@ g(len)").unwrap_err();
     fn resolve_index_deep_substitutes_inside_a_compound_expression() {
         use crate::index_expr::IndexExpr;
         use crate::typecheck::InferCtx;
-        use std::collections::HashMap;
         use std::rc::Rc;
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
         let expr = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)));
         let resolved = infer.resolve_index_deep(&expr);
@@ -4605,10 +4611,9 @@ g(len)").unwrap_err();
     fn resolve_deep_on_a_type_substitutes_inside_an_indexed_wrapper() {
         use crate::index_expr::IndexExpr;
         use crate::typecheck::InferCtx;
-        use std::collections::HashMap;
         use std::rc::Rc;
         use types::Type;
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
         let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
         let resolved = infer.resolve_deep(&ty);
@@ -4620,8 +4625,7 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
         use crate::typecheck::{unify_index, InferCtx};
-        use std::collections::HashMap;
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         let span = Span { start: 0, end: 0 };
         unify_index(&IndexExpr::Var("n".to_string()), &IndexExpr::Lit(3), &mut infer, span).unwrap();
         assert_eq!(infer.resolve_index(&IndexExpr::Var("n".to_string())), IndexExpr::Lit(3));
@@ -4632,8 +4636,7 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
         use crate::typecheck::{unify_index, InferCtx};
-        use std::collections::HashMap;
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         let span = Span { start: 0, end: 0 };
         unify_index(&IndexExpr::Lit(3), &IndexExpr::Var("n".to_string()), &mut infer, span).unwrap();
         assert_eq!(infer.resolve_index(&IndexExpr::Var("n".to_string())), IndexExpr::Lit(3));
@@ -4644,9 +4647,8 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
         use crate::typecheck::{unify_index, InferCtx};
-        use std::collections::HashMap;
         use std::rc::Rc;
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         let span = Span { start: 0, end: 0 };
         // Add(n, 1) unified against Add(3, 1) should bind n=3 by recursing
         // into both operand pairs, not by requiring the whole expressions
@@ -4663,9 +4665,8 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
         use crate::typecheck::{unify_index, InferCtx};
-        use std::collections::HashMap;
         use std::rc::Rc;
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         let span = Span { start: 0, end: 0 };
         // m*n vs n*m -- no variable to bind, but already equal per SOP
         // normalization (Phase 1's own index_exprs_equal).
@@ -4686,8 +4687,7 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
         use crate::typecheck::{unify_index, InferCtx};
-        use std::collections::HashMap;
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         let span = Span { start: 0, end: 0 };
         assert!(unify_index(&IndexExpr::Lit(3), &IndexExpr::Lit(4), &mut infer, span).is_err());
     }
@@ -4697,9 +4697,8 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
         use crate::typecheck::{unify_index, InferCtx};
-        use std::collections::HashMap;
         use std::rc::Rc;
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         let span = Span { start: 0, end: 0 };
         // n unified against (n + 1) would be an infinite index expression.
         let rhs = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)));
@@ -4723,10 +4722,9 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
         use crate::typecheck::{unify_trial, InferCtx};
-        use std::collections::HashMap;
         use std::rc::Rc;
         use types::Type;
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         let span = Span { start: 0, end: 0 };
         let t1 = Type::Tuple(Rc::new(vec![
             Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string()))),
@@ -4758,9 +4756,8 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
         use crate::typecheck::{unify_index, InferCtx};
-        use std::collections::HashMap;
         use std::rc::Rc;
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
         let span = Span { start: 0, end: 0 };
         let lhs = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)));
@@ -4779,9 +4776,8 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::span::Span;
         use crate::typecheck::{unify_index, InferCtx};
-        use std::collections::HashMap;
         use std::rc::Rc;
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         let span = Span { start: 0, end: 0 };
         let rhs = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(0)));
         unify_index(&IndexExpr::Var("n".to_string()), &rhs, &mut infer, span).unwrap();
@@ -4932,7 +4928,7 @@ g(len)").unwrap_err();
             Rc::new(Type::Fun(Rc::new(vec_of(n.clone())), EffectRow::Dyn, Rc::new(vec_of(n)))),
         );
 
-        let mut infer = InferCtx::new(std::collections::HashMap::new());
+        let mut infer = InferCtx::new();
         let ctx = extend_generalized(&Ctx::empty(), "identity_vec", identity_vec_ty, &infer, None);
 
         // Extracts the index-variable name inside `Fun(Int, Fun(Vec(idx), Vec(idx)))`.
@@ -4971,7 +4967,7 @@ g(len)").unwrap_err();
         use std::rc::Rc;
         use types::{EffectRow, Type};
 
-        let infer = InferCtx::new(std::collections::HashMap::new());
+        let infer = InferCtx::new();
         let mut ctx = Ctx::empty();
         for i in 0..3 {
             let a = Rc::new(Type::Var(format!("a{i}")));
@@ -5204,12 +5200,11 @@ g(len)").unwrap_err();
         use crate::span::Span;
         use crate::expr::{Arena, Expr, SpanMap};
         use crate::types::{Type, EffectRow};
-        use std::collections::HashMap;
         let mut arena = Arena::new();
         let mut spans = SpanMap::new();
         let e = arena.push(Expr::Int(5));
         spans.push(Span { start: 0, end: 0 });
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         let (row, _) = check_against(&mut arena, e, &Type::Int, &Ctx::empty(), &spans, &mut infer).unwrap();
         assert_eq!(row, EffectRow::pure());
     }
@@ -5220,12 +5215,11 @@ g(len)").unwrap_err();
         use crate::span::Span;
         use crate::expr::{Arena, Expr, SpanMap};
         use crate::types::Type;
-        use std::collections::HashMap;
         let mut arena = Arena::new();
         let mut spans = SpanMap::new();
         let e = arena.push(Expr::Int(5));
         spans.push(Span { start: 0, end: 0 });
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         assert!(check_against(&mut arena, e, &Type::Bool, &Ctx::empty(), &spans, &mut infer).is_err());
     }
 
@@ -5246,7 +5240,6 @@ g(len)").unwrap_err();
         use crate::span::Span;
         use crate::expr::{Arena, Expr, SpanMap};
         use crate::types::Type;
-        use std::collections::HashMap;
         let mut arena = Arena::new();
         let mut spans = SpanMap::new();
         // Build If(Bool(true), Int(1), Str("a")) by hand -- spans pushed
@@ -5260,7 +5253,7 @@ g(len)").unwrap_err();
         spans.push(Span { start: 0, end: 0 });
         let if_expr = arena.push(Expr::If(c, t, e));
         spans.push(Span { start: 0, end: 0 });
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         let err = check_against(&mut arena, if_expr, &Type::Int, &Ctx::empty(), &spans, &mut infer).unwrap_err();
         assert!(err.0.contains("expected Int, found Str"), "unexpected message: {}", err.0);
     }
@@ -5284,10 +5277,9 @@ g(len)").unwrap_err();
         use crate::span::Span;
         use crate::expr::{Arena, Expr, SpanMap};
         use crate::types::Type;
-        use std::collections::HashMap;
         use std::rc::Rc;
 
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         // Int elements: a Dyn-element Vec(n) into [Int] is a real crossing and
         // is checked; this test is about the index-forgetting widening alone.
         let vec_ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
@@ -5349,7 +5341,6 @@ g(len)").unwrap_err();
         use crate::span::Span;
         use crate::expr::{Arena, Expr, Pattern, SpanMap};
         use crate::types::Type;
-        use std::collections::HashMap;
         use std::rc::Rc;
 
         let mut arena = Arena::new();
@@ -5369,7 +5360,7 @@ g(len)").unwrap_err();
         ]);
         let match_expr = arena.push(Expr::Match(scrutinee, arms));
         spans.push(Span { start: 0, end: 0 });
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         let err = check_against(&mut arena, match_expr, &Type::Int, &Ctx::empty(), &spans, &mut infer).unwrap_err();
         assert!(err.0.contains("expected Int, found Str"), "unexpected message: {}", err.0);
     }
@@ -5424,10 +5415,9 @@ g(len)").unwrap_err();
         use crate::span::Span;
         use crate::expr::{Arena, Expr, Pattern, SpanMap};
         use crate::types::Type;
-        use std::collections::HashMap;
         use std::rc::Rc;
 
-        let mut infer = InferCtx::new(HashMap::new());
+        let mut infer = InferCtx::new();
         // Int elements: see if_check_mode_accepts_branches_that_only_agree_via_the_expected_type.
         let vec_ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend_generalized(&Ctx::empty(), "v", vec_ty, &infer, None);
@@ -6208,8 +6198,8 @@ g(len)").unwrap_err();
             | (h, t) -> let proof: Bool = t in 0
             | b -> 1
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let result = typecheck::check_with_named_types(&mut arena, root, &spans, named_types);
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let result = typecheck::check(&mut arena, root, &spans);
         let err = result.expect_err(
             "t's real type, if correctly correlated, is Type::Named(id) (a List), which must reject a Bool \
              annotation -- got Ok, meaning bind_pattern_vars fell back to an unconstrained type instead",
@@ -6228,8 +6218,8 @@ g(len)").unwrap_err();
     // new declaration OR annotation syntax, per the design spec's own
     // "Generalizing to Type::Indexed" section) doesn't add one either.
     // So both tests below parse an ordinary match EXPRESSION through the
-    // real parser (getting real Pattern nodes, a real Match ExprRef, and
-    // a real named_types registry for the recursive alias), then drive
+    // real parser (getting real Pattern nodes and a real Match ExprRef),
+    // register the recursive type's definition by hand, then drive
     // typecheck::check_against DIRECTLY against a hand-built Ctx binding
     // the scrutinee to the Case-B shape this task's own eligibility
     // logic is meant to recognize -- exactly mirroring this file's own
@@ -6277,7 +6267,8 @@ g(len)").unwrap_err();
         // The registry is built by hand: `List = (Int, List) | Bool`.
         let id = "List#0".to_string();
         let def = Type::Union(Rc::new(vec![Type::Tuple(Rc::new(vec![Type::Int, Type::Named(id.clone())])), Type::Bool]));
-        let mut infer = InferCtx::new(std::collections::HashMap::from([(id.clone(), def)]));
+        let mut infer = InferCtx::new();
+        Rc::make_mut(&mut infer.named_types).insert(id.clone(), def);
         let scrut_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend(&Ctx::empty(), "v", scrut_ty);
         let expected = Type::Indexed(Rc::new(Type::Named(id)), Rc::new(IndexExpr::Lit(1)));
@@ -6319,7 +6310,8 @@ g(len)").unwrap_err();
         // The registry is built by hand: `List = (Int, List) | Bool`.
         let id = "List#0".to_string();
         let def = Type::Union(Rc::new(vec![Type::Tuple(Rc::new(vec![Type::Int, Type::Named(id.clone())])), Type::Bool]));
-        let mut infer = InferCtx::new(std::collections::HashMap::from([(id.clone(), def)]));
+        let mut infer = InferCtx::new();
+        Rc::make_mut(&mut infer.named_types).insert(id.clone(), def);
         let scrut_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend(&Ctx::empty(), "v", scrut_ty);
         let expected = Type::Indexed(
@@ -6364,24 +6356,6 @@ g(len)").unwrap_err();
         // must terminate and type-check successfully (the match body
         // just returns an Int literal from each arm; nothing further
         // constrains t's own type).
-        //
-        // Task 4's own verification found this test as originally
-        // committed used `parser::parse` + `typecheck::check` -- which
-        // per `parse`'s own doc comment ("pairing this `parse` with plain
-        // `typecheck::check`... is exactly the condition every
-        // Type::Named consumer's own missing-registry-entry fallback
-        // exists to handle gracefully") means `infer.named_types` is
-        // ALWAYS EMPTY here, so `Type::Named("List")` never actually
-        // unfolds at all -- it hits the graceful "unknown id" fallback
-        // immediately, every time, regardless of whether the cycle-guard
-        // fix above is present. Confirmed empirically: this test as
-        // originally written keeps passing even with the fix fully
-        // reverted (the pre-fix code, and even a version with NO cycle
-        // guard at all), because the buggy code path is never reached.
-        // Switched to `parse_with_named_types` + `check_with_named_types`
-        // (the same pairing Task 3's own Case B tests already use)
-        // to make this test genuinely exercise the fix -- re-verified
-        // below.
         let src = r#"
             let rec List = Union(List, Tuple(Int, List)) in
             let f: (List -> Int) = fun v ->
@@ -6390,8 +6364,8 @@ g(len)").unwrap_err();
                 | x -> 1
             in 0
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types);
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans);
         assert!(
             elaborated.is_ok(),
             "expected the exact repro program to type-check successfully once the Union arm's own visiting set \
@@ -6443,16 +6417,6 @@ g(len)").unwrap_err();
         // instead been correlated to its real position-0 type (`Int`,
         // from `(Int, List)`), the same check would be a genuine,
         // provable mismatch.
-        //
-        // Uses `parse_with_named_types` + `check_with_named_types` (not
-        // plain `parse`/`check`) -- Task 4's own verification found that
-        // pairing plain `parse` with plain `check` leaves
-        // `infer.named_types` empty (see `parse`'s own doc comment), so
-        // `Type::Named("List")` would never actually unfold at all here,
-        // making the test vacuous regardless of the cycle guard. See the
-        // fix applied just above, to the pre-existing
-        // `bind_pattern_vars_union_arm_does_not_infinite_loop_on_a_bare_self_referential_alternative`
-        // test, for the same finding.
         let src = r#"
             let rec List = Union(List, Tuple(Int, List)) in
             let f: (List -> Int) = fun v ->
@@ -6461,8 +6425,8 @@ g(len)").unwrap_err();
                 | x -> 1
             in 0
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types);
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans);
         assert!(
             elaborated.is_ok(),
             "expected the cycle-detected fallback to give h2 a fresh, unconstrained type (permissive with \
@@ -6698,8 +6662,8 @@ g(len)").unwrap_err();
             | true -> 0
             | false -> 0
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 9);
     }
 
@@ -6710,8 +6674,8 @@ g(len)").unwrap_err();
             let f: (Int -> Indexed(List, 1)) = fun n -> (n, n, false) in
             f(9)
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let err = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap_err();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         // Tightened (final-review Finding 5): a 3-tuple isn't step-shaped
         // (step_alt is a 2-tuple), so this falls through to the ordinary
         // generic fallback -- a stable, predictable "expected List(1),
@@ -6732,8 +6696,8 @@ g(len)").unwrap_err();
             let f: (Int -> Indexed(List, 0)) = fun n -> false in
             f(9)
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert!(!machine::run(&arena, elaborated, Env::prelude(), &spans).as_bool());
     }
 
@@ -6769,8 +6733,8 @@ g(len)").unwrap_err();
             | false -> 0
             | true -> 0
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 1);
     }
 
@@ -6804,8 +6768,8 @@ g(len)").unwrap_err();
             let w: Indexed(T, 2) = v in
             0
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 0);
     }
 
@@ -6826,8 +6790,8 @@ g(len)").unwrap_err();
             let b: Indexed(T, 0) = v in
             0
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 0);
     }
 
@@ -7033,7 +6997,7 @@ g(len)").unwrap_err();
     }
 
     fn rigid_infer(names: &[&str]) -> crate::typecheck::InferCtx {
-        let mut infer = crate::typecheck::InferCtx::new(std::collections::HashMap::new());
+        let mut infer = crate::typecheck::InferCtx::new();
         for n in names {
             infer.rigid_index.insert((*n).to_string());
         }
@@ -7291,7 +7255,7 @@ g(len)").unwrap_err();
     fn obligations_after_checking(src: &str) -> usize {
         use crate::typecheck::{check_against, Ctx, InferCtx};
         let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let mut infer = InferCtx::new(std::collections::HashMap::new());
+        let mut infer = InferCtx::new();
         check_against(&mut arena, root, &crate::types::Type::Int, &Ctx::empty(), &spans, &mut infer).unwrap();
         infer.obligation_count()
     }
@@ -7518,8 +7482,8 @@ g(len)").unwrap_err();
     }
 
     fn elaborated_has_wrapper(src: &str) -> bool {
-        let (mut arena, spans, root, named) = parser::parse_with_named_types(src).unwrap();
-        let out = typecheck::check_with_named_types(&mut arena, root, &spans, named).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let out = typecheck::check(&mut arena, root, &spans).unwrap();
         has_let_named(&arena, out, "__cf#")
     }
 
@@ -7608,8 +7572,8 @@ g(len)").unwrap_err();
     // Lambda group (resolve::is_direct_group)? Otherwise the recursive name
     // becomes unbound.
     fn elaborated_let_rec_groups(src: &str) -> Vec<bool> {
-        let (mut arena, spans, root, named) = parser::parse_with_named_types(src).unwrap();
-        let out = typecheck::check_with_named_types(&mut arena, root, &spans, named).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let out = typecheck::check(&mut arena, root, &spans).unwrap();
         let (mut groups, mut work, mut kids) = (Vec::new(), vec![out], Vec::new());
         while let Some(n) = work.pop() {
             if let expr::Expr::LetRec(bindings, _) = &arena[n] {
@@ -7860,8 +7824,8 @@ g(len)").unwrap_err();
     // --- Native Expr::Check (spec 2026-10-08-cast-cost-design, phase 1) ---
 
     fn elaborated_tree(src: &str) -> (expr::Arena, expr::ExprRef) {
-        let (mut arena, spans, root, named) = parser::parse_with_named_types(src).unwrap();
-        let out = typecheck::check_with_named_types(&mut arena, root, &spans, named).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let out = typecheck::check(&mut arena, root, &spans).unwrap();
         (arena, out)
     }
 
@@ -8146,8 +8110,8 @@ g(len)").unwrap_err();
     // --- Join-to-Dyn arm casts (spec 2026-10-08-join-to-dyn-casts) ---
 
     fn elaborated_has_cast(src: &str) -> bool {
-        let (mut arena, spans, root, named) = parser::parse_with_named_types(src).unwrap();
-        let out = typecheck::check_with_named_types(&mut arena, root, &spans, named).unwrap();
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        let out = typecheck::check(&mut arena, root, &spans).unwrap();
         has_let_named(&arena, out, "__ca#")
     }
 

@@ -8,7 +8,6 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 #[cfg(test)]
 use std::collections::BTreeSet;
-use std::collections::HashMap;
 /// Native-stack guard (a source type that is itself very deep). Degenerate aliases are cut earlier
 /// by the revisit guard in the `Named` arm.
 const MAX_DEPTH: usize = 64;
@@ -317,7 +316,7 @@ fn relate_index(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Rel {
 }
 /// The unifier's own text for a refuted index pair (run on a scratch copy; nothing is bound).
 fn index_refuted(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Rel {
-    let mut scratch = InferCtx::new(HashMap::new());
+    let mut scratch = InferCtx::new();
     scratch.index_subst = infer.index_subst.clone();
     scratch.rigid_index = infer.rigid_index.clone();
     // (required, actual) = (target, source), the order unify_fits uses.
@@ -331,7 +330,6 @@ fn index_refuted(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Rel {
 mod tests {
     use super::*;
     use crate::types::EffectRow;
-    use std::collections::HashMap;
     use std::rc::Rc;
     fn list(t: Type) -> Type {
         Type::List(Rc::new(t))
@@ -369,7 +367,8 @@ mod tests {
     // a := Int, s := Str, u unbound; index n rigid, z := 0; L = (Int, L) | Bool.
     fn ctx() -> InferCtx {
         let raw = uni(&[tup(&[Type::Int, named("L#1")]), Type::Bool]);
-        let mut i = InferCtx::new(HashMap::from([("L#1".to_string(), raw)]));
+        let mut i = InferCtx::new();
+        Rc::make_mut(&mut i.named_types).insert("L#1".to_string(), raw);
         i.subst.insert("a".to_string(), Type::Int);
         i.subst.insert("s".to_string(), Type::Str);
         i.rigid_index.insert("n".to_string());
@@ -493,12 +492,11 @@ mod tests {
     fn relate_terminates_on_degenerate_aliases() {
         // let rec A = Union(A, A, Bool) (2^64 steps by depth alone), let rec B = B, let rec C = Union(Int, C): unfolding the
         // same alias against the same source again is a cycle, so these are Refuted, not Lazy.
-        let reg = HashMap::from([
-            ("A#1".to_string(), uni(&[named("A#1"), named("A#1"), Type::Bool])),
-            ("B#2".to_string(), named("B#2")),
-            ("C#3".to_string(), uni(&[Type::Int, named("C#3")])),
-        ]);
-        let infer = InferCtx::new(reg);
+        let mut infer = InferCtx::new();
+        let reg = Rc::make_mut(&mut infer.named_types);
+        reg.insert("A#1".to_string(), uni(&[named("A#1"), named("A#1"), Type::Bool]));
+        reg.insert("B#2".to_string(), named("B#2"));
+        reg.insert("C#3".to_string(), uni(&[Type::Int, named("C#3")]));
         assert!(matches!(relate(&Type::Int, &named("A#1"), &infer), Rel::Refuted(_)));
         assert!(matches!(relate(&Type::Int, &named("B#2"), &infer), Rel::Refuted(_)));
         assert_eq!(relate(&Type::Bool, &named("A#1"), &infer), Rel::Proven);

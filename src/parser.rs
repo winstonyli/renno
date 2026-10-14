@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
@@ -8,49 +7,15 @@ use crate::span::Span;
 use crate::types::Type;
 use crate::util::find_field;
 
-// Delegates to parse_with_named_types and drops the registry -- kept as
-// a separate signature (rather than making every caller take a 4th
-// tuple element) so the 115+ existing callers in this codebase's own
-// test suite that never use self-referential type aliases are
-// unaffected. Note this means `parse`'s own caller has no way to reach
-// the registry parse_with_named_types builds internally -- pairing this
-// `parse` with plain `typecheck::check` (which defaults to an empty
-// registry) on a program using a self-referential type alias is exactly
-// the condition every Type::Named consumer's own missing-registry-entry
-// fallback exists to handle gracefully; see coerce()'s own doc comment.
 pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
-    let (arena, spans, root, _named_types) = parse_with_named_types(src)?;
-    Ok((arena, spans, root))
-}
-
-// Same as `parse`, but ALSO returns the registry of genuinely
-// self-referential type aliases this parse registered (Parser's own
-// `named_types` field) -- needed by typecheck::check_with_named_types
-// to resolve a Type::Named reference's own shape. Every ordinary
-// caller that never uses self-referential type aliases keeps calling
-// plain `parse` above, completely unaffected; this exists so the one
-// real production entry point (lib.rs's own run_source_on_this_thread)
-// can support the feature end to end without changing `parse`'s own
-// signature and forcing every one of its 115+ existing callers in this
-// codebase's own test suite to update for a capability they don't use.
-pub fn parse_with_named_types(src: &str) -> Result<(Arena, SpanMap, ExprRef, HashMap<String, Type>), String> {
     let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
-    let mut p = Parser {
-        tokens,
-        tok_spans,
-        pos: 0,
-        arena: Arena::new(),
-        expr_spans: SpanMap::new(),
-        src,
-        type_aliases: HashMap::new(),
-        named_types: HashMap::new(),
-    };
+    let mut p = Parser { tokens, tok_spans, pos: 0, arena: Arena::new(), expr_spans: SpanMap::new(), src };
     let root = p.expr()?;
     if p.pos != p.tokens.len() {
         let span = p.span_at();
         return Err(p.err_at(span, format!("trailing tokens after expression: {:?}", &p.tokens[p.pos..])));
     }
-    Ok((p.arena, p.expr_spans, root, p.named_types))
+    Ok((p.arena, p.expr_spans, root))
 }
 
 // Test-only entry point: parses a single, standalone type expression
@@ -61,16 +26,7 @@ pub fn parse_with_named_types(src: &str) -> Result<(Arena, SpanMap, ExprRef, Has
 #[cfg(test)]
 pub fn parse_type_string(src: &str) -> Result<Type, String> {
     let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
-    let mut p = Parser {
-        tokens,
-        tok_spans,
-        pos: 0,
-        arena: Arena::new(),
-        expr_spans: SpanMap::new(),
-        src,
-        type_aliases: HashMap::new(),
-        named_types: HashMap::new(),
-    };
+    let mut p = Parser { tokens, tok_spans, pos: 0, arena: Arena::new(), expr_spans: SpanMap::new(), src };
     let ty = p.parse_fun_type()?;
     crate::machine::eval_type(&p.arena, ty, &p.expr_spans)
 }
@@ -82,96 +38,6 @@ struct Parser<'a> {
     arena: Arena,
     expr_spans: SpanMap,
     src: &'a str,
-    // Type name -> the fully-resolved Type it stands for -- `type Name =
-    // TypeExpr in body` (see atom's own `Some(Token::TypeKw)` arm), a pure
-    // compile-time directive with no runtime effect of its own. Consulted
-    // by parse_type's bare-identifier case: a name found here is
-    // substituted in directly, fully resolved at the point of use, not
-    // deferred. Scoped lexically: updated when a `type` binder is parsed,
-    // restored (LIFO) once its own `in <body>` ends -- see atom's own
-    // `type_alias_restore`.
-    type_aliases: HashMap<String, Type>,
-    // Every genuinely self-referential `type` alias registered so far
-    // (Parser::atom's own `Token::TypeKw` arm) -- keyed by the SAME
-    // gensym'd id its own Type::Named leaf carries, so it survives
-    // past this parser's own scoped/LIFO-restored `type_aliases`
-    // (which only remembers a NAME's CURRENT alias while parsing is
-    // still inside that name's own scope). Unlike `type_aliases`, this
-    // is never restored/popped -- once an alias is registered here, it
-    // stays for the rest of parsing and is handed to whichever of
-    // `parse`/`parse_with_named_types` the caller invoked.
-    named_types: HashMap<String, Type>,
-}
-
-// Mints a globally-unique id for a `type` alias binder occurrence --
-// same freshening idiom typecheck.rs's own fresh_row_name/
-// fresh_type_name already use (a monotonic counter appended to a base
-// name), just its own separate counter and its own separate namespace:
-// this mechanism exists purely at parse time, before InferCtx (which
-// owns the OTHER two) is even constructed. typecheck mints a `let rec`
-// type group's ids here too, so the two can never collide.
-pub(crate) fn fresh_named_type_id(base: &str) -> String {
-    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{base}#{n}")
-}
-
-// Does `ty` structurally contain a Type::Named leaf carrying exactly
-// `id` anywhere inside it? Used right after parsing a `type` alias's
-// own RHS to decide whether it actually referenced itself (mirrors the
-// shape of typecheck.rs's own vars_in -- a plain structural walk, terminating because `ty` here is always a
-// FRESH parse result, never something already containing a completed
-// recursive reference of its own). typecheck's recursive_type_group asks
-// the same question of a `let rec` type group's results.
-pub(crate) fn contains_named(ty: &Type, id: &str) -> bool {
-    match ty {
-        Type::Named(n) => n == id,
-        Type::List(elem) => contains_named(elem, id),
-        Type::Fun(param, _row, ret) => contains_named(param, id) || contains_named(ret, id),
-        Type::Tuple(items) | Type::Union(items) => items.iter().any(|t| contains_named(t, id)),
-        Type::Record(fields) => fields.iter().any(|(_, t)| contains_named(t, id)),
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Var(_) => false,
-        // Wraps one nested Type (the index is never itself a Type, so
-        // has nothing to check here) -- same recurse-into-the-wrapped-
-        // type precedent as List's own arm just above.
-        Type::Indexed(wrapped, _) => contains_named(wrapped, id),
-    }
-}
-
-// `contains_named`'s own occurrence-COUNTING analog, same recursive
-// shape exactly (bool-returning `||`/`any` swapped for usize-returning
-// `+`/`sum`) -- Case B's own eligibility needs to tell "exactly once"
-// apart from "zero" or "two or more" (spec section 5, Case B point 2:
-// a step alternative referencing the recursive id twice or more, e.g. a
-// binary tree's `Node(Tree, Tree)` shape, deliberately doesn't qualify),
-// which a plain bool can't distinguish. Terminates for the same
-// structural reason `contains_named` does, though NOT because `ty` is
-// always a fresh parse result here: Case B's own real caller
-// (`qualifying_named_alternatives`, typecheck.rs) runs this on an
-// ALREADY-REGISTERED alias's own RHS, which can (and typically does)
-// contain completed `Type::Named(id)` leaves. It still terminates
-// because neither `contains_named` nor `count_named` ever UNFOLDS a
-// `Type::Named` reference -- both only count/check its occurrences as
-// an opaque leaf in an already-fully-parsed type structure, so there's
-// no recursion to follow through it at all.
-//
-// `pub(crate)`, not private: Phase 4 Task 3's own Case B eligibility
-// check (typecheck.rs's `qualifying_named_alternatives`) needs to ask
-// this question about an already-registered alias's own alternatives
-// (spec section 5, Case B point 1) -- same progressive, only-as-far-
-// as-needed visibility widening this project already uses repeatedly
-// for `InferCtx`/`Scheme`/`Ctx`/etc. `contains_named` just above has no
-// caller outside this file and stays private.
-pub(crate) fn count_named(ty: &Type, id: &str) -> usize {
-    match ty {
-        Type::Named(n) => usize::from(n == id),
-        Type::List(elem) => count_named(elem, id),
-        Type::Fun(param, _row, ret) => count_named(param, id) + count_named(ret, id),
-        Type::Tuple(items) | Type::Union(items) => items.iter().map(|t| count_named(t, id)).sum(),
-        Type::Record(fields) => fields.iter().map(|(_, t)| count_named(t, id)).sum(),
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Var(_) => 0,
-        Type::Indexed(wrapped, _) => count_named(wrapped, id),
-    }
 }
 
 // A `let`/`fun` prefix collected while flattening a chain of them (see
@@ -484,7 +350,7 @@ impl<'a> Parser<'a> {
         self.type_call(name, tuple, start)
     }
 
-    // A type that is already known (an alias, a symbolic index): no evaluation left to do.
+    // A type that is already known (a symbolic index): no evaluation left to do.
     fn type_lit(&mut self, ty: Type, start: usize) -> ExprRef {
         let span = Span { start, end: self.span_before().end };
         self.push_spanned(Expr::TypeLit(Rc::new(ty)), span)
@@ -533,8 +399,7 @@ impl<'a> Parser<'a> {
     // parses as `(A -> B) | C`, not `A -> (B | C)`). Used everywhere a
     // trailing `->` couldn't be ambiguous with something else that follows
     // (unlike opt_annotation -- see parse_type_atom_union): inside `[...]`/
-    // `(...)`, and a `type` alias's own RHS (terminated by `in`, not `->`/
-    // `=`).
+    // `(...)`, and the arguments of a type call (terminated by `,`/`)`).
     fn parse_union_type(&mut self) -> Result<ExprRef, String> {
         let start = self.span_at().start;
         let first = self.parse_fun_type()?;
@@ -604,8 +469,8 @@ impl<'a> Parser<'a> {
             // call whatever `Vec` and `Indexed` are in scope, like any name
             // (spec 11.8), so a local binding of either changes them. The
             // index language stays built in: the index is parsed here and
-            // passed as an argument (index_arg). Matched before the alias
-            // lookup; `type` may not define either name.
+            // passed as an argument (index_arg). Matched before the plain
+            // name case below.
             Some(Token::Ident(name)) if (name == "Vec" || name == "Indexed") && matches!(self.peek(), Some(Token::LParen)) => {
                 let indexed = name == "Indexed";
                 let head_span = Span { start, end: self.span_before().end };
@@ -627,22 +492,13 @@ impl<'a> Parser<'a> {
                 let span = Span { start, end: self.span_before().end };
                 Ok(self.push_spanned(Expr::App(head, arg), span))
             }
-            // A name. A `type` alias in scope is substituted right here (its
-            // right-hand side was evaluated where it was defined); any other
-            // name is an ordinary variable, resolved lexically when typecheck
-            // evaluates the annotation, so `let Int = 5` changes what `Int`
-            // means (spec section 9.3). `F(A)` applies it (spec section 9.1).
+            // A name is an ordinary variable, resolved lexically when
+            // typecheck evaluates the annotation, so `let Int = 5` changes
+            // what `Int` means (spec section 9.3). `F(A)` applies it (spec
+            // section 9.1).
             Some(Token::Ident(name)) => {
-                let head = match self.type_aliases.get(&name) {
-                    Some(ty) => {
-                        let ty = ty.clone();
-                        self.type_lit(ty, start)
-                    }
-                    None => {
-                        let span = Span { start, end: self.span_before().end };
-                        self.push_spanned(Expr::Var(name), span)
-                    }
-                };
+                let span = Span { start, end: self.span_before().end };
+                let head = self.push_spanned(Expr::Var(name), span);
                 self.type_apps(head, start)
             }
             // An Int is a value an applied type function may take (`Rep(2)`).
@@ -733,13 +589,6 @@ impl<'a> Parser<'a> {
             }
             other => Err(self.err_at(self.span_before(), format!("expected an index expression, found {other:?}"))),
         }
-    }
-
-    // The five builtin type names, which a `type Name = ...` alias may not
-    // redefine (the binder's collision guard below). In an annotation they
-    // are ordinary prelude variables.
-    fn is_builtin_type(name: &str) -> bool {
-        matches!(name, "Int" | "Float" | "Bool" | "Str" | "Dyn")
     }
 
     // True iff the tokens right after the CURRENT position (not yet
@@ -1152,93 +1001,8 @@ impl<'a> Parser<'a> {
     // moved out of the call stack, not the grammar itself.
     fn atom(&mut self) -> Result<ExprRef, String> {
         let mut pending: Vec<(usize, PendingBinder)> = Vec::new();
-        // (name, its OLD value before this `type` binder touched it) --
-        // restored, in reverse, at the end of this atom() call, so a
-        // `type` binder's effect on `type_aliases` is scoped to its own
-        // `in <body>` the same way its Env binding already is, not left
-        // dangling for the rest of the file.
-        let mut type_alias_restore: Vec<(String, Option<Type>)> = Vec::new();
-        // `type` pushes NOTHING to `pending` (no AST node to fold back --
-        // see the arm below), so `pending.is_empty()` alone can't tell the
-        // terminal-parsing branch below "a prefix WAS seen" the way it can
-        // for Let/Fun/Data (which always push one). Without this, `type X
-        // = ... in BODY` where BODY starts with anything other than
-        // Let/Fun/Data/TypeKw would parse BODY as a single atom_leaf()
-        // atom instead of a full self.expr() -- meaning `type_aliases`
-        // gets restored (see the end of this function) the moment that
-        // ONE atom finishes, before any LATER sibling atom in the same
-        // expression (a juxtaposed argument, say) gets a chance to see the
-        // alias still in scope.
-        let mut saw_type_alias = false;
         loop {
             match self.peek() {
-                Some(Token::TypeKw) => {
-                    // The `type` form (Name, `=`, TypeExpr, `in`, body) -- a pure compile-time
-                    // directive: no wrapped AST node, no PendingBinder
-                    // entry (nothing to fold back), just a scoped update to
-                    // `type_aliases` before continuing this same peeling
-                    // loop (parsing the next prefix, or the terminal body).
-                    self.bump();
-                    saw_type_alias = true;
-                    let name = self.ident()?;
-                    if Self::is_builtin_type(&name) || name == "Vec" || name == "Indexed" {
-                        // An alias may not redefine a builtin type name.
-                        // parse_type's `Vec(` and `Indexed(` arms run before
-                        // the type_aliases lookup, so an alias of either
-                        // would be silently discarded whenever parens follow
-                        // it. Int/Float/Bool/Str/Dyn stay rejected as before
-                        // (a type `let` can rebind them; `type` itself goes
-                        // in Stage D of spec 2026-10-10 types-as-values).
-                        return Err(self.err_at(
-                            self.span_before(),
-                            format!("cannot redefine builtin type {name} as an alias"),
-                        ));
-                    }
-                    self.expect(&Token::Equals)?;
-                    // Insert a placeholder BEFORE parsing the RHS, keyed
-                    // to a fresh id -- any self-reference inside the RHS
-                    // resolves through the SAME, already-existing
-                    // alias-lookup path (parse_type's own
-                    // `self.type_aliases.get(&name)` arm) with no new
-                    // grammar needed. Captured here (before the insert),
-                    // not after parsing the RHS, so an OUTER scope's own
-                    // same-named alias (if any) is what gets restored,
-                    // exactly as the pre-existing scoping logic already
-                    // requires.
-                    let previous = self.type_aliases.get(&name).cloned();
-                    let fresh_id = fresh_named_type_id(&name);
-                    self.type_aliases.insert(name.clone(), Type::Named(fresh_id.clone()));
-                    let rhs_start = self.span_at().start;
-                    let rhs = self.parse_union_type()?;
-                    // The alias stands for the type its right-hand side
-                    // evaluates to (spec section 3: a type alias is a let
-                    // of a type value). Every name in it is a #constructor
-                    // or an already-evaluated alias, so this always finishes.
-                    let ty = match crate::machine::eval_type(&self.arena, rhs, &self.expr_spans) {
-                        Ok(ty) => ty,
-                        Err(msg) => return Err(self.err_at(Span { start: rhs_start, end: self.span_before().end }, msg)),
-                    };
-                    self.expect(&Token::In)?;
-                    // Did the RHS actually reference itself? If not,
-                    // this is an ordinary, non-recursive alias --
-                    // discard the placeholder, store the real parsed
-                    // type exactly as this alias mechanism already did
-                    // before this whole feature existed. If so,
-                    // register the definition (which may itself
-                    // structurally contain this SAME Type::Named leaf,
-                    // nested wherever the self-reference occurred) and
-                    // make every future use of `name` resolve to the
-                    // lightweight reference instead of the (impossible
-                    // to fully construct) expansion.
-                    let final_ty = if contains_named(&ty, &fresh_id) {
-                        self.named_types.insert(fresh_id.clone(), ty);
-                        Type::Named(fresh_id)
-                    } else {
-                        ty
-                    };
-                    type_alias_restore.push((name.clone(), previous));
-                    self.type_aliases.insert(name, final_ty);
-                }
                 Some(Token::Let) => {
                     let start = self.span_at().start;
                     self.bump();
@@ -1299,7 +1063,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let mut result = if pending.is_empty() && !saw_type_alias { self.atom_leaf()? } else { self.expr()? };
+        let mut result = if pending.is_empty() { self.atom_leaf()? } else { self.expr()? };
         // Every wrapping binder shares this same END position (the
         // terminal body's own end) -- only its START differs (where its
         // own `let`/`fun` keyword began). `let x = 1 in let y = 2 in
@@ -1329,16 +1093,6 @@ impl<'a> Parser<'a> {
                     self.push_spanned(Expr::Lambda(param, ann, body), span)
                 }
             };
-        }
-        for (name, old) in type_alias_restore.into_iter().rev() {
-            match old {
-                Some(ty) => {
-                    self.type_aliases.insert(name, ty);
-                }
-                None => {
-                    self.type_aliases.remove(&name);
-                }
-            }
         }
         Ok(result)
     }
