@@ -209,10 +209,12 @@ impl Ctx {
 // and the scope it was checked in. An annotation that names the binder is
 // evaluated inside a copy of the binders it depends on (annotation_type).
 pub(crate) struct CheckDef {
-    // Creation order. Every definition one annotation depends on lies on one
-    // scope chain, where a later binder has a larger seq.
-    seq: u64,
+    // Its place in InferCtx::defs, which is creation order: a definition reads
+    // only names bound before it, so every dependency has a smaller index.
+    idx: usize,
     node: DefNode,
+    // The definitions it reads directly (def_deps).
+    deps: OnceCell<Deps>,
     // The scope before the binder: where the right-hand side's names resolve.
     ctx: Ctx,
     // The elaborated value(s): what the run time evaluates for this binder.
@@ -224,6 +226,22 @@ pub(crate) struct CheckDef {
     proven: Cell<bool>,
     // Something named the binder at value position (lookup).
     used: Cell<bool>,
+}
+
+// What an expression reads of the definitions: the definition one name it uses
+// denotes (an index into InferCtx::defs).
+struct Read {
+    def: usize,
+}
+
+// The definitions one definition reads directly, and whether it is stuck: it
+// names a value that exists only at run time (a parameter, a pattern variable),
+// or reads a definition that is stuck (spec section 2's stuck rule), so only the
+// run time can evaluate it. Indices, never `Rc`s: a chain of `Rc`s would drop
+// recursively.
+struct Deps {
+    reads: Vec<Read>,
+    stuck: bool,
 }
 
 enum DefNode {
@@ -244,6 +262,25 @@ impl CheckDef {
     // calls it, and a caller looks the binder up (`used`).
     fn inert(&self, arena: &Arena) -> bool {
         self.values.iter().all(|v| matches!(arena[settled(arena, *v)], Expr::Lambda(..) | Expr::TypeLit(_)))
+    }
+
+    // What its right-hand side reads, in the scope the binder was checked in.
+    // Only a group of direct `fun`s is recursive; any other group's values see
+    // the outer scope (machine.rs's LetRec fallback). A type group's values are
+    // TypeLits.
+    fn direct_reads(&self, arena: &Arena, infer: &InferCtx) -> (Vec<Read>, bool) {
+        match &self.node {
+            DefNode::Let(_, rhs) => reads_in(arena, &[*rhs], &[], &self.ctx, infer),
+            DefNode::Group(bindings) => {
+                let names: Vec<String> = if crate::resolve::is_direct_group(arena, bindings) {
+                    bindings.iter().map(|(n, _, _)| n.clone()).collect()
+                } else {
+                    Vec::new()
+                };
+                let values: Vec<ExprRef> = bindings.iter().map(|(_, _, v)| *v).collect();
+                reads_in(arena, &values, &names, &self.ctx, infer)
+            }
+        }
     }
 
     // Some value holds a run-time check that could fail (fallible_check). The
@@ -383,8 +420,8 @@ pub(crate) struct InferCtx {
     // unbound, so annotation_type skips the scope walk for it: without this,
     // `Int` in each of n annotations would walk a scope n deep.
     bound_names: HashSet<String>,
-    // The next CheckDef::seq.
-    def_seq: u64,
+    // Every definition, by CheckDef::idx.
+    defs: Vec<Rc<CheckDef>>,
     // An annotation is being elaborated (annotation_type): a name it reads
     // is not a value-position read, so `lookup` leaves CheckDef::used alone.
     in_annotation: bool,
@@ -416,7 +453,7 @@ impl InferCtx {
             named_types: Rc::new(HashMap::new()),
             dyn_sunk: HashSet::new(),
             bound_names: HashSet::new(),
-            def_seq: 0,
+            defs: Vec::new(),
             in_annotation: false,
             direct_value: None,
             proofs: Vec::new(),
@@ -426,16 +463,18 @@ impl InferCtx {
     }
 
     fn new_def(&mut self, node: DefNode, values: Vec<ExprRef>, ctx: &Ctx) -> Rc<CheckDef> {
-        self.def_seq += 1;
-        Rc::new(CheckDef {
-            seq: self.def_seq,
+        let def = Rc::new(CheckDef {
+            idx: self.defs.len(),
             node,
+            deps: OnceCell::new(),
             ctx: ctx.clone(),
             values,
             fallible: OnceCell::new(),
             proven: Cell::new(false),
             used: Cell::new(false),
-        })
+        });
+        self.defs.push(def.clone());
+        def
     }
 
     // Flags `ty` as reaching a Dyn sink if it is (still) a bare type variable.
@@ -3349,43 +3388,69 @@ fn mark_proven(arena: &Arena, defs: &[Rc<CheckDef>], spans: &SpanMap, infer: &In
 // whether it is stuck: it names a value that exists only at run time (spec
 // section 2's stuck rule), so only the run time can evaluate it.
 fn definitions_used(arena: &Arena, root: ExprRef, skip: &[String], ctx: &Ctx, infer: &InferCtx) -> (Vec<Rc<CheckDef>>, bool) {
-    let mut defs: Vec<Rc<CheckDef>> = Vec::new();
+    let (reads, mut stuck) = reads_in(arena, &[root], skip, ctx, infer);
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut work: Vec<usize> = reads.iter().map(|r| r.def).collect();
+    while let Some(i) = work.pop() {
+        if !seen.insert(i) {
+            continue;
+        }
+        let deps = def_deps(arena, infer, i);
+        stuck |= deps.stuck;
+        work.extend(deps.reads.iter().map(|r| r.def));
+    }
+    let mut used: Vec<usize> = seen.into_iter().collect();
+    used.sort_unstable();
+    (used.into_iter().map(|i| infer.defs[i].clone()).collect(), stuck)
+}
+
+// The definitions `roots` (resolved in `ctx`, with `skip` bound around them)
+// read directly, one `Read` per name in first-use order, and whether one of
+// the names stands for a value that exists only at run time.
+fn reads_in(arena: &Arena, roots: &[ExprRef], skip: &[String], ctx: &Ctx, infer: &InferCtx) -> (Vec<Read>, bool) {
+    let mut reads: Vec<Read> = Vec::new();
     let mut stuck = false;
-    let mut work: Vec<(ExprRef, Vec<String>, Ctx)> = vec![(root, skip.to_vec(), ctx.clone())];
-    while let Some((root, skip, ctx)) = work.pop() {
-        for name in crate::resolve::free_vars(arena, root) {
-            if skip.contains(&name) || !infer.bound_names.contains(&name) {
+    let mut seen: HashSet<String> = HashSet::new();
+    for root in roots {
+        for name in crate::resolve::free_vars(arena, *root) {
+            if skip.contains(&name) || !infer.bound_names.contains(&name) || !seen.insert(name.clone()) {
                 continue;
             }
             let Some(scheme) = ctx.get(&name) else { continue };
-            let Some(def) = scheme.def.clone() else {
+            let Some(def) = &scheme.def else {
                 stuck = true;
                 continue;
             };
-            if defs.iter().any(|d| Rc::ptr_eq(d, &def)) {
-                continue;
-            }
-            match &def.node {
-                DefNode::Let(_, rhs) => work.push((*rhs, Vec::new(), def.ctx.clone())),
-                DefNode::Group(bindings) => {
-                    // Only a group of direct `fun`s is recursive; any other
-                    // group's values see the outer scope (machine.rs's
-                    // LetRec fallback). A type group's values are TypeLits.
-                    let names: Vec<String> = if crate::resolve::is_direct_group(arena, bindings) {
-                        bindings.iter().map(|(n, _, _)| n.clone()).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    for (_, _, v) in bindings.iter() {
-                        work.push((*v, names.clone(), def.ctx.clone()));
-                    }
-                }
-            }
-            defs.push(def);
+            reads.push(Read { def: def.idx });
         }
     }
-    defs.sort_by_key(|d| d.seq);
-    (defs, stuck)
+    (reads, stuck)
+}
+
+// What definition `i` reads directly, computed once, along with that of every
+// definition it reaches that has not been yet. Iterative: a chain of
+// dependencies reaches tens of thousands. A dependency has a smaller index, so
+// stuckness (transitive) is settled in ascending order.
+fn def_deps<'a>(arena: &Arena, infer: &'a InferCtx, i: usize) -> &'a Deps {
+    if infer.defs[i].deps.get().is_none() {
+        let mut fresh: Vec<(usize, Vec<Read>, bool)> = Vec::new();
+        let mut queued: HashSet<usize> = HashSet::new();
+        let mut work = vec![i];
+        while let Some(j) = work.pop() {
+            if infer.defs[j].deps.get().is_some() || !queued.insert(j) {
+                continue;
+            }
+            let (reads, stuck) = infer.defs[j].direct_reads(arena, infer);
+            work.extend(reads.iter().map(|r| r.def));
+            fresh.push((j, reads, stuck));
+        }
+        fresh.sort_unstable_by_key(|(j, _, _)| *j);
+        for (j, reads, direct) in fresh {
+            let stuck = direct || reads.iter().any(|r| infer.defs[r.def].deps.get().expect("a dependency has a smaller index").stuck);
+            let _ = infer.defs[j].deps.set(Deps { reads, stuck });
+        }
+    }
+    infer.defs[i].deps.get().expect("computed above")
 }
 
 // `root` inside a copy of `defs`' binders, oldest outermost: the same nearest
