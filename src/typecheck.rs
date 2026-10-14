@@ -485,8 +485,9 @@ pub(crate) struct InferCtx {
     defs: Vec<Rc<CheckDef>>,
     // Where the variables of every check-time evaluation live. One table for
     // them all: a closure one evaluation builds is called by a later one. Each
-    // evaluation resolves a fresh copy of its root (eval_pure_in), so a node
-    // is never resolved under two layouts.
+    // evaluation resolves a copy of the open part of its root (eval_pure_in),
+    // so a node is never resolved under two layouts; the closed parsed nodes
+    // resolve alike under any, so they are shared (`check` finds them up front).
     resolved: Resolved,
     // An annotation is being elaborated (annotation_type): a name it reads
     // is not a value-position read, so `lookup` leaves CheckDef::used alone.
@@ -1402,6 +1403,7 @@ fn resolve_pendings(arena: &mut Arena, infer: &InferCtx) {
         let (from, to) = (snapshot_type(&p.from, infer, &vars), snapshot_type(&p.to, infer, &vars));
         let result = cast_now(arena, p.e, &from, &to, &env);
         let node = arena[result].clone();
+        debug_assert!(!infer.resolved.shares(p.slot), "an in-place write to a shared node");
         arena[p.slot] = node;
     }
 }
@@ -2037,6 +2039,7 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
                 && !ob.witness_vars().contains(&name.as_str())
                 && mentions.get(name) == Some(&1)
                 && !infer.index_subst.values().any(|v| free_index_vars(v).contains(name)));
+        debug_assert!(!infer.resolved.shares(ob.slot), "an in-place write to a shared node");
         if unconstrained {
             arena[ob.slot] = Expr::Len(LenExpr::Any);
             continue;
@@ -3445,6 +3448,7 @@ fn settle_erasure(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx) {
     });
     splices.sort_by_key(|s| cranelift_entity::EntityRef::index(s.outer));
     for s in splices {
+        debug_assert!(!infer.resolved.shares(s.outer), "an in-place write to a shared node");
         arena[s.outer] = arena[s.inner].clone();
     }
 }
@@ -5269,6 +5273,7 @@ fn binder_names(arena: &Arena) -> HashSet<String> {
 pub fn check(arena: &mut Arena, root: ExprRef, spans: &SpanMap) -> Result<ExprRef, TypeError> {
     let mut infer = InferCtx::new();
     infer.bound_names = binder_names(arena);
+    infer.resolved = crate::resolve::sharing(arena, root, &infer.bound_names);
     let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), spans, &mut infer)?;
     resolve_pendings(arena, &infer);
     resolve_obligations(arena, &infer);

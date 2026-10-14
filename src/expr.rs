@@ -466,6 +466,11 @@ pub enum Expr {
 impl Expr {
     // Appends this node's direct sub-expressions to `out`, annotations included.
     pub fn children(&self, out: &mut Vec<ExprRef>) {
+        self.children_with(out, true);
+    }
+
+    // `children`, annotation slots only when `annotations`.
+    pub(crate) fn children_with(&self, out: &mut Vec<ExprRef>, annotations: bool) {
         match self {
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::TypeLit(_) => {}
             Expr::Check(e, spec) => {
@@ -479,7 +484,7 @@ impl Expr {
             }
             Expr::FieldAccess(e, _) | Expr::Perform(_, e) | Expr::Annot(e, _) => out.push(*e),
             Expr::Lambda(_, ann, body) => {
-                out.extend(*ann);
+                out.extend(ann.filter(|_| annotations));
                 out.push(*body);
             }
             Expr::MakeHandler { body, .. } => out.push(*body),
@@ -487,12 +492,12 @@ impl Expr {
             Expr::Record(fields) => out.extend(fields.iter().map(|(_, v)| *v)),
             Expr::App(a, b) | Expr::BinOp(_, a, b) => out.extend([*a, *b]),
             Expr::Let(_, ann, val, body) => {
-                out.extend(*ann);
+                out.extend(ann.filter(|_| annotations));
                 out.extend([*val, *body]);
             }
             Expr::LetRec(bindings, body) => {
                 for (_, ann, v) in bindings.iter() {
-                    out.extend(*ann);
+                    out.extend(ann.filter(|_| annotations));
                     out.push(*v);
                 }
                 out.push(*body);
@@ -510,12 +515,17 @@ impl Expr {
     }
 }
 
-// A fresh copy of the parsed tree rooted at `root`: every node reachable from it
-// is pushed again, children mapped to their copies (annotation slots included;
-// a node reached twice is copied once, so the copy shares as the original does).
+// A copy of the parsed tree rooted at `root`, except for the subtrees `keep`
+// names: those are not copied, the copy points at the originals. Every other
+// reachable node is pushed again, children mapped to their copies (a node
+// reached twice is copied once, so the copy shares as the original does).
+// Annotation slots are not copied either: neither the resolver nor the
+// check-mode machine enters them, so the copy's point at the originals.
 // Iterative, so a deep chain costs no native stack. Check-time evaluation runs
-// the copy (machine::eval_pure_in), which gives each evaluation nodes of its own.
-pub fn copy_tree(arena: &mut Arena, root: ExprRef) -> ExprRef {
+// the copy (machine::eval_pure_in); `keep` names the closed subtrees
+// (resolve::Resolved::shares), so each evaluation has nodes of its own only
+// for the part that reads outside itself. If `keep(root)`, nothing is copied.
+pub fn copy_open(arena: &mut Arena, root: ExprRef, keep: impl Fn(ExprRef) -> bool) -> ExprRef {
     let mut copies: HashMap<ExprRef, ExprRef> = HashMap::new();
     let mut stack = vec![(root, false)];
     let mut kids = Vec::new();
@@ -523,10 +533,14 @@ pub fn copy_tree(arena: &mut Arena, root: ExprRef) -> ExprRef {
         if copies.contains_key(&n) {
             continue;
         }
+        if keep(n) {
+            copies.insert(n, n);
+            continue;
+        }
         if !expanded {
             stack.push((n, true));
             kids.clear();
-            arena[n].children(&mut kids);
+            arena[n].children_with(&mut kids, false);
             stack.extend(kids.iter().filter(|k| !copies.contains_key(*k)).map(|k| (*k, false)));
             continue;
         }
@@ -544,11 +558,11 @@ pub fn copy_tree(arena: &mut Arena, root: ExprRef) -> ExprRef {
             Expr::ListLit(items) => Expr::ListLit(items.iter().map(at).collect()),
             Expr::Record(fields) => Expr::Record(Rc::new(fields.iter().map(|(name, v)| (name.clone(), at(v))).collect())),
             Expr::FieldAccess(e, name) => Expr::FieldAccess(at(e), name.clone()),
-            Expr::Lambda(param, ann, body) => Expr::Lambda(param.clone(), ann.as_ref().map(at), at(body)),
+            Expr::Lambda(param, ann, body) => Expr::Lambda(param.clone(), *ann, at(body)),
             Expr::App(f, a) => Expr::App(at(f), at(a)),
-            Expr::Let(name, ann, val, body) => Expr::Let(name.clone(), ann.as_ref().map(at), at(val), at(body)),
+            Expr::Let(name, ann, val, body) => Expr::Let(name.clone(), *ann, at(val), at(body)),
             Expr::LetRec(bindings, body) => {
-                Expr::LetRec(Rc::new(bindings.iter().map(|(name, ann, v)| (name.clone(), ann.as_ref().map(at), at(v))).collect()), at(body))
+                Expr::LetRec(Rc::new(bindings.iter().map(|(name, ann, v)| (name.clone(), *ann, at(v))).collect()), at(body))
             }
             Expr::BinOp(op, a, b) => Expr::BinOp(*op, at(a), at(b)),
             Expr::If(c, t, e) => Expr::If(at(c), at(t), at(e)),

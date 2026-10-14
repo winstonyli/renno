@@ -118,16 +118,19 @@ pub fn eval_pure(arena: &Arena, expr: ExprRef, spans: &SpanMap, fuel: u64) -> Pu
 }
 
 // `eval_pure` inside one enclosing frame: `names` are bound to `values`. A
-// copy of `expr` is resolved into `resolved`, which the caller keeps so that a
-// closure this evaluation returns (or stores in a value) can be called by a
-// later one that shares the table. The copy is what keeps that table sound: a
-// variable's slot is only valid for the layout its node was resolved under, and
-// the same tree can be evaluated under several (a `let` nested in another
-// definition's right-hand side is reached by both), so every evaluation gets
-// nodes no other evaluation has resolved.
+// copy of `expr`'s open part is resolved into `resolved`, which the caller keeps
+// so that a closure this evaluation returns (or stores in a value) can be called
+// by a later one that shares the table. The copy is what keeps that table
+// sound: a variable's slot is only valid for the layout its node was resolved
+// under, and the same tree can be evaluated under several (a `let` nested in
+// another definition's right-hand side is reached by both), so every
+// evaluation gets its own nodes wherever the layout could differ. The closed
+// subtrees (`resolved.shares`) resolve alike under every layout: they are not
+// copied, the copy points at the originals, and a whole closed `expr` is run
+// as it is.
 pub fn eval_pure_in(arena: &mut Arena, expr: ExprRef, names: &[String], values: Vec<Value>, resolved: &mut Resolved, spans: &SpanMap, fuel: u64) -> Pure {
     debug_assert_eq!(names.len(), values.len(), "eval_pure_in: one value per name");
-    let expr = crate::expr::copy_tree(arena, expr);
+    let expr = crate::expr::copy_open(arena, expr, |n| resolved.shares(n));
     crate::resolve::resolve_into(arena, expr, names, resolved);
     let mut frame = Bindings::default();
     values.into_iter().for_each(|v| frame.push(v));
@@ -1965,6 +1968,33 @@ mod tests {
             assert_eq!(sum.as_int(), want);
         }
         build(&mut arena, &["a"], vec![Value::Int(30)], &mut table);
+    }
+
+    // A closed root (`fun a -> (a, a)` reads only its own parameter) is run as
+    // it is under any frame: no copy, so the arena does not grow, and the
+    // closures it builds under two frames behave alike.
+    #[test]
+    fn eval_pure_in_shares_a_closed_root_under_two_frames() {
+        let mut arena = Arena::new();
+        let spans = SpanMap::new();
+        let (a1, a2) = (arena.push(Expr::Var("a".into())), arena.push(Expr::Var("a".into())));
+        let body = arena.push(Expr::Tuple(vec![a1, a2]));
+        let lam = arena.push(Expr::Lambda("a".into(), None, body));
+        let (f, five) = (arena.push(Expr::Var("f".into())), arena.push(Expr::Int(5)));
+        let call = arena.push(Expr::App(f, five));
+        let mut table = crate::resolve::sharing(&arena, lam, &std::collections::HashSet::new());
+        assert!(table.shares(lam));
+        let len = arena.len();
+        let mut closures = Vec::new();
+        for (names, values) in [(vec!["a".to_string()], vec![Value::Int(10)]), (vec!["z".to_string(), "a".to_string()], vec![Value::Int(0), Value::Int(20)])] {
+            let Pure::Done(closure) = eval_pure_in(&mut arena, lam, &names, values, &mut table, &spans, 100) else { panic!("the lambda must evaluate") };
+            closures.push(closure);
+            assert_eq!(arena.len(), len, "a closed root is not copied");
+        }
+        for closure in closures {
+            let Pure::Done(pair) = eval_pure_in(&mut arena, call, &["f".to_string()], vec![closure], &mut table, &spans, 100) else { panic!("the call must evaluate") };
+            assert_eq!(pair.to_string(), "[5, 5]");
+        }
     }
 
     #[test]

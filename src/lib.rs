@@ -2989,7 +2989,8 @@ g(len)").unwrap_err();
 
     // A `let` nested in another definition's right-hand side is a definition of
     // its own whose nodes also sit inside the enclosing one: each evaluation
-    // must run its own copy. Every result is what the checker gave before
+    // gets its own copy of the parts that read outside themselves and shares
+    // the closed parts (resolve::sharing). Every result is what the checker gave before
     // definitions were evaluated once (bbdc1cf).
     #[test]
     fn definitions_nested_in_definitions_evaluate_as_before() {
@@ -3023,6 +3024,25 @@ g(len)").unwrap_err();
         }
     }
 
+    // Pins shadowing of a prelude name under sharing: `Int` here is the user's
+    // `Bool`, so `Z`, `q` and `B` must not resolve it as the prelude's. Clause (c)
+    // of `resolve::sharing` (a name no binder binds) is defensive: a shadowed
+    // name is Local in the program walk anyway, and no program is known that
+    // reaches (c) with a name that is Local in some other walk.
+    #[test]
+    fn shadowed_prelude_names_are_not_shared() {
+        let src = "let Int = Bool in let Z = Int in let A = (let q = Z in let B = Int in B) in let x: A = true in x";
+        assert_eq!(run_source(src).unwrap().to_string(), "true");
+    }
+
+    // A closed lambda is shared by every evaluation that reads it, under
+    // different frames: it has one layout everywhere.
+    #[test]
+    fn a_shared_closed_lambda_keeps_one_layout() {
+        let src = "let F = fun a -> Tuple(a, a) in let G = F in let x: G(Int) = (1, 2) in x";
+        assert_eq!(run_source(src).unwrap().to_string(), "[1, 2]");
+    }
+
     // A `let` nested in another definition is evaluated once, not once per
     // enclosing evaluation: A, B and F.
     #[test]
@@ -3031,6 +3051,90 @@ g(len)").unwrap_err();
         assert_eq!(definitions_evaluated(src), 3);
         let src = "let A = Int in let rec F = fun n -> (let G = fun v -> A in let y: G(0) = 1 in let z: F(0) = 1 in let w: G(1) = 2 in A) in 0";
         assert_eq!(definitions_evaluated(src), 3);
+    }
+
+    // `d` definitions nested in each other's right-hand sides, each annotating a
+    // `let` of its own: the shape whose check-time copies once grew as d^2.
+    // `innermost` is the whole innermost level; `applied` annotates with `name{k}(Int)`.
+    fn nested_source(name: &str, applied: bool, d: usize, innermost: &str) -> String {
+        let ann = |k: usize| if applied { format!("{name}{k}(Int)") } else { format!("{name}{k}") };
+        let mut s = innermost.to_string();
+        for k in (2..d).rev() {
+            s = format!("let {name}{k} = ({s}) in let y{k}: {a} = 1 in {name}{k}", a = ann(k));
+        }
+        format!("let {name}1 = ({s}) in let x: {a} = 1 in x", a = ann(1))
+    }
+
+    // (nodes the checker added to the arena, the program's result), on a thread
+    // with the interpreter's stack.
+    fn arena_growth(src: String) -> (usize, i64) {
+        std::thread::Builder::new()
+            .stack_size(WORKER_STACK_SIZE)
+            .spawn(move || {
+                let (mut arena, spans, root) = parser::parse(&src).expect("parse");
+                let before = arena.len();
+                let elaborated = typecheck::check(&mut arena, root, &spans).expect("check");
+                let grown = arena.len() - before;
+                (grown, machine::run(&arena, elaborated, Env::prelude(), &spans).as_int())
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn closed_nested(d: usize) -> String {
+        nested_source("A", false, d, &format!("let A{d} = Int in let y{d}: A{d} = 1 in A{d}"))
+    }
+
+    fn function_nested(d: usize) -> String {
+        nested_source("F", true, d, &format!("let F{d} = fun a -> a in F{d}"))
+    }
+
+    fn open_nested(d: usize) -> String {
+        format!("let B = Int in {}", nested_source("A", false, d, &format!("let A{d} = B in let y{d}: A{d} = 1 in A{d}")))
+    }
+
+    // Doubling the depth must about double what the checker adds to the arena
+    // (it quadrupled when every evaluation copied its whole root).
+    fn assert_linear_growth(make: impl Fn(usize) -> String) {
+        let grown: Vec<usize> = [50, 100, 200]
+            .iter()
+            .map(|&d| {
+                let (grown, result) = arena_growth(make(d));
+                assert_eq!(result, 1);
+                grown
+            })
+            .collect();
+        eprintln!("arena growth at depth 50/100/200: {grown:?}");
+        for pair in grown.windows(2) {
+            assert!(pair[1] as f64 <= 2.5 * pair[0] as f64, "arena growth {grown:?}: doubling the depth more than 2.5x'd it");
+        }
+    }
+
+    #[test]
+    fn nested_definitions_grow_the_arena_linearly() {
+        assert_linear_growth(closed_nested);
+    }
+
+    #[test]
+    fn nested_function_definitions_grow_the_arena_linearly() {
+        assert_linear_growth(function_nested);
+    }
+
+    // Open nesting (the innermost definition reads an outer one) is still copied
+    // once per enclosing evaluation: a documented residual, so its growth is
+    // printed (`--nocapture`), not asserted.
+    #[test]
+    fn nested_open_definitions_evaluate_as_before() {
+        let grown: Vec<usize> = [50, 100, 200]
+            .iter()
+            .map(|&d| {
+                let (grown, result) = arena_growth(open_nested(d));
+                assert_eq!(result, 1);
+                grown
+            })
+            .collect();
+        eprintln!("open nesting arena growth at depth 50/100/200: {grown:?}");
     }
 
     // Two definitions per group (an early one for the group's own values, a final
@@ -3060,8 +3164,8 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn copy_tree_makes_new_nodes_that_evaluate_the_same() {
-        use crate::expr::{copy_tree, Expr};
+    fn copy_open_makes_new_nodes_that_evaluate_the_same() {
+        use crate::expr::{copy_open, Expr};
         use cranelift_entity::EntityRef;
         use std::collections::HashSet;
         let src = "let o = opaque in let rec go = fun n -> if n == 0 then [] else n :: go(n - 1) in \
@@ -3073,13 +3177,14 @@ g(len)").unwrap_err();
         let mut arena = arena;
         let before = arena.len();
         let want = machine::run(&arena, root, Env::prelude(), &spans).to_string();
-        let copy = copy_tree(&mut arena, root);
+        let copy = copy_open(&mut arena, root, |_| false);
         assert_ne!(copy, root);
         let mut seen = HashSet::new();
         let mut stack = vec![copy];
         let mut tokens = Vec::new();
         let mut originals = Vec::new();
         let mut kids = Vec::new();
+        // Annotation slots point at the originals: left out of both walks.
         while let Some(n) = stack.pop() {
             if !seen.insert(n) {
                 continue;
@@ -3089,7 +3194,7 @@ g(len)").unwrap_err();
                 tokens.push(*id);
             }
             kids.clear();
-            arena[n].children(&mut kids);
+            arena[n].children_with(&mut kids, false);
             stack.extend(kids.iter().copied());
         }
         stack.push(root);
@@ -3102,7 +3207,7 @@ g(len)").unwrap_err();
                 originals.push(*id);
             }
             kids.clear();
-            arena[n].children(&mut kids);
+            arena[n].children_with(&mut kids, false);
             stack.extend(kids.iter().copied());
         }
         assert!(!tokens.is_empty());
@@ -3114,16 +3219,60 @@ g(len)").unwrap_err();
 
     // The copy walks and rebuilds iteratively: 50k nested lets on the default stack.
     #[test]
-    fn copy_tree_is_iterative() {
-        use crate::expr::{copy_tree, Arena, Expr};
+    fn copy_open_is_iterative() {
+        use crate::expr::{copy_open, Arena, Expr};
         let mut arena = Arena::new();
         let mut body = arena.push(Expr::Int(0));
         for _ in 0..50_000 {
             let val = arena.push(Expr::Int(1));
             body = arena.push(Expr::Let("x".into(), None, val, body));
         }
-        let copy = copy_tree(&mut arena, body);
+        let copy = copy_open(&mut arena, body, |_| false);
         let _resolved = resolve::resolve(&arena, copy);
+    }
+
+    // A kept subtree comes back as the original, everything else is new, and an
+    // annotation slot still names the original annotation.
+    #[test]
+    fn copy_open_shares_closed_subtrees() {
+        use crate::expr::{copy_open, Expr};
+        use cranelift_entity::EntityRef;
+        use std::collections::HashSet;
+        let src = "let t: Int = 3 in let u = (4, 5) in (t, u)";
+        let (mut arena, spans, root) = parser::parse(src).expect("parse");
+        let before = arena.len();
+        let want = machine::run(&arena, root, Env::prelude(), &spans).to_string();
+        let kept: HashSet<_> = arena
+            .iter()
+            .filter(|(_, e)| matches!(e, Expr::Tuple(items) if items.len() == 2 && items.iter().all(|i| matches!(arena[*i], Expr::Int(_)))))
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(kept.len(), 1);
+        let Expr::Let(_, Some(ann), ..) = arena[root].clone() else { panic!("an annotated let") };
+        let copy = copy_open(&mut arena, root, |n| kept.contains(&n));
+        assert_ne!(copy, root);
+        let Expr::Let(_, copy_ann, ..) = arena[copy].clone() else { panic!("a let") };
+        assert_eq!(copy_ann, Some(ann));
+        let (mut stack, mut seen, mut shared, mut kids) = (vec![copy], HashSet::new(), 0, Vec::new());
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            if kept.contains(&n) {
+                shared += 1;
+                continue;
+            }
+            assert!(n.index() >= before, "node {n:?} of the copy is an original");
+            kids.clear();
+            arena[n].children_with(&mut kids, false);
+            stack.extend(kids.iter().copied());
+        }
+        assert_eq!(shared, 1);
+        assert_eq!(machine::run(&arena, copy, Env::prelude(), &spans).to_string(), want);
+        // A kept root is not copied at all.
+        let len = arena.len();
+        assert_eq!(copy_open(&mut arena, root, |_| true), root);
+        assert_eq!(arena.len(), len);
     }
 
     #[test]
