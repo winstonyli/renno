@@ -7,6 +7,7 @@ use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, 
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::plist::PList;
 use crate::span::Span;
+use rpds::HashTrieSet;
 use crate::types::{consistent, row_consistent, EffectRow, Type};
 use crate::util::find_field;
 mod relate;
@@ -60,15 +61,9 @@ pub struct TypeError(pub String, pub Span);
 // model" section).
 #[derive(Clone)]
 pub(crate) struct Scheme {
-    row_vars: Vec<String>,
-    type_vars: Vec<String>,
-    // Index-variable names generalized over this binding -- Phase 2's
-    // own addition, alongside row_vars/type_vars above. Same
-    // generalize-then-instantiate treatment: generalizable_index_vars
-    // computes this set at the `let` (a ctx-wide "still open elsewhere"
-    // exclusion, exactly like the other two), lookup mints a fresh
-    // IndexExpr::Var name per reference via fresh_index_name.
-    index_vars: Vec<String>,
+    // The variables generalized over this binding, of all three sorts,
+    // sorted by sort then name. lookup mints a fresh name per reference.
+    quantified: Vec<TyVar>,
     ty: Type,
     // A `let`/`let rec` binder's definition, which an annotation naming it
     // evaluates (CheckDef). None for a binder whose value exists only at run
@@ -78,7 +73,97 @@ pub(crate) struct Scheme {
 
 impl Scheme {
     fn mono(ty: Type) -> Scheme {
-        Scheme { row_vars: Vec::new(), type_vars: Vec::new(), index_vars: Vec::new(), ty, def: None }
+        Scheme { quantified: Vec::new(), ty, def: None }
+    }
+}
+
+// A type variable of any of the three sorts a Scheme can quantify: an
+// effect-row variable, a Type::Var, or an index variable.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum TyVar {
+    Row(String),
+    Type(String),
+    Index(String),
+}
+
+// Every variable of every sort `ty` mentions, as written: no substitution
+// is consulted (callers resolve first, or reopen the names later).
+fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
+    fn go(ty: &Type, out: &mut BTreeSet<TyVar>) {
+        match ty {
+            Type::Var(name) => {
+                out.insert(TyVar::Type(name.clone()));
+            }
+            Type::Fun(param, row, ret) => {
+                if let EffectRow::Var(name) = row {
+                    out.insert(TyVar::Row(name.clone()));
+                }
+                go(param, out);
+                go(ret, out);
+            }
+            Type::List(elem) => go(elem, out),
+            Type::Tuple(items) | Type::Union(items) => items.iter().for_each(|t| go(t, out)),
+            Type::Record(fields) => fields.iter().for_each(|(_, t)| go(t, out)),
+            Type::Indexed(wrapped, index) => {
+                go(wrapped, out);
+                out.extend(free_index_vars(index).into_iter().map(TyVar::Index));
+            }
+            Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) => {}
+        }
+    }
+    let mut out = BTreeSet::new();
+    go(ty, &mut out);
+    out
+}
+
+// The variables a stored name stands for now: a Type or Index variable that
+// unification has since bound stands for the variables of what it was bound
+// to; a Row variable is never bound.
+fn reopen(var: &TyVar, infer: &InferCtx) -> BTreeSet<TyVar> {
+    match var {
+        TyVar::Row(_) => BTreeSet::from([var.clone()]),
+        TyVar::Type(name) => {
+            vars_in(&infer.resolve_deep(&Type::Var(name.clone()))).into_iter().filter(|v| matches!(v, TyVar::Type(_))).collect()
+        }
+        TyVar::Index(name) => {
+            free_index_vars(&infer.resolve_index_deep(&IndexExpr::Var(name.clone()))).into_iter().map(TyVar::Index).collect()
+        }
+    }
+}
+
+// A scope: its bindings, and the variables still open in it, i.e. free in
+// some binding's type and not quantified by that binding. A `let` may
+// quantify only a variable no enclosing scope has open.
+#[derive(Clone)]
+pub(crate) struct Ctx {
+    binds: PList<Scheme>,
+    // As written when each binding was added, union-only (a shadowed binding
+    // keeps its variables open, as it did when the whole list was scanned);
+    // open_vars reads the names through the substitution as it stands.
+    open: HashTrieSet<TyVar>,
+}
+
+impl Ctx {
+    pub(crate) fn empty() -> Ctx {
+        Ctx { binds: PList::empty(), open: HashTrieSet::new() }
+    }
+
+    fn get(&self, name: &str) -> Option<Scheme> {
+        self.binds.get(name)
+    }
+
+    fn bind(&self, name: &str, scheme: Scheme) -> Ctx {
+        let mut open = self.open.clone();
+        for var in vars_in(&scheme.ty) {
+            if !scheme.quantified.contains(&var) && !open.contains(&var) {
+                open = open.insert(var);
+            }
+        }
+        Ctx { binds: self.binds.bind(name, scheme), open }
+    }
+
+    pub(crate) fn open_vars(&self, infer: &InferCtx) -> BTreeSet<TyVar> {
+        self.open.iter().flat_map(|v| reopen(v, infer)).collect()
     }
 }
 
@@ -189,8 +274,6 @@ fn fallible_check(arena: &Arena, root: ExprRef, spans: &SpanMap, infer: &InferCt
 // convention (see unify_index_expr's neighbors) keeps tests in
 // src/lib.rs -- a different module -- rather than because anything
 // outside typecheck.rs is meant to name this directly.
-pub(crate) type Ctx = PList<Scheme>;
-
 // The real, threaded state a Hindley-Milner-style unifier needs, carried
 // through every elaborate()/elaborate_node() call as `&mut InferCtx` --
 // see the design spec's own "Data model" section for the full rationale
@@ -807,15 +890,16 @@ pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
     }
     match scheme {
         None => Type::Dyn,
-        Some(scheme) if scheme.row_vars.is_empty() && scheme.type_vars.is_empty() && scheme.index_vars.is_empty() => scheme.ty,
+        Some(scheme) if scheme.quantified.is_empty() => scheme.ty,
         Some(scheme) => {
-            let row_subst: HashMap<String, EffectRow> = scheme
-                .row_vars
-                .iter()
-                .map(|v| (v.clone(), EffectRow::Var(fresh_row_name(v))))
-                .collect();
+            let names = |sort: fn(&TyVar) -> Option<&String>| -> Vec<String> { scheme.quantified.iter().filter_map(sort).cloned().collect() };
+            let row_vars = names(|v| if let TyVar::Row(n) = v { Some(n) } else { None });
+            let type_vars = names(|v| if let TyVar::Type(n) = v { Some(n) } else { None });
+            let index_vars = names(|v| if let TyVar::Index(n) = v { Some(n) } else { None });
+            let row_subst: HashMap<String, EffectRow> =
+                row_vars.iter().map(|v| (v.clone(), EffectRow::Var(fresh_row_name(v)))).collect();
             let type_subst: HashMap<String, Type> =
-                scheme.type_vars.iter().map(|v| (v.clone(), infer.fresh_var(v))).collect();
+                type_vars.iter().map(|v| (v.clone(), infer.fresh_var(v))).collect();
             // An instance of a quantified variable that reaches a Dyn sink
             // reaches it too.
             if !infer.dyn_sunk.is_empty() {
@@ -826,7 +910,7 @@ pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
                 }
             }
             let index_subst: HashMap<String, IndexExpr> =
-                scheme.index_vars.iter().map(|v| (v.clone(), IndexExpr::Var(fresh_index_name(v)))).collect();
+                index_vars.iter().map(|v| (v.clone(), IndexExpr::Var(fresh_index_name(v)))).collect();
             subst_type(&scheme.ty, &row_subst, &type_subst, &index_subst)
         }
     }
@@ -904,10 +988,35 @@ pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // `def` is the binder's definition, which an annotation naming it evaluates.
 pub(crate) fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &InferCtx, def: Option<Rc<CheckDef>>) -> Ctx {
     let ty = infer.resolve_deep(&ty);
-    let row_vars = generalizable_row_vars(ctx, &ty);
-    let type_vars = generalizable_type_vars(ctx, &ty, infer);
-    let index_vars = generalizable_index_vars(ctx, &ty, infer);
-    ctx.bind(name, Scheme { row_vars, type_vars, index_vars, ty, def })
+    let quantified = generalizable(ctx, &ty, infer);
+    if cfg!(debug_assertions) {
+        let old: BTreeSet<TyVar> = generalizable_row_vars(ctx, &ty)
+            .into_iter()
+            .map(TyVar::Row)
+            .chain(generalizable_type_vars(ctx, &ty, infer).into_iter().map(TyVar::Type))
+            .chain(generalizable_index_vars(ctx, &ty, infer).into_iter().map(TyVar::Index))
+            .collect();
+        assert_eq!(old, quantified.iter().cloned().collect::<BTreeSet<_>>(), "open-set generalization differs from the ctx scan for `{name}`: {ty:?}");
+    }
+    ctx.bind(name, Scheme { quantified, ty, def })
+}
+
+// The variables of `ty` (already resolve_deep'ed) that this `let` may
+// quantify: those no enclosing scope has open. An index variable a pending
+// obligation still needs is decided by whoever binds it later, inside the
+// function containing the crossing; generalizing it would give each use a
+// fresh copy and leave the obligation unresolvable (spec
+// 2026-10-07-dyn-crossing-deferred-length-checks, polymorphism rule).
+fn generalizable(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<TyVar> {
+    let candidates = vars_in(ty);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut open = ctx.open_vars(infer);
+    if candidates.iter().any(|v| matches!(v, TyVar::Index(_))) {
+        open.extend(pending_obligation_vars(infer).into_iter().map(TyVar::Index));
+    }
+    candidates.difference(&open).cloned().collect()
 }
 
 // Row-variable names free in `ty` that are actually safe to generalize
@@ -962,8 +1071,8 @@ fn generalizable_row_vars(ctx: &Ctx, ty: &Type) -> Vec<String> {
 // O(1) amortized) instead of re-walking the whole chain from scratch here.
 fn free_row_vars_in_ctx(ctx: &Ctx) -> BTreeSet<String> {
     let mut vars = BTreeSet::new();
-    ctx.for_each(|scheme: &Scheme| {
-        let sealed: BTreeSet<String> = scheme.row_vars.iter().cloned().collect();
+    ctx.binds.for_each(|scheme: &Scheme| {
+        let sealed: BTreeSet<String> = scheme.quantified.iter().filter_map(|v| if let TyVar::Row(n) = v { Some(n.clone()) } else { None }).collect();
         vars.extend(free_row_vars(&scheme.ty).difference(&sealed).cloned());
     });
     vars
@@ -1089,8 +1198,8 @@ fn collect_index_vars(ty: &Type, resolve: &dyn Fn(&IndexExpr) -> IndexExpr) -> B
 // incrementally through Ctx itself instead of re-walking the chain here.
 fn free_type_vars_in_ctx(ctx: &Ctx, infer: &InferCtx) -> BTreeSet<String> {
     let mut vars = BTreeSet::new();
-    ctx.for_each(|scheme: &Scheme| {
-        let sealed: BTreeSet<String> = scheme.type_vars.iter().cloned().collect();
+    ctx.binds.for_each(|scheme: &Scheme| {
+        let sealed: BTreeSet<String> = scheme.quantified.iter().filter_map(|v| if let TyVar::Type(n) = v { Some(n.clone()) } else { None }).collect();
         vars.extend(free_type_vars_resolved(&scheme.ty, infer).difference(&sealed).cloned());
     });
     vars
@@ -1117,8 +1226,8 @@ fn generalizable_type_vars(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<String
 // Scheme.index_vars instead of free_type_vars_resolved/Scheme.type_vars.
 fn free_index_vars_in_ctx(ctx: &Ctx, infer: &InferCtx) -> BTreeSet<String> {
     let mut vars = BTreeSet::new();
-    ctx.for_each(|scheme: &Scheme| {
-        let sealed: BTreeSet<String> = scheme.index_vars.iter().cloned().collect();
+    ctx.binds.for_each(|scheme: &Scheme| {
+        let sealed: BTreeSet<String> = scheme.quantified.iter().filter_map(|v| if let TyVar::Index(n) = v { Some(n.clone()) } else { None }).collect();
         vars.extend(free_index_vars_resolved(&scheme.ty, infer).difference(&sealed).cloned());
     });
     vars

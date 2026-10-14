@@ -5178,6 +5178,50 @@ g(len)").unwrap_err();
         assert_ne!(name_a, name_b, "two separate lookups of a generalized index variable must get INDEPENDENT fresh names");
     }
 
+    // A `let` quantifies the variables of its type that no enclosing scope has
+    // open. A chain of polymorphic lets therefore leaves nothing open however
+    // long it is, and a monomorphic binding opens exactly its own variable.
+    #[test]
+    fn polymorphic_let_chain_leaves_no_open_variable() {
+        use crate::typecheck::{extend, extend_generalized, Ctx, InferCtx};
+        use std::rc::Rc;
+        use types::{EffectRow, Type};
+
+        let infer = InferCtx::new(std::collections::HashMap::new());
+        let mut ctx = Ctx::empty();
+        for i in 0..3 {
+            let a = Rc::new(Type::Var(format!("a{i}")));
+            ctx = extend_generalized(&ctx, &format!("id{i}"), Type::Fun(a.clone(), EffectRow::Dyn, a), &infer, None);
+        }
+        assert!(ctx.open_vars(&infer).is_empty());
+        let ctx = extend(&ctx, "x", Type::Var("b".to_string()));
+        assert_eq!(ctx.open_vars(&infer).len(), 1);
+    }
+
+    // Generalization is blocked exactly where a binder still holds the variable:
+    // a lambda parameter, a pattern variable, a let-bound alias or tuple, a
+    // shadowed binder, a `let rec`, a Vec(n) parameter. The same shapes with
+    // their own fresh variable (P5) still generalize.
+    #[test]
+    fn generalization_respects_every_binder_form() {
+        let gs = "let g = fun n: Int -> n in let s = fun m: Str -> m in ";
+        for src in [
+            "let f = fun x -> let z = x in let a = g(z) in s(z) in 0",
+            "let f = fun x -> let z = (x, 1) in match z | (p, q) -> let a = g(p) in s(p) in 0",
+            "let f = fun x -> let h = fun y -> x in let a = g(h(1)) in s(h(2)) in 0",
+            "let f = fun x -> let z = x in let x = 5 in let a = g(z) in s(z) in 0",
+            "let rec r = fun x -> let z = x in let a = g(z) in s(z) in 0",
+            "let f = fun x -> let rec h = fun y -> x in let a = g(h(1)) in s(h(2)) in 0",
+            "let f = fun x -> match [x] | [w] -> (let z = w in let a = g(z) in s(z)) | _ -> \"\" in 0",
+        ] {
+            let err = run_source(&format!("{gs}{src}")).unwrap_err();
+            assert!(err.contains("expected Str, found Int"), "{src}: {err}");
+        }
+        let err = run_source("let f = fun x: Vec(n) -> let a = x in let k: Vec(5) = a in let j: Vec(4) = a in j in 0").unwrap_err();
+        assert!(err.contains("index 4 does not unify with index 5"), "{err}");
+        assert_eq!(run_source(&format!("{gs}let f = fun x -> let h = fun y -> y in let a = g(h(1)) in s(h(\"b\")) in f(0)")).unwrap().to_string(), "b");
+    }
+
     // Task 6: closes the Expr::App/coerce gap the test just above
     // documents (and Expr::Let/LetRec's identical gap) -- coerce() alone
     // can't bind an index variable, so consistent()'s Type::Indexed arm
