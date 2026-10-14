@@ -1,0 +1,6 @@
+// A value shared as a DAG (2^6 leaves, 7 distinct nodes) checks against a type shared the same way, and a union diamond accepts its value.
+let P0 = Int in let P1 = Tuple((P0, P0)) in let P2 = Tuple((P1, P1)) in let P3 = Tuple((P2, P2)) in let P4 = Tuple((P3, P3)) in let P5 = Tuple((P4, P4)) in let P6 = Tuple((P5, P5)) in
+let v0 = 1 in let v1 = (v0, v0) in let v2 = (v1, v1) in let v3 = (v2, v2) in let v4 = (v3, v3) in let v5 = (v4, v4) in let v6 = (v5, v5) in
+let d: Dyn = v6 in let t: P6 = d in
+let T0 = Int in let T1 = Union((Tuple((Int, T0)), Tuple((Bool, T0)))) in let T2 = Union((Tuple((Int, T1)), Tuple((Bool, T1)))) in let T3 = Union((Tuple((Int, T2)), Tuple((Bool, T2)))) in let T4 = Union((Tuple((Int, T3)), Tuple((Bool, T3)))) in
+let e: Dyn = (1, (true, (1, (true, 5)))) in let u: T4 = e in 0

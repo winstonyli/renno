@@ -9823,4 +9823,152 @@ g(len)").unwrap_err();
         let src = "handle [perform c(0), perform c(0)] with deep(handler c(p, resume) -> resume(1) ++ resume(2))";
         assert_eq!(run_source(src).unwrap().to_string(), "[1, 1, 1, 2, 2, 1, 2, 2]");
     }
+
+    // ---- types shaped as DAGs: checking costs the distinct nodes, not the expanded tree ----
+
+    // `run_source` on its own thread, panicking when it has not finished in `secs`: an
+    // exponential checker then fails the test instead of hanging it (the stuck thread is
+    // left behind and dies with the test process).
+    fn finishes_within(secs: u64, src: &str) -> Result<Outcome, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let src = src.to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_source(&src));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs)).unwrap_or_else(|_| panic!("did not finish within {secs}s"))
+    }
+
+    // `let T0 = Int in let T1 = <ctor with P replaced by T0> in ...`: n + 1 distinct types whose
+    // expansions have 2^n leaves.
+    fn dag_chain(ctor: &str, n: usize) -> String {
+        let mut src = String::from("let T0 = Int in ");
+        for i in 1..=n {
+            src.push_str(&format!("let T{i} = {} in ", ctor.replace('P', &format!("T{}", i - 1))));
+        }
+        src
+    }
+
+    const DAG_CTORS: [&str; 6] = [
+        "Tuple((P, P))",
+        "Fun((P, P))",
+        "Record({a: P, b: P})",
+        "Union((Tuple((Int, P)), Tuple((Bool, P))))",
+        "Union((P, Tuple((P,))))",
+        "List(Tuple((P, P)))",
+    ];
+
+    // Every way a checked type is used, with `@` for the type under test.
+    const DAG_PHASES: [(&str, &str); 8] = [
+        ("annotation only", "let f = fun x: @ -> 0 in 0"),
+        ("one use", "let f = fun x: @ -> 0 in let g = fun y: @ -> f(y) in 0"),
+        ("unannotated use and generalization", "let f = fun x: @ -> 0 in let h = fun z -> f(z) in let id = h in 0"),
+        ("Dyn crossing, not run", "let g = fun d: Dyn -> (let y: @ = d in 0) in 0"),
+        ("unify_fits rescue", "let k = fun y: @ | Int -> 0 in let g = fun y: @ -> k(y) in 0"),
+        ("if join", "let g = fun x: @ -> if true then x else 0 in 0"),
+        ("match", "let g = fun x: @ -> match x | _ -> 0 in 0"),
+        ("run-time ==", "if @ == @ then 0 else 1"),
+    ];
+
+    #[test]
+    fn dag_types_check_in_time_linear_in_distinct_nodes() {
+        for n in [20, 24, 30] {
+            for ctor in DAG_CTORS {
+                for (phase, tail) in DAG_PHASES {
+                    eprintln!("n={n} {ctor} / {phase}");
+                    let src = format!("{}{}", dag_chain(ctor, n), tail.replace('@', &format!("T{n}")));
+                    assert_eq!(finishes_within(20, &src).expect("runs").as_int(), 0, "n={n} {ctor} / {phase}");
+                }
+            }
+        }
+    }
+
+    // Two separately built equal chains are one type.
+    #[test]
+    fn dag_separately_built_equal_types_are_one_type() {
+        for n in [20, 24, 30] {
+            for ctor in ["Tuple((P, P))", "Union((Tuple((Int, P)), Tuple((Bool, P))))"] {
+                let u_ctor = ctor.replace('P', "U?");
+                let mut src = dag_chain(ctor, n);
+                src.push_str("let U0 = Int in ");
+                for i in 1..=n {
+                    src.push_str(&format!("let U{i} = {} in ", u_ctor.replace('?', &format!("{}", i - 1))));
+                }
+                let src = format!("{src}let f = fun x: T{n} -> 0 in let g = fun y: U{n} -> f(y) in if T{n} == U{n} then 0 else 1");
+                assert_eq!(finishes_within(20, &src).expect("runs").as_int(), 0, "n={n} {ctor}");
+            }
+        }
+    }
+
+    // A type function applied n times, written twice, and with an indexed leaf.
+    #[test]
+    fn dag_type_function_applied_repeatedly() {
+        for n in [20, 24, 30] {
+            let nest = |leaf: &str| format!("{}{leaf}{}", "D(".repeat(n), ")".repeat(n));
+            let src = format!(
+                "let D = fun a -> Tuple((a, a)) in let f = fun x: {} -> 0 in let g = fun y: {} -> f(y) in 0",
+                nest("Int"),
+                nest("Int")
+            );
+            assert_eq!(finishes_within(20, &src).expect("runs").as_int(), 0, "n={n} twice");
+            let src = format!("let D = fun a -> Tuple((a, a)) in let g = fun d: Dyn -> (let y: {} = d in 0) in 0", nest("Vec(3)"));
+            assert_eq!(finishes_within(20, &src).expect("runs").as_int(), 0, "n={n} Vec leaf");
+        }
+    }
+
+    #[test]
+    fn dag_recursive_groups() {
+        for n in [20, 24, 30] {
+            let src = format!(
+                "{}let rec L = Union((Tuple((T{n}, L)), Bool)) in let f = fun x: L -> x in let g = fun y: Dyn -> f(y) in f(true)",
+                dag_chain("Tuple((P, P))", n)
+            );
+            assert_eq!(finishes_within(20, &src).expect("runs").to_string(), "true", "n={n} let rec L");
+            let nest = "D(".repeat(n) + "Int" + &")".repeat(n);
+            let defs = format!("let D = fun v -> (let rec R = Union((Tuple((v, v, R)), Bool)) in R) in let A = {nest} in let B = {nest} in ");
+            for tail in [
+                "let f = fun x: A -> 0 in let g = fun y: B -> f(y) in 0",
+                "if A == B then 0 else 1",
+                "let k = fun d: Dyn -> (let y: A = d in 0) in 0",
+            ] {
+                assert_eq!(finishes_within(20, &format!("{defs}{tail}")).expect("runs").as_int(), 0, "n={n} {tail}");
+            }
+        }
+    }
+
+    // An inferred type with Var leaves, doubled n times: generalization, instantiation and
+    // resolve_deep walk a DAG.
+    #[test]
+    fn dag_inferred_var_leaves() {
+        for n in [20, 24, 30] {
+            let mut body = String::from("let p0 = (a, a) in ");
+            for i in 1..n {
+                body.push_str(&format!("let p{i} = (p{}, p{}) in ", i - 1, i - 1));
+            }
+            let src = format!("let mk = fun a -> ({body}p{}) in let r = mk(1) in 0", n - 1);
+            assert_eq!(finishes_within(20, &src).expect("runs").as_int(), 0, "n={n}");
+        }
+    }
+
+    // A value shared as a DAG checks against a type shared the same way in time linear in the
+    // distinct nodes; a wrong shared leaf is reported.
+    #[test]
+    fn dag_runtime_value_checks() {
+        let program = |n: usize, leaf: &str| {
+            let mut src = dag_chain("Tuple((P, P))", n);
+            src.push_str(&format!("let v0 = {leaf} in "));
+            for i in 1..=n {
+                src.push_str(&format!("let v{i} = (v{}, v{}) in ", i - 1, i - 1));
+            }
+            src.push_str(&format!("let d: Dyn = v{n} in let t: T{n} = d in 0"));
+            src
+        };
+        for n in [20, 24, 30] {
+            assert_eq!(finishes_within(20, &program(n, "1")).expect("runs").as_int(), 0, "n={n}");
+            // The message names the whole expected type; keep n small enough to print it.
+        }
+        let err = finishes_within(20, &program(10, "true")).unwrap_err();
+        assert!(err.contains("found Bool"), "{err}");
+        let err = finishes_within(20, &program(24, "true")).expect_err("wrong leaf");
+        assert!(err.contains("found Bool"), "{}", &err[..err.len().min(300)]);
+    }
 }

@@ -1,0 +1,3 @@
+// Runtime error: a union diamond type (2^4 expanded leaves) checked against a value whose innermost leaf is a Str.
+let T0 = Int in let T1 = Union((Tuple((Int, T0)), Tuple((Bool, T0)))) in let T2 = Union((Tuple((Int, T1)), Tuple((Bool, T1)))) in let T3 = Union((Tuple((Int, T2)), Tuple((Bool, T2)))) in let T4 = Union((Tuple((Int, T3)), Tuple((Bool, T3)))) in
+let e: Dyn = (1, (true, (1, (true, "s")))) in let u: T4 = e in 0
