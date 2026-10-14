@@ -2866,8 +2866,9 @@ g(len)").unwrap_err();
         // (see the next test for the full breakdown): parser::atom and
         // typecheck::elaborate flatten a Let/Fun chain iteratively instead
         // of recursing, frame.rs's custom iterative Drop fixes the
-        // Env teardown cost (typecheck's Ctx is a hash trie, with no
-        // chain to recurse through), and Expr moved into a
+        // Env teardown cost (typecheck's Ctx is a hash trie, but a Scheme's
+        // def holds the Ctx before its binder, so a drop path through defs
+        // is O(n) deep; it is kept short, see Ctx's doc comment), and Expr moved into a
         // flat arena (expr.rs) so dropping the whole tree is one Vec
         // drop -- O(n), no recursion -- instead of a recursive walk
         // through nested Rc<Expr> fields. run_source's large-stack thread
@@ -2891,7 +2892,10 @@ g(len)").unwrap_err();
         // AND dropping everything afterward, all on the default stack, at
         // 10x the depth that used to crash a 256 MiB thread. Construction
         // was fixed by chain flattening (parser.rs, typecheck.rs); Ctx/Env
-        // teardown by frame.rs's custom Drop (Ctx is a hash trie); Expr's own teardown by
+        // teardown by frame.rs's custom Drop; Ctx is a hash trie, but
+        // Scheme.def -> CheckDef.ctx -> trie -> previous Scheme is an O(n)
+        // drop path, and this test survives only because the Splice{Binder(def)}
+        // entries drop innermost-first in settle_erasure; Expr's own teardown by
         // moving the AST into a flat arena (expr.rs) instead of a linked
         // Rc<Expr> tree -- dropping the arena is dropping one Vec.
         let n = 50_000;
@@ -5210,6 +5214,32 @@ g(len)").unwrap_err();
         let err = run_source("let f = fun x: Vec(n) -> let a = x in let k: Vec(5) = a in let j: Vec(4) = a in j in 0").unwrap_err();
         assert!(err.contains("index 4 does not unify with index 5"), "{err}");
         assert_eq!(run_source(&format!("{gs}let f = fun x -> let h = fun y -> y in let a = g(h(1)) in s(h(\"b\")) in f(0)")).unwrap().to_string(), "b");
+    }
+
+    // A type variable bound to a type that mentions a row or index variable
+    // keeps that variable open: `x` is bound through `u`'s unification, and
+    // its alias `g`/`a` must not generalize over it.
+    // Rejected at the program as a whole (column 1), exactly like the control
+    // that uses `x` instead of the alias; a run-time error would blame the
+    // `perform` (column 95 / 99).
+    #[test]
+    fn row_variable_behind_a_bound_type_variable_stays_open_via_call() {
+        let err = run_source("let mk = fun cb: (Dyn ->{e} Dyn) -> cb in let f = fun x -> let u = mk(x) in let g = x in g in f(fun y -> perform choose(y))(0)").unwrap_err();
+        assert!(err.contains("line 1, column 1: unhandled effect: choose"), "{err}");
+    }
+
+    #[test]
+    fn row_variable_behind_a_bound_type_variable_stays_open_via_branch() {
+        let err = run_source("let f = fun x -> let u = (fun cb: (Dyn ->{e} Dyn) -> if true then cb else x) in let g = x in g in f(fun y -> perform choose(y))(0)").unwrap_err();
+        assert!(err.contains("line 1, column 1: unhandled effect: choose"), "{err}");
+    }
+
+    #[test]
+    fn index_variable_behind_a_bound_type_variable_stays_open() {
+        let err = run_source("let f = fun x -> let u = (fun w: Vec(m) -> if true then w else x) in let a = x in let j: Vec(4) = a in len(j) in f([1,2,3,4,5])").unwrap_err();
+        assert!(err.contains("line 1, column 116: type mismatch: expected [Dyn](4), found [Int](5)"), "{err}");
+        let err = run_source("let f = fun x -> let u = (fun w: Vec(m) -> if true then w else x) in let a = x in let k: Vec(5) = a in let j: Vec(4) = a in j in f([1,2,3,4,5])").unwrap_err();
+        assert!(err.contains("line 1, column 120: type mismatch: index 4 does not unify with index 5"), "{err}");
     }
 
     // Task 6: closes the Expr::App/coerce gap the test just above

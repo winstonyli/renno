@@ -113,7 +113,7 @@ fn reopen(var: &TyVar, infer: &InferCtx) -> BTreeSet<TyVar> {
     match var {
         TyVar::Row(_) => BTreeSet::from([var.clone()]),
         TyVar::Type(name) => {
-            vars_in(&infer.resolve_deep(&Type::Var(name.clone()))).into_iter().filter(|v| matches!(v, TyVar::Type(_))).collect()
+            vars_in(&infer.resolve_deep(&Type::Var(name.clone())))
         }
         TyVar::Index(name) => {
             free_index_vars(&infer.resolve_index_deep(&IndexExpr::Var(name.clone()))).into_iter().map(TyVar::Index).collect()
@@ -4252,8 +4252,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 _ => elaborate(arena, a, ctx, spans, infer)?,
             };
             // Resolve before dispatching: f_ty is read straight out of
-            // Ctx (via lookup), which -- since Task 7's ctx-wide
-            // generalization -- can hand back a raw Type::Var that
+            // Ctx (via lookup), which -- since generalization quantifies
+            // only variables not open in the context -- can hand back a raw Type::Var that
             // unify() has ALREADY bound to something concrete elsewhere
             // (e.g. a variable reused across two calls in the same
             // scope). Matching on the unresolved form would route a

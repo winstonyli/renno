@@ -6,9 +6,10 @@ use renno::run_source;
 // scaling: Env is a persistent chain of per-scope frames with O(1) extend
 // and O(hops) lookup (statically resolved by resolve.rs, so no name
 // comparison at runtime); Ctx is a persistent hash trie plus an open-variable
-// set, with O(log n) extend and lookup. This benchmark is the direct proof that a chain of n
-// bindings costs O(n) end to end, not the O(n^2) the old Vec-cloning Ctx
-// used to cost before that fix.
+// set, with O(log n) extend and lookup. This benchmark checks that a chain of
+// n bindings costs O(n) end to end, not the O(n^2) the old Vec-cloning Ctx
+// used to cost. Its chain has no type variables, so it does not exercise
+// the open-variable set (open_vars).
 //
 // n=1000 used to crash the process here with STATUS_STACK_OVERFLOW:
 // unlike machine::run (trampolined, stack-safe at any depth), the parser
