@@ -28,7 +28,7 @@ pub enum VarRef {
 // its check-time evaluations, since a closure built in one run is called in a
 // later one, and its body needs an entry whichever run resolved it. A node
 // must be resolved under one layout only.
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct Resolved {
     base: usize,
     vars: Vec<Option<VarRef>>,

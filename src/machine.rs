@@ -114,20 +114,29 @@ pub const ANNOTATION_FUEL: u64 = 1_000_000;
 // (eval_pure_in; typecheck's annotation_type). It never prints, and it leaves
 // CURRENT_SPAN as it found it.
 pub fn eval_pure(arena: &Arena, expr: ExprRef, spans: &SpanMap, fuel: u64) -> Pure {
-    eval_pure_in(arena, expr, &[], Vec::new(), &mut Resolved::default(), spans, fuel)
+    run_pure(arena, expr, Env::prelude(), spans, &resolve(arena, expr), fuel)
 }
 
-// `eval_pure` inside one enclosing frame: `names` are bound to `values`, and
-// `expr` is resolved into `resolved`, which the caller keeps so that a closure
-// this evaluation returns (or stores in a value) can be called by a later one
-// that shares the table.
-pub fn eval_pure_in(arena: &Arena, expr: ExprRef, names: &[String], values: Vec<Value>, resolved: &mut Resolved, spans: &SpanMap, fuel: u64) -> Pure {
+// `eval_pure` inside one enclosing frame: `names` are bound to `values`. A
+// copy of `expr` is resolved into `resolved`, which the caller keeps so that a
+// closure this evaluation returns (or stores in a value) can be called by a
+// later one that shares the table. The copy is what keeps that table sound: a
+// variable's slot is only valid for the layout its node was resolved under, and
+// the same tree can be evaluated under several (a `let` nested in another
+// definition's right-hand side is reached by both), so every evaluation gets
+// nodes no other evaluation has resolved.
+pub fn eval_pure_in(arena: &mut Arena, expr: ExprRef, names: &[String], values: Vec<Value>, resolved: &mut Resolved, spans: &SpanMap, fuel: u64) -> Pure {
     debug_assert_eq!(names.len(), values.len(), "eval_pure_in: one value per name");
+    let expr = crate::expr::copy_tree(arena, expr);
     crate::resolve::resolve_into(arena, expr, names, resolved);
     let mut frame = Bindings::default();
     values.into_iter().for_each(|v| frame.push(v));
     let env = frame.extend(&Env::prelude());
-    let resolved = &*resolved;
+    run_pure(arena, expr, env, spans, resolved, fuel)
+}
+
+// Runs `expr` (resolved in `resolved`) in check mode; see eval_pure.
+fn run_pure(arena: &Arena, expr: ExprRef, env: Env, spans: &SpanMap, resolved: &Resolved, fuel: u64) -> Pure {
     let saved_span = current_span();
     let run = std::panic::AssertUnwindSafe(|| run_loop::<true>(arena, Control::Eval(expr, env), Cont::nil(), spans, resolved, fuel));
     let result = std::panic::catch_unwind(run);
@@ -1852,15 +1861,42 @@ mod tests {
         let (f, five) = (arena.push(Expr::Var("f".into())), arena.push(Expr::Int(5)));
         let call = arena.push(Expr::App(f, five));
         let mut table = Resolved::default();
-        let Pure::Done(closure) = eval_pure_in(&arena, lam, &["a".to_string()], vec![Value::Int(10)], &mut table, &spans, 100) else {
+        let Pure::Done(closure) = eval_pure_in(&mut arena, lam, &["a".to_string()], vec![Value::Int(10)], &mut table, &spans, 100) else {
             panic!("the lambda must evaluate")
         };
-        let Pure::Done(sum) = eval_pure_in(&arena, call, &["f".to_string()], vec![closure], &mut table, &spans, 100) else {
+        let Pure::Done(sum) = eval_pure_in(&mut arena, call, &["f".to_string()], vec![closure], &mut table, &spans, 100) else {
             panic!("the call must evaluate")
         };
         assert_eq!(sum.as_int(), 15);
-        let Pure::Done(pair) = eval_pure_in(&arena, five, &[], Vec::new(), &mut table, &spans, 100) else { panic!("a literal") };
+        let Pure::Done(pair) = eval_pure_in(&mut arena, five, &[], Vec::new(), &mut table, &spans, 100) else { panic!("a literal") };
         assert_eq!(pair.as_int(), 5);
+    }
+
+    // One root evaluated under two different frames: each evaluation runs its
+    // own copy, so the closures it builds read their own `a` and the shared
+    // table never sees one node under two layouts.
+    #[test]
+    fn eval_pure_in_evaluates_one_root_under_two_frames() {
+        let mut arena = Arena::new();
+        let spans = SpanMap::new();
+        let (x, a) = (arena.push(Expr::Var("x".into())), arena.push(Expr::Var("a".into())));
+        let body = arena.push(Expr::BinOp(BinOp::Add, x, a));
+        let lam = arena.push(Expr::Lambda("x".into(), None, body));
+        let (f, five) = (arena.push(Expr::Var("f".into())), arena.push(Expr::Int(5)));
+        let call = arena.push(Expr::App(f, five));
+        let mut table = Resolved::default();
+        let build = |arena: &mut Arena, names: &[&str], values: Vec<Value>, table: &mut Resolved| {
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let Pure::Done(closure) = eval_pure_in(arena, lam, &names, values, table, &spans, 100) else { panic!("the lambda must evaluate") };
+            closure
+        };
+        let c1 = build(&mut arena, &["a"], vec![Value::Int(10)], &mut table);
+        let c2 = build(&mut arena, &["z", "a"], vec![Value::Int(0), Value::Int(20)], &mut table);
+        for (closure, want) in [(c1, 15), (c2, 25)] {
+            let Pure::Done(sum) = eval_pure_in(&mut arena, call, &["f".to_string()], vec![closure], &mut table, &spans, 100) else { panic!("the call must evaluate") };
+            assert_eq!(sum.as_int(), want);
+        }
+        build(&mut arena, &["a"], vec![Value::Int(30)], &mut table);
     }
 
     #[test]

@@ -512,6 +512,64 @@ impl Expr {
     }
 }
 
+// A fresh copy of the parsed tree rooted at `root`: every node reachable from it
+// is pushed again, children mapped to their copies (annotation slots included;
+// a node reached twice is copied once, so the copy shares as the original does).
+// Iterative, so a deep chain costs no native stack. Check-time evaluation runs
+// the copy (machine::eval_pure_in), which gives each evaluation nodes of its own.
+pub fn copy_tree(arena: &mut Arena, root: ExprRef) -> ExprRef {
+    let mut copies: HashMap<ExprRef, ExprRef> = HashMap::new();
+    let mut stack = vec![(root, false)];
+    let mut kids = Vec::new();
+    while let Some((n, expanded)) = stack.pop() {
+        if copies.contains_key(&n) {
+            continue;
+        }
+        if !expanded {
+            stack.push((n, true));
+            kids.clear();
+            arena[n].children(&mut kids);
+            stack.extend(kids.iter().filter(|k| !copies.contains_key(*k)).map(|k| (*k, false)));
+            continue;
+        }
+        let at = |k: &ExprRef| copies[k];
+        let node = match &arena[n] {
+            Expr::Check(..) | Expr::Annot(..) | Expr::Conform(..) | Expr::Len(_) => unreachable!("a check-time evaluation runs a parsed tree"),
+            Expr::Int(i) => Expr::Int(*i),
+            Expr::Float(f) => Expr::Float(*f),
+            Expr::Bool(b) => Expr::Bool(*b),
+            Expr::Str(s) => Expr::Str(s.clone()),
+            Expr::Token(t) => Expr::Token(*t),
+            Expr::Var(v) => Expr::Var(v.clone()),
+            Expr::TypeLit(t) => Expr::TypeLit(t.clone()),
+            Expr::Tuple(items) => Expr::Tuple(items.iter().map(at).collect()),
+            Expr::ListLit(items) => Expr::ListLit(items.iter().map(at).collect()),
+            Expr::Record(fields) => Expr::Record(Rc::new(fields.iter().map(|(name, v)| (name.clone(), at(v))).collect())),
+            Expr::FieldAccess(e, name) => Expr::FieldAccess(at(e), name.clone()),
+            Expr::Lambda(param, ann, body) => Expr::Lambda(param.clone(), ann.as_ref().map(at), at(body)),
+            Expr::App(f, a) => Expr::App(at(f), at(a)),
+            Expr::Let(name, ann, val, body) => Expr::Let(name.clone(), ann.as_ref().map(at), at(val), at(body)),
+            Expr::LetRec(bindings, body) => {
+                Expr::LetRec(Rc::new(bindings.iter().map(|(name, ann, v)| (name.clone(), ann.as_ref().map(at), at(v))).collect()), at(body))
+            }
+            Expr::BinOp(op, a, b) => Expr::BinOp(*op, at(a), at(b)),
+            Expr::If(c, t, e) => Expr::If(at(c), at(t), at(e)),
+            Expr::Perform(effect, e) => Expr::Perform(effect.clone(), at(e)),
+            Expr::Handle { body, handler } => Expr::Handle { body: at(body), handler: at(handler) },
+            Expr::MakeHandler { effect, payload_var, resume_var, body } => {
+                Expr::MakeHandler { effect: effect.clone(), payload_var: payload_var.clone(), resume_var: resume_var.clone(), body: at(body) }
+            }
+            Expr::Match(scrutinee, arms) => Expr::Match(
+                at(scrutinee),
+                Rc::new(arms.iter().map(|(pat, guard, body)| (pat.clone(), guard.as_ref().map(at), at(body))).collect()),
+            ),
+        };
+        let copy = arena.push(node);
+        copies.insert(n, copy);
+    }
+    copies[&root]
+}
+
 // Gives every node typecheck synthesized (index >= spans.len()) the span of its children's
 // hull, so spans.get(n) is Some for every node of the elaborated tree rooted at `root`. A
 // synthesized leaf takes its parent's span; a node unreachable from `root` takes the root's.

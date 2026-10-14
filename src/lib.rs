@@ -2966,6 +2966,111 @@ g(len)").unwrap_err();
         assert_eq!(run_source(src).unwrap().as_int(), 1);
     }
 
+    // A `let` nested in another definition's right-hand side is a definition of
+    // its own whose nodes also sit inside the enclosing one: each evaluation
+    // must run its own copy. Every result is what the checker gave before
+    // definitions were evaluated once (bbdc1cf).
+    #[test]
+    fn definitions_nested_in_definitions_evaluate_as_before() {
+        let cases: &[(&str, &str)] = &[
+            ("let A = Int in let F = fun u -> (let B = A in let y: B = 1 in B) in let x: F(0) = 1 in x", "1"),
+            ("let A = Int in let F = fun u -> (let B = A in let y: B = 1 in B) in let G = F(0) in let z: Tuple(G, G) = (1, 2) in z", "[1, 2]"),
+            ("let Base = Int in let MkPair = fun a -> (let P = Tuple(Base, Base) in let p: P = (1, 2) in P) in let x: MkPair(1) = (1, 2) in x", "[1, 2]"),
+            ("let Base = Int in let rec F = fun n -> (let P = List(Base) in let p: P = [1] in P) in let x: F(1) = [2] in x", "[2]"),
+            ("let A = Int in let F = fun u -> (let rec g = fun n -> A in let y: g(0) = 1 in g(0)) in let x: F(0) = 1 in x", "1"),
+            ("let A = Int in let rec F = fun n -> (let B = A in let y: B = 1 in let z: F(0) = 1 in B) in 0", "0"),
+            ("let A = Int in let rec F = fun n -> (let z: F(0) = 1 in if n == 0 then Int else (let C = A in let w: C = 1 in C)) in 0", "0"),
+            ("let A = Int in let rec F = fun n -> (let z: F(0) = 1 in if n == 0 then Int else (let rec L = Union(Tuple(A, L), Bool) in L)) in 0", "0"),
+            ("let A = Int in let rec F = fun n -> (let G = fun v -> A in let y: G(0) = 1 in let z: F(0) = 1 in let w: G(1) = 2 in A) in 0", "0"),
+            ("let A = Int in let X = Bool in let F = Tuple(X, (let B = A in let y: B = 1 in B)) in let z: F = (true, 1) in z", "[true, 1]"),
+            ("let A = Int in let F = fun p -> match p | k -> (let B = A in let y: B = 1 in B) in let x: F(0) = 3 in x", "3"),
+            ("let A = Int in let rec F = fun n -> if n == 0 then Int else (let z: F(0) = 1 in let B = A in let y: B = 1 in B) in let x: F(1) = 1 in x", "1"),
+            ("let Base = Int in let MkPair = fun a -> (let P = Tuple(Base, Base) in let p: P = (1, 2) in P) in 0", "0"),
+            ("let A = Int in let F = (let B = A in let y: B = 1 in B) in let x: F = 1 in x", "1"),
+        ];
+        for (src, want) in cases {
+            assert_eq!(run_source(src).unwrap().to_string(), *want, "{src}");
+        }
+        let errors: &[(&str, &str)] = &[
+            // Main's older, separate bug: a right-hand side containing a recursive
+            // type group runs the parsed group, so `L` is unbound there.
+            ("let A = Int in let MkL = fun u -> (let C = A in let rec L = Union(Tuple(C, L), Bool) in L) in let x: MkL(0) = true in x", "line 1, column 102: unbound variable: L"),
+            ("let A = Int in let F = fun u -> (let B = A in let y: B = 1 in B) in let x: F(0) = true in x", "line 1, column 83: type mismatch: expected Int, found Bool"),
+            ("let A = List(1) in let F = fun u -> (let B = A in let y: B = 1 in B) in 0", "line 1, column 58: List cannot take a Int"),
+        ];
+        for (src, want) in errors {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains(want), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn copy_tree_makes_new_nodes_that_evaluate_the_same() {
+        use crate::expr::{copy_tree, Expr};
+        use cranelift_entity::EntityRef;
+        use std::collections::HashSet;
+        let src = "let o = opaque in let rec go = fun n -> if n == 0 then [] else n :: go(n - 1) in \
+                   let r = {b: (1, 2.5), a: \"s\"} in \
+                   let h = handle perform ping(3) with handler ping(x, k) -> k(x + 1) in \
+                   let m = match go(2) | [a, b] if a == 2 -> a + b | _ -> 0 in \
+                   let t: Int = m * 2 in (o, r, h, t, go(3))";
+        let (arena, spans, root) = parser::parse(src).expect("parse");
+        let mut arena = arena;
+        let before = arena.len();
+        let want = machine::run(&arena, root, Env::prelude(), &spans).to_string();
+        let copy = copy_tree(&mut arena, root);
+        assert_ne!(copy, root);
+        let mut seen = HashSet::new();
+        let mut stack = vec![copy];
+        let mut tokens = Vec::new();
+        let mut originals = Vec::new();
+        let mut kids = Vec::new();
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            assert!(n.index() >= before, "node {n:?} of the copy is an original");
+            if let Expr::Token(id) = &arena[n] {
+                tokens.push(*id);
+            }
+            kids.clear();
+            arena[n].children(&mut kids);
+            stack.extend(kids.iter().copied());
+        }
+        stack.push(root);
+        let mut seen_orig = HashSet::new();
+        while let Some(n) = stack.pop() {
+            if !seen_orig.insert(n) {
+                continue;
+            }
+            if let Expr::Token(id) = &arena[n] {
+                originals.push(*id);
+            }
+            kids.clear();
+            arena[n].children(&mut kids);
+            stack.extend(kids.iter().copied());
+        }
+        assert!(!tokens.is_empty());
+        tokens.sort_unstable();
+        originals.sort_unstable();
+        assert_eq!(tokens, originals);
+        assert_eq!(machine::run(&arena, copy, Env::prelude(), &spans).to_string(), want);
+    }
+
+    // The copy walks and rebuilds iteratively: 50k nested lets on the default stack.
+    #[test]
+    fn copy_tree_is_iterative() {
+        use crate::expr::{copy_tree, Arena, Expr};
+        let mut arena = Arena::new();
+        let mut body = arena.push(Expr::Int(0));
+        for _ in 0..50_000 {
+            let val = arena.push(Expr::Int(1));
+            body = arena.push(Expr::Let("x".into(), None, val, body));
+        }
+        let copy = copy_tree(&mut arena, body);
+        let _resolved = resolve::resolve(&arena, copy);
+    }
+
     #[test]
     fn deep_cont_chain_drops_without_overflowing_the_stack() {
         // Cont(Rc<ContNode>) is a struct wrapping an Rc pointing at

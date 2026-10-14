@@ -222,9 +222,6 @@ pub(crate) struct CheckDef {
     deps: OnceCell<Deps>,
     // Its right-hand side's value, computed on first demand (def_value).
     value: OnceCell<DefValue>,
-    // For a group: the `let rec (bindings) in (names)` node that evaluates it
-    // to the tuple of its values, made once.
-    synth: OnceCell<ExprRef>,
     // The scope before the binder: where the right-hand side's names resolve.
     ctx: Ctx,
     // The elaborated value(s): what the run time evaluates for this binder.
@@ -534,7 +531,6 @@ impl InferCtx {
             node,
             deps: OnceCell::new(),
             value: OnceCell::new(),
-            synth: OnceCell::new(),
             ctx: ctx.clone(),
             values,
             fallible: OnceCell::new(),
@@ -3688,11 +3684,11 @@ fn def_value(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx, i: usize)
     };
     let root = match &def.node {
         DefNode::Let(rhs) => *rhs,
-        DefNode::Group(bindings) => *def.synth.get_or_init(|| {
+        DefNode::Group(bindings) => {
             let members: Vec<ExprRef> = bindings.iter().map(|(n, _, _)| arena.push(Expr::Var(n.clone()))).collect();
             let tuple = arena.push(Expr::Tuple(members));
             arena.push(Expr::LetRec(bindings.clone(), tuple))
-        }),
+        }
     };
     match eval_pure_in(arena, root, &names, values, &mut infer.resolved, spans, ANNOTATION_FUEL) {
         Pure::Done(value) => DefValue::Done(value),
@@ -3774,16 +3770,11 @@ fn recursive_type_group(
         let roots: Vec<usize> = reads.iter().map(|r| r.def).collect();
         ensure_values(arena, spans, infer, &roots);
         // The group's names are bound to their leaves, then the values read.
-        // A table of its own, seeded with the shared one (a definition's closure
-        // may be called): this value's nodes are resolved under this layout, and
-        // the group may yet turn out to be an ordinary `let rec` that resolves
-        // them under another.
         let (read_names, read_values) = read_frame(infer, &reads).ok()?;
         let frame_names: Vec<String> = names.iter().cloned().chain(read_names).collect();
         let leaves = ids.iter().map(|id| Value::Type(Rc::new(Type::Named(id.clone()))));
         let frame_values: Vec<Value> = leaves.chain(read_values).collect();
-        let mut table = infer.resolved.clone();
-        let ty = (*pure_type(eval_pure_in(arena, *v, &frame_names, frame_values, &mut table, spans, ANNOTATION_FUEL)).ok()?).clone();
+        let ty = (*pure_type(eval_pure_in(arena, *v, &frame_names, frame_values, &mut infer.resolved, spans, ANNOTATION_FUEL)).ok()?).clone();
         if matches!(&ty, Type::Named(n) if ids.contains(n)) {
             return None;
         }
