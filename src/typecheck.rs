@@ -153,8 +153,12 @@ pub(crate) struct Ctx {
 }
 
 // What a written annotation variable stands for in a scope. `universal`: a function
-// signature's or a lambda parameter's variable, one the body may not pin; otherwise an
-// existential, one the checked value fixes.
+// signature's or a lambda parameter's variable, one an inner binder of the same name
+// shares; otherwise an existential, one the checked value fixes. Only a signature's
+// variables are rigid (`rigid_index`: the body may not pin them); a lambda parameter's
+// stays flexible, so a body that pins it is rejected by the ordinary mismatch, not by
+// "fixed by the signature". A body annotation reusing the name shares the variable
+// either way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AnnotVar {
     pub(crate) var: TyVar,
@@ -943,9 +947,10 @@ pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
 }
 
 // Ordinary (non-generalized) binding -- lambda parameters, and anything
-// else that isn't a `let`. Row variables in `ty`, if any, stay exactly as
-// written: shared verbatim by every use within this one scope, not
-// instantiated fresh per use (that's what `extend_generalized` is for).
+// else that isn't a `let`. Variables in `ty`, if any, are shared verbatim by
+// every use within this one scope, not instantiated fresh per use (that's what
+// `extend_generalized` is for). Annotation row variables are already fresh
+// `e#k` by the time they get here (open_annotation).
 //
 // `pub(crate)`, not private: Task 3's own Case B tests need to bind a
 // scrutinee variable directly to a hand-built `Type::Indexed(Type::
@@ -1499,10 +1504,12 @@ fn cast_up(arena: &mut Arena, res: ExprRef, b: &Type, b_target: &Type, env: &Che
 // so a nested wrapper compares against the outer value. Any other open index
 // degrades to is_list.
 // Known limitation (spec 2026-10-08 sec 7): a monomorphic `n` that no witness
-// in scope covers (e.g. `n` fixed by an earlier Dyn-to-Vec(n) check, then
-// `let f = fun w: Vec(n) -> .. in let d: Dyn = f in d([1])`) gets a fresh
-// per-call witness, so DOWN checks list shape only, while the direct call
-// `f([1])` is rejected. Pinned by a test.
+// in scope covers gets a fresh per-call witness, so DOWN checks list shape
+// only. The real case is `n` bound through a tuple-typed existential
+// (`let y: Vec(n) = x in let p: ((Vec(n) -> Int), Int) = (fun w -> len(w), 0)
+// in match p | (f, _) -> let d: Dyn = f in d([1])` returns 1), while the
+// direct call `f([1])` fails at run time. Pinned by
+// `a_monomorphic_vec_n_witness_checks_list_shape_only_in_the_closure_form_known_limitation`.
 fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let Type::Fun(a, _, b) = from else { unreachable!("build_cast takes a Fun source") };
     let (a_target, b_target) = cast_targets(to, env.infer);
@@ -3617,7 +3624,12 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 let mut val_ctx = cur_ctx.clone();
                 // Each annotation opened once, against the outer scope and
                 // into one `introduced` vector (a name two members write is
-                // one variable; written by both a function and a non-function
+                // one variable, unless an outer existential of that name is in
+                // scope: a function member then shadows it with a fresh one
+                // while a non-function member shares the outer one, so
+                // `let rec f: (Vec(n) -> Int) = .. and k: Vec(n) = [1, 2]`
+                // differs with and without `let a: Vec(n) = [1, 2] in` in
+                // front; written by both a function and a non-function
                 // member it is existential), so the pre-binding below and the
                 // value check share its variables. A kept one is evaluated
                 // before the group, in the scope its annotation was

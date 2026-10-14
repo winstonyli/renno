@@ -7126,7 +7126,7 @@ g(len)").unwrap_err();
     #[test]
     fn signature_variable_shadows_an_earlier_existential_of_the_same_name() {
         // `let a: Vec(n) = [1, 2]` binds the existential n := 2 for the rest of
-        // the program; a later function signature reusing the name `n` must
+        // the scope; a later function signature reusing the name `n` must
         // still quantify its own variable, not inherit 2.
         let accepted = [
             ("let a: Vec(n) = [1, 2] in let f: (Vec(n) -> Vec(n)) = fun v -> v in f([1, 2, 3])", "[1, 2, 3]"),
@@ -7149,6 +7149,65 @@ g(len)").unwrap_err();
         // `Int -> Vec(n)` promises every length, so returning the length-2 `a` is rejected.
         let src = "let a: Vec(n) = [1, 2] in let f: (Int -> Vec(n)) = fun k -> a in 0";
         assert!(run_source(src).unwrap_err().contains("fixed by the signature"));
+    }
+
+    // Known limitation, pinned (not desired behaviour). The scoped universal `n` of the
+    // signature `Int -> Vec(n)` / parameter `Vec(n)` unifies with an existential `n` that is
+    // still open in an enclosing scope and was only ever checked at run time (Dyn into
+    // Vec(n)), so the checker finds no static conflict and the run-time check has no value
+    // for `n` to compare a length against. main accepted these (returning 2 and 0). Intended
+    // fix, NOT implemented (parked): report the usual "fixed by the signature" static error
+    // when a scoped universal would unify with a variable open in an enclosing scope.
+    #[test]
+    fn a_scoped_universal_unifying_with_an_enclosing_open_variable_is_a_runtime_error_known_limitation() {
+        let programs = [
+            // 1a: signature `Int -> Vec(n)` returning the Dyn-checked existential `y`
+            "let x: Dyn = [1, 2] in let y: Vec(n) = x in let f: (Int -> Vec(n)) = fun k -> y in len(f(0))",
+            // 1b: parameter annotation `Vec(n)` whose body re-annotates the outer existential `a`
+            "let x: Dyn = [1, 2] in let a: Vec(n) = x in let f = fun v: Vec(n) -> let r: Vec(n) = a in r in 0",
+        ];
+        for src in programs {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains("line 1, column 40"), "{src}: unexpected message: {err}");
+            assert!(err.contains("index variable n has no runtime value to check a length against"), "{src}: unexpected message: {err}");
+        }
+    }
+
+    // Known limitation, pinned. The body's `let b: Vec(2) = a` pins the parameter's flexible
+    // `n := 2` (a lambda parameter's variable is not rigid), and the inner signature's
+    // `Vec(n) -> Int` still sees that `n` as open in the enclosing scope, so `f([1, 2, 3])`
+    // is checked against length 2 instead of the signature generalising its own `n`. main
+    // returned 3. The message ([Dyn](2)) does not say which `n` it means.
+    #[test]
+    fn a_pinned_parameter_variable_leaks_into_an_inner_signature_known_limitation() {
+        let src = "(fun a: Vec(n) -> let b: Vec(2) = a in let f: (Vec(n) -> Int) = fun v -> len(v) in f([1, 2, 3]))([1, 2])";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("line 1, column 86"), "unexpected message: {err}");
+        assert!(err.contains("expected [Dyn](2), found [Int](3)"), "unexpected message: {err}");
+    }
+
+    // Known limitation, pinned. Error messages print an index variable by the name the user
+    // wrote, so two distinct variables spelled `n` (the existential `a`'s and the lambda
+    // parameter's, generalised at the `let`) print identically in one message.
+    #[test]
+    fn two_distinct_index_variables_print_with_the_same_name_known_limitation() {
+        let src = "let x: Dyn = [1, 2] in let a: Vec(n) = x in let f = fun v: Vec(n) -> v in let r: Int = (a, f) in r";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("found ([Dyn](n), ([Dyn](n) ->{} [Dyn](n)))"), "unexpected message: {err}");
+    }
+
+    // Known limitation (spec 2026-10-08 sec 7), pinned. `n` is monomorphic here (fixed by the
+    // Dyn-to-Vec(n) check on `y`) and bound through a tuple-typed existential, so no witness in
+    // scope covers it: the closure form `d([1])` (a cast through Dyn) gets a fresh per-call
+    // witness and checks list shape only, returning 1, while the direct call `f([1])` fails at
+    // run time. The two forms should agree.
+    #[test]
+    fn a_monomorphic_vec_n_witness_checks_list_shape_only_in_the_closure_form_known_limitation() {
+        let prefix = "let x: Dyn = [1, 2] in let y: Vec(n) = x in let p: ((Vec(n) -> Int), Int) = (fun w -> len(w), 0) in match p | (f, _) -> ";
+        assert_eq!(run_source(&format!("{prefix}let d: Dyn = f in d([1])")).unwrap().as_int(), 1);
+        let err = run_source(&format!("{prefix}f([1])")).unwrap_err();
+        assert!(err.contains("line 1, column 40"), "unexpected message: {err}");
+        assert!(err.contains("expected [Dyn](n), found List"), "unexpected message: {err}");
     }
 
     // A Dyn value crossing into Vec(n) is checked at runtime against n's
