@@ -25,8 +25,10 @@ pub struct TypeError(pub String, pub Span);
 
 // A binding's type, plus the variables generalized over it -- quantified
 // fresh at every use, the way ML/Haskell generalize a `let`-bound type.
-// Three sorts of variable can be quantified. Row variables only ever come
-// from what the user wrote (an explicit `->{e}` annotation); type variables
+// Three sorts of variable can be quantified. Row variables come from a
+// `->{e}` the user wrote, but the name is never kept: the binder mints a
+// fresh `e#k` for it (open_annotation, see Ctx::annot), as it does for a
+// written index name; type variables
 // are manufactured by real unification (`unify`, via `InferCtx::fresh_var`)
 // at many sites, never written by a user -- see Type::Var's own doc comment;
 // index variables are the same idea one level down, for a name appearing
@@ -121,11 +123,12 @@ fn reopen(var: &TyVar, infer: &InferCtx) -> BTreeSet<TyVar> {
     }
 }
 
-// A scope: the visible bindings, and the variables still open in it, i.e.
-// free in some binding's type and not quantified by that binding. Both are
-// persistent, so extending a scope is cheap and an enclosing scope is
-// untouched: a `let` may quantify only a variable no enclosing scope has
-// open.
+// A scope: the visible bindings, the variables still open in it (i.e. free in
+// some binding's type and not quantified by that binding), and the annotation
+// variables its binders introduced. All three are persistent, so extending a
+// scope is cheap and an enclosing scope is untouched: a `let` may quantify
+// only a variable no enclosing scope has open, and an annotation variable is
+// visible exactly in the scope that introduced it.
 //
 // Constructing and dropping a 50k-binding chain on the default stack is
 // pinned by let_chain_is_o1_stack_construction_and_teardown. A `CheckDef`
@@ -329,7 +332,8 @@ pub(crate) struct InferCtx {
     // own index-var name.
     pub(crate) index_subst: HashMap<String, IndexExpr>,
     // Index variables that unify_index_expr must NOT bind: the free index
-    // variables of an annotated binding's signature while its value is
+    // variables of an annotated binding's signature (the fresh ones its
+    // binder introduced, not the user's spelling) while its value is
     // checked (spec 2026-10-07). Hypotheses injected by Match write
     // index_subst directly, so they are unaffected.
     pub(crate) rigid_index: HashSet<String>,
@@ -3999,12 +4003,13 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
 }
 
 // check_against for an annotated binding's value: a FUNCTION signature's
-// still-unbound index variables are rigid for the duration, so the body
-// cannot pin them (e.g. `n := 3`) by unification. Only variables THIS call
-// newly marked are released afterwards, so nested annotated bindings
-// compose. Non-function annotations (`let x: Vec(n) = [1, 2]`) keep their
-// flexible, binding-style variables: there `n` is an existential to be
-// inferred from the value, not a signature parameter. See spec 2026-10-07.
+// index variables (already the fresh ones open_annotation minted at the
+// binder) are rigid for the duration, so the body cannot pin them (e.g.
+// `n := 3`) by unification. Only variables THIS call newly marked are
+// released afterwards, so nested annotated bindings compose. Non-function
+// annotations (`let x: Vec(n) = [1, 2]`) keep their flexible, binding-style
+// variables: there `n` is an existential to be inferred from the value, not
+// a signature parameter. See spec 2026-10-07.
 fn check_against_rigid(arena: &mut Arena, val: ExprRef, ann: &Type, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<(EffectRow, ExprRef), TypeError> {
     let signature_vars = if is_signature(ann) { index_names(vars_in(&infer.resolve_deep(ann))) } else { BTreeSet::new() };
     let added: Vec<String> = signature_vars.into_iter().filter(|v| infer.rigid_index.insert(v.clone())).collect();
