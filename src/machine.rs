@@ -911,6 +911,12 @@ fn param_witness(param: &Type, arg: &Value) -> Option<(String, Len)> {
     Some((n.clone(), len))
 }
 
+#[cfg(test)]
+thread_local! {
+    // How many Lazy families conform_lazy has minted (memo misses) on this thread.
+    pub(crate) static LAZY_MINTS: Cell<usize> = const { Cell::new(0) };
+}
+
 // An Unknown site's checks against type value `t`, lowered once while the same
 // value keeps coming back (spec 11.5).
 fn conform_lazy(spec: &ConformSpec, t: Rc<Type>) -> Rc<Lazy> {
@@ -922,6 +928,8 @@ fn conform_lazy(spec: &ConformSpec, t: Rc<Type>) -> Rc<Lazy> {
         // without it every call would mint a fresh Lazy cycle.
         return seen.clone();
     }
+    #[cfg(test)]
+    LAZY_MINTS.with(|c| c.set(c.get() + 1));
     let lazy = Lazy::new(t);
     *memo = Some(lazy.clone());
     lazy

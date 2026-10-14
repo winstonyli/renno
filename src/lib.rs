@@ -2900,6 +2900,27 @@ g(len)").unwrap_err();
         typecheck::DEF_EVALS.with(|c| c.get())
     }
 
+    // A recursive type function applied afresh on every call rebuilds an equal but
+    // not pointer-equal type each time; the site's memo must still hit (the `==` half
+    // of conform_lazy), or every call mints a fresh Lazy family.
+    #[test]
+    fn a_type_rebuilt_per_call_hits_the_conform_memo() {
+        let src = |n: usize| {
+            format!(
+                "let A = fun v -> (let rec R = Union(Tuple(v, R), Bool) in R) in \
+                 let f = fun T -> fun x: A(T) -> x in \
+                 let rec go = fun i -> fun acc -> if i == 0 then acc else go(i - 1)(acc + len([f(Int)((i, true))])) in go({n})(0)"
+            )
+        };
+        let mints = |n: usize| {
+            machine::LAZY_MINTS.with(|c| c.set(0));
+            assert_eq!(run_source_on_this_thread(&src(n)).expect("runs").as_int(), n as i64);
+            machine::LAZY_MINTS.with(|c| c.get())
+        };
+        let (few, many) = (mints(5), mints(200));
+        assert_eq!(few, many, "minting must not grow with the number of calls");
+    }
+
     // Each definition an annotation reaches is evaluated once, however many
     // annotations read it and however deep the chain.
     #[test]

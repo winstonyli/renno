@@ -3688,7 +3688,7 @@ fn read_frame(infer: &InferCtx, reads: &[Read]) -> Result<(Vec<String>, Vec<Valu
 // Definition `i`'s value: its right-hand side evaluated in a frame of the
 // values of the definitions it reads, with a step budget of its own. A group's
 // definition builds its `let rec (bindings) in (names)` root here; it runs once
-// per definition, and a direct or recursive-type group is two definitions.
+// per definition, and only a group of direct `fun`s is two definitions.
 fn def_value(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx, i: usize) -> DefValue {
     #[cfg(test)]
     DEF_EVALS.with(|c| c.set(c.get() + 1));
