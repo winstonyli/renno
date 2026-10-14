@@ -1,10 +1,353 @@
+use std::cell::RefCell;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::rc::Rc;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::ops::Deref;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::LocalKey;
 
 use crate::index_expr::{index_exprs_equal, IndexExpr};
 use crate::util::find_field;
+
+// ---- Shared nodes ----------------------------------------------------------------------
+//
+// Every compound type payload is an `Hc` (a hash-consed `Rc`): building the same structure
+// twice gives the same node, so a type is a DAG whose size is its number of DISTINCT nodes
+// however large its expansion, and equal types are pointer-equal. Each node carries a
+// `Summary` of what its subtree holds (see below), computed once when the node is made.
+//
+// Node identity is exact: a node's key is its variant plus its children's pointers plus its
+// inline data (a variable's name, a token's id, an effect row, an index expression, a `Rec`'s
+// member names). `==` is the language's equality, which is coarser in one way (E1: recursive
+// groups are equal up to member names), so `Hc::eq` is a pointer test, falling back to a
+// structural comparison only when a `Rec` is inside, the one place equal types can be
+// distinct nodes (they must stay distinct so each prints its own names).
+
+// What a subtree contains. A summary may only PRUNE a walk ("this flag is absent, so the
+// walker's 'nothing here' answer holds"); it never replaces a walker's answer, because some
+// walkers stop at `Rec` or `Fun`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Summary {
+    flags: u8,
+    reach: u32,
+}
+
+impl Summary {
+    // A `Type::Var` appears.
+    pub const VAR: u8 = 1;
+    // A `Fun` has an `EffectRow::Var`.
+    pub const ROWVAR: u8 = 2;
+    // An `Indexed` appears.
+    pub const INDEXED: u8 = 4;
+    // A `RecVar::Free` placeholder appears.
+    pub const FREE: u8 = 8;
+    // A `Rec` appears.
+    pub const REC: u8 = 16;
+
+    fn of(flags: u8) -> Summary {
+        Summary { flags, reach: 0 }
+    }
+
+    fn join(self, other: Summary) -> Summary {
+        Summary { flags: self.flags | other.flags, reach: self.reach.max(other.reach) }
+    }
+
+    // Does any flag in `mask` appear?
+    pub fn any(self, mask: u8) -> bool {
+        self.flags & mask != 0
+    }
+
+    // The deepest `RecVar::Bound` reference plus one that points out of the subtree (0: no
+    // reference leaves it, so the subtree is closed).
+    pub fn reach(self) -> u32 {
+        self.reach
+    }
+}
+
+pub struct HcBox<T> {
+    summary: Summary,
+    value: T,
+}
+
+// The table of live nodes of one payload type: buckets by exact hash, holding weak
+// references so a node dies with its last user. Swept when it has doubled since the last sweep.
+pub struct Table<T> {
+    buckets: HashMap<u64, Bucket<T>, BuildHasherDefault<KeyHasher>>,
+    entries: usize,
+    sweep_at: usize,
+}
+
+// The nodes sharing one hash: almost always a single one.
+struct Bucket<T> {
+    first: Weak<HcBox<T>>,
+    more: Vec<Weak<HcBox<T>>>,
+}
+
+impl<T> Default for Table<T> {
+    fn default() -> Table<T> {
+        Table { buckets: HashMap::default(), entries: 0, sweep_at: 1024 }
+    }
+}
+
+// The table's keys are already hashes.
+#[derive(Default)]
+pub struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("keys are u64")
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+pub trait Interned: Sized + 'static {
+    fn table() -> &'static LocalKey<RefCell<Table<Self>>>;
+    fn summary(&self) -> Summary;
+    fn exact_eq(&self, other: &Self) -> bool;
+    fn exact_hash(&self, h: &mut FxHasher);
+}
+
+pub struct Hc<T: Interned>(Rc<HcBox<T>>);
+
+impl<T: Interned> Hc<T> {
+    pub fn new(value: T) -> Hc<T> {
+        let mut hasher = FxHasher::default();
+        value.exact_hash(&mut hasher);
+        let key = hasher.finish();
+        T::table().with(|cell| {
+            let mut table = cell.borrow_mut();
+            let node = match table.buckets.entry(key) {
+                Entry::Occupied(mut slot) => {
+                    let bucket = slot.get();
+                    for weak in std::iter::once(&bucket.first).chain(&bucket.more) {
+                        if let Some(found) = weak.upgrade()
+                            && found.value.exact_eq(&value)
+                        {
+                            return Hc(found);
+                        }
+                    }
+                    let node = Rc::new(HcBox { summary: value.summary(), value });
+                    slot.get_mut().more.push(Rc::downgrade(&node));
+                    node
+                }
+                Entry::Vacant(slot) => {
+                    let node = Rc::new(HcBox { summary: value.summary(), value });
+                    slot.insert(Bucket { first: Rc::downgrade(&node), more: Vec::new() });
+                    node
+                }
+            };
+            table.entries += 1;
+            if table.entries > table.sweep_at {
+                table.buckets.retain(|_, bucket| {
+                    bucket.more.retain(|w| w.strong_count() > 0);
+                    if bucket.first.strong_count() == 0 && !bucket.more.is_empty() {
+                        bucket.first = bucket.more.swap_remove(0);
+                    }
+                    bucket.first.strong_count() > 0
+                });
+                table.entries = table.buckets.values().map(|b| 1 + b.more.len()).sum();
+                table.sweep_at = 2 * table.entries + 1024;
+            }
+            Hc(node)
+        })
+    }
+
+    pub fn ptr_eq(a: &Hc<T>, b: &Hc<T>) -> bool {
+        Rc::ptr_eq(&a.0, &b.0)
+    }
+
+    // The node's address, for exact hashing.
+    fn addr(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+
+    pub fn summary(&self) -> Summary {
+        self.0.summary
+    }
+}
+
+impl<T: Interned> Clone for Hc<T> {
+    fn clone(&self) -> Hc<T> {
+        Hc(self.0.clone())
+    }
+}
+
+impl<T: Interned> Deref for Hc<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0.value
+    }
+}
+
+impl<T: Interned> AsRef<T> for Hc<T> {
+    fn as_ref(&self) -> &T {
+        &self.0.value
+    }
+}
+
+impl<T: Interned + fmt::Debug> fmt::Debug for Hc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.value.fmt(f)
+    }
+}
+
+impl<T: Interned + fmt::Display> fmt::Display for Hc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.value.fmt(f)
+    }
+}
+
+impl<T: Interned + PartialEq> PartialEq for Hc<T> {
+    fn eq(&self, other: &Hc<T>) -> bool {
+        Hc::ptr_eq(self, other) || (self.0.summary.any(Summary::REC) && other.0.summary.any(Summary::REC) && self.0.value == other.0.value)
+    }
+}
+
+// A small multiplicative hasher for node keys (the keys are short and hashed on every
+// construction).
+#[derive(Default)]
+pub struct FxHasher(u64);
+
+impl FxHasher {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+    fn write_u8(&mut self, n: u8) {
+        self.add(n as u64);
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.add(n as u64);
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.add(n);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(26)
+    }
+}
+
+macro_rules! interned_table {
+    ($t:ty) => {
+        fn table() -> &'static LocalKey<RefCell<Table<$t>>> {
+            thread_local! {
+                static TABLE: RefCell<Table<$t>> = RefCell::new(Table::default());
+            }
+            &TABLE
+        }
+    };
+}
+
+impl Interned for Type {
+    interned_table!(Type);
+
+    fn summary(&self) -> Summary {
+        match self {
+            Type::Var(_) => Summary::of(Summary::VAR),
+            Type::List(e) => e.summary(),
+            Type::Fun(a, row, b) => {
+                let rows = if matches!(row, EffectRow::Var(_)) { Summary::ROWVAR } else { 0 };
+                a.summary().join(b.summary()).join(Summary::of(rows))
+            }
+            Type::Tuple(items) | Type::Union(items) => items.summary(),
+            Type::Record(fields) => fields.summary(),
+            Type::Indexed(w, _) => w.summary().join(Summary::of(Summary::INDEXED)),
+            Type::RecVar(RecVar::Free { .. }) => Summary::of(Summary::FREE),
+            Type::RecVar(RecVar::Bound { depth, .. }) => Summary { flags: 0, reach: depth + 1 },
+            Type::Rec(g, _) => Summary { flags: g.0.bodies.summary().flags | Summary::REC, reach: g.0.escape },
+            Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) => Summary::default(),
+        }
+    }
+
+    fn exact_eq(&self, other: &Type) -> bool {
+        match (self, other) {
+            (Type::Dyn, Type::Dyn) | (Type::Int, Type::Int) | (Type::Float, Type::Float) | (Type::Bool, Type::Bool) | (Type::Str, Type::Str) => true,
+            (Type::Var(a), Type::Var(b)) => a == b,
+            (Type::List(a), Type::List(b)) => Hc::ptr_eq(a, b),
+            (Type::Fun(a1, r1, b1), Type::Fun(a2, r2, b2)) => Hc::ptr_eq(a1, a2) && r1 == r2 && Hc::ptr_eq(b1, b2),
+            (Type::Token(a), Type::Token(b)) => a == b,
+            (Type::Rec(g, i), Type::Rec(h, j)) => i == j && (Rc::ptr_eq(&g.0, &h.0) || (g.0.names == h.0.names && Hc::ptr_eq(&g.0.bodies, &h.0.bodies))),
+            (Type::RecVar(a), Type::RecVar(b)) => a == b,
+            (Type::Tuple(a), Type::Tuple(b)) | (Type::Union(a), Type::Union(b)) => Hc::ptr_eq(a, b),
+            (Type::Record(a), Type::Record(b)) => Hc::ptr_eq(a, b),
+            (Type::Indexed(a, i), Type::Indexed(b, j)) => Hc::ptr_eq(a, b) && i == j,
+            _ => false,
+        }
+    }
+
+    fn exact_hash(&self, h: &mut FxHasher) {
+        std::mem::discriminant(self).hash(h);
+        match self {
+            Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str => {}
+            Type::Var(name) => name.hash(h),
+            Type::List(e) => e.addr().hash(h),
+            Type::Fun(a, row, b) => (a.addr(), row, b.addr()).hash(h),
+            Type::Token(id) => id.hash(h),
+            Type::Rec(g, i) => (&g.0.names, g.0.bodies.addr(), i).hash(h),
+            Type::RecVar(RecVar::Bound { depth, member }) => (depth, member).hash(h),
+            Type::RecVar(RecVar::Free { id, name }) => (id, name).hash(h),
+            Type::Tuple(items) | Type::Union(items) => items.addr().hash(h),
+            Type::Record(fields) => fields.addr().hash(h),
+            Type::Indexed(w, i) => (w.addr(), i).hash(h),
+        }
+    }
+}
+
+impl Interned for Vec<Type> {
+    interned_table!(Vec<Type>);
+
+    fn summary(&self) -> Summary {
+        self.iter().fold(Summary::default(), |s, t| s.join(t.summary()))
+    }
+
+    fn exact_eq(&self, other: &Vec<Type>) -> bool {
+        self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a.exact_eq(b))
+    }
+
+    fn exact_hash(&self, h: &mut FxHasher) {
+        self.len().hash(h);
+        self.iter().for_each(|t| t.exact_hash(h));
+    }
+}
+
+impl Interned for Vec<(String, Type)> {
+    interned_table!(Vec<(String, Type)>);
+
+    fn summary(&self) -> Summary {
+        self.iter().fold(Summary::default(), |s, (_, t)| s.join(t.summary()))
+    }
+
+    fn exact_eq(&self, other: &Vec<(String, Type)>) -> bool {
+        self.len() == other.len() && self.iter().zip(other).all(|((n, a), (m, b))| n == m && a.exact_eq(b))
+    }
+
+    fn exact_hash(&self, h: &mut FxHasher) {
+        self.len().hash(h);
+        for (name, t) in self {
+            name.hash(h);
+            t.exact_hash(h);
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
@@ -41,9 +384,9 @@ pub enum Type {
     Str,
     // Element type. renno's List is a native primitive (Value::List,
     // Rc<Vec<Value>>).
-    List(Rc<Type>),
+    List(Hc<Type>),
     // param, effect row (what calling this may perform), return type.
-    Fun(Rc<Type>, EffectRow, Rc<Type>),
+    Fun(Hc<Type>, EffectRow, Hc<Type>),
     // The static type of an `opaque` expression -- a singleton, one per
     // SOURCE POSITION (the u64), never per evaluation: `opaque` written at
     // one spot always has this same type no matter how many times that
@@ -64,7 +407,7 @@ pub enum Type {
     // compares two Tuple types directly, positionally, with nothing to
     // look up. Runtime representation is a plain Value::List (see
     // Expr::Tuple's own doc comment) -- no new Value kind needed.
-    Tuple(Rc<Vec<Type>>),
+    Tuple(Hc<Vec<Type>>),
     // Fixed-arity, per-position-typed product, like Tuple -- but each
     // position also carries a field name, and consistency additionally
     // requires the names to match (not just the types). ALWAYS stored
@@ -82,7 +425,7 @@ pub enum Type {
     // to be projected away at some boundary). `coerce` uses a SEPARATE,
     // one-directional relation for that -- types::record_satisfies, not
     // this type's own (exact, symmetric) consistency.
-    Record(Rc<Vec<(String, Type)>>),
+    Record(Hc<Vec<(String, Type)>>),
     // "One of these" -- a self-contained sum, no registry/name lookup.
     // Typically each alternative is a Tuple whose first element is a
     // distinct Token (a hand-rolled sum: `Type::Union([Tuple([
@@ -91,13 +434,13 @@ pub enum Type {
     // `let Name = Union(A, B) in ...`; the union itself
     // has no runtime representation of its own, only whatever VALUE
     // actually flows through ends up being one alternative's own shape.
-    Union(Rc<Vec<Type>>),
+    Union(Hc<Vec<Type>>),
     // `Vec(n)` sugars over this -- NOT its own bespoke primitive. Wraps
     // either Type::List directly (the primary, worked case) or a
     // qualifying Type::Rec+Type::Union (derived index-refinement, a
     // later phase) with one IndexExpr tracking its own length/size.
     // See the design spec's own section 2 for the full rationale.
-    Indexed(Rc<Type>, Rc<IndexExpr>),
+    Indexed(Hc<Type>, Rc<IndexExpr>),
 }
 
 // Closed effect row: an exact known set (Closed), "unknown, could be
@@ -111,7 +454,7 @@ pub enum Type {
 // instantiation (typecheck::lookup, at each use) by simple substitution,
 // plus a small binding step at the App site where a concrete function
 // value finally supplies what the variable stands for. See typecheck.rs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EffectRow {
     Dyn,
     Closed(BTreeSet<String>),
@@ -186,7 +529,7 @@ impl EffectRow {
 #[derive(Debug)]
 pub struct RecGroup {
     pub names: Vec<Rc<str>>,
-    pub bodies: Vec<Type>,
+    pub bodies: Hc<Vec<Type>>,
     // No body mentions (at any depth, nested groups included) a Type::Var, an Indexed, an
     // EffectRow::Var or a RecVar::Free: a walker that renames variables may return it as is.
     pub plain: bool,
@@ -197,11 +540,10 @@ pub struct RecGroup {
 
 impl RecGroup {
     pub fn new(names: Vec<Rc<str>>, bodies: Vec<Type>) -> RecGroup {
-        let (mut plain, mut escape) = (true, 0);
-        for body in &bodies {
-            scan(body, 0, &mut plain, &mut escape);
-        }
-        RecGroup { names, bodies, plain, escape }
+        let bodies = Hc::new(bodies);
+        let summary = bodies.summary();
+        let plain = !summary.any(Summary::VAR | Summary::ROWVAR | Summary::INDEXED | Summary::FREE);
+        RecGroup { names, bodies, plain, escape: summary.reach().saturating_sub(1) }
     }
 }
 
@@ -241,21 +583,6 @@ pub fn each_child(t: &Type, f: &mut dyn FnMut(&Type)) {
     }
 }
 
-fn scan(t: &Type, nest: u32, plain: &mut bool, escape: &mut u32) {
-    match t {
-        Type::Var(_) | Type::Indexed(..) | Type::Fun(_, EffectRow::Var(_), _) | Type::RecVar(RecVar::Free { .. }) => *plain = false,
-        Type::RecVar(RecVar::Bound { depth, .. }) if *depth > nest => *escape = (*escape).max(*depth - nest),
-        Type::Rec(h, _) => {
-            *plain &= h.0.plain;
-            if h.0.escape > nest + 1 {
-                *escape = (*escape).max(h.0.escape - (nest + 1));
-            }
-        }
-        _ => {}
-    }
-    each_child(t, &mut |c| scan(c, nest, plain, escape));
-}
-
 fn map_vec(items: &[Type], f: &mut dyn FnMut(&Type) -> Option<Type>) -> Option<Vec<Type>> {
     let mapped: Vec<Option<Type>> = items.iter().map(&mut *f).collect();
     if mapped.iter().all(Option::is_none) {
@@ -268,26 +595,26 @@ fn map_vec(items: &[Type], f: &mut dyn FnMut(&Type) -> Option<Type>) -> Option<V
 // unchanged subtree keeps its Rc). Rec and RecVar have no children here: callers own them.
 fn map_children(t: &Type, f: &mut dyn FnMut(&Type) -> Option<Type>) -> Option<Type> {
     match t {
-        Type::List(e) => f(e).map(|e| Type::List(Rc::new(e))),
+        Type::List(e) => f(e).map(|e| Type::List(Hc::new(e))),
         Type::Fun(a, row, b) => {
             let (na, nb) = (f(a), f(b));
             if na.is_none() && nb.is_none() {
                 return None;
             }
-            Some(Type::Fun(na.map_or_else(|| a.clone(), Rc::new), row.clone(), nb.map_or_else(|| b.clone(), Rc::new)))
+            Some(Type::Fun(na.map_or_else(|| a.clone(), Hc::new), row.clone(), nb.map_or_else(|| b.clone(), Hc::new)))
         }
-        Type::Tuple(items) => map_vec(items, f).map(|v| Type::Tuple(Rc::new(v))),
-        Type::Union(items) => map_vec(items, f).map(|v| Type::Union(Rc::new(v))),
+        Type::Tuple(items) => map_vec(items, f).map(|v| Type::Tuple(Hc::new(v))),
+        Type::Union(items) => map_vec(items, f).map(|v| Type::Union(Hc::new(v))),
         Type::Record(fields) => {
             let mapped: Vec<Option<Type>> = fields.iter().map(|(_, t)| f(t)).collect();
             if mapped.iter().all(Option::is_none) {
                 return None;
             }
-            Some(Type::Record(Rc::new(
+            Some(Type::Record(Hc::new(
                 mapped.into_iter().zip(fields.iter()).map(|(m, (n, old))| (n.clone(), m.unwrap_or_else(|| old.clone()))).collect(),
             )))
         }
-        Type::Indexed(w, i) => f(w).map(|w| Type::Indexed(Rc::new(w), i.clone())),
+        Type::Indexed(w, i) => f(w).map(|w| Type::Indexed(Hc::new(w), i.clone())),
         _ => None,
     }
 }

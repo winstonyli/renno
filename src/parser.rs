@@ -4,7 +4,7 @@ use crate::expr::{Arena, BinOp, Expr, ExprRef, Pattern, SpanMap};
 use crate::index_expr::IndexExpr;
 use crate::lexer::{tokenize, Token};
 use crate::span::Span;
-use crate::types::Type;
+use crate::types::{Hc, Type};
 use crate::util::find_field;
 
 pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
@@ -368,7 +368,7 @@ impl<'a> Parser<'a> {
                 let span = Span { start, end: self.span_before().end };
                 self.push_spanned(Expr::Int(k), span)
             }
-            index => self.type_lit(Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index)), start),
+            index => self.type_lit(Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(index)), start),
         })
     }
 

@@ -97,6 +97,7 @@ fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use types::Hc;
 
     #[test]
     fn panic_message_tells_run_errors_from_interpreter_bugs() {
@@ -1656,16 +1657,16 @@ mod tests {
         // the other, the static counterpart of Meters(n)/Seconds(n)'s
         // own tuple values never comparing `==` at runtime either.
         use types::{consistent, Type};
-        let a = Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Token(1)]));
-        let b = Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Token(2)]));
+        let a = Type::Tuple(Hc::new(vec![Type::Int, Type::Token(1)]));
+        let b = Type::Tuple(Hc::new(vec![Type::Int, Type::Token(2)]));
         assert!(!consistent(&a, &b));
     }
 
     #[test]
     fn tuple_containing_the_same_opaque_token_is_consistent() {
         use types::{consistent, Type};
-        let a = Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Token(7)]));
-        let b = Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Token(7)]));
+        let a = Type::Tuple(Hc::new(vec![Type::Int, Type::Token(7)]));
+        let b = Type::Tuple(Hc::new(vec![Type::Int, Type::Token(7)]));
         assert!(consistent(&a, &b));
     }
 
@@ -3590,10 +3591,10 @@ g(len)").unwrap_err();
         types::RecRef(std::rc::Rc::new(types::RecGroup::new(names.iter().map(|n| std::rc::Rc::from(*n)).collect(), bodies)))
     }
     fn rec_tup(items: Vec<types::Type>) -> types::Type {
-        types::Type::Tuple(std::rc::Rc::new(items))
+        types::Type::Tuple(Hc::new(items))
     }
     fn rec_uni(items: Vec<types::Type>) -> types::Type {
-        types::Type::Union(std::rc::Rc::new(items))
+        types::Type::Union(Hc::new(items))
     }
     // L = (Int, L) | Bool
     fn rec_list() -> types::RecRef {
@@ -3615,7 +3616,67 @@ g(len)").unwrap_err();
         let Type::Rec(h, k) = &step[1] else { panic!("the reference became the group") };
         assert!(Rc::ptr_eq(&h.0, &g.0) && *k == 0, "the unfolding shares the group, it does not copy it");
         let (Type::Tuple(a), Type::Tuple(b)) = (&old[1], &new[1]) else { panic!("a tuple base") };
-        assert!(Rc::ptr_eq(a, b), "a subtree with no reference keeps its Rc");
+        assert!(Hc::ptr_eq(a, b), "a subtree with no reference keeps its node");
+    }
+
+    // Building the same structure twice gives one node; anything that prints or compares
+    // differently (a variable's name, a token, a row, an index) is a different node.
+    #[test]
+    fn equal_structure_is_one_node() {
+        use crate::index_expr::IndexExpr;
+        use std::rc::Rc;
+        use types::{EffectRow, Type};
+        let pair = || Type::Tuple(Hc::new(vec![Type::Int, Type::Int]));
+        let (Type::Tuple(a), Type::Tuple(b)) = (pair(), pair()) else { unreachable!() };
+        assert!(Hc::ptr_eq(&a, &b));
+        let fun = |row: EffectRow| Type::Fun(Hc::new(Type::Int), row, Hc::new(Type::Int));
+        let node = |t: &Type| match t {
+            Type::Fun(a, _, _) => a.clone(),
+            _ => unreachable!(),
+        };
+        assert!(Hc::ptr_eq(&node(&fun(EffectRow::Dyn)), &node(&fun(EffectRow::Var("e".into())))), "the parameter is one node");
+        let (f1, f2) = (Type::List(Hc::new(fun(EffectRow::Dyn))), Type::List(Hc::new(fun(EffectRow::pure()))));
+        let (Type::List(x), Type::List(y)) = (&f1, &f2) else { unreachable!() };
+        assert!(!Hc::ptr_eq(x, y), "an effect row is part of a node's identity");
+        let tup = |t: Type| Type::Tuple(Hc::new(vec![t]));
+        assert!(tup(Type::Var("a".into())) != tup(Type::Var("b".into())));
+        assert!(tup(Type::Token(1)) != tup(Type::Token(2)));
+        let idx = |n: i64| Type::Indexed(Hc::new(Type::Int), Rc::new(IndexExpr::Lit(n)));
+        assert!(tup(idx(1)) == tup(idx(1)) && tup(idx(1)) != tup(idx(2)));
+    }
+
+    // Two groups of equal structure under different names are equal (E1) but stay distinct
+    // nodes once something holds them, so each prints its own names.
+    #[test]
+    fn equal_groups_with_different_names_are_equal_but_print_their_own() {
+        use types::Type;
+        let group = |name: &str| Type::Rec(rec_group(&[name], vec![rec_uni(vec![rec_tup(vec![Type::Int, rec_bound(0, 0)]), Type::Bool])]), 0);
+        let (a, b) = (rec_tup(vec![group("A")]), rec_tup(vec![group("B")]));
+        assert!(a == b, "E1: equal up to member names");
+        let (Type::Tuple(x), Type::Tuple(y)) = (&a, &b) else { unreachable!() };
+        assert!(!Hc::ptr_eq(x, y));
+        assert_eq!((a.to_string(), b.to_string()), ("(A)".to_string(), "(B)".to_string()));
+        let (Type::Rec(ga, _), Type::Rec(gb, _)) = (group("A"), group("B")) else { unreachable!() };
+        assert!(Hc::ptr_eq(&ga.0.bodies, &gb.0.bodies), "the bodies hold no names, so they are one node");
+    }
+
+    // `plain` and `escape` come from the bodies' summary.
+    #[test]
+    fn rec_group_plain_and_escape_come_from_the_summary() {
+        use types::{EffectRow, Type};
+        let list = rec_list();
+        assert!(list.0.plain && list.0.escape == 0);
+        let var = rec_group(&["V"], vec![rec_tup(vec![Type::Var("a".into()), rec_bound(0, 0)])]);
+        assert!(!var.0.plain && var.0.escape == 0);
+        let row = rec_group(&["R"], vec![Type::Fun(Hc::new(rec_bound(0, 0)), EffectRow::Var("e".into()), Hc::new(Type::Int))]);
+        assert!(!row.0.plain);
+        let free = rec_group(&["F"], vec![rec_tup(vec![rec_free(1, "X"), rec_bound(0, 0)])]);
+        assert!(!free.0.plain);
+        // An inner group that reaches the outer one: the outer is closed, the inner escapes by one.
+        let inner = rec_group(&["I"], vec![rec_tup(vec![rec_bound(1, 0), rec_bound(0, 0)])]);
+        assert!(inner.0.escape == 1 && inner.0.plain);
+        let outer = rec_group(&["O"], vec![rec_tup(vec![Type::Rec(inner, 0)])]);
+        assert!(outer.0.escape == 0 && outer.0.plain);
     }
 
     #[test]
@@ -3644,7 +3705,7 @@ g(len)").unwrap_err();
         assert!(!Rc::ptr_eq(&g.0, &g2.0), "but they are distinct allocations");
         // A nested group R over the outer placeholder A: R's body reaches A one group out.
         let (a_id, r_id) = (fresh_rec_id(), fresh_rec_id());
-        let r_body = Type::List(Rc::new(rec_tup(vec![rec_free(r_id, "R"), rec_free(a_id, "A")])));
+        let r_body = Type::List(Hc::new(rec_tup(vec![rec_free(r_id, "R"), rec_free(a_id, "A")])));
         let inner = close_group(&[Rc::from("R")], &[r_id], &[Some(r_body)]).unwrap().remove(0).unwrap();
         let outer = close_group(&[Rc::from("A")], &[a_id], &[Some(rec_tup(vec![Type::Int, inner]))]).unwrap().remove(0).unwrap();
         let Type::Rec(og, 0) = &outer else { panic!("{outer:?}") };
@@ -3660,9 +3721,9 @@ g(len)").unwrap_err();
         use types::{close_group, fresh_rec_id, Type};
         let names: Vec<Rc<str>> = ["T", "P", "L", "N"].iter().map(|n| Rc::from(*n)).collect();
         let ids: Vec<u64> = (0..4).map(|_| fresh_rec_id()).collect();
-        let t = Type::List(Rc::new(Type::Int));
+        let t = Type::List(Hc::new(Type::Int));
         let p = rec_tup(vec![rec_free(ids[2], "L"), rec_free(ids[2], "L")]);
-        let l = rec_uni(vec![Type::Int, Type::List(Rc::new(rec_free(ids[2], "L")))]);
+        let l = rec_uni(vec![Type::Int, Type::List(Hc::new(rec_free(ids[2], "L")))]);
         let out = close_group(&names, &ids, &[Some(t.clone()), Some(p), Some(l), None]).unwrap();
         assert_eq!(out[0], Some(t), "an unreferenced member keeps its type");
         let Some(Type::Rec(g, 0)) = &out[2] else { panic!("{:?}", out[2]) };
@@ -3680,7 +3741,7 @@ g(len)").unwrap_err();
         assert_eq!(close_group(&an, &[a], &[Some(rec_free(a, "A"))]), Err((0, CloseError::Bare)));
         let (x, y) = (fresh_rec_id(), fresh_rec_id());
         let names: [Rc<str>; 2] = [Rc::from("A"), Rc::from("B")];
-        let r = close_group(&names, &[x, y], &[Some(Type::List(Rc::new(rec_free(y, "B")))), None]);
+        let r = close_group(&names, &[x, y], &[Some(Type::List(Hc::new(rec_free(y, "B")))), None]);
         assert_eq!(r, Err((1, CloseError::NotAType)));
         // A = X, X = A where X is an inner group: unfolding A loops without reaching a constructor.
         let gx = RecRef(Rc::new(RecGroup::new(vec![Rc::from("X")], vec![rec_free(a, "A")])));
@@ -3788,7 +3849,7 @@ g(len)").unwrap_err();
         use crate::typecheck::{subst_type, vars_in, TyVar};
         use std::{collections::HashMap, rc::Rc};
         use types::Type;
-        let indexed = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".into())));
+        let indexed = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".into())));
         let g = rec_group(&["L"], vec![rec_tup(vec![Type::Var("a".into()), indexed, rec_bound(0, 0)])]);
         let ty = Type::Rec(g, 0);
         let vars = vars_in(&ty);
@@ -3808,7 +3869,7 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use std::rc::Rc;
         use types::Type;
-        let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
+        let ty = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
         assert_eq!(ty.to_string(), "[Dyn](n)");
     }
 
@@ -3817,8 +3878,8 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use std::rc::Rc;
         use types::Type;
-        let a = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
-        let b = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
+        let a = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
+        let b = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
         assert!(types::consistent(&a, &b));
     }
 
@@ -3827,8 +3888,8 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use std::rc::Rc;
         use types::Type;
-        let a = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(3)));
-        let b = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(4)));
+        let a = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Int))), Rc::new(IndexExpr::Lit(3)));
+        let b = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Int))), Rc::new(IndexExpr::Lit(4)));
         assert!(!types::consistent(&a, &b));
     }
 
@@ -3837,7 +3898,7 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use std::rc::Rc;
         use types::Type;
-        let a = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Lit(3)));
+        let a = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Int))), Rc::new(IndexExpr::Lit(3)));
         assert!(types::consistent(&a, &Type::Dyn));
         assert!(types::consistent(&Type::Dyn, &a));
     }
@@ -5366,9 +5427,9 @@ g(len)").unwrap_err();
         use types::Type;
         let mut infer = InferCtx::new();
         infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
-        let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
+        let ty = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
         let resolved = infer.resolve_deep(&ty);
-        assert_eq!(resolved, Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Lit(3))));
+        assert_eq!(resolved, Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Lit(3))));
     }
 
     #[test]
@@ -5477,12 +5538,12 @@ g(len)").unwrap_err();
         use types::Type;
         let mut infer = InferCtx::new();
         let span = Span { start: 0, end: 0 };
-        let t1 = Type::Tuple(Rc::new(vec![
-            Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string()))),
+        let t1 = Type::Tuple(Hc::new(vec![
+            Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string()))),
             Type::Int,
         ]));
-        let t2 = Type::Tuple(Rc::new(vec![
-            Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Lit(3))),
+        let t2 = Type::Tuple(Hc::new(vec![
+            Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Lit(3))),
             Type::Bool,
         ]));
         assert!(unify_trial(&t1, &t2, &mut infer, span).is_err());
@@ -5607,7 +5668,7 @@ g(len)").unwrap_err();
         use std::collections::BTreeSet;
         use std::rc::Rc;
         use types::Type;
-        let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
+        let ty = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
         assert_eq!(vars_in(&ty), BTreeSet::from([TyVar::Index("n".to_string())]));
     }
 
@@ -5619,7 +5680,7 @@ g(len)").unwrap_err();
         use std::rc::Rc;
         use types::Type;
         let index = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Var("m".to_string())));
-        let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index));
+        let ty = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(index));
         assert_eq!(vars_in(&ty), BTreeSet::from([TyVar::Index("n".to_string()), TyVar::Index("m".to_string())]));
     }
 
@@ -5668,15 +5729,15 @@ g(len)").unwrap_err();
         use types::{EffectRow, Type};
 
         fn vec_of(index: IndexExpr) -> Type {
-            Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index))
+            Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(index))
         }
 
         // fun n: Int -> fun v: Vec(n) -> v
         let n = IndexExpr::Var("n".to_string());
         let identity_vec_ty = Type::Fun(
-            Rc::new(Type::Int),
+            Hc::new(Type::Int),
             EffectRow::Dyn,
-            Rc::new(Type::Fun(Rc::new(vec_of(n.clone())), EffectRow::Dyn, Rc::new(vec_of(n)))),
+            Hc::new(Type::Fun(Hc::new(vec_of(n.clone())), EffectRow::Dyn, Hc::new(vec_of(n)))),
         );
 
         let mut infer = InferCtx::new();
@@ -5715,13 +5776,12 @@ g(len)").unwrap_err();
     #[test]
     fn polymorphic_let_chain_leaves_no_open_variable() {
         use crate::typecheck::{extend, extend_generalized, Ctx, InferCtx};
-        use std::rc::Rc;
         use types::{EffectRow, Type};
 
         let infer = InferCtx::new();
         let mut ctx = Ctx::empty();
         for i in 0..3 {
-            let a = Rc::new(Type::Var(format!("a{i}")));
+            let a = Hc::new(Type::Var(format!("a{i}")));
             ctx = extend_generalized(&ctx, &format!("id{i}"), Type::Fun(a.clone(), EffectRow::Dyn, a), &infer, None);
         }
         assert!(ctx.open_vars(&infer).is_empty());
@@ -6033,7 +6093,7 @@ g(len)").unwrap_err();
         let mut infer = InferCtx::new();
         // Int elements: a Dyn-element Vec(n) into [Int] is a real crossing and
         // is checked; this test is about the index-forgetting widening alone.
-        let vec_ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
+        let vec_ty = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend_generalized(&Ctx::empty(), "x", vec_ty, &infer, None);
 
         let mut arena = Arena::new();
@@ -6051,7 +6111,7 @@ g(len)").unwrap_err();
         let if_expr = arena.push(Expr::If(c, t, e));
         spans.push(Span { start: 0, end: 0 });
 
-        let expected = Type::List(Rc::new(Type::Int));
+        let expected = Type::List(Hc::new(Type::Int));
         let (_, result_expr) = check_against(&mut arena, if_expr, &expected, &ctx, &spans, &mut infer)
             .expect("both branches individually fit [Int] via Check-mode's own per-branch dispatch, even though they'd never mutually unify under Synth");
 
@@ -6170,7 +6230,7 @@ g(len)").unwrap_err();
 
         let mut infer = InferCtx::new();
         // Int elements: see if_check_mode_accepts_branches_that_only_agree_via_the_expected_type.
-        let vec_ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
+        let vec_ty = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend_generalized(&Ctx::empty(), "v", vec_ty, &infer, None);
 
         let mut arena = Arena::new();
@@ -6192,7 +6252,7 @@ g(len)").unwrap_err();
         let match_expr = arena.push(Expr::Match(scrutinee, arms));
         spans.push(Span { start: 0, end: 0 });
 
-        let expected = Type::List(Rc::new(Type::Int));
+        let expected = Type::List(Hc::new(Type::Int));
         let (_, result_expr) = check_against(&mut arena, match_expr, &expected, &ctx, &spans, &mut infer)
             .expect("both arms individually fit [Int] via Check-mode's own per-arm dispatch, even though they'd never mutually unify under Synth");
 
@@ -6995,9 +7055,9 @@ g(len)").unwrap_err();
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let rec = Type::Rec(rec_list(), 0);
         let mut infer = InferCtx::new();
-        let scrut_ty = Type::Indexed(Rc::new(rec.clone()), Rc::new(IndexExpr::Var("n".to_string())));
+        let scrut_ty = Type::Indexed(Hc::new(rec.clone()), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend(&Ctx::empty(), "v", scrut_ty);
-        let expected = Type::Indexed(Rc::new(rec), Rc::new(IndexExpr::Lit(1)));
+        let expected = Type::Indexed(Hc::new(rec), Rc::new(IndexExpr::Lit(1)));
         let result = check_against(&mut arena, root, &expected, &ctx, &spans, &mut infer);
         assert!(result.is_err(), "expected a real index conflict from the base alternative's n=0 hypothesis, got: {result:?}");
     }
@@ -7019,10 +7079,10 @@ g(len)").unwrap_err();
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let rec = Type::Rec(rec_list(), 0);
         let mut infer = InferCtx::new();
-        let scrut_ty = Type::Indexed(Rc::new(rec.clone()), Rc::new(IndexExpr::Var("n".to_string())));
+        let scrut_ty = Type::Indexed(Hc::new(rec.clone()), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend(&Ctx::empty(), "v", scrut_ty);
         let expected = Type::Indexed(
-            Rc::new(rec),
+            Hc::new(rec),
             Rc::new(IndexExpr::Sub(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)))),
         );
         let result = check_against(&mut arena, root, &expected, &ctx, &spans, &mut infer);
@@ -8555,7 +8615,7 @@ g(len)").unwrap_err();
         // depth, so a call chain allocates nothing per call.
         use crate::types::{EffectRow, Type};
         use std::rc::Rc;
-        let g = rec_group(&["F"], vec![Type::Fun(Rc::new(Type::Dyn), EffectRow::Dyn, Rc::new(rec_bound(0, 0)))]);
+        let g = rec_group(&["F"], vec![Type::Fun(Hc::new(Type::Dyn), EffectRow::Dyn, Hc::new(rec_bound(0, 0)))]);
         let f = Type::Rec(g, 0);
         let root = expr::Lazy::new(Rc::new(f));
         let mut level = root.clone();
@@ -9682,9 +9742,9 @@ g(len)").unwrap_err();
 
         // (Vec(n) ->{n} Dyn): an index variable and a row variable that share the spelling `n`.
         let ann = Type::Fun(
-            Rc::new(Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".into())))),
+            Hc::new(Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".into())))),
             EffectRow::Var("n".into()),
-            Rc::new(Type::Dyn),
+            Hc::new(Type::Dyn),
         );
         let names = |t: &Type| match t {
             Type::Fun(p, EffectRow::Var(r), _) => match p.as_ref() {

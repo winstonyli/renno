@@ -10,7 +10,7 @@ use crate::resolve::{group_kind, GroupKind, Resolved};
 use crate::span::Span;
 use crate::value::Value;
 use rpds::{HashTrieMap, HashTrieSet};
-use crate::types::{consistent, each_child, map_group, row_consistent, unfold, EffectRow, RecGroup, RecRef, RecVar, Type};
+use crate::types::{consistent, each_child, map_group, row_consistent, unfold, EffectRow, Hc, RecGroup, RecRef, RecVar, Type};
 use crate::util::find_field;
 mod relate;
 use self::relate::{relate, relate_cast};
@@ -612,16 +612,16 @@ impl InferCtx {
     pub(crate) fn resolve_deep(&self, ty: &Type) -> Type {
         match self.resolve(ty) {
             Type::Fun(param, row, ret) => {
-                Type::Fun(Rc::new(self.resolve_deep(&param)), row, Rc::new(self.resolve_deep(&ret)))
+                Type::Fun(Hc::new(self.resolve_deep(&param)), row, Hc::new(self.resolve_deep(&ret)))
             }
-            Type::List(elem) => Type::List(Rc::new(self.resolve_deep(&elem))),
-            Type::Tuple(items) => Type::Tuple(Rc::new(items.iter().map(|t| self.resolve_deep(t)).collect())),
-            Type::Union(items) => Type::Union(Rc::new(items.iter().map(|t| self.resolve_deep(t)).collect())),
+            Type::List(elem) => Type::List(Hc::new(self.resolve_deep(&elem))),
+            Type::Tuple(items) => Type::Tuple(Hc::new(items.iter().map(|t| self.resolve_deep(t)).collect())),
+            Type::Union(items) => Type::Union(Hc::new(items.iter().map(|t| self.resolve_deep(t)).collect())),
             Type::Record(fields) => {
-                Type::Record(Rc::new(fields.iter().map(|(n, t)| (n.clone(), self.resolve_deep(t))).collect()))
+                Type::Record(Hc::new(fields.iter().map(|(n, t)| (n.clone(), self.resolve_deep(t))).collect()))
             }
             Type::Indexed(wrapped, index) => {
-                Type::Indexed(Rc::new(self.resolve_deep(&wrapped)), Rc::new(self.resolve_index_deep(&index)))
+                Type::Indexed(Hc::new(self.resolve_deep(&wrapped)), Rc::new(self.resolve_index_deep(&index)))
             }
             // A plain group holds no variable to resolve: shared as is.
             Type::Rec(g, k) if !g.0.plain => {
@@ -1235,19 +1235,19 @@ pub(crate) fn subst_type(ty: &Type, row_subst: &HashMap<String, EffectRow>, type
     match ty {
         Type::Var(name) => type_subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Indexed(wrapped, index) => Type::Indexed(
-            Rc::new(subst_type(wrapped, row_subst, type_subst, index_subst)),
+            Hc::new(subst_type(wrapped, row_subst, type_subst, index_subst)),
             Rc::new(subst_index_expr(index, index_subst)),
         ),
         Type::Fun(param, row, ret) => Type::Fun(
-            Rc::new(subst_type(param, row_subst, type_subst, index_subst)),
+            Hc::new(subst_type(param, row_subst, type_subst, index_subst)),
             resolve_row(row, row_subst),
-            Rc::new(subst_type(ret, row_subst, type_subst, index_subst)),
+            Hc::new(subst_type(ret, row_subst, type_subst, index_subst)),
         ),
-        Type::List(elem) => Type::List(Rc::new(subst_type(elem, row_subst, type_subst, index_subst))),
-        Type::Tuple(items) => Type::Tuple(Rc::new(items.iter().map(|t| subst_type(t, row_subst, type_subst, index_subst)).collect())),
-        Type::Union(alts) => Type::Union(Rc::new(alts.iter().map(|t| subst_type(t, row_subst, type_subst, index_subst)).collect())),
+        Type::List(elem) => Type::List(Hc::new(subst_type(elem, row_subst, type_subst, index_subst))),
+        Type::Tuple(items) => Type::Tuple(Hc::new(items.iter().map(|t| subst_type(t, row_subst, type_subst, index_subst)).collect())),
+        Type::Union(alts) => Type::Union(Hc::new(alts.iter().map(|t| subst_type(t, row_subst, type_subst, index_subst)).collect())),
         Type::Record(fields) => {
-            Type::Record(Rc::new(fields.iter().map(|(n, t)| (n.clone(), subst_type(t, row_subst, type_subst, index_subst))).collect()))
+            Type::Record(Hc::new(fields.iter().map(|(n, t)| (n.clone(), subst_type(t, row_subst, type_subst, index_subst))).collect()))
         }
         // A plain group names no variable: shared as is.
         Type::Rec(g, k) if !g.0.plain => {
@@ -1281,7 +1281,7 @@ fn bind_row_vars(param: &Type, arg: &Type, subst: &mut HashMap<String, EffectRow
 // applicable at all without knowing its exact signature (an unannotated
 // Dyn-typed callee, or the innermost check inside a function contract).
 fn any_fun() -> Type {
-    Type::Fun(Rc::new(Type::Dyn), EffectRow::Dyn, Rc::new(Type::Dyn))
+    Type::Fun(Hc::new(Type::Dyn), EffectRow::Dyn, Hc::new(Type::Dyn))
 }
 
 // The only place a runtime boundary check gets built: `from` is Dyn (or
@@ -1358,12 +1358,12 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
 fn snapshot_type(t: &Type, infer: &InferCtx, witness_vars: &[&str]) -> Type {
     let go = |t: &Type| snapshot_type(t, infer, witness_vars);
     match infer.resolve(t) {
-        Type::Fun(p, r, b) => Type::Fun(Rc::new(go(&p)), r, Rc::new(go(&b))),
-        Type::List(e) => Type::List(Rc::new(go(&e))),
-        Type::Tuple(ts) => Type::Tuple(Rc::new(ts.iter().map(go).collect())),
-        Type::Union(ts) => Type::Union(Rc::new(ts.iter().map(go).collect())),
-        Type::Record(fs) => Type::Record(Rc::new(fs.iter().map(|(n, t)| (n.clone(), go(t))).collect())),
-        Type::Indexed(w, i) => Type::Indexed(Rc::new(go(&w)), Rc::new(runtime_index(&i, infer, witness_vars, false))),
+        Type::Fun(p, r, b) => Type::Fun(Hc::new(go(&p)), r, Hc::new(go(&b))),
+        Type::List(e) => Type::List(Hc::new(go(&e))),
+        Type::Tuple(ts) => Type::Tuple(Hc::new(ts.iter().map(go).collect())),
+        Type::Union(ts) => Type::Union(Hc::new(ts.iter().map(go).collect())),
+        Type::Record(fs) => Type::Record(Hc::new(fs.iter().map(|(n, t)| (n.clone(), go(t))).collect())),
+        Type::Indexed(w, i) => Type::Indexed(Hc::new(go(&w)), Rc::new(runtime_index(&i, infer, witness_vars, false))),
         Type::Rec(g, k) if !g.0.plain => map_group(&g, k, &mut |b| Some(go(b))).unwrap_or(Type::Rec(g, k)),
         other => other,
     }
@@ -1444,10 +1444,10 @@ fn refuted_error(from: &Type, to: &Type, why: &Why, span: Span) -> TypeError {
 fn strip_indexed(t: &Type) -> Type {
     match t {
         Type::Indexed(wrapped, _) => strip_indexed(wrapped),
-        Type::List(e) => Type::List(Rc::new(strip_indexed(e))),
-        Type::Tuple(ts) => Type::Tuple(Rc::new(ts.iter().map(strip_indexed).collect())),
-        Type::Union(ts) => Type::Union(Rc::new(ts.iter().map(strip_indexed).collect())),
-        Type::Record(fs) => Type::Record(Rc::new(fs.iter().map(|(n, t)| (n.clone(), strip_indexed(t))).collect())),
+        Type::List(e) => Type::List(Hc::new(strip_indexed(e))),
+        Type::Tuple(ts) => Type::Tuple(Hc::new(ts.iter().map(strip_indexed).collect())),
+        Type::Union(ts) => Type::Union(Hc::new(ts.iter().map(strip_indexed).collect())),
+        Type::Record(fs) => Type::Record(Hc::new(fs.iter().map(|(n, t)| (n.clone(), strip_indexed(t))).collect())),
         other => other.clone(),
     }
 }
@@ -1460,13 +1460,13 @@ fn strip_indexed(t: &Type) -> Type {
 fn erase_open_indexed(t: &Type, env: &CheckEnv) -> Type {
     let go = |t: &Type| erase_open_indexed(t, env);
     match t {
-        Type::Indexed(w, i) if index_has_value(i, env) => Type::Indexed(Rc::new(go(w)), i.clone()),
+        Type::Indexed(w, i) if index_has_value(i, env) => Type::Indexed(Hc::new(go(w)), i.clone()),
         Type::Indexed(w, _) => go(w),
-        Type::List(e) => Type::List(Rc::new(go(e))),
-        Type::Tuple(ts) => Type::Tuple(Rc::new(ts.iter().map(go).collect())),
-        Type::Union(ts) => Type::Union(Rc::new(ts.iter().map(go).collect())),
-        Type::Record(fs) => Type::Record(Rc::new(fs.iter().map(|(n, t)| (n.clone(), go(t))).collect())),
-        Type::Fun(p, r, b) => Type::Fun(Rc::new(go(p)), r.clone(), Rc::new(go(b))),
+        Type::List(e) => Type::List(Hc::new(go(e))),
+        Type::Tuple(ts) => Type::Tuple(Hc::new(ts.iter().map(go).collect())),
+        Type::Union(ts) => Type::Union(Hc::new(ts.iter().map(go).collect())),
+        Type::Record(fs) => Type::Record(Hc::new(fs.iter().map(|(n, t)| (n.clone(), go(t))).collect())),
+        Type::Fun(p, r, b) => Type::Fun(Hc::new(go(p)), r.clone(), Hc::new(go(b))),
         Type::Rec(g, k) if !g.0.plain => map_group(g, *k, &mut |b| Some(go(b))).unwrap_or_else(|| t.clone()),
         other => other.clone(),
     }
@@ -1680,7 +1680,7 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
     match ty {
         Type::Int | Type::Float => Ok(e),
         Type::Dyn | Type::Var(_) => {
-            let numeric = Type::Union(Rc::new(vec![Type::Int, Type::Float]));
+            let numeric = Type::Union(Hc::new(vec![Type::Int, Type::Float]));
             Ok(build_check_node(arena, e, Shape::plain(Test::Or(vec![Test::Int, Test::Float])), &numeric, &env.with_span(span)))
         }
         other => Err(TypeError(format!("type mismatch: expected Int or Float, found {other}"), span)),
@@ -1724,7 +1724,7 @@ enum Boundary {
     Shape(Type),
     // A contract on a callable value: the unfolded Fun type, its parameter
     // and its result.
-    Fun(Type, Rc<Type>, Rc<Type>),
+    Fun(Type, Hc<Type>, Hc<Type>),
     // A union with a Fun alternative: the first alternative that holds is
     // picked, and a Fun one gets its contract.
     Union(Type),
@@ -1871,7 +1871,7 @@ pub(crate) fn lower_conform(lazy: &Lazy, span: Option<Span>) -> Option<Rc<Lowere
     let (test, to, then) = match boundary(ty, &mut visiting) {
         Boundary::None => return None,
         Boundary::Shape(to) => (shape_test(&to, &env, &mut defs, &Visiting::default()), to, Then::Done),
-        Boundary::Fun(fun_ty, param, ret) => (Test::Fun, fun_ty, Then::Wrap(lazy.child(param), lazy.child(ret))),
+        Boundary::Fun(fun_ty, param, ret) => (Test::Fun, fun_ty, Then::Wrap(lazy.child(Rc::new((*param).clone())), lazy.child(Rc::new((*ret).clone())))),
         Boundary::Union(to) => {
             let then = pick(lazy, &to, &env, &mut defs, &visiting);
             (Test::Never, to, then)
@@ -1895,7 +1895,7 @@ fn pick(lazy: &Lazy, to: &Type, env: &CheckEnv, defs: &mut Defs, visiting: &Visi
         };
         let mut visiting = visiting.clone();
         let then = match boundary(alt, &mut visiting) {
-            Boundary::Fun(_, param, ret) => Then::Wrap(lazy.child(param), lazy.child(ret)),
+            Boundary::Fun(_, param, ret) => Then::Wrap(lazy.child(Rc::new((*param).clone())), lazy.child(Rc::new((*ret).clone()))),
             Boundary::Union(nested) => pick(lazy, &nested, env, defs, &visiting),
             Boundary::None | Boundary::Shape(_) => Then::Done,
         };
@@ -2393,7 +2393,7 @@ fn pattern_type(pat: &Pattern) -> Type {
         Pattern::Int(_) => Type::Int,
         Pattern::Bool(_) => Type::Bool,
         Pattern::Str(_) => Type::Str,
-        Pattern::List(_) | Pattern::Cons(..) => Type::List(Rc::new(Type::Dyn)),
+        Pattern::List(_) | Pattern::Cons(..) => Type::List(Hc::new(Type::Dyn)),
         // Dyn -- but unlike every other arm above, this is NOT what
         // decides whether a Record pattern can match a given scrutinee
         // (Dyn is trivially consistent with anything, which would make
@@ -2574,7 +2574,7 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, visiting: &Visiting) -> bool {
 // `case_a_refinement_target` now that Task 3 extends it to cover Case B
 // too.
 enum IndexedRefinementTarget {
-    List { index_var: String, elem_ty: Rc<Type> },
+    List { index_var: String, elem_ty: Hc<Type> },
     // `rec` is the recursive type (a Type::Rec) the Indexed wraps;
     // `base_alt`/`step_alt` are the two alternatives
     // `qualifying_alternatives` already sorted out -- the SAME
@@ -3013,7 +3013,7 @@ fn bind_pattern_vars(
         },
         Pattern::Cons(head, tail) => {
             let elem_ty = infer.fresh_var("elem");
-            let list_shape = Type::List(Rc::new(elem_ty.clone()));
+            let list_shape = Type::List(Hc::new(elem_ty.clone()));
             // "Forget" an Indexed scrutinee's own tracked index before
             // correlating its shape -- same widening as BinOp::Cons's own
             // fix (see forget_index's own doc comment): matching `h :: t`
@@ -4202,7 +4202,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // Matches the original Lambda arm: the body's row is
                 // embedded in the Fun type, not propagated -- evaluating
                 // the Lambda expression itself is always pure.
-                result_ty = Type::Fun(Rc::new(param_ty.clone()), result_row, Rc::new(result_ty));
+                result_ty = Type::Fun(Hc::new(param_ty.clone()), result_row, Hc::new(result_ty));
                 result_row = EffectRow::pure();
                 if witness {
                     let w = infer.index_witness.pop().expect("a Fun frame's witness is the innermost one");
@@ -4444,7 +4444,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 tys.push(item_ty);
                 refs.push(item2);
             }
-            Ok((Type::Tuple(Rc::new(tys)), row, arena.push(Expr::Tuple(refs))))
+            Ok((Type::Tuple(Hc::new(tys)), row, arena.push(Expr::Tuple(refs))))
         }
 
         // Fields already arrive sorted by name (parser::parse_record_fields),
@@ -4465,7 +4465,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 field_tys.push((name.clone(), field_ty));
                 field_refs.push((name.clone(), field2));
             }
-            Ok((Type::Record(Rc::new(field_tys)), row, arena.push(Expr::Record(Rc::new(field_refs)))))
+            Ok((Type::Record(Hc::new(field_tys)), row, arena.push(Expr::Record(Rc::new(field_refs)))))
         }
 
         // `p.x` -- desugars into an ordinary get_field(target, "x") call
@@ -4493,7 +4493,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 other => return Err(TypeError(format!("expected a record, found {other}"), spans[target])),
             };
             let checked_target = if matches!(target_ty, Type::Dyn | Type::Var(_)) {
-                let required = Type::Record(Rc::new(vec![(name.clone(), Type::Dyn)]));
+                let required = Type::Record(Hc::new(vec![(name.clone(), Type::Dyn)]));
                 build_shape_check(arena, target2, &required, &CheckEnv::at(infer, spans[target]))
             } else {
                 target2
@@ -4553,12 +4553,12 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             if let Mode::Check(expected) = mode {
                 if let Type::Indexed(wrapped, _) = infer.resolve_deep(expected) {
                     if matches!(wrapped.as_ref(), Type::List(_)) {
-                        let list_ty = Type::Indexed(Rc::new(Type::List(Rc::new(elem_ty))), Rc::new(IndexExpr::Lit(item_count as i64)));
+                        let list_ty = Type::Indexed(Hc::new(Type::List(Hc::new(elem_ty))), Rc::new(IndexExpr::Lit(item_count as i64)));
                         return Ok((list_ty, row, arena.push(Expr::ListLit(refs))));
                     }
                 }
             }
-            let list_ty = Type::List(Rc::new(elem_ty));
+            let list_ty = Type::List(Hc::new(elem_ty));
             Ok((list_ty, row, arena.push(Expr::ListLit(refs))))
         }
 
@@ -4681,7 +4681,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 Type::Var(_) => {
                     let param_ty = infer.fresh_var("param");
                     let ret_ty = infer.fresh_var("ret");
-                    let fun_shape = Type::Fun(Rc::new(param_ty.clone()), EffectRow::Dyn, Rc::new(ret_ty.clone()));
+                    let fun_shape = Type::Fun(Hc::new(param_ty.clone()), EffectRow::Dyn, Hc::new(ret_ty.clone()));
                     unify(&f_ty, &fun_shape, infer, spans[f])?;
                     unify(&param_ty, &a_ty, infer, spans[a])?;
                     let ret_ty2 = infer.resolve_deep(&ret_ty);
@@ -4858,7 +4858,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // one, so a failure here stays a real error, not a
                     // fallback-to-Dyn.
                     let elem_ty = infer.fresh_var("elem");
-                    let list_shape = Type::List(Rc::new(elem_ty.clone()));
+                    let list_shape = Type::List(Hc::new(elem_ty.clone()));
                     // "Forget" the tail's own tracked index before
                     // unifying its shape -- same widening as Concat's own
                     // arm just above (see forget_index's own doc
@@ -4867,7 +4867,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // preserve past this point anyway.
                     unify(&forget_index(&r_ty), &list_shape, infer, spans[r])?;
                     unify(&l_ty, &elem_ty, infer, spans[l])?;
-                    let result_ty = Type::List(Rc::new(infer.resolve_deep(&elem_ty)));
+                    let result_ty = Type::List(Hc::new(infer.resolve_deep(&elem_ty)));
                     Ok((result_ty, row, arena.push(Expr::BinOp(op, l2, r2))))
                 }
             }
@@ -5115,7 +5115,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                                     let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
                                     infer.index_subst.insert(n_name.clone(), hypothesis);
                                     infer.rigid_index.insert(m.clone());
-                                    let refined_tail_ty = Type::Indexed(Rc::new(Type::List(elem_ty.clone())), Rc::new(IndexExpr::Var(m)));
+                                    let refined_tail_ty = Type::Indexed(Hc::new(Type::List(elem_ty.clone())), Rc::new(IndexExpr::Var(m)));
                                     arm_ctx = extend(&arm_ctx, tail_name, refined_tail_ty);
                                 }
                                 // A compound/nested tail pattern: no override,
@@ -5151,7 +5151,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                                     let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
                                     infer.index_subst.insert(n_name.clone(), hypothesis);
                                     infer.rigid_index.insert(m.clone());
-                                    let refined_ty = Type::Indexed(Rc::new(rec.clone()), Rc::new(IndexExpr::Var(m)));
+                                    let refined_ty = Type::Indexed(Hc::new(rec.clone()), Rc::new(IndexExpr::Var(m)));
                                     arm_ctx = extend(&arm_ctx, self_ref_name, refined_ty);
                                 }
                                 // The self-referential position is bound
@@ -5260,7 +5260,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         Expr::MakeHandler { effect, payload_var, resume_var, body } => {
             let resume_row = infer.resume_row.take();
             let resume_ty = match &resume_row {
-                Some(row) => Type::Fun(Rc::new(Type::Dyn), row.clone(), Rc::new(Type::Dyn)),
+                Some(row) => Type::Fun(Hc::new(Type::Dyn), row.clone(), Hc::new(Type::Dyn)),
                 None => Type::Dyn,
             };
             let inner_ctx = extend(&extend(ctx, &payload_var, Type::Dyn), &resume_var, resume_ty);

@@ -329,22 +329,22 @@ fn index_refuted(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Rel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::EffectRow;
+    use crate::types::{EffectRow, Hc};
     use std::rc::Rc;
     fn list(t: Type) -> Type {
-        Type::List(Rc::new(t))
+        Type::List(Hc::new(t))
     }
     fn tup(ts: &[Type]) -> Type {
-        Type::Tuple(Rc::new(ts.to_vec()))
+        Type::Tuple(Hc::new(ts.to_vec()))
     }
     fn uni(ts: &[Type]) -> Type {
-        Type::Union(Rc::new(ts.to_vec()))
+        Type::Union(Hc::new(ts.to_vec()))
     }
     fn rec(fs: &[(&str, Type)]) -> Type {
-        Type::Record(Rc::new(fs.iter().map(|(n, t)| (n.to_string(), t.clone())).collect()))
+        Type::Record(Hc::new(fs.iter().map(|(n, t)| (n.to_string(), t.clone())).collect()))
     }
     fn fun(a: Type, b: Type) -> Type {
-        Type::Fun(Rc::new(a), EffectRow::Dyn, Rc::new(b))
+        Type::Fun(Hc::new(a), EffectRow::Dyn, Hc::new(b))
     }
     fn var(n: &str) -> Type {
         Type::Var(n.to_string())
@@ -370,7 +370,7 @@ mod tests {
         IndexExpr::Add(Rc::new(a), Rc::new(b))
     }
     fn vec_n(i: IndexExpr) -> Type {
-        Type::Indexed(Rc::new(list(Type::Dyn)), Rc::new(i))
+        Type::Indexed(Hc::new(list(Type::Dyn)), Rc::new(i))
     }
     // a := Int, s := Str, u unbound; index n rigid, z := 0.
     fn ctx() -> InferCtx {
@@ -397,7 +397,7 @@ mod tests {
         let (i, s, d, b) = (Type::Int, Type::Str, Type::Dyn, Type::Bool);
         let is = uni(&[i.clone(), s.clone()]);
         let ii = tup(&[i.clone(), i.clone()]);
-        let fx = |p: Type, r: Type, row: EffectRow| Type::Fun(Rc::new(p), row, Rc::new(r));
+        let fx = |p: Type, r: Type, row: EffectRow| Type::Fun(Hc::new(p), row, Hc::new(r));
         let cases: Vec<(&str, Type, Type, Exp)> = vec![
             ("int-int", i.clone(), i.clone(), P),
             ("int-str", i.clone(), s.clone(), R),
@@ -489,7 +489,7 @@ mod tests {
         let lits = Why::Index { msg: "type mismatch: index 4 does not unify with index 3".into(), bare: false };
         assert_eq!(relate(&vec_n(lit(3)), &vec_n(lit(4)), &infer), Rel::Refuted(lits));
         // Rows have no runtime representation: a cast ignores them.
-        let fx = |row: EffectRow| Type::Fun(Rc::new(i.clone()), row, Rc::new(i.clone()));
+        let fx = |row: EffectRow| Type::Fun(Hc::new(i.clone()), row, Hc::new(i.clone()));
         assert!(matches!(relate(&fx(EffectRow::single("a")), &fx(EffectRow::pure()), &infer), Rel::Refuted(_)));
         assert_eq!(relate_cast(&fx(EffectRow::single("a")), &fx(EffectRow::pure()), &infer), Rel::Proven);
     }

@@ -9,7 +9,7 @@ use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::resolve::{group_kind, resolve, GroupKind, Resolved, VarRef};
 use crate::span::Span;
-use crate::types::{close_group, first_free, fresh_rec_id, EffectRow, RecVar, Type};
+use crate::types::{close_group, first_free, fresh_rec_id, EffectRow, Hc, RecVar, Type};
 use crate::util::find_field;
 use crate::value::{table_lookup, Builtin, Contract, HandlerData, SiteCtx, TypeCtor, Value};
 
@@ -1673,9 +1673,9 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
 // What a type constructor builds from its argument (spec section 3's call forms).
 fn construct_type(ctor: TypeCtor, arg: Value) -> Type {
     match (ctor, arg) {
-        (TypeCtor::List, Value::Type(t)) => Type::List(t),
-        (TypeCtor::Tuple, Value::List(items)) if !items.is_empty() => Type::Tuple(Rc::new(types_of(&items, "Tuple"))),
-        (TypeCtor::Union, Value::List(items)) if !items.is_empty() => Type::Union(Rc::new(types_of(&items, "Union"))),
+        (TypeCtor::List, Value::Type(t)) => Type::List(Hc::new((*t).clone())),
+        (TypeCtor::Tuple, Value::List(items)) if !items.is_empty() => Type::Tuple(Hc::new(types_of(&items, "Tuple"))),
+        (TypeCtor::Union, Value::List(items)) if !items.is_empty() => Type::Union(Hc::new(types_of(&items, "Union"))),
         (TypeCtor::Record, Value::Record(fields)) => {
             let mut fields: Vec<(String, Type)> = fields
                 .iter()
@@ -1685,30 +1685,32 @@ fn construct_type(ctor: TypeCtor, arg: Value) -> Type {
                 })
                 .collect();
             fields.sort_by(|a, b| a.0.cmp(&b.0));
-            Type::Record(Rc::new(fields))
+            Type::Record(Hc::new(fields))
         }
         // (A, B) is `A -> B`; (A, "e", B) is `A ->{e} B`.
         (TypeCtor::Fun, Value::List(items)) => match &items[..] {
-            [Value::Type(a), Value::Type(b)] => Type::Fun(a.clone(), EffectRow::Dyn, b.clone()),
-            [Value::Type(a), Value::Str(row), Value::Type(b)] => Type::Fun(a.clone(), EffectRow::Var(row.to_string()), b.clone()),
+            [Value::Type(a), Value::Type(b)] => Type::Fun(Hc::new((**a).clone()), EffectRow::Dyn, Hc::new((**b).clone())),
+            [Value::Type(a), Value::Str(row), Value::Type(b)] => {
+                Type::Fun(Hc::new((**a).clone()), EffectRow::Var(row.to_string()), Hc::new((**b).clone()))
+            }
             _ => crate::run_error!("Fun expects (param, result) or (param, \"row\", result) types"),
         },
         (TypeCtor::Vec, Value::Int(n)) if n >= 0 => {
-            Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Lit(n)))
+            Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Lit(n)))
         }
         // An indexed type gives its index: an annotation passes a symbolic
         // `Vec(n)` as the type Vec(n), since an index variable is not a value
         // (spec 11.8, 12.4). Any other type gets the generic message.
         (TypeCtor::Vec, Value::Type(t)) => match &*t {
-            Type::Indexed(_, index) => Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), index.clone()),
+            Type::Indexed(_, index) => Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), index.clone()),
             _ => crate::run_error!("Vec cannot take a Type"),
         },
         // (T, k) is T at index k; (T, Vec(n)) takes the index n, which is
         // how the parser passes a symbolic `Indexed(T, n)`.
         (TypeCtor::Indexed, Value::List(items)) => match &items[..] {
-            [Value::Type(t), Value::Int(k)] if *k >= 0 => Type::Indexed(t.clone(), Rc::new(IndexExpr::Lit(*k))),
+            [Value::Type(t), Value::Int(k)] if *k >= 0 => Type::Indexed(Hc::new((**t).clone()), Rc::new(IndexExpr::Lit(*k))),
             [Value::Type(t), Value::Type(i)] => match &**i {
-                Type::Indexed(_, index) => Type::Indexed(t.clone(), index.clone()),
+                Type::Indexed(_, index) => Type::Indexed(Hc::new((**t).clone()), index.clone()),
                 _ => crate::run_error!("Indexed expects (type, index)"),
             },
             _ => crate::run_error!("Indexed expects (type, index)"),
