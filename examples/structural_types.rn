@@ -9,7 +9,7 @@ let Meters = Tuple((Int,)) in
 let Seconds = Tuple((Int,)) in
 
 let identity_meters = fun x: Meters -> x in
-let five = identity_meters((5,)) in   // (5,) freely satisfies either alias
+let five = identity_meters((5,)) in   // (5,) freely satisfies either type
 
 // Opt a value OUT of structural matching with `opaque`: a literal,
 // singleton per SOURCE POSITION (see types::Type::Token's own doc

@@ -3355,7 +3355,7 @@ g(len)").unwrap_err();
             let g = fun v: Dyn -> f(v) in
             g("not a list at all")
         "#;
-        rejects(src, "expected (Int, List) | Bool, found Str");
+        rejects(src, "type error: expected (Int, List) | Bool, found Str");
     }
 
     #[test]
@@ -7986,7 +7986,7 @@ g(len)").unwrap_err();
         assert_eq!(run_source(&within("[Vec(n)]", "[[1, 2], [3, 4]]")).unwrap().as_int(), 1);
         // A Dyn parameter crossed into [Vec(n)] on a call.
         rejects("let g = fun xs: Vec(n) -> fun d: Dyn -> let ys: [Vec(n)] = d in len(ys) in g([1, 2])([[1, 2], [3]])", "found List at element 1");
-        // Tuple, record, and through a type function (index names are program-wide).
+        // Tuple, record, and through a type function.
         rejects(&within("(Vec(n), Int)", "([1], 3)"), "type error: expected ([Dyn](n), Int), found List at element 0");
         assert_eq!(run_source(&within("(Vec(n), Int)", "([1, 2], 3)")).unwrap().as_int(), 1);
         rejects(&within("{a: Vec(n)}", "{a: [1]}"), "type error: expected {a: [Dyn](n)}, found List at field a");
