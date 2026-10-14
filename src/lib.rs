@@ -5060,40 +5060,33 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn free_index_vars_resolved_finds_a_bare_index_variable() {
+    fn vars_in_finds_a_bare_index_variable() {
         use crate::index_expr::IndexExpr;
-        use crate::typecheck::{free_index_vars_resolved, InferCtx};
-        use std::collections::{BTreeSet, HashMap};
+        use crate::typecheck::{vars_in, TyVar};
+        use std::collections::BTreeSet;
         use std::rc::Rc;
         use types::Type;
-        let infer = InferCtx::new(HashMap::new());
         let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
-        let vars = free_index_vars_resolved(&ty, &infer);
-        assert_eq!(vars, BTreeSet::from(["n".to_string()]));
+        assert_eq!(vars_in(&ty), BTreeSet::from([TyVar::Index("n".to_string())]));
     }
 
     #[test]
-    fn free_index_vars_resolved_finds_variables_inside_a_compound_index() {
+    fn vars_in_finds_variables_inside_a_compound_index() {
         use crate::index_expr::IndexExpr;
-        use crate::typecheck::{free_index_vars_resolved, InferCtx};
-        use std::collections::{BTreeSet, HashMap};
+        use crate::typecheck::{vars_in, TyVar};
+        use std::collections::BTreeSet;
         use std::rc::Rc;
         use types::Type;
-        let infer = InferCtx::new(HashMap::new());
         let index = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Var("m".to_string())));
         let ty = Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(index));
-        let vars = free_index_vars_resolved(&ty, &infer);
-        assert_eq!(vars, BTreeSet::from(["n".to_string(), "m".to_string()]));
+        assert_eq!(vars_in(&ty), BTreeSet::from([TyVar::Index("n".to_string()), TyVar::Index("m".to_string())]));
     }
 
     #[test]
-    fn free_index_vars_resolved_finds_nothing_in_an_ordinary_type() {
-        use crate::typecheck::{free_index_vars_resolved, InferCtx};
-        use std::collections::HashMap;
+    fn vars_in_finds_nothing_in_an_ordinary_type() {
+        use crate::typecheck::vars_in;
         use types::Type;
-        let infer = InferCtx::new(HashMap::new());
-        let vars = free_index_vars_resolved(&Type::Int, &infer);
-        assert!(vars.is_empty());
+        assert!(vars_in(&Type::Int).is_empty());
     }
 
     #[test]

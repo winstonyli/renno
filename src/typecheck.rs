@@ -73,7 +73,7 @@ pub(crate) enum TyVar {
 
 // Every variable of every sort `ty` mentions, as written: no substitution
 // is consulted (callers resolve first, or reopen the names later).
-fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
+pub(crate) fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
     fn go(ty: &Type, out: &mut BTreeSet<TyVar>) {
         match ty {
             Type::Var(name) => {
@@ -99,6 +99,11 @@ fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
     let mut out = BTreeSet::new();
     go(ty, &mut out);
     out
+}
+
+// The index-variable names among `vars`.
+fn index_names(vars: BTreeSet<TyVar>) -> BTreeSet<String> {
+    vars.into_iter().filter_map(|v| if let TyVar::Index(name) = v { Some(name) } else { None }).collect()
 }
 
 // The variables a stored name stands for now: a Type or Index variable that
@@ -997,59 +1002,10 @@ fn generalizable(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<TyVar> {
     candidates.difference(&open).cloned().collect()
 }
 
-fn free_row_vars(ty: &Type) -> BTreeSet<String> {
-    match ty {
-        Type::Fun(param, row, ret) => {
-            let mut vars = free_row_vars(param);
-            vars.extend(free_row_vars(ret));
-            if let EffectRow::Var(name) = row {
-                vars.insert(name.clone());
-            }
-            vars
-        }
-        Type::List(elem) => free_row_vars(elem),
-        Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(free_row_vars).collect(),
-        Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_row_vars(t)).collect(),
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) | Type::Var(_) => BTreeSet::new(),
-        // Wraps one nested Type -- same recurse-into-the-wrapped-type
-        // precedent as List's own arm just above.
-        Type::Indexed(wrapped, _) => free_row_vars(wrapped),
-    }
-}
-
-// Collects `ty`'s own free Type::Var names, resolved through infer's
-// current substitution first -- a variable already bound to something
-// concrete isn't "free" any more. Unlike free_row_vars, this needs
-// infer: an EffectRow::Var is never bound by anything except generalize/
-// instantiate itself, but a Type::Var can be bound at any point during
-// elaboration by unify().
-fn free_type_vars_resolved(ty: &Type, infer: &InferCtx) -> BTreeSet<String> {
-    match infer.resolve(ty) {
-        Type::Var(name) => {
-            let mut vars = BTreeSet::new();
-            vars.insert(name);
-            vars
-        }
-        Type::Fun(param, _row, ret) => {
-            let mut vars = free_type_vars_resolved(&param, infer);
-            vars.extend(free_type_vars_resolved(&ret, infer));
-            vars
-        }
-        Type::List(elem) => free_type_vars_resolved(&elem, infer),
-        Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(|t| free_type_vars_resolved(t, infer)).collect(),
-        Type::Record(fields) => fields.iter().flat_map(|(_, t)| free_type_vars_resolved(t, infer)).collect(),
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) => BTreeSet::new(),
-        // Wraps one nested Type -- same recurse-into-the-wrapped-type
-        // precedent as List's own arm just above.
-        Type::Indexed(wrapped, _) => free_type_vars_resolved(&wrapped, infer),
-    }
-}
-
 // Every index-variable name free anywhere inside `e` -- IndexExpr has
 // no binding forms of its own (see its own grammar), so every Var is
 // free by construction; this is a plain collection, not an occurs- or
-// scope-sensitive walk the way free_type_vars_resolved needs to be
-// for Type::Var.
+// scope-sensitive walk.
 fn free_index_vars(e: &IndexExpr) -> BTreeSet<String> {
     match e {
         IndexExpr::Var(name) => BTreeSet::from([name.clone()]),
@@ -1059,43 +1015,6 @@ fn free_index_vars(e: &IndexExpr) -> BTreeSet<String> {
             vars.extend(free_index_vars(b));
             vars
         }
-    }
-}
-
-// Type::Indexed's own index-variable analog of free_type_vars_resolved
-// -- walks both the wrapped type (for a NESTED Indexed, however deep)
-// and, at each Indexed layer, the index expression's own free
-// variables (resolved through infer.index_subst first, mirroring how
-// free_type_vars_resolved resolves through infer.subst before
-// collecting). Every other Type variant contributes nothing -- an
-// index variable can only ever appear inside a Type::Indexed's own
-// IndexExpr, never anywhere else in a Type.
-pub(crate) fn free_index_vars_resolved(ty: &Type, infer: &InferCtx) -> BTreeSet<String> {
-    collect_index_vars(ty, &|e| infer.resolve_index_deep(e))
-}
-
-// The index-variable names `ty` mentions as written, NOT resolved through
-// index_subst (open_signature needs to see the already-bound ones).
-fn index_vars_as_written(ty: &Type) -> BTreeSet<String> {
-    collect_index_vars(ty, &|e| e.clone())
-}
-
-fn collect_index_vars(ty: &Type, resolve: &dyn Fn(&IndexExpr) -> IndexExpr) -> BTreeSet<String> {
-    match ty {
-        Type::Indexed(wrapped, index) => {
-            let mut vars = collect_index_vars(wrapped, resolve);
-            vars.extend(free_index_vars(&resolve(index)));
-            vars
-        }
-        Type::Fun(param, _row, ret) => {
-            let mut vars = collect_index_vars(param, resolve);
-            vars.extend(collect_index_vars(ret, resolve));
-            vars
-        }
-        Type::List(elem) => collect_index_vars(elem, resolve),
-        Type::Tuple(items) | Type::Union(items) => items.iter().flat_map(|t| collect_index_vars(t, resolve)).collect(),
-        Type::Record(fields) => fields.iter().flat_map(|(_, t)| collect_index_vars(t, resolve)).collect(),
-        _ => BTreeSet::new(),
     }
 }
 
@@ -1135,11 +1054,11 @@ fn resolve_row(row: &EffectRow, subst: &HashMap<String, EffectRow>) -> EffectRow
     }
 }
 
-// Recurses into every Type variant free_row_vars also recurses into
+// Recurses into every Type variant vars_in also recurses into
 // (Fun/List/Tuple/Union/Record), so a row variable this function finds
 // reachable is also one this function can rename -- the two are meant to
 // stay in lockstep, since a variable extend_generalized captured (via
-// free_row_vars) but subst_type then failed to touch would keep its
+// vars_in) but subst_type then failed to touch would keep its
 // literal original name at every instantiation instead of getting a
 // fresh one per reference, silently breaking per-reference row
 // polymorphism for whatever's inside that untouched variant.
@@ -1151,7 +1070,7 @@ fn resolve_row(row: &EffectRow, subst: &HashMap<String, EffectRow>) -> EffectRow
 // regardless of name, and the only way to get a callable Fun back out of
 // a Union/Record is by pattern-matching it, which types the result Dyn
 // regardless of what precision subst_type preserved going in. Kept
-// anyway, on the same "recurse everywhere free_row_vars does" principle
+// anyway, on the same "recurse everywhere vars_in does" principle
 // the Fun/List/Tuple arms already establish -- correct by construction,
 // not by a failing case this fixed.
 // Index-expression analog of subst_type's own Type::Var arm -- renames a
@@ -1412,7 +1331,8 @@ fn erase_open_indexed(t: &Type, env: &CheckEnv) -> Type {
 fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let from = env.infer.resolve_deep(from);
     let to = env.infer.resolve_deep(to);
-    if !free_type_vars_resolved(&from, env.infer).is_empty() || !free_type_vars_resolved(&to, env.infer).is_empty() {
+    let has_type_var = |ty: &Type| vars_in(ty).iter().any(|v| matches!(v, TyVar::Type(_)));
+    if has_type_var(&from) || has_type_var(&to) {
         return defer_cast(arena, e, &from, &to, env);
     }
     cast_now(arena, e, &from, &to, env)
@@ -3291,7 +3211,7 @@ fn conform_spec(arena: &mut Arena, root: ExprRef, blame: Span, infer: &InferCtx)
     let (mut work, mut kids) = (vec![root], Vec::new());
     while let Some(n) = work.pop() {
         if let Expr::TypeLit(t) = &arena[n] {
-            names.extend(index_vars_as_written(t));
+            names.extend(index_names(vars_in(t)));
         }
         kids.clear();
         arena[n].children(&mut kids);
@@ -4020,7 +3940,7 @@ fn check_against_rigid(
     spans: &SpanMap,
     infer: &mut InferCtx,
 ) -> Result<(EffectRow, ExprRef), TypeError> {
-    let signature_vars = if matches!(ann, Type::Fun(..)) { free_index_vars_resolved(ann, infer) } else { BTreeSet::new() };
+    let signature_vars = if matches!(ann, Type::Fun(..)) { index_names(vars_in(&infer.resolve_deep(ann))) } else { BTreeSet::new() };
     let added: Vec<String> = signature_vars.into_iter().filter(|v| infer.rigid_index.insert(v.clone())).collect();
     let prior: Vec<(String, Option<String>)> =
         renames.iter().map(|(from, to)| (from.clone(), infer.index_rename.insert(from.clone(), to.clone()))).collect();
@@ -4063,7 +3983,7 @@ fn open_signature(ann: &Type, infer: &InferCtx) -> (Type, Renames) {
     if !matches!(ann, Type::Fun(..)) {
         return (ann, Vec::new());
     }
-    let renames: Renames = index_vars_as_written(&ann)
+    let renames: Renames = index_names(vars_in(&ann))
         .into_iter()
         .filter(|v| infer.index_subst.contains_key(v) && !infer.rigid_index.contains(v))
         .map(|v| {
@@ -4323,7 +4243,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let (a_ty, a_row, a2) = match &f_ty {
                 Type::Fun(param_ty, ..) if {
                     let p = infer.resolve_deep(param_ty);
-                    contains_indexed(&p) && free_row_vars(&p).is_empty()
+                    contains_indexed(&p) && !vars_in(&p).iter().any(|v| matches!(v, TyVar::Row(_)))
                 } => {
                     let param_resolved = infer.resolve_deep(param_ty);
                     let (row, a2) = check_against(arena, a, &param_resolved, ctx, spans, infer)?;

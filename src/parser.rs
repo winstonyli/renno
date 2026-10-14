@@ -119,8 +119,7 @@ pub(crate) fn fresh_named_type_id(base: &str) -> String {
 // Does `ty` structurally contain a Type::Named leaf carrying exactly
 // `id` anywhere inside it? Used right after parsing a `type` alias's
 // own RHS to decide whether it actually referenced itself (mirrors the
-// shape of typecheck.rs's own free_row_vars/free_type_vars_resolved --
-// a plain structural walk, terminating because `ty` here is always a
+// shape of typecheck.rs's own vars_in -- a plain structural walk, terminating because `ty` here is always a
 // FRESH parse result, never something already containing a completed
 // recursive reference of its own). typecheck's recursive_type_group asks
 // the same question of a `let rec` type group's results.
