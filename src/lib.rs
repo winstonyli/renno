@@ -4231,13 +4231,13 @@ g(len)").unwrap_err();
         assert_eq!(run_source("let B = opaque in to_str(TypeOf(B))").unwrap().to_string(), "Token#8");
     }
 
-    // A function-typed Unknown site wraps its value in the site's contract
-    // (spec 11.6), which checks every call as wrap_fun_contract does: the
-    // argument, callability, and the result (itself wrapped if a function),
-    // blaming the site. A union with a function alternative picks the first
+    // A function-typed Unknown site checks callability at once, then wraps its
+    // value in the site's contract (spec 11.6), which checks every call as
+    // wrap_fun_contract does: the argument and the result (itself wrapped if a
+    // function), blaming the site. A union with a function alternative picks the first
     // alternative whose shape holds.
     #[test]
-    fn a_function_typed_unknown_site_checks_each_call() {
+    fn a_function_typed_unknown_site_checks_callability_at_the_boundary() {
         let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
         let f = "let f = fun T -> fun g: T -> g in ";
         assert_eq!(ok(&format!("{f}f(Fun((Int, Int)))(fun y -> y)(3)")), "3");
@@ -4245,15 +4245,15 @@ g(len)").unwrap_err();
         assert_eq!(ok("let f = fun T -> let rec g: T = fun x -> x in g in f(Fun((Int, Int)))(3)"), "3");
         // A function inside a container is only a callability test, as statically.
         assert_eq!(ok("let f = fun T -> fun x: List(T) -> len(x) in f(Fun((Int, Int)))([fun y -> y])"), "1");
-        // Wrapping a non-function succeeds; calling it fails.
-        assert_eq!(ok("let f = fun T -> let d: Dyn = 5 in let g: T = d in 0 in f(Fun((Int, Int)))"), "0");
         for (src, want) in [
+            // A non-function fails at the boundary, called or not.
+            ("let f = fun T -> let d: Dyn = 5 in let g: T = d in 0 in f(Fun((Int, Int)))".to_string(), "column 47: type error: expected (Int -> Int), found Int"),
             (format!("{f}f(Fun((Int, Int)))(fun y -> true)(3)"), "column 25: type error: expected Int, found Bool"),
             (format!("{f}let h = f(Fun((Int, Int)))(fun x -> x) in let k: Dyn = h in k(true)"), "column 25: type error: expected Int, found Bool"),
             (format!("{f}f(Fun((Fun((Int, Int)), Int)))(fun k -> k(true))(fun y -> y)"), "column 25: type error: expected Int, found Bool"),
             (format!("{f}f(Fun((Int, Fun((Int, Bool)))))(fun x -> fun y -> 5)(1)(2)"), "column 25: type error: expected Bool, found Int"),
             (format!("{f}f(Union((Int, Fun((Int, Int)))))(\"a\")"), "column 25: type error: expected Int | (Int -> Int), found Str"),
-            ("let f = fun T -> let d: Dyn = 5 in let g: T = d in g(1) in f(Fun((Int, Int)))".to_string(), "column 47: type error: expected (Dyn -> Dyn), found Int"),
+            ("let f = fun T -> let d: Dyn = 5 in let g: T = d in g(1) in f(Fun((Int, Int)))".to_string(), "column 47: type error: expected (Int -> Int), found Int"),
             ("let f = fun T -> let rec g: T = fun x -> true in g in f(Fun((Int, Int)))(3)".to_string(), "column 33: type error: expected Int, found Bool"),
             // The contract reads a length from the site's scope, as the site does.
             (
@@ -7994,7 +7994,7 @@ g(len)").unwrap_err();
             ("Bool", vec!["true"], vec![("3", "type error: expected Bool, found Int")], true),
             ("Str", vec!["\"a\""], vec![("3", "type error: expected Str, found Int")], true),
             ("[Int]", vec!["[1]", "[]"], vec![("3", "type error: expected [Int], found Int")], true),
-            ("(Int -> Int)", vec!["fun x: Int -> x"], vec![("3", "type error: expected (Dyn -> Dyn), found Int")], true),
+            ("(Int -> Int)", vec!["fun x: Int -> x"], vec![("3", "type error: expected (Int -> Int), found Int")], true),
             (
                 "(Int, Int)",
                 vec!["[1, 2]"],

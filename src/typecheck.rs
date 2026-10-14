@@ -1692,7 +1692,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
     match boundary(to, &env.infer.named_types, &mut visiting) {
         Boundary::None => e,
         Boundary::Shape(to) => build_shape_check(arena, e, to, env),
-        Boundary::Fun(param_ty, ret_ty) => wrap_fun_contract(arena, e, param_ty.clone(), ret_ty.clone(), env, &visiting),
+        Boundary::Fun(fun_ty, param_ty, ret_ty) => wrap_fun_contract(arena, e, fun_ty, param_ty.clone(), ret_ty.clone(), env, &visiting),
         Boundary::Union(to) => build_union_check(arena, e, to, env, &visiting),
     }
 }
@@ -1704,8 +1704,9 @@ enum Boundary<'t> {
     None,
     // One native check of this function-free type (build_shape_check).
     Shape(&'t Type),
-    // A per-call contract (wrap_fun_contract).
-    Fun(&'t Rc<Type>, &'t Rc<Type>),
+    // A per-call contract (wrap_fun_contract) on a callable value: the unfolded
+    // Fun type, its parameter and its result.
+    Fun(&'t Type, &'t Rc<Type>, &'t Rc<Type>),
     // A union with a Fun alternative (build_union_check).
     Union(&'t Type),
 }
@@ -1715,7 +1716,7 @@ enum Boundary<'t> {
 fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut HashSet<String>) -> Boundary<'t> {
     match to {
         Type::Int | Type::Float | Type::Bool | Type::Str | Type::List(_) | Type::Token(_) | Type::Tuple(_) | Type::Record(_) => Boundary::Shape(to),
-        Type::Fun(param_ty, _row, ret_ty) => Boundary::Fun(param_ty, ret_ty),
+        Type::Fun(param_ty, _row, ret_ty) => Boundary::Fun(to, param_ty, ret_ty),
         Type::Union(_) if needs_contract(to, named, visiting) => Boundary::Union(to),
         Type::Union(_) => Boundary::Shape(to),
         // Dyn accepts everything, so a check against it is the identity. Not
@@ -1783,7 +1784,7 @@ pub(crate) fn lower_residual(ty: &Type, named: &Rc<HashMap<String, Type>>, span:
     let (test, to, then) = match boundary(ty, named, &mut visiting) {
         Boundary::None => return None,
         Boundary::Shape(to) => (shape_test(to, &env, &mut defs, &HashSet::new()), to, Then::Done),
-        Boundary::Fun(param, ret) => (Test::Any, ty, Then::Wrap(param.clone(), ret.clone())),
+        Boundary::Fun(fun_ty, param, ret) => (Test::Fun, fun_ty, Then::Wrap(param.clone(), ret.clone())),
         Boundary::Union(to) => (Test::Never, to, pick(to, &env, &mut defs, &visiting)),
     };
     let bodies = defs.bodies.into_iter().map(|body| body.expect("every alias body is built before shape_test returns")).collect();
@@ -1804,7 +1805,7 @@ fn pick(to: &Type, env: &CheckEnv, defs: &mut Defs, visiting: &HashSet<String>) 
         };
         let mut visiting = visiting.clone();
         let then = match boundary(alt, &env.infer.named_types, &mut visiting) {
-            Boundary::Fun(param, ret) => Then::Wrap(param.clone(), ret.clone()),
+            Boundary::Fun(_, param, ret) => Then::Wrap(param.clone(), ret.clone()),
             Boundary::Union(nested) => pick(nested, env, defs, &visiting),
             Boundary::None | Boundary::Shape(_) => Then::Done,
         };
@@ -2294,13 +2295,14 @@ fn build_str_call(arena: &mut Arena, builtin: &str, value_ref: ExprRef, str_arg:
 // TypeError's doc comment).
 // A Vec(n) parameter makes `n` the argument's length for the return check
 // (a local witness, bound inside the wrapper only if that check reads it).
-fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, param_ty: Rc<Type>, ret_ty: Rc<Type>, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
+fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, fun_ty: &Type, param_ty: Rc<Type>, ret_ty: Rc<Type>, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
     let fn_var = fresh_index_name("__contract_fn");
     let arg_var = fresh_index_name("__contract_arg");
     let fn_var_ref = arena.push(Expr::Var(fn_var.clone()));
     let arg_var_ref = arena.push(Expr::Var(arg_var.clone()));
-    let checked_fn = build_shape_check(arena, fn_var_ref, &any_fun(), env);
-    let call = arena.push(Expr::App(checked_fn, arg_var_ref));
+    // Callability is checked once, where the value crosses the boundary.
+    let e = build_shape_check(arena, e, fun_ty, env);
+    let call = arena.push(Expr::App(fn_var_ref, arg_var_ref));
     let witness = list_length_var(&param_ty, env.infer).map(|var| IndexWitness::new(var, &arg_var));
     let checked_call = match &witness {
         Some(w) => {
@@ -3415,28 +3417,27 @@ fn residual_spec(arena: &mut Arena, root: ExprRef, blame: Span, infer: &InferCtx
             witness: None,
         }
     };
-    let template = contract_template(arena, blame, infer, &contract, &|arena, depth| check(arena, depth, None));
+    let template = contract_template(arena, &contract, &|arena, depth| check(arena, depth, None));
     Rc::new(check(arena, 0, Some(template)))
 }
 
 // An Unknown site's function contract (spec 11.6), the run-time twin of
 // wrap_fun_contract: `fun f -> fun p -> fun r -> fun a -> body`, where
-// `body` checks `a` against the type `p` holds, calls `f` (failing, as there,
-// if it is not callable) and checks the result against `r`, all blaming the
+// `body` checks `a` against the type `p` holds, calls `f` (callability was
+// checked when the value reached the site) and checks the result against `r`, all blaming the
 // site. It sits in the site's scope, so its checks read the site's length
 // table: machine::contract_value enters `body` with the site's env plus `f`,
 // `p` and `r`, and `contract` is set to it. `check` builds one of its checks,
 // given its depth.
-fn contract_template(arena: &mut Arena, blame: Span, infer: &InferCtx, contract: &OnceCell<ExprRef>, check: &dyn Fn(&mut Arena, u32) -> ResidualSpec) -> ExprRef {
+fn contract_template(arena: &mut Arena, contract: &OnceCell<ExprRef>, check:&dyn Fn(&mut Arena, u32) -> ResidualSpec) -> ExprRef {
     let [f, p, r, a] = ["__contract_fn", "__contract_param", "__contract_ret", "__contract_arg"].map(fresh_index_name);
     // The body's checks run 4 frames inside the site's env: `f`, `p`, `r`, `a`.
     let depth = 4;
     let mut var = |name: &str| arena.push(Expr::Var(name.to_string()));
     let (f_ref, a_ref, p_ref, r_ref, wp_ref, wa_ref) = (var(&f), var(&a), var(&p), var(&r), var(&p), var(&a));
-    let checked_fn = build_shape_check(arena, f_ref, &any_fun(), &CheckEnv::at(infer, blame));
     let arg_check = check(arena, depth);
     let checked_arg = arena.push(Expr::Residual(a_ref, p_ref, Rc::new(arg_check)));
-    let call = arena.push(Expr::App(checked_fn, checked_arg));
+    let call = arena.push(Expr::App(f_ref, checked_arg));
     let result_check = ResidualSpec { witness: Some((wp_ref, wa_ref)), ..check(arena, depth) };
     let body = arena.push(Expr::Residual(call, r_ref, Rc::new(result_check)));
     contract.set(body).expect("internal: a site's contract is built once");

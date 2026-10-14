@@ -644,6 +644,10 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                             control = Control::Apply(Value::Type(t));
                         }
                         Frame::Contract { lowered, lens, site, env } => {
+                            // A function type's callability is checked before the wrap.
+                            if matches!(lowered.then, Then::Wrap(..)) && !test_holds(&lowered.check.test, &lowered.check.defs, lens, &value) {
+                                check_failed(&lowered.check, lens, &value)
+                            }
                             let value = contract_value(&lowered.then, &lowered.check, lens, value, site, env);
                             cont = rest;
                             control = Control::Apply(value);
