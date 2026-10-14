@@ -798,7 +798,7 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
 
 /// The checker could neither prove nor refute the equation.
 fn undecided() -> Rel {
-    Rel::Unknown(Residual::IndexEq, Cause::Incomplete)
+    Rel::Unknown(Residual::INDEX_EQ, Cause::Incomplete)
 }
 
 /// `unify_index_expr` as the checker's `Result`: a refutation is its message, and an Unknown is a
@@ -824,9 +824,26 @@ pub(crate) fn unify_index(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, sp
 // (Tasks 4-6) -- a real decision point on every elaboration, not a
 // not-yet-wired-in mechanism.
 fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
+    unify_in(t1, t2, infer, span, &mut HashSet::new())
+}
+
+// `done` holds the big pairs this call has already unified (after resolution). Within one call
+// the substitution only grows, so a pair unified once stays unified; a failure ends the call,
+// so no failed pair is ever recorded. Each call (and each unify_trial) has its own set.
+fn unify_in(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), TypeError> {
     let t1 = infer.resolve(t1);
     let t2 = infer.resolve(t2);
-    match (&t1, &t2) {
+    let key = (is_big(&t1) || is_big(&t2)).then(|| (ById(t1.clone()), ById(t2.clone())));
+    if key.as_ref().is_some_and(|k| done.contains(k)) {
+        return Ok(());
+    }
+    unify_resolved(&t1, &t2, infer, span, done)?;
+    done.extend(key);
+    Ok(())
+}
+
+fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), TypeError> {
+    match (t1, t2) {
         (Type::Var(n1), Type::Var(n2)) if n1 == n2 => Ok(()),
         (Type::Var(name), other) | (other, Type::Var(name)) => {
             if occurs_in(name, other, infer) {
@@ -849,7 +866,7 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
         // Equal recursive types (structurally, E1): never unfolds, never binds a
         // Type::Var as a side effect of comparing them.
         (Type::Rec(a, i), Type::Rec(b, j)) if i == j && a == b => Ok(()),
-        (Type::List(a), Type::List(b)) => unify(a, b, infer, span),
+        (Type::List(a), Type::List(b)) => unify_in(a, b, infer, span, done),
         // The wrapped type recurses through unify()'s own Var-binding
         // behavior first (matching Type::Fun's own param-then-return
         // order just below); the index halves then go through
@@ -859,24 +876,24 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
         // SOP-equality check this arm used before Phase 2 Task 3 wired
         // real index-variable inference in.
         (Type::Indexed(wa, ia), Type::Indexed(wb, ib)) => {
-            unify(wa, wb, infer, span)?;
+            unify_in(wa, wb, infer, span, done)?;
             unify_index(ia, ib, infer, span)
         }
         (Type::Fun(p1, _r1, ret1), Type::Fun(p2, _r2, ret2)) => {
-            unify(p1, p2, infer, span)?;
-            unify(ret1, ret2, infer, span)
+            unify_in(p1, p2, infer, span, done)?;
+            unify_in(ret1, ret2, infer, span, done)
             // Row unification is out of scope here -- effect rows already
             // have their own, separate, unrelated generalize/instantiate
             // mechanism (bind_row_vars/resolve_row), untouched by this
             // plan; two Fun types unify on their param/return shape only.
         }
         (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
-            a.iter().zip(b.iter()).try_for_each(|(x, y)| unify(x, y, infer, span))
+            a.iter().zip(b.iter()).try_for_each(|(x, y)| unify_in(x, y, infer, span, done))
         }
         (Type::Record(a), Type::Record(b)) if a.len() == b.len() => {
             for (name, ty_a) in a.iter() {
                 match find_field(b, name) {
-                    Some(ty_b) => unify(ty_a, ty_b, infer, span)?,
+                    Some(ty_b) => unify_in(ty_a, ty_b, infer, span, done)?,
                     None => return Err(TypeError(format!("type mismatch: expected {t2}, found {t1}"), span)),
                 }
             }
@@ -897,12 +914,30 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
 // coerce_check, since it runs right after coerce() as a pure add-on
 // (binding Vars), not a second gate. See the catch-all below.
 fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
+    fits_in(required, actual, infer, span, &mut HashSet::new())
+}
+
+// `done` holds the big pairs this call has already accepted, relate rescue included. That is
+// safe under the contract above (never stricter than coerce_check): a remembered acceptance
+// cannot add strictness, and every caller propagates an error with `?`, so a failure ends the
+// call.
+fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), TypeError> {
     let required = infer.resolve(required);
     let actual = infer.resolve(actual);
-    match (&required, &actual) {
+    let key = (is_big(&required) || is_big(&actual)).then(|| (ById(required.clone()), ById(actual.clone())));
+    if key.as_ref().is_some_and(|k| done.contains(k)) {
+        return Ok(());
+    }
+    fits_resolved(&required, &actual, infer, span, done)?;
+    done.extend(key);
+    Ok(())
+}
+
+fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), TypeError> {
+    match (required, actual) {
         (Type::Fun(req_param, req_row, req_ret), Type::Fun(act_param, act_row, act_ret)) => {
-            unify_fits(act_param, req_param, infer, span)?;
-            unify_fits(req_ret, act_ret, infer, span)?;
+            fits_in(act_param, req_param, infer, span, done)?;
+            fits_in(req_ret, act_ret, infer, span, done)?;
             if !row_consistent(req_row, act_row) {
                 return Err(TypeError(format!("type mismatch: expected {required}, found {actual}"), span));
             }
@@ -911,7 +946,7 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
         (Type::Record(req_fields), Type::Record(act_fields)) => {
             for (name, req_ty) in req_fields.iter() {
                 match find_field(act_fields, name) {
-                    Some(act_ty) => unify_fits(req_ty, act_ty, infer, span)?,
+                    Some(act_ty) => fits_in(req_ty, act_ty, infer, span, done)?,
                     None => return Err(TypeError(format!("type mismatch: expected {required}, found {actual}"), span)),
                 }
             }
@@ -934,9 +969,9 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
         // arm just below in this file: a length mismatch is a plain type
         // mismatch, not something to recurse into element-wise.
         (Type::Tuple(req_items), Type::Tuple(act_items)) if req_items.len() == act_items.len() => {
-            req_items.iter().zip(act_items.iter()).try_for_each(|(req_ty, act_ty)| unify_fits(req_ty, act_ty, infer, span))
+            req_items.iter().zip(act_items.iter()).try_for_each(|(req_ty, act_ty)| fits_in(req_ty, act_ty, infer, span, done))
         }
-        (Type::List(req_elem), Type::List(act_elem)) => unify_fits(req_elem, act_elem, infer, span),
+        (Type::List(req_elem), Type::List(act_elem)) => fits_in(req_elem, act_elem, infer, span, done),
         // Type::Indexed gets no explicit arm here, deliberately -- this
         // match already has none for Union either, so anything that isn't
         // Fun/Record/Tuple/List falls through to the generic catch-all
@@ -957,7 +992,7 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
         // documents elsewhere (e.g. If/Match/ListLit branch combination), not a
         // regression, just not newly closed by this fix. Upgrade if real programs
         // need tighter constraint binding through these rescue-only paths.
-        _ => match unify_trial(&required, &actual, infer, span) {
+        _ => match unify_trial(required, actual, infer, span) {
             Ok(()) => Ok(()),
             Err(e) => {
                 // An Indexed-vs-Indexed pair already has full, authoritative
@@ -979,13 +1014,13 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
                 // rescue entirely rather than let it re-litigate what
                 // unify_index_expr (which DOES resolve through
                 // infer.index_subst) already decided.
-                if matches!((&required, &actual), (Type::Indexed(..), Type::Indexed(..))) {
+                if matches!((required, actual), (Type::Indexed(..), Type::Indexed(..))) {
                     return Err(e);
                 }
                 // Never stricter than coerce_check, which rejects exactly the Refuted and Undecided pairs.
-                match relate(&actual, &required, infer) {
+                match relate(actual, required, infer) {
                     Rel::Refuted(_) => Err(e),
-                    Rel::Unknown(res, _) if res.undecided() => Err(cannot_tell(&actual, &required, span)),
+                    Rel::Unknown(res, _) if res.undecided() => Err(cannot_tell(actual, required, span)),
                     _ => Ok(()),
                 }
             }
@@ -1491,7 +1526,7 @@ fn resolve_pendings(arena: &mut Arena, infer: &InferCtx) {
     }
 }
 
-// The one message for a non-dischargeable Unknown (Residual::Undecided).
+// The one message for a non-dischargeable Unknown (Residual::UNDECIDED).
 fn cannot_tell(from: &Type, to: &Type, span: Span) -> TypeError {
     TypeError(
         format!("cannot tell statically or at run time whether {from} fits {to}: an alternative differs only in a function type, a nominal type or a length"),

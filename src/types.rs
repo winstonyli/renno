@@ -1110,6 +1110,23 @@ impl fmt::Display for EffectRow {
 // back-references are Bound indices, never pointers), so a plain structural recursion always
 // terminates.
 pub fn consistent(a: &Type, b: &Type) -> bool {
+    consistent_in(a, b, &mut HashMap::new())
+}
+
+// `memo` holds the answers for big pairs (the relation is pure), so a shared pair is decided once.
+fn consistent_in(a: &Type, b: &Type, memo: &mut HashMap<(ById, ById), bool>) -> bool {
+    let key = (is_big(a) || is_big(b)).then(|| (ById(a.clone()), ById(b.clone())));
+    if let Some(done) = key.as_ref().and_then(|k| memo.get(k)) {
+        return *done;
+    }
+    let result = consistent_pair(a, b, memo);
+    if let Some(key) = key {
+        memo.insert(key, result);
+    }
+    result
+}
+
+fn consistent_pair(a: &Type, b: &Type, memo: &mut HashMap<(ById, ById), bool>) -> bool {
     match (a, b) {
         (Type::Dyn, _) | (_, Type::Dyn) => true,
         // Treated exactly like Dyn here -- the one place it behaves
@@ -1124,9 +1141,9 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         (Type::Float, Type::Float) => true,
         (Type::Bool, Type::Bool) => true,
         (Type::Str, Type::Str) => true,
-        (Type::List(a), Type::List(b)) => consistent(a, b),
+        (Type::List(a), Type::List(b)) => consistent_in(a, b, memo),
         (Type::Fun(a1, r1, b1), Type::Fun(a2, r2, b2)) => {
-            consistent(a1, a2) && consistent(b1, b2) && row_consistent(r1, r2)
+            consistent_in(a1, a2, memo) && consistent_in(b1, b2, memo) && row_consistent(r1, r2)
         }
         // A singleton per source position -- consistent only with itself
         // (and Dyn, already handled above). No registry lookup: the id
@@ -1155,14 +1172,14 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         // silently UNBOUND with no runtime check at all (rigid vs.
         // flexible index variables is a deeper, still-open concern).
         (Type::Indexed(wa, ia), Type::Indexed(wb, ib)) => {
-            consistent(wa, wb)
+            consistent_in(wa, wb, memo)
                 && (index_exprs_equal(ia, ib) || matches!(**ia, IndexExpr::Var(_)) || matches!(**ib, IndexExpr::Var(_)))
         }
         // Positional, structural, no name/registry involved -- same idea
         // as List's own element comparison, just per-position instead of
         // one shared element type.
         (Type::Tuple(a), Type::Tuple(b)) => {
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| consistent(x, y))
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| consistent_in(x, y, memo))
         }
         // Same idea as Tuple, plus each position's NAME must also match --
         // reuses record_satisfies (the one-directional "has at least
@@ -1174,7 +1191,7 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         // every one of `a`'s (name, type) pairs found in `b` forces the
         // two name SETS to be identical, not just one contained in the
         // other.
-        (Type::Record(a), Type::Record(b)) => a.len() == b.len() && record_satisfies(a, b),
+        (Type::Record(a), Type::Record(b)) => a.len() == b.len() && record_satisfies_in(a, b, memo),
         // Two unions: consistent as SETS -- every alternative on each
         // side has a match on the other (order and duplicates don't
         // matter, only membership). Must come before the single-Union
@@ -1182,13 +1199,13 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         // `other: &Type` would otherwise also match a Union on the other
         // side).
         (Type::Union(a), Type::Union(b)) => {
-            a.iter().all(|x| b.iter().any(|y| consistent(x, y))) && b.iter().all(|y| a.iter().any(|x| consistent(x, y)))
+            a.iter().all(|x| b.iter().any(|y| consistent_in(x, y, memo))) && b.iter().all(|y| a.iter().any(|x| consistent_in(x, y, memo)))
         }
         // One union, one concrete type: consistent if the concrete side
         // matches ANY ONE alternative -- "is this one of the possible
         // shapes," the same question a runtime value crossing a
         // Union-typed boundary would need answered.
-        (Type::Union(alts), other) | (other, Type::Union(alts)) => alts.iter().any(|alt| consistent(alt, other)),
+        (Type::Union(alts), other) | (other, Type::Union(alts)) => alts.iter().any(|alt| consistent_in(alt, other, memo)),
         // Every Tuple value IS, structurally, a List at runtime (see
         // Type::Tuple's own doc comment) -- needed so a tuple pattern
         // (parser::pattern_atom desugars `(p, q)` straight into
@@ -1216,7 +1233,11 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
 // by relate (typecheck/relate.rs), which has its own Record arm; this
 // helper survives for consistent()'s width-aware callers.
 pub fn record_satisfies(required: &[(String, Type)], actual: &[(String, Type)]) -> bool {
-    required.iter().all(|(name, ty)| find_field(actual, name).is_some_and(|aty| consistent(ty, aty)))
+    record_satisfies_in(required, actual, &mut HashMap::new())
+}
+
+fn record_satisfies_in(required: &[(String, Type)], actual: &[(String, Type)], memo: &mut HashMap<(ById, ById), bool>) -> bool {
+    required.iter().all(|(name, ty)| find_field(actual, name).is_some_and(|aty| consistent_in(ty, aty, memo)))
 }
 
 pub fn row_consistent(a: &EffectRow, b: &EffectRow) -> bool {

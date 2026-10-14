@@ -3641,6 +3641,22 @@ g(len)").unwrap_err();
         assert!(Hc::ptr_eq(left, right), "both children of a node are one node");
     }
 
+    // unify and consistent over two 2^60-leaf DAGs decide each distinct pair once.
+    #[test]
+    fn unify_and_consistent_decide_shared_pairs_once() {
+        use crate::span::Span;
+        use crate::typecheck::{unify_trial, InferCtx};
+        use types::Type;
+        let dag = |leaf: Type| (0..60).fold(leaf, |t, _| rec_tup(vec![t.clone(), t]));
+        let span = Span { start: 0, end: 0 };
+        let mut infer = InferCtx::new();
+        assert!(unify_trial(&dag(Type::Var("a".into())), &dag(Type::Int), &mut infer, span).is_ok());
+        assert_eq!(infer.resolve_deep(&Type::Var("a".into())), Type::Int);
+        assert!(unify_trial(&dag(Type::Int), &dag(Type::Str), &mut infer, span).is_err(), "a mismatch at the far end is still found");
+        assert!(types::consistent(&dag(Type::Int), &dag(Type::Dyn)));
+        assert!(!types::consistent(&dag(Type::Int), &dag(Type::Str)));
+    }
+
     // A query over a 2^60-leaf DAG costs its distinct nodes, and one over a subtree its summary
     // rules out costs nothing.
     #[test]
@@ -7772,7 +7788,7 @@ g(len)").unwrap_err();
         use std::rc::Rc;
         let lit = IndexExpr::Lit;
         let mut infer = rigid_infer(&["n"]);
-        let undecided = Rel::Unknown(Residual::IndexEq, Cause::Incomplete);
+        let undecided = Rel::Unknown(Residual::INDEX_EQ, Cause::Incomplete);
         let zero_big = IndexExpr::Mul(Rc::new(capped_index()), Rc::new(lit(0)));
         // rigid arm, occurs arm, compound arm
         let n_plus = IndexExpr::Add(Rc::new(var("n")), Rc::new(zero_big.clone()));

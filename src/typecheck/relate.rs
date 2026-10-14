@@ -2,10 +2,11 @@
 //! S2 T1 added `Why`/`Undecided`/`relate_cast`; consumers: coerce_check and the unify_fits rescue (T3), coerce_cast (T4).
 use super::{free_index_vars, unify_index_expr, InferCtx};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
-use crate::types::{row_consistent, unfold, RecRef, Type};
+use crate::types::{is_big, row_consistent, unfold, ById, RecRef, Type};
 use crate::util::find_field;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
 /// Native-stack guard (a source type that is itself very deep). Degenerate aliases are cut earlier
@@ -22,63 +23,40 @@ pub(crate) enum Cause {
 }
 /// The runtime work that would decide an Unknown. Unit placeholders: payloads were not built (S3 lowers from `to`). `Fun` is
 /// a wrapper around a function value (no value test); a Dyn used as a function is `Test` + `Fun`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Residual {
-    Test,
-    Fun,
-    Len,
-    IndexEq,
-    Lazy,
+/// A set of the kinds of work an Unknown mentions. Nothing reads how they combine (all of, any
+/// of), only which kinds occur, so a union of bits is enough and costs nothing to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Residual(u8);
+impl Residual {
+    pub(crate) const TEST: Residual = Residual(1);
+    pub(crate) const FUN: Residual = Residual(2);
+    pub(crate) const LEN: Residual = Residual(4);
+    pub(crate) const INDEX_EQ: Residual = Residual(8);
+    /// A cap was hit.
+    pub(crate) const LAZY: Residual = Residual(16);
     /// No value test, wrapper or unifier step decides it: a static error.
-    Undecided,
-    All(Vec<Residual>),
-    Any(Vec<Residual>),
-}
-impl Residual {
+    pub(crate) const UNDECIDED: Residual = Residual(32);
     #[cfg(test)]
-    fn collect(&self, out: &mut BTreeSet<&'static str>) {
-        match self {
-            Residual::Test => {
-                out.insert("Test");
-            }
-            Residual::Fun => {
-                out.insert("Fun");
-            }
-            Residual::Len => {
-                out.insert("Len");
-            }
-            Residual::IndexEq => {
-                out.insert("IndexEq");
-            }
-            Residual::Lazy => {
-                out.insert("Lazy");
-            }
-            Residual::Undecided => {
-                out.insert("Undecided");
-            }
-            Residual::All(rs) | Residual::Any(rs) => rs.iter().for_each(|r| r.collect(out)),
-        }
+    fn collect(self, out: &mut BTreeSet<&'static str>) {
+        let names = [(Self::TEST, "Test"), (Self::FUN, "Fun"), (Self::LEN, "Len"), (Self::INDEX_EQ, "IndexEq"), (Self::LAZY, "Lazy"), (Self::UNDECIDED, "Undecided")];
+        out.extend(names.iter().filter(|(bit, _)| self.0 & bit.0 != 0).map(|(_, name)| *name));
+    }
+    /// Some part is decided by a value test (lowered by `build_boundary_check`).
+    pub(crate) fn needs_test(self) -> bool {
+        self.0 & (Self::TEST.0 | Self::LEN.0 | Self::LAZY.0) != 0
+    }
+    pub(crate) fn undecided(self) -> bool {
+        self.0 & Self::UNDECIDED.0 != 0
     }
 }
-impl Residual {
-    /// Some part is decided by a value test (lowered by `build_boundary_check`).
-    pub(crate) fn needs_test(&self) -> bool {
-        match self {
-            Residual::Test | Residual::Len | Residual::Lazy => true,
-            Residual::All(rs) | Residual::Any(rs) => rs.iter().any(Residual::needs_test),
-            _ => false,
-        }
-    }
-    pub(crate) fn undecided(&self) -> bool {
-        match self {
-            Residual::Undecided => true,
-            Residual::All(rs) | Residual::Any(rs) => rs.iter().any(Residual::undecided),
-            _ => false,
-        }
+impl std::ops::BitOr for Residual {
+    type Output = Residual;
+    fn bitor(self, other: Residual) -> Residual {
+        Residual(self.0 | other.0)
     }
 }
 /// Why a pair is Refuted. Only a `Shape` refutation is seen by the value test that lowers a
-/// `Residual::Test`, which matters when it is one alternative of a Union source.
+/// `Residual::TEST`, which matters when it is one alternative of a Union source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Why {
     /// A value test tells them apart: base type, tuple arity, missing field, list vs tuple.
@@ -125,38 +103,34 @@ impl Rel {
 }
 // Conjunction: Refuted dominates, then Unknown (worst cause), else Proven.
 fn and(rels: impl IntoIterator<Item = Rel>) -> Rel {
-    let (mut unknowns, mut cause) = (Vec::new(), Cause::Imprecise);
+    let (mut unknown, mut cause) = (None, Cause::Imprecise);
     for r in rels {
         match r {
             Rel::Refuted(why) => return Rel::Refuted(why),
             Rel::Unknown(res, c) => {
                 cause = cause.max(c);
-                unknowns.push(res);
+                unknown = Some(unknown.map_or(res, |seen| seen | res));
             }
             Rel::Proven => {}
         }
     }
-    match unknowns.len() {
-        0 => Rel::Proven,
-        1 => Rel::Unknown(unknowns.remove(0), cause),
-        _ => Rel::Unknown(Residual::All(unknowns), cause),
-    }
+    unknown.map_or(Rel::Proven, |res| Rel::Unknown(res, cause))
 }
 // Disjunction over target-Union alternatives (the caller already returned on a Proven one):
 // all Refuted refutes; otherwise Unknown, as precise as its most precise Unknown alternative.
 fn or(rels: Vec<Rel>) -> Rel {
-    let (mut unknowns, mut cause, mut why) = (Vec::new(), Cause::Incomplete, Why::Shape("empty union"));
+    let (mut unknown, mut cause, mut why) = (None, Cause::Incomplete, Why::Shape("empty union"));
     for r in rels {
         match r {
             Rel::Unknown(res, c) => {
                 cause = cause.min(c);
-                unknowns.push(res);
+                unknown = Some(unknown.map_or(res, |seen| seen | res));
             }
             Rel::Refuted(w) => if why.observable() { why = w },
             Rel::Proven => return Rel::Proven,
         }
     }
-    if unknowns.is_empty() { Rel::Refuted(why) } else { Rel::Unknown(Residual::Any(unknowns), cause) }
+    unknown.map_or(Rel::Refuted(why), |res| Rel::Unknown(res, cause))
 }
 /// Per-`relate` bookkeeping: remaining `go` calls, and the (source, recursive type) pairs being unfolded.
 struct Budget {
@@ -165,10 +139,28 @@ struct Budget {
     // unique) and member.
     unfolding_rec: RefCell<Vec<(Type, RecRef, usize)>>,
     ignore_rows: bool,
+    // The decided pairs of big nodes, by (source, target, context): a shared node is related
+    // once per context, not once per path to it. The context names the stack of recursive
+    // unfoldings above a call (0: none; each unfolding gets a fresh number for its extent), since
+    // the revisit guard makes an answer depend on that stack. A pair whose computation hit a cap
+    // (`caps` counts them) is never stored, so a stored answer never depends on how much budget
+    // was left.
+    pairs: RefCell<HashMap<(ById, ById, u32), Rel>>,
+    context: Cell<u32>,
+    contexts: Cell<u32>,
+    caps: Cell<u32>,
 }
 impl Default for Budget {
     fn default() -> Self {
-        Budget { left: Cell::new(FUEL), unfolding_rec: RefCell::new(Vec::new()), ignore_rows: false }
+        Budget {
+            left: Cell::new(FUEL),
+            unfolding_rec: RefCell::new(Vec::new()),
+            ignore_rows: false,
+            pairs: RefCell::new(HashMap::new()),
+            context: Cell::new(0),
+            contexts: Cell::new(0),
+            caps: Cell::new(0),
+        }
     }
 }
 fn loose(t: &Type) -> bool {
@@ -188,19 +180,35 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
     if from == to {
         return Rel::Proven;
     }
+    let (from, to) = (infer.resolve(from), infer.resolve(to));
+    let key = (is_big(&from) || is_big(&to)).then(|| (ById(from.clone()), ById(to.clone()), fuel.context.get()));
+    if let Some(done) = key.as_ref().and_then(|k| fuel.pairs.borrow().get(k).cloned()) {
+        return done;
+    }
     if depth > MAX_DEPTH || fuel.left.get() == 0 {
-        return Rel::Unknown(Residual::Lazy, Cause::Incomplete);
+        fuel.caps.set(fuel.caps.get() + 1);
+        return Rel::Unknown(Residual::LAZY, Cause::Incomplete);
     }
     fuel.left.set(fuel.left.get() - 1);
-    let (from, to, d) = (infer.resolve(from), infer.resolve(to), depth + 1);
+    let caps = fuel.caps.get();
+    let result = decide(from, to, infer, fuel, depth + 1);
+    // A result computed past a cap (even one a union folded into a plain test) is not stored.
+    if let Some(key) = key
+        && fuel.caps.get() == caps
+    {
+        fuel.pairs.borrow_mut().insert(key, result.clone());
+    }
+    result
+}
+fn decide(from: Type, to: Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Rel {
     let unknown = |r: Residual| Rel::Unknown(r, Cause::Imprecise);
     match (&from, &to) {
         (Type::Var(a), Type::Var(b)) if a == b => Rel::Proven,
         (Type::Fun(..), Type::Dyn) => fun_rel(&from, &to, infer, fuel, d), // cast as Fun(Dyn, Dyn)
         (_, t) if loose(t) => Rel::Proven,
-        (f, Type::Fun(..)) if loose(f) => unknown(Residual::All(vec![Residual::Test, Residual::Fun])),
-        (f, Type::Indexed(..)) if loose(f) => unknown(Residual::All(vec![Residual::Test, Residual::Len])),
-        (f, _) if loose(f) => unknown(Residual::Test),
+        (f, Type::Fun(..)) if loose(f) => unknown(Residual::TEST | Residual::FUN),
+        (f, Type::Indexed(..)) if loose(f) => unknown(Residual::TEST | Residual::LEN),
+        (f, _) if loose(f) => unknown(Residual::TEST),
         (Type::Union(alts), _) => {
             let rels: Vec<Rel> = alts.iter().map(|a| go(a, &to, infer, fuel, d)).collect();
             if rels.iter().all(|r| *r == Rel::Proven) {
@@ -216,9 +224,9 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
                 Rel::Unknown(res, c) => res.undecided() || (*c == Cause::Imprecise && matches!(infer.resolve(a), Type::Fun(..))),
                 Rel::Proven => false,
             }) {
-                Rel::Unknown(Residual::Undecided, Cause::Incomplete)
+                Rel::Unknown(Residual::UNDECIDED, Cause::Incomplete)
             } else {
-                unknown(Residual::Test)
+                unknown(Residual::TEST)
             }
         }
         (_, Type::Union(alts)) => {
@@ -244,7 +252,10 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
                 return Rel::refuted("recursive: cyclic unfolding");
             }
             fuel.unfolding_rec.borrow_mut().push((from.clone(), g.clone(), *i));
+            let outer = fuel.context.replace(fuel.contexts.get() + 1);
+            fuel.contexts.set(fuel.contexts.get() + 1);
             let r = go(&from, &unfold(g, *i), infer, fuel, d);
+            fuel.context.set(outer);
             fuel.unfolding_rec.borrow_mut().pop();
             r
         }
@@ -258,7 +269,7 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
         (Type::Tuple(_), Type::Tuple(_)) => Rel::refuted("tuple arity"),
         // The tuple/list bridge exists only for a Dyn/Var element (types::consistent's has Dyn only).
         (Type::List(e), Type::Tuple(_)) => {
-            if loose(&infer.resolve(e)) { unknown(Residual::Test) } else { Rel::refuted("list into tuple") }
+            if loose(&infer.resolve(e)) { unknown(Residual::TEST) } else { Rel::refuted("list into tuple") }
         }
         (Type::Tuple(_), Type::List(e)) => {
             if loose(&infer.resolve(e)) { Rel::Proven } else { Rel::refuted("tuple into list") }
@@ -271,7 +282,7 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
         _ => Rel::refuted("shape"),
     }
 }
-// Params contravariant, returns covariant; any Unknown component is a wrapper (Residual::Fun),
+// Params contravariant, returns covariant; any Unknown component is a wrapper (Residual::FUN),
 // except an Undecided, which no wrapper can discharge and so propagates.
 fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Rel {
     let Type::Fun(a, r, b) = from else { return Rel::refuted("not a function") };
@@ -285,7 +296,7 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
         _ => (Type::Dyn, Type::Dyn),
     };
     match and([go(&a2, a, infer, fuel, d), go(b, &b2, infer, fuel, d)]) {
-        Rel::Unknown(res, c) if !res.undecided() => Rel::Unknown(Residual::Fun, c),
+        Rel::Unknown(res, c) if !res.undecided() => Rel::Unknown(Residual::FUN, c),
         Rel::Refuted(Why::Shape(w)) => Rel::Refuted(Why::Opaque(w)),
         other => other,
     }
@@ -297,7 +308,7 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
 fn relate_index(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Rel {
     let (ra, rb) = (infer.resolve_index_deep(a), infer.resolve_index_deep(b));
     match index_exprs_compare(&ra, &rb) {
-        None => return Rel::Unknown(Residual::IndexEq, Cause::Incomplete),
+        None => return Rel::Unknown(Residual::INDEX_EQ, Cause::Incomplete),
         Some(IndexCmp::Equal) => return Rel::Proven,
         Some(IndexCmp::NonzeroConst) => return index_refuted(a, b, infer),
         Some(IndexCmp::Other) => {}
@@ -307,9 +318,9 @@ fn relate_index(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Rel {
     let mut vars = free_index_vars(&ra);
     vars.extend(free_index_vars(&rb));
     if bare_flexible(&ra) || bare_flexible(&rb) {
-        Rel::Unknown(Residual::IndexEq, Cause::Imprecise)
+        Rel::Unknown(Residual::INDEX_EQ, Cause::Imprecise)
     } else if vars.iter().any(flexible) {
-        Rel::Unknown(Residual::IndexEq, Cause::Incomplete)
+        Rel::Unknown(Residual::INDEX_EQ, Cause::Incomplete)
     } else {
         index_refuted(a, b, infer)
     }
@@ -494,11 +505,25 @@ mod tests {
         assert_eq!(relate_cast(&fx(EffectRow::single("a")), &fx(EffectRow::pure()), &infer), Rel::Proven);
     }
 
+    // 2^50 leaves, 50 nodes: the pair memo makes each distinct pair cost one decision, so this
+    // is far under the fuel cap and decides exactly (a tree walk would run out of fuel first).
+    #[test]
+    fn relate_decides_shared_nodes_exactly() {
+        let dag = |leaf: Type| (0..50).fold(leaf, |t, _| tup(&[t.clone(), t]));
+        let infer = InferCtx::new();
+        assert_eq!(relate(&dag(Type::Int), &dag(Type::Dyn), &infer), Rel::Proven);
+        assert_eq!(relate(&dag(Type::Dyn), &dag(Type::Int), &infer).kinds(), BTreeSet::from(["Test"]));
+        assert!(matches!(relate(&dag(Type::Int), &dag(Type::Str), &infer), Rel::Refuted(_)));
+        // Past the depth cap the answer is still Lazy, and a capped answer is not remembered.
+        let deep = |leaf: Type| (0..70).fold(leaf, |t, _| tup(&[t.clone(), t]));
+        assert!(matches!(relate(&deep(Type::Int), &deep(Type::Bool), &infer), Rel::Unknown(Residual::LAZY, Cause::Incomplete)));
+    }
+
     #[test]
     fn relate_depth_guard_backstops_a_deep_source() {
         let infer = InferCtx::new();
         let deep = |leaf: Type| (0..70).fold(leaf, |t, _| list(t));
-        assert!(matches!(relate(&deep(Type::Int), &deep(Type::Bool), &infer), Rel::Unknown(Residual::Lazy, Cause::Incomplete)));
+        assert!(matches!(relate(&deep(Type::Int), &deep(Type::Bool), &infer), Rel::Unknown(Residual::LAZY, Cause::Incomplete)));
     }
 
     #[test]
@@ -572,6 +597,6 @@ mod tests {
         let (d1, d2) = (0..MAX_DEPTH + 6).fold((Type::Int, Type::Bool), |(a, b), _| (fun(Type::Int, a), fun(Type::Int, b)));
         let (u1, u2) = (uni(&[d1, Type::Bool]), uni(&[d2, Type::Bool, Type::Str]));
         let got = relate(&u1, &u2, &infer);
-        assert!(!matches!(got, Rel::Unknown(Residual::Undecided, _)), "{got:?}");
+        assert!(!matches!(got, Rel::Unknown(Residual::UNDECIDED, _)), "{got:?}");
     }
 }
