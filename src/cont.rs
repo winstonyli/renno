@@ -27,6 +27,11 @@ pub enum Frame {
     // evaluating the binding values left to right in the OUTER scope;
     // `remaining`/`done` mirror ListElems's accumulation shape.
     LetRecBody { remaining: Vec<ExprRef>, done: Vec<Value>, body: ExprRef, env: Env },
+    // A `let rec` of unannotated calls (resolve::GroupKind::Types): its values run
+    // in `vals_env`, a frame of one placeholder type per name (`ids`); `done`
+    // holds the finished ones. After the last, types::close_group builds the
+    // recursive types and the body runs in a frame of the finished values on `env`.
+    TypeGroupBody { group: ExprRef, ids: Rc<[u64]>, done: Vec<Value>, env: Env, vals_env: Env },
     // Scrutinee has just been evaluated to `value` -- try `arms` in order.
     MatchArms { arms: Rc<Vec<(Pattern, Option<ExprRef>, ExprRef)>>, env: Env },
     // A pattern matched (binding `guard_env`) but its arm has a guard,

@@ -54,31 +54,6 @@ pub enum Type {
     // identity using nothing but ordinary structural comparison -- no
     // separate name-registry/brand-comparison mechanism needed.
     Token(u64),
-    // A reference to a genuinely self-referential type's own
-    // definition -- `let rec List = Union(Tuple(Int, List), Bool) in ...` -- rather
-    // than the ordinary, fully-expanded structural value every OTHER
-    // (non-recursive) type resolves to directly. The string is always
-    // a gensym'd unique id in the shape "Base#N" (see typecheck's
-    // fresh_named_type_id), never the bare user-typed name --
-    // recursive types in different, unrelated scopes can share a surface
-    // name, and the registry this leaf is looked up in (InferCtx's own
-    // `named_types`, populated by recursive_type_group) outlives those
-    // scopes, so it needs a name that can never collide across them.
-    //
-    // A lightweight, non-expanding leaf, in the same spirit as
-    // Type::Var/Type::Token: a tag consulted on demand, never
-    // something requiring evaluation or unfolding to construct.
-    // Comparison (consistent()/unify()) is purely nominal, by id --
-    // see their own new arms -- so nothing here ever needs to unfold
-    // what this id actually stands for, and no cycle-detection is
-    // needed anywhere in this file's own structural recursion, even
-    // though a registry entry for a genuinely recursive type
-    // structurally contains this SAME leaf pointing at itself.
-    // shape_test/build_boundary_check/pattern_could_match/
-    // relate/unify_fits (typecheck.rs) are the consumers that ever look
-    // up what a Named id stands for, and only one level at a time -- see
-    // their own doc comments.
-    Named(String),
     // Member `usize` of a recursive type group: a closed, finite mu-term (see RecGroup).
     Rec(RecRef, usize),
     // A reference inside a group's bodies (Bound), or the placeholder the machine hands a
@@ -119,7 +94,7 @@ pub enum Type {
     Union(Rc<Vec<Type>>),
     // `Vec(n)` sugars over this -- NOT its own bespoke primitive. Wraps
     // either Type::List directly (the primary, worked case) or a
-    // qualifying Type::Named+Type::Union (derived index-refinement, a
+    // qualifying Type::Rec+Type::Union (derived index-refinement, a
     // later phase) with one IndexExpr tracking its own length/size.
     // See the design spec's own section 2 for the full rationale.
     Indexed(Rc<Type>, Rc<IndexExpr>),
@@ -479,10 +454,9 @@ impl fmt::Display for EffectRow {
 // same rule: Dyn row is consistent with any row, two Closed rows must
 // match exactly (no row subtyping/variance modeled yet).
 //
-// No registry, no cycle guard: every Type here is a plain finite tree
-// (Tuple/Union hold an Rc<Vec<Type>>, never a back-reference to
-// themselves -- nothing in this checker ever builds a genuinely-cyclic
-// Type value), so a plain structural recursion always terminates.
+// No cycle guard: every Type here is a finite tree (a recursive type is a closed mu-term whose
+// back-references are Bound indices, never pointers), so a plain structural recursion always
+// terminates.
 pub fn consistent(a: &Type, b: &Type) -> bool {
     match (a, b) {
         (Type::Dyn, _) | (_, Type::Dyn) => true,
@@ -506,13 +480,6 @@ pub fn consistent(a: &Type, b: &Type) -> bool {
         // (and Dyn, already handled above). No registry lookup: the id
         // alone says everything there is to say.
         (Type::Token(a), Type::Token(b)) => a == b,
-        // Nominal, not structural -- same singleton-by-id precedent
-        // Token's own arm just above already sets. Two Named types are
-        // consistent only when their ids match exactly; a Named type
-        // is never consistent with anything structurally identical to
-        // what it (or any other Named type) unfolds to. Never unfolds
-        // the registry -- see Type::Named's own doc comment.
-        (Type::Named(a), Type::Named(b)) => a == b,
         // Structural up to member names (RecRef's own equality); never against its unfolding.
         (Type::Rec(a, i), Type::Rec(b, j)) => i == j && a == b,
         // Two Indexed types are consistent when their wrapped types are
@@ -619,13 +586,6 @@ impl fmt::Display for Type {
             // identically to Type::Dyn, which is what a Type::Var
             // actually behaves like everywhere it's observable.
             Type::Var(_) => write!(f, "Dyn"),
-            // Shows the clean surface name, not the internal gensym'd
-            // id -- mirrors Type::Var's own precedent just above
-            // (hiding its internal name, always showing "Dyn" instead)
-            // of not exposing machinery the user never wrote. The
-            // surface name is always the part before the first "#" --
-            // see the id's own construction in parser::atom.
-            Type::Named(id) => write!(f, "{}", surface_name(id)),
             // The member's own name, never its body.
             Type::Rec(g, i) => write!(f, "{}", g.0.names[*i]),
             Type::RecVar(RecVar::Free { name, .. }) => write!(f, "{name}"),

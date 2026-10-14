@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 #[cfg(test)]
 use std::collections::BTreeSet;
 /// Native-stack guard (a source type that is itself very deep). Degenerate aliases are cut earlier
-/// by the revisit guard in the `Named` arm.
+/// by the revisit guard in the `Rec` arm.
 const MAX_DEPTH: usize = 64;
 /// Total `go` calls per `relate`: a breadth backstop for pathological unions.
 const FUEL: u32 = 10_000;
@@ -158,18 +158,17 @@ fn or(rels: Vec<Rel>) -> Rel {
     }
     if unknowns.is_empty() { Rel::Refuted(why) } else { Rel::Unknown(Residual::Any(unknowns), cause) }
 }
-/// Per-`relate` bookkeeping: remaining `go` calls, and the (source, alias) pairs being unfolded.
+/// Per-`relate` bookkeeping: remaining `go` calls, and the (source, recursive type) pairs being unfolded.
 struct Budget {
     left: Cell<u32>,
-    unfolding: RefCell<Vec<(Type, String)>>,
-    // The same guard for a Rec target: the source, and the group (kept, so its pointer stays
-    // unique) and member being unfolded.
+    // A Rec target being unfolded: the source, and the group (kept, so its pointer stays
+    // unique) and member.
     unfolding_rec: RefCell<Vec<(Type, RecRef, usize)>>,
     ignore_rows: bool,
 }
 impl Default for Budget {
     fn default() -> Self {
-        Budget { left: Cell::new(FUEL), unfolding: RefCell::new(Vec::new()), unfolding_rec: RefCell::new(Vec::new()), ignore_rows: false }
+        Budget { left: Cell::new(FUEL), unfolding_rec: RefCell::new(Vec::new()), ignore_rows: false }
     }
 }
 fn loose(t: &Type) -> bool {
@@ -236,22 +235,6 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
         (Type::Indexed(wf, i), Type::Indexed(wt, j)) => and([go(wf, wt, infer, fuel, d), relate_index(i, j, infer)]),
         (Type::Indexed(wf, _), _) => go(wf, &to, infer, fuel, d), // forgetting an index is sound; the reverse is not
         (_, Type::Indexed(..)) => Rel::opaque("plain type into indexed"),
-        (Type::Named(a), Type::Named(b)) => {
-            if a == b { Rel::Proven } else { Rel::opaque("named: different ids") }
-        }
-        (_, Type::Named(id)) => match infer.named_types.get(id) {
-            // Unfolding the same alias against the same source again is a cycle with no new evidence
-            // (`let rec A = Union(Int, A)`): no finite derivation, so Refuted rather than Lazy.
-            Some(_) if fuel.unfolding.borrow().iter().any(|(f, i)| i == id && *f == from) => Rel::refuted("named: cyclic unfolding"),
-            Some(raw) => {
-                fuel.unfolding.borrow_mut().push((from.clone(), id.clone()));
-                let r = go(&from, raw, infer, fuel, d);
-                fuel.unfolding.borrow_mut().pop();
-                r
-            }
-            None => Rel::opaque("named: not in registry"),
-        },
-        (Type::Named(_), _) => Rel::opaque("named: nominal source"),
         // Equal pairs were proven by `from == to` above. No directional body relating: Amber's
         // rule without an assumption set is unsound for a contravariant occurrence.
         (Type::Rec(..), Type::Rec(..)) => Rel::opaque("recursive: different types"),
@@ -366,8 +349,16 @@ mod tests {
     fn var(n: &str) -> Type {
         Type::Var(n.to_string())
     }
-    fn named(id: &str) -> Type {
-        Type::Named(id.to_string())
+    fn rec_group(bodies: Vec<Type>) -> crate::types::RecRef {
+        use crate::types::{RecGroup, RecRef};
+        RecRef(Rc::new(RecGroup::new(vec![Rc::from("L")], bodies)))
+    }
+    fn bound0() -> Type {
+        Type::RecVar(crate::types::RecVar::Bound { depth: 0, member: 0 })
+    }
+    // L = (Int, L) | Bool
+    fn l_ty() -> Type {
+        Type::Rec(rec_group(vec![uni(&[tup(&[Type::Int, bound0()]), Type::Bool])]), 0)
     }
     fn iv(n: &str) -> IndexExpr {
         IndexExpr::Var(n.to_string())
@@ -381,11 +372,9 @@ mod tests {
     fn vec_n(i: IndexExpr) -> Type {
         Type::Indexed(Rc::new(list(Type::Dyn)), Rc::new(i))
     }
-    // a := Int, s := Str, u unbound; index n rigid, z := 0; L = (Int, L) | Bool.
+    // a := Int, s := Str, u unbound; index n rigid, z := 0.
     fn ctx() -> InferCtx {
-        let raw = uni(&[tup(&[Type::Int, named("L#1")]), Type::Bool]);
         let mut i = InferCtx::new();
-        Rc::make_mut(&mut i.named_types).insert("L#1".to_string(), raw);
         i.subst.insert("a".to_string(), Type::Int);
         i.subst.insert("s".to_string(), Type::Str);
         i.rigid_index.insert("n".to_string());
@@ -447,12 +436,11 @@ mod tests {
             ("fun wider param ok", fun(is.clone(), i.clone()), fun(i.clone(), i.clone()), P),
             ("fun narrower param", fun(i.clone(), i.clone()), fun(is.clone(), i.clone()), U(&["Fun"], Imp)),
             ("fun rows differ", fx(i.clone(), i.clone(), EffectRow::single("a")), fx(i.clone(), i.clone(), EffectRow::pure()), R),
-            ("named same", named("L#1"), named("L#1"), P),
-            ("named different", named("M#2"), named("L#1"), R),
-            ("named into int", named("L#1"), i.clone(), R),
-            ("literal one level into L", tup(&[i.clone(), b.clone()]), named("L#1"), P),
-            ("literal two levels into L (t10)", tup(&[i.clone(), ii.clone()]), named("L#1"), R),
-            ("dyn into L", d.clone(), named("L#1"), U(&["Test"], Imp)),
+            ("rec same", l_ty(), l_ty(), P),
+            ("rec into int", l_ty(), i.clone(), R),
+            ("literal one level into L", tup(&[i.clone(), b.clone()]), l_ty(), P),
+            ("literal two levels into L (t10)", tup(&[i.clone(), ii.clone()]), l_ty(), R),
+            ("dyn into L", d.clone(), l_ty(), U(&["Test"], Imp)),
             ("vec same", vec_n(lit(3)), vec_n(lit(3)), P),
             ("vec literal mismatch", vec_n(lit(3)), vec_n(lit(4)), R),
             ("vec into flexible var", vec_n(lit(3)), vec_n(iv("m")), U(&["IndexEq"], Imp)),
@@ -493,7 +481,8 @@ mod tests {
         let infer = ctx();
         let (i, s) = (Type::Int, Type::Str);
         assert_eq!(relate(&i, &s, &infer), Rel::Refuted(Why::Shape("shape")));
-        assert!(matches!(relate(&named("M#2"), &named("L#1"), &infer), Rel::Refuted(Why::Opaque(_))));
+        let m = Type::Rec(rec_group(vec![list(bound0())]), 0);
+        assert!(matches!(relate(&m, &l_ty(), &infer), Rel::Refuted(Why::Opaque(_))));
         assert!(matches!(relate(&fun(i.clone(), i.clone()), &fun(s.clone(), i.clone()), &infer), Rel::Refuted(Why::Opaque(_))));
         let rigid = Why::Index { msg: "index variable n is fixed by the signature and cannot equal 3".into(), bare: true };
         assert_eq!(relate(&vec_n(iv("n")), &vec_n(lit(3)), &infer), Rel::Refuted(rigid));
@@ -506,37 +495,16 @@ mod tests {
     }
 
     #[test]
-    fn relate_terminates_on_degenerate_aliases() {
-        // let rec A = Union(A, A, Bool) (2^64 steps by depth alone), let rec B = B, let rec C = Union(Int, C): unfolding the
-        // same alias against the same source again is a cycle, so these are Refuted, not Lazy.
-        let mut infer = InferCtx::new();
-        let reg = Rc::make_mut(&mut infer.named_types);
-        reg.insert("A#1".to_string(), uni(&[named("A#1"), named("A#1"), Type::Bool]));
-        reg.insert("B#2".to_string(), named("B#2"));
-        reg.insert("C#3".to_string(), uni(&[Type::Int, named("C#3")]));
-        assert!(matches!(relate(&Type::Int, &named("A#1"), &infer), Rel::Refuted(_)));
-        assert!(matches!(relate(&Type::Int, &named("B#2"), &infer), Rel::Refuted(_)));
-        assert_eq!(relate(&Type::Bool, &named("A#1"), &infer), Rel::Proven);
-        assert_eq!(relate(&Type::Int, &named("C#3"), &infer), Rel::Proven);
-        assert!(matches!(relate(&Type::Str, &named("C#3"), &infer), Rel::Refuted(_)));
-        // The depth guard is the backstop for a source that is itself too deep.
+    fn relate_depth_guard_backstops_a_deep_source() {
+        let infer = InferCtx::new();
         let deep = |leaf: Type| (0..70).fold(leaf, |t, _| list(t));
         assert!(matches!(relate(&deep(Type::Int), &deep(Type::Bool), &infer), Rel::Unknown(Residual::Lazy, Cause::Incomplete)));
     }
 
-    fn rec_group(bodies: Vec<Type>) -> crate::types::RecRef {
-        use crate::types::{RecGroup, RecRef};
-        RecRef(Rc::new(RecGroup::new(vec![Rc::from("L")], bodies)))
-    }
-    fn bound0() -> Type {
-        Type::RecVar(crate::types::RecVar::Bound { depth: 0, member: 0 })
-    }
-
     #[test]
     fn relate_unfolds_a_rec_target() {
-        // The twin of the L#1 cases of relate_table: L = (Int, L) | Bool.
         let (i, b, d) = (Type::Int, Type::Bool, Type::Dyn);
-        let l = Type::Rec(rec_group(vec![uni(&[tup(&[i.clone(), bound0()]), b.clone()])]), 0);
+        let l = l_ty();
         let m = Type::Rec(rec_group(vec![list(bound0())]), 0);
         let infer = ctx();
         assert_eq!(relate(&l, &l, &infer), Rel::Proven);
@@ -551,7 +519,9 @@ mod tests {
 
     #[test]
     fn relate_terminates_on_degenerate_rec_types() {
-        // The twin of relate_terminates_on_degenerate_aliases, hand-built (close_group would reject B).
+        // let rec A = Union(A, A, Bool) (2^64 steps by depth alone), B = B, C = Union(Int, C), hand-built
+        // (close_group would reject B): unfolding the same type against the same source again is a cycle,
+        // so these are Refuted, not Lazy.
         let a = Type::Rec(rec_group(vec![uni(&[bound0(), bound0(), Type::Bool])]), 0);
         let b = Type::Rec(rec_group(vec![bound0()]), 0);
         let c = Type::Rec(rec_group(vec![uni(&[Type::Int, bound0()])]), 0);
@@ -577,7 +547,7 @@ mod tests {
         assert!(p(&uni(&[i.clone(), s.clone()]), &uni(&[i.clone(), s.clone()]))); // cons: no redundant DOWN
         // A wrapper iff the Fun source is Unknown (was needs_wrapper).
         assert!(matches!(relate_cast(&fun(i.clone(), i.clone()), &d, &infer), Rel::Unknown(..)));
-        assert!(p(&fun(d.clone(), d.clone()), &d) && p(&fun(d.clone(), named("L#1")), &d));
+        assert!(p(&fun(d.clone(), d.clone()), &d) && p(&fun(d.clone(), l_ty()), &d));
         assert!(matches!(relate_cast(&fun(d.clone(), fun(i.clone(), i.clone())), &d, &infer), Rel::Unknown(..)));
         // Migrated from the fits unit tests.
         assert!(p(&fun(rec_(&["x"]), i.clone()), &fun(rec_(&["x", "y"]), i.clone())));

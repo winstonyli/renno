@@ -13,7 +13,7 @@ pub enum IndexExpr {
 impl std::fmt::Display for IndexExpr {
     // Parenthesizes by precedence (a sum or difference under `*`, a sum or difference on the
     // right of `-`), and shows a variable by its surface name: the part before the first `#`
-    // is what the user wrote, the rest is checker bookkeeping (as for Type::Named).
+    // is what the user wrote, the rest is checker bookkeeping (as for Type::Var).
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         fn operand(e: &IndexExpr, wrap: bool, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             if wrap { write!(f, "({e})") } else { write!(f, "{e}") }

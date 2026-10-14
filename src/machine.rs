@@ -7,9 +7,9 @@ use crate::env::{Env, PRELUDE};
 use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
-use crate::resolve::{is_direct_group, resolve, Resolved, VarRef};
+use crate::resolve::{group_kind, resolve, GroupKind, Resolved, VarRef};
 use crate::span::Span;
-use crate::types::{EffectRow, Type};
+use crate::types::{close_group, first_free, fresh_rec_id, EffectRow, RecVar, Type};
 use crate::util::find_field;
 use crate::value::{table_lookup, Builtin, Contract, HandlerData, SiteCtx, TypeCtor, Value};
 
@@ -164,7 +164,12 @@ pub fn eval_type(arena: &Arena, ann: ExprRef, spans: &SpanMap) -> Result<Type, S
 // Expr::Annot) report the same words.
 pub fn pure_type(outcome: Pure) -> Result<Rc<Type>, String> {
     match outcome {
-        Pure::Done(Value::Type(t)) => Ok(t),
+        // A placeholder of a recursive type group that has not closed yet can never
+        // become an annotation, whether bare or nested (see Frame::TypeGroupBody).
+        Pure::Done(Value::Type(t)) => match first_free(&t) {
+            Some(name) => Err(format!("recursive type {name} is used before it is built")),
+            None => Ok(t),
+        },
         Pure::Done(v) => Err(format!("annotation did not evaluate to a type, found {}", v.type_name())),
         Pure::Stuck(Stuck::Fuel) => Err(format!("annotation did not terminate within {ANNOTATION_FUEL} steps")),
         Pure::Stuck(Stuck::Effect) => Err("an annotation cannot perform an effect".to_string()),
@@ -401,7 +406,22 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                     control = Control::Eval(*val_expr, env);
                 }
                 Expr::LetRec(bindings, body) => {
-                    if is_direct_group(arena, bindings) {
+                    let kind = group_kind(arena, bindings);
+                    if kind == GroupKind::Types {
+                        // Rule P: every value is an unannotated call, so the group
+                        // builds recursive types. The values run in a frame [names…]
+                        // of placeholders (one fresh id per name); once all have
+                        // run, close_group ties the knot (Frame::TypeGroupBody).
+                        let ids: Rc<[u64]> = bindings.iter().map(|_| fresh_rec_id()).collect();
+                        let mut frame = Bindings::default();
+                        for ((name, _, _), id) in bindings.iter().zip(ids.iter()) {
+                            frame.push(Value::Type(Rc::new(Type::RecVar(RecVar::Free { id: *id, name: Rc::from(name.as_str()) }))));
+                        }
+                        let vals_env = frame.extend(&env);
+                        let first = bindings[0].2; // parser never emits an empty group
+                        cont = Cont::cons(Frame::TypeGroupBody { group: expr, ids, done: Vec::new(), env, vals_env: vals_env.clone() }, cont);
+                        control = Control::Eval(first, vals_env);
+                    } else if kind == GroupKind::Functions {
                         // Every value is a direct Lambda: build the group
                         // straight from the lambda bodies -- evaluating a
                         // Lambda is pure, so skipping it is unobservable --
@@ -411,7 +431,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                             .iter()
                             .map(|(_, _, v)| match &arena[*v] {
                                 Expr::Lambda(_, _, b) => *b,
-                                _ => unreachable!("is_direct_group checked"),
+                                _ => unreachable!("group_kind checked"),
                             })
                             .collect();
                         let mut frame = Bindings::default();
@@ -420,7 +440,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                         }
                         control = Control::Eval(*body, frame.extend(&env));
                     } else {
-                        // Not a function group (spec §2 fallback): values
+                        // Plain group (spec §2 fallback): values
                         // evaluate in the OUTER scope, left to right, and the
                         // names are bound plainly (non-recursively) for the
                         // body only. Reversed, same reason as ListLit: pop().
@@ -589,6 +609,31 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                                     }
                                     control = Control::Eval(body, frame.extend(&env));
                                 }
+                            }
+                        }
+                        Frame::TypeGroupBody { group, ids, done, env, vals_env } => {
+                            let group = *group;
+                            let Expr::LetRec(bindings, body) = &arena[group] else { unreachable!("a type group frame names a LetRec") };
+                            let mut done = done.clone();
+                            done.push(value);
+                            let (ids, env, vals_env) = (ids.clone(), env.clone(), vals_env.clone());
+                            cont = rest;
+                            if done.len() < bindings.len() {
+                                let next = bindings[done.len()].2;
+                                cont = Cont::cons(Frame::TypeGroupBody { group, ids, done, env, vals_env: vals_env.clone() }, cont);
+                                control = Control::Eval(next, vals_env);
+                            } else {
+                                let results: Vec<Option<Type>> = done.iter().map(|v| if let Value::Type(t) = v { Some((**t).clone()) } else { None }).collect();
+                                let names: Vec<Rc<str>> = bindings.iter().map(|(n, _, _)| Rc::from(n.as_str())).collect();
+                                let closed = close_group(&names, &ids, &results).unwrap_or_else(|(i, _)| {
+                                    set_current_span(spans.get(bindings[i].2).copied());
+                                    crate::run_error!("recursive type {} is not built by a type constructor", names[i])
+                                });
+                                let mut frame = Bindings::default();
+                                for (v, c) in done.into_iter().zip(closed) {
+                                    frame.push(c.map_or(v, |t| Value::Type(Rc::new(t))));
+                                }
+                                control = Control::Eval(*body, frame.extend(&env));
                             }
                         }
                         Frame::MatchArms { arms, env } => {
@@ -871,8 +916,10 @@ fn param_witness(param: &Type, arg: &Value) -> Option<(String, Len)> {
 fn conform_lazy(spec: &ConformSpec, t: Rc<Type>) -> Rc<Lazy> {
     let mut memo = spec.memo.borrow_mut();
     if let Some(seen) = memo.as_ref()
-        && Rc::ptr_eq(&seen.ty, &t)
+        && (Rc::ptr_eq(&seen.ty, &t) || *seen.ty == *t)
     {
+        // `==`: a recursive type rebuilt per call is a new value but the same type;
+        // without it every call would mint a fresh Lazy cycle.
         return seen.clone();
     }
     let lazy = Lazy::new(t);
@@ -881,14 +928,9 @@ fn conform_lazy(spec: &ConformSpec, t: Rc<Type>) -> Rc<Lazy> {
 }
 
 // The checks for a type (None: nothing to check), lowered the first time they
-// are asked for: the registry and blame span are the site's.
+// are asked for: the blame span is the site's.
 fn lazy_lowered(lazy: &Lazy, spec: &ConformSpec) -> Option<Rc<Lowered>> {
-    lazy.lowered
-        .get_or_init(|| {
-            let named = spec.named.get().expect("internal: the registry is set when checking finishes");
-            crate::typecheck::lower_conform(lazy, named, spec.span)
-        })
-        .clone()
+    lazy.lowered.get_or_init(|| crate::typecheck::lower_conform(lazy, spec.span)).clone()
 }
 
 // `value` conformed to the type `lazy` holds, at the site `ctx` (spec 11.6): a
@@ -1763,8 +1805,8 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Token(x), Value::Token(y)) => x == y,
-        // Structural (spec section 9.2): a recursive type compares by its
-        // Named id, so this terminates.
+        // Structural (spec section 9.2): a recursive type is a finite closed term, so
+        // comparing it terminates.
         (Value::Type(x), Value::Type(y)) => x == y,
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_eq(a, b))

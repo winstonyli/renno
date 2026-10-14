@@ -2987,14 +2987,12 @@ g(len)").unwrap_err();
             ("let A = Int in let rec F = fun n -> if n == 0 then Int else (let z: F(0) = 1 in let B = A in let y: B = 1 in B) in let x: F(1) = 1 in x", "1"),
             ("let Base = Int in let MkPair = fun a -> (let P = Tuple(Base, Base) in let p: P = (1, 2) in P) in 0", "0"),
             ("let A = Int in let F = (let B = A in let y: B = 1 in B) in let x: F = 1 in x", "1"),
+            ("let A = Int in let MkL = fun u -> (let C = A in let rec L = Union(Tuple(C, L), Bool) in L) in let x: MkL(0) = true in x", "true"),
         ];
         for (src, want) in cases {
             assert_eq!(run_source(src).unwrap().to_string(), *want, "{src}");
         }
         let errors: &[(&str, &str)] = &[
-            // Main's older, separate bug: a right-hand side containing a recursive
-            // type group runs the parsed group, so `L` is unbound there.
-            ("let A = Int in let MkL = fun u -> (let C = A in let rec L = Union(Tuple(C, L), Bool) in L) in let x: MkL(0) = true in x", "line 1, column 102: unbound variable: L"),
             ("let A = Int in let F = fun u -> (let B = A in let y: B = 1 in B) in let x: F(0) = true in x", "line 1, column 83: type mismatch: expected Int, found Bool"),
             ("let A = List(1) in let F = fun u -> (let B = A in let y: B = 1 in B) in 0", "line 1, column 58: List cannot take a Int"),
         ];
@@ -3015,7 +3013,8 @@ g(len)").unwrap_err();
     }
 
     // Two definitions per group (an early one for the group's own values, a final
-    // one for the code after it): merging them is parked.
+    // one for the code after it): merging them is parked. Only a function group is two
+    // definitions in the sense that matters; a type group's values run on the machine.
     #[test]
     fn a_recursive_group_is_evaluated_once_per_definition() {
         let src = "let rec F = fun n -> if n == 0 then Int else (let z: F(0) = 1 in Int) in let x: F(1) = 1 in x";
@@ -3400,49 +3399,6 @@ g(len)").unwrap_err();
         assert!(err.0.contains("cannot compare") || err.0.contains("type mismatch"), "unexpected message: {}", err.0);
     }
 
-    #[test]
-    fn consistent_treats_two_named_types_with_the_same_id_as_consistent() {
-        use types::{consistent, Type};
-        let a = Type::Named("List#3".to_string());
-        let b = Type::Named("List#3".to_string());
-        assert!(consistent(&a, &b));
-    }
-
-    #[test]
-    fn consistent_rejects_two_named_types_with_different_ids() {
-        // Nominal, not structural: two DIFFERENT ids are never
-        // consistent, even though this test never gives either one a
-        // real registry definition to compare structurally against --
-        // that's the whole point, comparison never looks at what a
-        // Named type unfolds to.
-        use types::{consistent, Type};
-        let a = Type::Named("List#3".to_string());
-        let b = Type::Named("Tree#7".to_string());
-        assert!(!consistent(&a, &b));
-    }
-
-    #[test]
-    fn consistent_rejects_a_named_type_against_a_structurally_identical_concrete_type() {
-        // Pure nominal comparison: a Named type is never consistent
-        // with anything other than another Named type sharing its
-        // exact id, even a hand-built value that happens to look
-        // exactly like what it (hypothetically) unfolds to.
-        use types::{consistent, Type};
-        let named = Type::Named("List#3".to_string());
-        let concrete = Type::Union(std::rc::Rc::new(vec![
-            Type::Tuple(std::rc::Rc::new(vec![Type::Int, Type::Dyn])),
-            Type::Int,
-        ]));
-        assert!(!consistent(&named, &concrete));
-    }
-
-    #[test]
-    fn named_type_displays_as_its_own_clean_surface_name() {
-        use types::Type;
-        let ty = Type::Named("List#3".to_string());
-        assert_eq!(format!("{ty}"), "List");
-    }
-
     // Test helpers for recursive (Rec) types: `bound0` is a reference to member 0 of the group being built.
     fn rec_bound(depth: u32, member: u32) -> types::Type {
         types::Type::RecVar(types::RecVar::Bound { depth, member })
@@ -3634,7 +3590,7 @@ g(len)").unwrap_err();
 
     #[test]
     fn two_recursive_aliases_sharing_a_surface_name_in_different_scopes_do_not_collide() {
-        // Each `List` is its own `let rec`, so each mints its own Named id; the
+        // Each `List` is its own `let rec`, so each builds its own recursive type; the
         // second scope's `("s", true)` must be checked against ITS List, not the first.
         let scope = |elem: &str, v: &str, n: i64| {
             format!(
@@ -3648,10 +3604,10 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn coerce_accepts_a_tuple_literal_against_a_named_type_via_a_one_level_unfold() {
+    fn coerce_accepts_a_tuple_literal_against_a_recursive_type_via_a_one_level_unfold() {
         // xs: List is a CONCRETE annotation, not Dyn -- the tuple
         // literal's own inferred type is a plain Type::Tuple, never
-        // itself Type::Named, so this exercises relate's one-level
+        // itself a Type::Rec, so this exercises relate's one-level
         // unfold of the alias (Proven), not a runtime boundary
         // check at all. Confirmed statically accepted with zero
         // wrapping: if this compiles and runs to completion, relate
@@ -3675,7 +3631,7 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn a_genuinely_dyn_sourced_value_is_checked_at_runtime_against_a_named_type_all_the_way_down() {
+    fn a_genuinely_dyn_sourced_value_is_checked_at_runtime_against_a_recursive_type_all_the_way_down() {
         // g's own parameter is explicitly Dyn -- it stays Dyn all the
         // way to `f(v)` inside g's body, so THAT call genuinely
         // crosses a real Dyn boundary at runtime (build_boundary_check
@@ -3701,7 +3657,7 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn a_dyn_sourced_value_is_rejected_deep_inside_a_named_recursive_type() {
+    fn a_dyn_sourced_value_is_rejected_deep_inside_a_recursive_type() {
         let src = r#"
             let rec List = Union(Tuple(Int, List), Bool) in
             let f = fun xs: List -> xs in
@@ -3727,15 +3683,15 @@ g(len)").unwrap_err();
         // A's own recursive occurrence is a BARE Union alternative -- not
         // wrapped in a Tuple/Record the way List = (Int, List) | Bool is
         // above, whose Tuple shape check never inspects element types and
-        // so never revisits the Named leaf. Unfolding Type::Named(id) here
-        // reproduces the exact same Union([Int, Named(id)]) again, which
+        // so never revisits the recursive leaf. Unfolding the Rec here
+        // reproduces the exact same Union([Int, A]) again, which
         // used to send the union check/shape builders/
         // build_boundary_check into genuine infinite recursion in THIS
         // PROCESS's own call stack during elaboration (a real stack
         // overflow, not a graceful type error). g's own parameter is
         // explicitly Dyn, so it stays Dyn all the way to f(v) -- forcing a
         // real runtime boundary check against A, not coerce's own static
-        // rescue (mirrors a_genuinely_dyn_sourced_value_is_checked_at_runtime_against_a_named_type_all_the_way_down
+        // rescue (mirrors a_genuinely_dyn_sourced_value_is_checked_at_runtime_against_a_recursive_type_all_the_way_down
         // above). With the ancestor-tracking fix, `A`'s own self-reference
         // contributes nothing new to the check -- `let rec A = Union(Int, A)`
         // behaves exactly like plain `Int`, the only alternative that can
@@ -3766,10 +3722,10 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn matching_on_a_named_typed_value_is_not_incorrectly_flagged_as_impossible() {
+    fn matching_on_a_recursive_typed_value_is_not_incorrectly_flagged_as_impossible() {
         // Without this task's own fix, pattern_could_match would reject
-        // BOTH arms below as statically impossible (consistent()'s new
-        // nominal-only Type::Named arm rejects it against any
+        // BOTH arms below as statically impossible (a nominal leaf for the
+        // recursive type would have been rejected against any
         // structural pattern type), making this a static error instead
         // of running to completion.
         let src = r#"
@@ -3793,9 +3749,9 @@ g(len)").unwrap_err();
         // wrapped in a Tuple the way List = (Int, List) | Bool is
         // above), same shape as shape_test's own regression
         // at a_bare_union_self_reference_does_not_infinite_loop_at_a_dyn_boundary.
-        // A List pattern against a Named(A) scrutinee unfolds to
-        // Union([Int, Named(A)]), and Pattern::List's own Union arm fans
-        // out into EVERY alternative -- including Named(A) again -- which
+        // A List pattern against an A scrutinee unfolds to
+        // Union([Int, A]), and Pattern::List's own Union arm fans
+        // out into EVERY alternative -- including A again -- which
         // without pattern_could_match's own ancestor-tracking cycle
         // break would send it into genuine infinite recursion (a real
         // stack overflow) in THIS PROCESS's own call stack during
@@ -3823,9 +3779,11 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn two_different_named_types_are_never_interchangeable_even_if_isomorphic() {
-        // Two SEPARATE recursive aliases with IDENTICAL structure --
-        // nominal comparison means they're still not interchangeable.
+    fn a_body_that_misses_its_recursive_type_is_a_type_mismatch() {
+        // `make_other`'s body is (Int, (Int, Token)), which is not an
+        // OtherIntList, so the annotation fails at the body. (Two recursive
+        // types of identical structure ARE equal now: see
+        // recursive_types_are_compared_structurally.)
         let src = r#"
             let rec IntList = Union(Tuple(Int, IntList), Bool) in
             let rec OtherIntList = Union(Tuple(Int, OtherIntList), Bool) in
@@ -3871,9 +3829,9 @@ g(len)").unwrap_err();
     fn coerce_rejects_a_bare_union_self_reference_given_the_wrong_type() {
         // Regression test for the final fix wave's Defect 2
         // (the static rescue it names was replaced by relate in S2):
-        // the old rescue's own Union arm used to map a bare
-        // Type::Named(id) alternative to Type::Dyn (e.g. Union([Int,
-        // Named(id)]) -> Union([Int, Dyn])) instead of dropping it --
+        // the old rescue's own Union arm used to map a
+        // bare self-reference alternative to Type::Dyn (e.g. Union([Int,
+        // A]) -> Union([Int, Dyn])) instead of dropping it --
         // and Dyn is consistent with EVERYTHING, so the whole Union
         // became trivially satisfied by any value at all, making an
         // `A`-typed annotation completely inert. With the fix, the
@@ -4507,7 +4465,7 @@ g(len)").unwrap_err();
     }
 
     // A `let rec` whose values are type constructor applications is a
-    // recursive type (spec section 1): a Named leaf in named_types.
+    // recursive type (spec section 1): a closed Rec term the machine builds.
     #[test]
     fn a_let_rec_of_type_constructors_is_a_recursive_type() {
         let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
@@ -4524,17 +4482,18 @@ g(len)").unwrap_err();
         assert_eq!(ok("let E = Int in let rec L = Union((Tuple((E, L)), Bool)) in let l: L = (1, true) in l"), "[1, true]");
         // No self-reference: just the type.
         assert_eq!(ok("let rec T = List(Int) in let x: T = [1] in to_str(T)"), "[Int]");
-        // A bare name of the group builds no type: an ordinary `let rec`,
-        // whose value sees the outer scope.
-        assert_eq!(ok("let T = Int in let rec T = (fun u -> u)(T) in to_str(T)"), "Int");
+        // A bare name of the group is not a type constructor: the value sees the group's own
+        // (unfinished) name, and the group cannot be built.
+        let err = run_source("let T = Int in let rec T = (fun u -> u)(T) in to_str(T)").unwrap_err();
+        assert!(err.contains("recursive type T is not built by a type constructor"), "{err}");
         let err = run_source("let rec T = (fun x -> x)(T) in 1").unwrap_err();
-        assert!(err.contains("unbound variable: T"), "{err}");
+        assert!(err.contains("recursive type T is not built by a type constructor"), "{err}");
         // Not a type at check time: an ordinary `let rec`, as before.
         assert_eq!(ok("let rec x = len([1]) in x"), "1");
-        // `==` compares a recursive type by its Named id (spec section 9.2).
+        // `==` compares recursive types structurally, up to member names (spec section 9.2).
         let m = "let rec M = Union((Tuple((Int, M)), Bool)) in ";
         assert_eq!(ok(&format!("{l}{m}L == L")), "true");
-        assert_eq!(ok(&format!("{l}{m}L == M")), "false");
+        assert_eq!(ok(&format!("{l}{m}L == M")), "true");
         // Indexed applies to it like to any type.
         let b = "let rec B = Union((Bool, Tuple((Int, B)))) in ";
         assert_eq!(ok(&format!("{b}let x: Indexed(B, 2) = (1, (2, false)) in 0")), "0");
@@ -4858,8 +4817,9 @@ g(len)").unwrap_err();
         assert!(!elaborated_binds("let Pair = fun a -> Tuple((a, a)) in let x: Pair(Int) = (1, 2) in x", "Pair"));
     }
 
-    // A recursive type's values are elaborated once, with the names bound to
-    // their types: their type errors are reported and their casts kept.
+    // A recursive type's values are elaborated once: their type errors are
+    // reported and their casts kept. The group's names are unfinished inside
+    // its values, so an annotation cannot use them.
     #[test]
     fn a_type_groups_values_are_type_checked() {
         for (src, want) in [
@@ -4867,22 +4827,135 @@ g(len)").unwrap_err();
             ("let rec L = Union((Tuple((Int, L)), (fun u -> Bool)(match 1 | _ -> 1 | 2 -> 2))) in to_str(L)", "unreachable match arm"),
             ("let rec L = Union((Tuple((Int, L)), (fun u -> Bool)(match (1, 2) | (a, b, c) -> 1 | _ -> 2))) in to_str(L)", "can never match"),
             ("let rec L = Union((Tuple((Int, L)), (fun x: Nope -> Bool)(1))) in to_str(L)", "unbound variable: Nope"),
-            ("let rec L = Union((Tuple((Int, L)), (fun x: L -> Bool)((1, 2)))) in to_str(L)", "type mismatch: expected L, found (Int, Int)"),
+            ("let rec L = Union((Tuple((Int, L)), (fun x: L -> Bool)((1, 2)))) in to_str(L)", "recursive type L is used before it is built"),
         ] {
             let err = run_source(src).unwrap_err();
             assert!(err.contains(want), "{src}: {err}");
         }
-        // An annotation inside a value can name the group.
-        assert_eq!(run_source("let rec L = Union((Tuple((Int, L)), (fun x: L -> Bool)((1, true)))) in let l: L = (1, true) in l").unwrap(), Outcome::List(vec![Outcome::Int(1), Outcome::Bool(true)]));
+        // The group's names are unfinished inside its values.
+        let err = run_source("let rec L = Union((Tuple((Int, L)), (fun x: L -> Bool)((1, true)))) in let l: L = (1, true) in l").unwrap_err();
+        assert!(err.contains("recursive type L is used before it is built"), "{err}");
         // A cast the value needs is kept, so the group stays and fails at run time.
         let src = "let rec L = Union((Tuple((Int, L)), (fun a -> if true then a else 5)(Bool))) in let l: L = (1, true) in l";
         assert!(elaborated_binds(src, "L"));
         assert!(run_source(src).unwrap_err().contains("expected Int, found Type"));
-        // A kept check that passes: the value runs first (the `_` binding)
-        // and the type keeps its identity.
+        // A kept check that passes: the group stays a group, and the type keeps its identity.
         let src = "let z: Dyn = 0 in let rec L = Union((Tuple((Int, L)), (fun x: Int -> Bool)(z))) in (to_str(L), L == L)";
-        assert!(elaborated_binds(src, "_"));
+        assert!(elaborated_binds(src, "L"));
         assert_eq!(run_source(src).unwrap(), Outcome::List(vec![Outcome::Str("L".to_string()), Outcome::Bool(true)]));
+    }
+
+    // The type function A builds a fresh recursive type on each call.
+    const REC_FN: &str = "let A = fun v -> (let rec R = Union(Tuple(v, R), Bool) in R) in ";
+
+    #[test]
+    fn a_recursive_type_inside_a_type_function() {
+        let ok = |src: String| run_source(&src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
+        assert_eq!(ok(format!("{REC_FN}let x: A(Int) = (1, (2, true)) in x")), "[1, [2, true]]");
+        rejects(&format!("{REC_FN}let x: A(Int) = (1, (2, 3)) in x"), "type mismatch: expected R, found (Int, (Int, Int))");
+        assert_eq!(ok(format!("{REC_FN}A(Int) == A(Int)")), "true");
+        assert_eq!(ok(format!("{REC_FN}A(Int) == A(Str)")), "false");
+        assert_eq!(ok(format!("{REC_FN}let f = fun T -> fun x: A(T) -> x in f(Int)((1, (2, true)))")), "[1, [2, true]]");
+        rejects(
+            &format!("{REC_FN}let f = fun T -> fun x: A(T) -> x in f(Int)((1, (\"a\", true)))"),
+            "type error: expected (Int, R) | Bool, found Str at element 1, element 0",
+        );
+    }
+
+    #[test]
+    fn two_evaluations_of_a_recursive_type_function_are_equal() {
+        let src = format!("{REC_FN}let x: A(Int) = (1, true) in let y: A(Int) = x in y");
+        assert_eq!(run_source(&src).unwrap().to_string(), "[1, true]");
+        // Different arguments give different types (the ambiguous message is parked).
+        rejects(&format!("{REC_FN}let x: A(Int) = (1, true) in let y: A(Str) = x in y"), "type mismatch: expected R, found R");
+    }
+
+    #[test]
+    fn mutual_and_nested_recursive_types_in_type_functions() {
+        let nested = "let L = fun v -> (let rec R = Union(Tuple(v, R), Bool) in R) in let rec A = Union(Int, L(A)) in let x: A = (3, (4, true)) in to_str(A)";
+        assert_eq!(run_source(nested).unwrap().to_string(), "A");
+        let mutual = "let M = fun v -> (let rec E = Union(Tuple(v, O), Bool) and O = Tuple(v, E) in E) in let x: M(Int) = (1, (2, true)) in x";
+        assert_eq!(run_source(mutual).unwrap().to_string(), "[1, [2, true]]");
+    }
+
+    #[test]
+    fn an_index_variable_reaches_a_recursive_type_through_an_argument() {
+        let head = "let L = fun V -> (let rec R = Union(Tuple(V, R), Bool) in R) in (fun v: Vec(n) -> fun d: Dyn -> (let x: L(Vec(n)) = d in x))([1, 2])";
+        assert_eq!(run_source(&format!("{head}(([3, 4], ([5, 6], true)))")).unwrap().to_string(), "[[3, 4], [[5, 6], true]]");
+        rejects(&format!("{head}(([3, 4], ([5], true)))"), "expected ([Dyn](n), R) | Bool, found List at element 1, element 0");
+    }
+
+    #[test]
+    fn a_let_rec_of_calls_is_built_by_the_machine() {
+        rejects("let T = Int in let rec T = (fun u -> u)(T) in to_str(T)", "recursive type T is not built by a type constructor");
+        rejects("let rec T = (fun x -> x)(T) in 1", "recursive type T is not built by a type constructor");
+        // A member that is not a type does not stop the others from being built.
+        assert_eq!(run_source("let rec T = Union(Int, T) and n = len([1]) in n").unwrap().to_string(), "1");
+        rejects("let rec T = Union(Int, X) and X = len([1]) in 0", "recursive type X is not built by a type constructor");
+        // A fix-point attempt: the group's name is a placeholder Type, not a function, so the
+        // run-time contract on `g` fails before the call (main said "unbound variable: f").
+        // Measured (F8a/F8b): "type error: expected (Dyn -> Int), found Type" at column 64, both.
+        let f = "let rec f = (fun g -> fun n -> if n == 0 then 0 else g(n - 1))(f) in ";
+        assert!(run_source(&format!("{f}f(0)")).is_err());
+        assert!(run_source(&format!("{f}f(1)")).is_err());
+    }
+
+    #[test]
+    fn recursive_types_are_compared_structurally() {
+        let t = "let rec T = Union(Tuple(Int, T), Bool) in let rec U = Union(Tuple(Int, U), Bool) in ";
+        // Same shape, different names: interchangeable.
+        assert_eq!(run_source(&format!("{t}let f = fun x: T -> x in let y: U = (1, true) in f(y)")).unwrap().to_string(), "[1, true]");
+        assert_eq!(run_source(&format!("{t}T == U")).unwrap().to_string(), "true");
+        assert_eq!(run_source(&format!("{t}let x: T = (1, true) in let y: U = x in y")).unwrap().to_string(), "[1, true]");
+        assert!(run_source(&format!("{t}let f = fun x: (T -> T) -> x in let g: (U -> U) = fun u -> u in f(g)")).is_ok());
+        // A different shape is still a mismatch.
+        let s = "let rec T = Union(Tuple(Int, T), Bool) in let rec U = Union(Tuple(Str, U), Bool) in ";
+        rejects(&format!("{s}let f = fun x: T -> x in let y: U = (\"a\", true) in f(y)"), "type mismatch: expected T, found U");
+    }
+
+    #[test]
+    fn a_noncontractive_recursive_type_is_an_error() {
+        let src = "let rec A = (fun u -> (let rec X = (fun v -> A)(0) and Y = Tuple(X, Y) in X))(0) in let d: Dyn = 1 in let a: A = d in a";
+        rejects(src, "recursive type A is not built by a type constructor");
+    }
+
+    #[test]
+    fn an_unfinished_recursive_type_cannot_be_an_annotation() {
+        rejects("let rec L = Union((Tuple((Int, L)), (fun x: L -> Bool)((1, 2)))) in to_str(L)", "recursive type L is used before it is built");
+        rejects(
+            "let rec T = Union(Int, T) and g = (fun u -> fun z -> T)(0) in let x: List(g(0)) = [1] in x",
+            "recursive type T is used before it is built",
+        );
+    }
+
+    #[test]
+    fn a_type_group_runs_a_fallible_definition_it_reads() {
+        let src = "let G = fun u -> (let d: Dyn = true in let i: Int = d in Int) in let rec L = Union(Tuple(G(0), L), Bool) in let x: L = true in x";
+        rejects(src, "type error: expected Int, found Bool");
+    }
+
+    #[test]
+    fn elaborated_type_groups_stay_type_groups() {
+        use resolve::GroupKind::Types;
+        let cast = "let rec L = Union((Tuple((Int, L)), (fun a -> if true then a else 5)(Bool))) in let l: L = (1, true) in l";
+        assert_eq!(elaborated_let_rec_groups(cast), vec![Types]);
+        let inner = "let A = fun v -> (let rec R = Union((Tuple((v, R)), (fun a -> if true then a else 5)(Bool))) in R) in let x: A(Int) = (1, true) in x";
+        assert_eq!(elaborated_let_rec_groups(inner), vec![Types]);
+        let erased = "let rec L = Union((Tuple((Int, L)), (fun x: Int -> Bool)(1))) in to_str(L)";
+        assert_eq!(elaborated_let_rec_groups(erased), vec![Types]);
+    }
+
+    #[test]
+    fn a_long_chain_of_recursive_types_checks() {
+        // The release bench rec50k is the 50,000-group version of this.
+        let n = 3_000;
+        let mut src = String::from("let rec L0 = Union(Tuple(Int, L0), Bool) in ");
+        for i in 1..n {
+            src.push_str(&format!("let rec L{i} = Union(Tuple(L{}, L{i}), Bool) in ", i - 1));
+        }
+        let last = n - 1;
+        src.push_str(&format!("let x: L{last} = (true, true) in let d: Dyn = (true, (true, true)) in let y: L{last} = d in 0"));
+        assert_eq!(run_source(&src).unwrap().as_int(), 0);
     }
 
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain
@@ -6534,7 +6607,7 @@ g(len)").unwrap_err();
     // --- Task 3, Step 1: bind_pattern_vars's own Union-correlation gap ---
 
     #[test]
-    fn bind_pattern_vars_falls_back_to_an_unconstrained_type_for_a_named_union_scrutinee() {
+    fn bind_pattern_vars_falls_back_to_an_unconstrained_type_for_a_recursive_union_scrutinee() {
         // Task 3's own real prerequisite investigation (spec section 5,
         // Case B): does bind_pattern_vars correlate a Type::Union-typed
         // scrutinee's own alternative-specific field types to a
@@ -6542,16 +6615,16 @@ g(len)").unwrap_err();
         // fall back to some unconstrained fresh type with no real
         // precision? Confirmed empirically BEFORE writing any Case B
         // refinement logic, per this task's own brief: with the
-        // Pattern::List match's Type::Named/Type::Union arms removed
+        // Pattern::List match's Type::Rec/Type::Union arms removed
         // (this fix reverted), this exact test fails -- `t`'s real type
         // falls into the generic catch-all (a fresh, totally
         // unconstrained Type::Var, permissive with anything exactly
         // like Type::Dyn), so `let proof: Bool = t in 0` WRONGLY
         // type-checks even though `t`'s real position in `(Int, List)`
         // is the recursive `List` alternative, not `Bool` at all. With
-        // the fix, `t` is correctly `Type::Named(id)` (a `List`), and
-        // `Type::Named` is nominal-only (types::consistent's own
-        // Type::Named arm: consistent only when both ids match exactly,
+        // the fix, `t` is correctly a `Type::Rec` (a `List`), and
+        // a `Type::Rec` is consistent only with itself (types::consistent's own
+        // Rec arm: structural equality of the closed terms,
         // never structurally with anything else) -- so comparing it
         // against a required `Bool` is a genuine, provable mismatch,
         // correctly rejected.
@@ -6565,15 +6638,15 @@ g(len)").unwrap_err();
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let result = typecheck::check(&mut arena, root, &spans);
         let err = result.expect_err(
-            "t's real type, if correctly correlated, is Type::Named(id) (a List), which must reject a Bool \
+            "t's real type, if correctly correlated, is a Type::Rec (a List), which must reject a Bool \
              annotation -- got Ok, meaning bind_pattern_vars fell back to an unconstrained type instead",
         );
         assert!(err.0.contains("type mismatch: expected Bool, found List"), "unexpected message: {}", err.0);
     }
 
-    // --- Task 3, Case B: Named+Union-derived pattern-match index refinement ---
+    // --- Task 3, Case B: Rec+Union-derived pattern-match index refinement ---
     //
-    // No surface syntax builds a `Type::Indexed(Type::Named(id), _)`
+    // No surface syntax builds a `Type::Indexed(Type::Rec(..), _)`
     // value directly: `Vec(n)`'s own parser sugar (parser.rs's `parse_type`,
     // the `name == "Vec"` arm) is hard-coded to wrap `Type::List(Type::Dyn)`
     // only, confirmed by reading it -- there is no `List(n)`-style
@@ -6583,7 +6656,7 @@ g(len)").unwrap_err();
     // "Generalizing to Type::Indexed" section) doesn't add one either.
     // So both tests below parse an ordinary match EXPRESSION through the
     // real parser (getting real Pattern nodes and a real Match ExprRef),
-    // register the recursive type's definition by hand, then drive
+    // build the recursive type by hand, then drive
     // typecheck::check_against DIRECTLY against a hand-built Ctx binding
     // the scrutinee to the Case-B shape this task's own eligibility
     // logic is meant to recognize -- exactly mirroring this file's own
@@ -6592,108 +6665,8 @@ g(len)").unwrap_err();
     // internals below the parser's reach.
 
     #[test]
-    fn case_b_base_case_hypothesis_is_real_and_enforced() {
-        // Case A's own `base_case_arm_alone_is_rejected_when_it_does_not_fit_vec_zero`
-        // test, adapted for Case B: the base alternative (`Bool`, the
-        // one NOT structurally containing List) implies index := 0.
-        // `v`'s own real type is always the literal, bare
-        // `Indexed(Named(id), n)` -- so the only way to observe the
-        // base arm's own n=0 hypothesis is through a REAL,
-        // index_subst-consulting comparison (unify_fits/
-        // unify_index_expr), not coerce's own static permissiveness.
-        // Requiring the base arm's own body (bare `v`) to fit
-        // `Indexed(Named(id), 1)` forces exactly that comparison: a
-        // genuine, provable "1 != 0" conflict if (and only if) the
-        // n=0 hypothesis is actually active.
-        //
-        // Base arm uses `true`/`false` literal patterns, not a bare
-        // `b`/wildcard Var -- a Var pattern trivially "could match"
-        // BOTH alternatives (pattern_could_match's own generic
-        // consistent()-with-Dyn fallback), which this task's own
-        // eligibility logic correctly treats as ambiguous (no
-        // hypothesis at all, the same safe fallback Case A's own
-        // catch-all `_ => {}` uses) -- exactly the arm shape needed
-        // to observe a REAL hypothesis, not a Var that would earn none.
-        // Both together also satisfy missing_case's own has_true &&
-        // has_false exhaustiveness heuristic.
-        use crate::index_expr::IndexExpr;
-        use crate::typecheck::{check_against, extend, Ctx, InferCtx};
-        use std::rc::Rc;
-        use types::Type;
-
-        let src = r#"
-            match v
-            | (h, t) -> let x: Dyn = 0 in x
-            | true -> v
-            | false -> v
-        "#;
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        // The registry is built by hand: `List = (Int, List) | Bool`.
-        let id = "List#0".to_string();
-        let def = Type::Union(Rc::new(vec![Type::Tuple(Rc::new(vec![Type::Int, Type::Named(id.clone())])), Type::Bool]));
-        let mut infer = InferCtx::new();
-        Rc::make_mut(&mut infer.named_types).insert(id.clone(), def);
-        let scrut_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var("n".to_string())));
-        let ctx = extend(&Ctx::empty(), "v", scrut_ty);
-        let expected = Type::Indexed(Rc::new(Type::Named(id)), Rc::new(IndexExpr::Lit(1)));
-        let result = check_against(&mut arena, root, &expected, &ctx, &spans, &mut infer);
-        assert!(
-            result.is_err(),
-            "expected a real index conflict from the base alternative's own n=0 hypothesis (1 vs 0), got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn case_b_step_case_hypothesis_and_retyping_enable_a_real_recursive_proof() {
-        // Case A's own `recursive_vec_function_typechecks_via_pattern_refinement`
-        // test, adapted for Case B: the step alternative (`(Int, List)`,
-        // the one containing List exactly once) mints a fresh index
-        // variable `m`, retypes the self-referential sub-binding `t` as
-        // `Indexed(Named(id), m)` (overriding bind_pattern_vars's own
-        // plain `Named(id)` binding), and hypothesizes the scrutinee's
-        // own index is `m + 1`. Requiring the step arm's own body (bare
-        // `t`) to fit `Indexed(Named(id), n - 1)` only type-checks if
-        // BOTH halves are real: resolve_index_deep must actually see
-        // n -> m + 1 (the hypothesis) for "(m + 1) - 1" to SOP-normalize
-        // to exactly "m" (t's own real, retyped index) -- exactly the
-        // same composition Case A's own analogous test relies on,
-        // independent of whether the wrapped type is List or a
-        // qualifying Named+Union.
-        use crate::index_expr::IndexExpr;
-        use crate::typecheck::{check_against, extend, Ctx, InferCtx};
-        use std::rc::Rc;
-        use types::Type;
-
-        let src = r#"
-            match v
-            | (h, t) -> t
-            | true -> let x: Dyn = 0 in x
-            | false -> let x: Dyn = 0 in x
-        "#;
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        // The registry is built by hand: `List = (Int, List) | Bool`.
-        let id = "List#0".to_string();
-        let def = Type::Union(Rc::new(vec![Type::Tuple(Rc::new(vec![Type::Int, Type::Named(id.clone())])), Type::Bool]));
-        let mut infer = InferCtx::new();
-        Rc::make_mut(&mut infer.named_types).insert(id.clone(), def);
-        let scrut_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var("n".to_string())));
-        let ctx = extend(&Ctx::empty(), "v", scrut_ty);
-        let expected = Type::Indexed(
-            Rc::new(Type::Named(id)),
-            Rc::new(IndexExpr::Sub(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)))),
-        );
-        let result = check_against(&mut arena, root, &expected, &ctx, &spans, &mut infer);
-        assert!(
-            result.is_ok(),
-            "expected the step alternative's own m+1 hypothesis to make t: Indexed(Named(id), m) satisfy \
-             Indexed(Named(id), n - 1) via SOP normalization, got: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
     fn case_b_refinement_on_a_rec_type() {
-        // The Rec twin of the Named refinement test above: the base alternative's own n=0 hypothesis conflicts with 1.
+        // The base alternative's own n=0 hypothesis conflicts with 1.
         use crate::index_expr::IndexExpr;
         use crate::typecheck::{check_against, extend, Ctx, InferCtx};
         use std::rc::Rc;
@@ -6717,7 +6690,7 @@ g(len)").unwrap_err();
 
     #[test]
     fn case_b_step_retyping_on_a_rec_type() {
-        // The Rec twin of the Named step test above: t is retyped Indexed(L, m) and n = m + 1, so t fits Indexed(L, n - 1).
+        // t is retyped Indexed(L, m) and n = m + 1, so t fits Indexed(L, n - 1).
         use crate::index_expr::IndexExpr;
         use crate::typecheck::{check_against, extend, Ctx, InferCtx};
         use std::rc::Rc;
@@ -6749,25 +6722,25 @@ g(len)").unwrap_err();
         // Critical review finding, confirmed via a traced counterexample
         // (see this task's own fix-round-1 report entry): reachable via
         // ORDINARY source syntax, no check_against-bypass needed.
-        // `named_types["List"]` resolves to `Union([Named("List"),
-        // Tuple([Int, Named("List")])])` -- the FIRST alternative is a
+        // `List` is the recursive type `Union([List,
+        // Tuple([Int, List])])` -- the FIRST alternative is a
         // BARE self-reference, not wrapped in anything structural. The
         // pre-fix bind_pattern_vars's own Type::Union arm ran its
         // `pattern_could_match` reachability probe with a fresh, empty
         // `visiting` set every time, with no memory of the enclosing
-        // Type::Named arm's own unfolding -- so it would judge
-        // `Named("List")` "reachable" (via ITS OWN nested unfold finding
+        // Type::Rec arm's own unfolding -- so it would judge
+        // `List` "reachable" (via ITS OWN nested unfold finding
         // the genuine Tuple alternative two levels down, using yet
         // another fresh empty set), recurse into it, unfold to the same
         // Union again, and repeat forever: unbounded recursion / stack
         // overflow, purely from typechecking this one match expression.
         //
         // With the fix (visiting threaded through, mirroring
-        // pattern_could_match's own already-correct Type::Named/
+        // pattern_could_match's own already-correct Type::Rec/
         // Type::Union arms exactly), the Union arm's reachability probe
         // sees "List" already in `visiting` and correctly skips the bare
         // self-referential alternative, landing on the genuine
-        // Tuple([Int, Named("List")]) alternative instead -- so this
+        // Tuple([Int, List]) alternative instead -- so this
         // must terminate and type-check successfully (the match body
         // just returns an Int literal from each arm; nothing further
         // constrains t's own type).
@@ -6796,17 +6769,17 @@ g(len)").unwrap_err();
     #[test]
     fn bind_pattern_vars_falls_back_to_fresh_vars_at_a_cycle_detected_nested_position() {
         // Finding 6 (Task 4 brief): the cycle-detected fallback branch in
-        // bind_pattern_vars's own Type::Named arm (`if visiting.contains(id)
+        // bind_pattern_vars's own Type::Rec arm (`if visiting.contains(id)
         // { return bind_fresh_positions(...) }`, added by Task 3's own
         // fix-round-1) is correct by inspection and was re-verified there,
         // but wasn't exercised by any existing test -- every existing
         // Case B test puts a bare Var at the self-referential position
         // (`t` in `(h, t)`), which binds via Pattern::Var's own arm
-        // directly and never re-enters bind_pattern_vars's Type::Named
+        // directly and never re-enters bind_pattern_vars's Type::Rec
         // match at all. Triggering the cycle-detected branch specifically
         // needs a NESTED structural pattern (not a bare Var) at that
         // position, so bind_pattern_vars recurses back into a
-        // Pattern::List/Type::Named combination with "List" already in
+        // Pattern::List/Type::Rec combination with "List" already in
         // `visiting` from the outer unfold -- no third level of recursive
         // type nesting needed, just one more level of pattern nesting on
         // top of the existing two-alternative `List | (Int, List)` type.
@@ -6815,9 +6788,9 @@ g(len)").unwrap_err();
         // "List" once for the outer `(h, ..)` (visiting: {} -> {List}),
         // lands on the Tuple alternative, then recurses into position 1
         // with pat=(h2, t2) (a nested Pattern::List) against
-        // ty=Named("List") -- this time "List" is ALREADY in visiting, so
+        // ty=List -- this time "List" is ALREADY in visiting, so
         // the cycle guard fires and h2/t2 both get fresh, uncorrelated
-        // types via bind_fresh_positions, rather than h2:Int/t2:Named(id)
+        // types via bind_fresh_positions, rather than h2:Int/t2:List
         // the way a genuinely one-more-level unfold would give them. This
         // is a real, deliberate conservative approximation (mirroring
         // pattern_could_match's own identical stance) -- it fires here
@@ -7161,14 +7134,14 @@ g(len)").unwrap_err();
         // with anything, so a qualifying named union whose BASE
         // alternative happens to be Dyn (like this `T`) made the hook
         // wrongly treat ANY actual_ty -- including `w`'s real
-        // Indexed(Named(T), 2) -- as satisfying the base case, force-
+        // Indexed(Rec(T), 2) -- as satisfying the base case, force-
         // asserting its index to 0 (a genuine conflict with the real
         // index 2) and failing typecheck with a spurious error.
         //
         // The fix shipped is NOT a symmetric Dyn/Var exclusion on
         // `base_alt` -- that was tried and found to regress the
         // legitimate `let x: T(0) = 5 in x` case (Int can only ever
-        // satisfy an Indexed(Named(_), _) through base_alt's own Dyn
+        // satisfy an Indexed(Rec(_), _) through base_alt's own Dyn
         // permissiveness, since `consistent` has no Indexed-vs-non-
         // Indexed arm). Instead, `actual_ty` itself is excluded when it
         // already resolves to Type::Indexed AND base_alt is Dyn/Var --
@@ -7197,7 +7170,7 @@ g(len)").unwrap_err();
         // genuinely is that base case. The shipped guard only excludes
         // Indexed actual_ty when base_alt is Dyn/Var, so this must still
         // unify the index to 0 via the hook, not fall through to the
-        // fallback (which has no Indexed-vs-Named consistent arm and
+        // fallback (which has no Indexed-vs-Rec consistent arm and
         // would reject it).
         let src = r#"
             let rec T = Union(Vec(3), Tuple(Int, T)) in
@@ -7267,8 +7240,8 @@ g(len)").unwrap_err();
     }
 
     // Spec §2 decision lock: `f`'s value is an `If`, not a direct Lambda, so
-    // is_direct_group is false even though both branches are functions --
-    // is_direct_group is syntactic, not semantic. That routes the whole
+    // group_kind is not Functions even though both branches are functions --
+    // group_kind is syntactic, not semantic. That routes the whole
     // group through the same non-recursive fallback as
     // `let_rec_fallback_binds_non_function_values_for_the_body` above, so
     // `f` is NOT in scope while its own value is elaborated/evaluated.
@@ -8031,7 +8004,7 @@ g(len)").unwrap_err();
 
     #[test]
     fn a_named_return_through_dyn_terminates_without_upcast() {
-        // Only an annotated binding gives a source Fun a recursive Named return that typechecks today.
+        // Only an annotated binding gives a source Fun a recursive named return that typechecks today.
         assert_eq!(run_source("let rec F = Union(Int, Tuple(Int, F)) in let mk: (Int -> F) = fun a: Int -> a in let d: Dyn = mk in d(1)").unwrap().as_int(), 1);
     }
 
@@ -8042,16 +8015,16 @@ g(len)").unwrap_err();
         assert_eq!(run_source(src).unwrap().as_int(), 100000);
     }
 
-    // For each LetRec in the elaborated tree of `src`: is it still a direct
-    // Lambda group (resolve::is_direct_group)? Otherwise the recursive name
-    // becomes unbound.
-    fn elaborated_let_rec_groups(src: &str) -> Vec<bool> {
+    // For each LetRec in the elaborated tree of `src`: what kind of group is it still
+    // (resolve::group_kind)? A function group that stopped being one would leave its
+    // recursive name unbound.
+    fn elaborated_let_rec_groups(src: &str) -> Vec<resolve::GroupKind> {
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let out = typecheck::check(&mut arena, root, &spans).unwrap();
         let (mut groups, mut work, mut kids) = (Vec::new(), vec![out], Vec::new());
         while let Some(n) = work.pop() {
             if let expr::Expr::LetRec(bindings, _) = &arena[n] {
-                groups.push(resolve::is_direct_group(&arena, bindings));
+                groups.push(resolve::group_kind(&arena, bindings));
             }
             kids.clear();
             arena[n].children(&mut kids);
@@ -8080,7 +8053,7 @@ g(len)").unwrap_err();
             assert!(err.contains("type error: expected Int, found Bool"), "{src}: {err}");
         }
         let rec = "let rec is_int: Dyn = fun is_int: Int -> if is_int < 1 then 0 else 1 in is_int(3)";
-        assert_eq!(elaborated_let_rec_groups(rec), vec![true]);
+        assert_eq!(elaborated_let_rec_groups(rec), vec![resolve::GroupKind::Functions]);
     }
 
     #[test]
@@ -8093,7 +8066,7 @@ g(len)").unwrap_err();
     #[test]
     fn an_annotated_let_rec_literal_at_dyn_stays_a_direct_recursive_group() {
         let src = "let rec f: Dyn = fun n: Int -> if n < 1 then 0 else f(n - 1) in ";
-        assert_eq!(elaborated_let_rec_groups(&format!("{src}f(3)")), vec![true]);
+        assert_eq!(elaborated_let_rec_groups(&format!("{src}f(3)")), vec![resolve::GroupKind::Functions]);
         assert_eq!(run_source(&format!("{src}f(3)")).unwrap().as_int(), 0);
         let err = run_source(&format!("{src}f(true)")).expect_err("bad argument");
         assert!(err.contains("type error") && err.contains("expected Int, found Bool"), "{err}");
@@ -8151,7 +8124,7 @@ g(len)").unwrap_err();
         let bad = "handle (let f = perform choose(0) in f(true)) with handler choose(p, resume) -> resume(fun a: Int -> a + 1) + resume(fun a: Int -> a * 2)";
         assert!(run_source(bad).unwrap_err().contains("type error: expected Int, found Bool"));
         let lit = "let rec f: Dyn = fun n: Int -> if n < 1 then 0 else f(n - 1) in handle (perform choose(0)) + f(2) with handler choose(p, resume) -> resume(1) + resume(2)";
-        assert_eq!(elaborated_let_rec_groups(lit), vec![true]);
+        assert_eq!(elaborated_let_rec_groups(lit), vec![resolve::GroupKind::Functions]);
         assert_eq!(run_source(lit).unwrap().as_int(), 3);
     }
 
@@ -8263,36 +8236,17 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn a_recursive_function_type_lowers_to_one_shared_cyclic_graph() {
-        // F = Dyn -> F: the result of F's contract is F's own Lazy, at every
-        // depth, so a call chain allocates nothing per call (it used to build
-        // a fresh Lazy chain, held by the site's memo, one link per call).
-        use crate::types::{EffectRow, Type};
-        use std::{collections::HashMap, rc::Rc};
-        let f = Type::Named("F".into());
-        let named = Rc::new(HashMap::from([("F".to_string(), Type::Fun(Rc::new(Type::Dyn), EffectRow::Dyn, Rc::new(f.clone())))]));
-        let root = expr::Lazy::new(Rc::new(f));
-        let mut level = root.clone();
-        for _ in 0..3 {
-            let lowered = typecheck::lower_conform(&level, &named, None).expect("a function type is checked");
-            let expr::Then::Wrap(_, ret) = &lowered.then else { panic!("a function type wraps in a contract") };
-            assert!(Rc::ptr_eq(ret, &root), "the result's Lazy is F's own, not a fresh link");
-            level = ret.clone();
-        }
-    }
-
-    #[test]
     fn a_recursive_rec_function_type_lowers_to_one_shared_cyclic_graph() {
-        // The Rec twin of the Named test above: F = Dyn -> F, built as a closed group.
+        // F = Dyn -> F, built as a closed group: the result of F's contract is F's own Lazy, at every
+        // depth, so a call chain allocates nothing per call.
         use crate::types::{EffectRow, Type};
-        use std::{collections::HashMap, rc::Rc};
+        use std::rc::Rc;
         let g = rec_group(&["F"], vec![Type::Fun(Rc::new(Type::Dyn), EffectRow::Dyn, Rc::new(rec_bound(0, 0)))]);
         let f = Type::Rec(g, 0);
-        let named = Rc::new(HashMap::new());
         let root = expr::Lazy::new(Rc::new(f));
         let mut level = root.clone();
         for _ in 0..3 {
-            let lowered = typecheck::lower_conform(&level, &named, None).expect("a function type is checked");
+            let lowered = typecheck::lower_conform(&level, None).expect("a function type is checked");
             let expr::Then::Wrap(_, ret) = &lowered.then else { panic!("a function type wraps in a contract") };
             assert!(Rc::ptr_eq(ret, &root), "the result's Lazy is F's own, not a fresh link");
             level = ret.clone();
@@ -9073,7 +9027,7 @@ g(len)").unwrap_err();
         assert_eq!(run_source("let xs: [Int] = [] in len(xs)").unwrap().as_int(), 0);
     }
 
-    // coerce_check's early accepts (width subtyping, the Named rescue) used to
+    // coerce_check's early accepts (width subtyping, the recursive-alias rescue) used to
     // skip the partly-Dyn gate.
     #[test]
     fn deep_partly_dyn_sources_are_checked_on_the_width_and_named_paths_too() {

@@ -220,14 +220,29 @@ fn scoped(work: &mut Vec<Work>, names: Vec<String>, child: ExprRef) {
     work.push(Work::Push(names));
 }
 
-// The ONE definition of "this `let rec` is a recursive function group"
-// (spec §2): every binding value is syntactically a direct Lambda. The
-// resolver assigns the group layout ([names…, param] per function body,
-// [names…] for the body) iff this holds, and machine.rs's Expr::LetRec arm
-// builds the RecClosure group iff this holds -- sharing this function is
-// what keeps the two from drifting apart.
-pub fn is_direct_group(arena: &Arena, bindings: &[(String, Option<ExprRef>, ExprRef)]) -> bool {
-    bindings.iter().all(|(_, _, v)| matches!(arena[*v], Expr::Lambda(..)))
+// What a `let rec` builds. The ONE syntactic classification (spec §2, §15),
+// shared by the resolver, the machine and the checker so they cannot drift:
+//   Functions: every value is a direct Lambda: a RecClosure group, layout
+//              [names…, param] per function body, [names…] for the body.
+//   Types:     every value is an unannotated call (rule P): the machine builds a
+//              recursive type group; the values run in a frame [names…] of
+//              placeholders, the body in [names…] of the finished values.
+//   Plain:     anything else: the values run in the OUTER scope.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GroupKind {
+    Functions,
+    Types,
+    Plain,
+}
+
+pub fn group_kind(arena: &Arena, bindings: &[(String, Option<ExprRef>, ExprRef)]) -> GroupKind {
+    if bindings.iter().all(|(_, _, v)| matches!(arena[*v], Expr::Lambda(..))) {
+        GroupKind::Functions
+    } else if bindings.iter().all(|(_, ann, v)| ann.is_none() && matches!(arena[*v], Expr::App(..))) {
+        GroupKind::Types
+    } else {
+        GroupKind::Plain
+    }
 }
 
 fn visit(
@@ -291,9 +306,13 @@ fn visit(
             let names: Vec<String> = bindings.iter().map(|(n, _, _)| n.clone()).collect();
             // Reverse processing order: the body's frame [names…] comes last…
             scoped(work, names.clone(), *body);
-            let group = is_direct_group(arena, bindings);
+            let kind = group_kind(arena, bindings);
             for (_, _, v) in bindings.iter().rev() {
-                if group {
+                if kind == GroupKind::Types {
+                    // Type group: the values run in a frame of the group's own
+                    // placeholders, the same layout as the body's.
+                    scoped(work, names.clone(), *v);
+                } else if kind == GroupKind::Functions {
                     // Direct-Lambda group: each function body runs in one
                     // frame [names…, param] (the Lambda node itself is never
                     // evaluated in the runtime's group form).
@@ -405,15 +424,21 @@ mod tests {
     }
 
     #[test]
-    fn is_direct_group_true_only_when_every_value_is_a_lambda() {
-        let (a, b) = let_rec_bindings("let rec f = fun x -> f(x) in f");
-        assert!(is_direct_group(&a, &b));
-        let (a, b) = let_rec_bindings("let rec f = fun x -> x and g = fun y -> y in f");
-        assert!(is_direct_group(&a, &b));
-        let (a, b) = let_rec_bindings("let rec f = fun x -> x and y = 3 in f");
-        assert!(!is_direct_group(&a, &b));
-        let (a, b) = let_rec_bindings("let rec x = 5 in x");
-        assert!(!is_direct_group(&a, &b));
+    fn group_kind_classifies_functions_types_and_plain() {
+        use GroupKind::{Functions, Plain, Types};
+        for (src, want) in [
+            ("let rec f = fun x -> f(x) in f", Functions),
+            ("let rec f = fun x -> x and g = fun y -> y in f", Functions),
+            ("let rec f = fun x -> x and y = 3 in f", Plain),
+            ("let rec x = 5 in x", Plain),
+            ("let rec T = Union(Int, T) in T", Types),
+            ("let rec A = Union(Int, B) and B = Tuple(Bool, A) in A", Types),
+            ("let rec T = Union(Int, T) and n = 3 in T", Plain),
+            ("let rec T: Type = Union(Int, T) in T", Plain),
+        ] {
+            let (a, b) = let_rec_bindings(src);
+            assert_eq!(group_kind(&a, &b), want, "{src}");
+        }
     }
 
     // Every Var node named `name` that the resolver assigned a VarRef to,

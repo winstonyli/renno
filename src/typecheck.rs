@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::machine::{eval_pure_in, pure_type, Pure, Stuck, ANNOTATION_FUEL};
-use crate::resolve::Resolved;
+use crate::resolve::{group_kind, GroupKind, Resolved};
 use crate::span::Span;
 use crate::value::Value;
 use rpds::{HashTrieMap, HashTrieSet};
@@ -103,7 +103,7 @@ pub(crate) fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
                     g.0.bodies.iter().for_each(|b| go(b, out));
                 }
             }
-            Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) | Type::RecVar(_) => {}
+            Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::RecVar(_) => {}
         }
     }
     let mut out = BTreeSet::new();
@@ -212,9 +212,9 @@ impl Ctx {
     }
 }
 
-// A direct group or a recursive type group is two definitions (one for its own
-// values, one for the code after it), so it is evaluated at most twice; any
-// other `let` at most once.
+// A group of direct `fun`s is two definitions (one for its own values, one for
+// the code after it), so it is evaluated at most twice; any other `let`, a
+// type group included, at most once.
 // What a check-time evaluation needs to evaluate a `let`-bound name (spec
 // section 1, type lets): the binder's right-hand side as the parser built it,
 // and the scope it was checked in. The right-hand side is evaluated once, on
@@ -304,7 +304,7 @@ struct Deps {
 
 enum DefNode {
     Let(ExprRef),
-    // A `let rec` group: the original bindings, or TypeLits for a recursive type.
+    // A `let rec` group: the original bindings.
     Group(Rc<Vec<(String, Option<ExprRef>, ExprRef)>>),
 }
 
@@ -332,14 +332,14 @@ impl CheckDef {
     }
 
     // What its right-hand side reads, in the scope the binder was checked in.
-    // Only a group of direct `fun`s is recursive; any other group's values see
-    // the outer scope (machine.rs's LetRec fallback). A type group's values are
-    // TypeLits.
+    // A group of direct `fun`s and a type group bind their own names for their
+    // values (closures, placeholders); any other group's values see the outer
+    // scope (machine.rs's LetRec fallback).
     fn direct_reads(&self, arena: &Arena, infer: &InferCtx) -> (Vec<Read>, bool) {
         match &self.node {
             DefNode::Let(rhs) => reads_in(arena, &[*rhs], &[], &self.ctx, infer),
             DefNode::Group(bindings) => {
-                let names: Vec<String> = if crate::resolve::is_direct_group(arena, bindings) {
+                let names: Vec<String> = if group_kind(arena, bindings) != GroupKind::Plain {
                     bindings.iter().map(|(n, _, _)| n.clone()).collect()
                 } else {
                     Vec::new()
@@ -468,12 +468,6 @@ pub(crate) struct InferCtx {
     // How many function bodies (Lambda, handler clause) enclose the point
     // being elaborated: code inside one can run any number of times.
     repeatable_depth: usize,
-    // Every recursive type this program defines -- consulted on demand by
-    // build_boundary_check/shape_test/pattern_could_match
-    // whenever they encounter a Type::Named reference, to unfold it
-    // exactly one level. A recursive `let rec` type group adds its ids
-    // when it is checked (recursive_type_group), before any use of them.
-    pub(crate) named_types: Rc<HashMap<String, Type>>,
     // Names of type variables whose value reaches a Dyn sink (the argument of
     // a Dyn callee, a Perform payload) while the variable is still unbound
     // (spec 2026-10-08-var-passthrough-casts). The Fun-callee App arm casts a
@@ -498,7 +492,7 @@ pub(crate) struct InferCtx {
     // is not a value-position read, so `lookup` leaves CheckDef::used alone.
     in_annotation: bool,
     // The value of a recursive `let rec` group about to be elaborated: its
-    // `fun` must stay a direct Lambda (resolve::is_direct_group), so a kept
+    // `fun` must stay a direct Lambda (resolve::GroupKind::Functions), so a kept
     // parameter annotation goes inside it (the Fun fold).
     direct_value: Option<ExprRef>,
     // The finished check-time evaluations and the nodes erasure may remove,
@@ -506,9 +500,6 @@ pub(crate) struct InferCtx {
     // inference has finished.
     proofs: Vec<Proof>,
     splices: Vec<Splice>,
-    // The recursive types every Unknown site lowers its run-time type
-    // against: named_types as it stands when checking finishes.
-    registry: Rc<OnceCell<Rc<HashMap<String, Type>>>>,
 }
 
 impl InferCtx {
@@ -522,7 +513,6 @@ impl InferCtx {
             pendings: RefCell::new(Vec::new()),
             resume_row: None,
             repeatable_depth: 0,
-            named_types: Rc::new(HashMap::new()),
             dyn_sunk: HashSet::new(),
             bound_names: HashSet::new(),
             defs: Vec::new(),
@@ -531,7 +521,6 @@ impl InferCtx {
             direct_value: None,
             proofs: Vec::new(),
             splices: Vec::new(),
-            registry: Rc::new(OnceCell::new()),
         }
     }
 
@@ -678,11 +667,7 @@ fn occurs_in(name: &str, ty: &Type, infer: &InferCtx) -> bool {
         Type::Fun(param, _row, ret) => occurs_in(name, &param, infer) || occurs_in(name, &ret, infer),
         Type::Tuple(items) | Type::Union(items) => items.iter().any(|t| occurs_in(name, t, infer)),
         Type::Record(fields) => fields.iter().any(|(_, t)| occurs_in(name, t, infer)),
-        // A Named reference is a fixed nominal leaf (see its own doc
-        // comment) -- it never structurally contains a nested Type, so
-        // it can never contain `name` as a free Type::Var either, same
-        // as Type::Token right next to it here.
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Named(_) | Type::RecVar(_) => false,
+        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::RecVar(_) => false,
         Type::Rec(g, _) => !g.0.plain && g.0.bodies.iter().any(|b| occurs_in(name, b, infer)),
         // Wraps one nested Type (the index expression is never itself a
         // Type::Var) -- same recurse-into-the-wrapped-type precedent as
@@ -827,10 +812,8 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), T
         (Type::Dyn, _) | (_, Type::Dyn) => Ok(()),
         (Type::Int, Type::Int) | (Type::Float, Type::Float) | (Type::Bool, Type::Bool) | (Type::Str, Type::Str) => Ok(()),
         (Type::Token(a), Type::Token(b)) if a == b => Ok(()),
-        // Same nominal-by-id precedent as consistent()'s own new arm
-        // (types.rs) -- never unfolds, never binds a Type::Var as a
-        // side effect of comparing two Named ids.
-        (Type::Named(a), Type::Named(b)) if a == b => Ok(()),
+        // Equal recursive types (structurally, E1): never unfolds, never binds a
+        // Type::Var as a side effect of comparing them.
         (Type::Rec(a, i), Type::Rec(b, j)) if i == j && a == b => Ok(()),
         (Type::List(a), Type::List(b)) => unify(a, b, infer, span),
         // The wrapped type recurses through unify()'s own Var-binding
@@ -1078,7 +1061,7 @@ pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
 //
 // `pub(crate)`, not private: Task 3's own Case B tests need to bind a
 // scrutinee variable directly to a hand-built `Type::Indexed(Type::
-// Named(id), _)` -- a shape no surface syntax can express (`Vec(n)`'s
+// Rec(..), _)` -- a shape no surface syntax can express (`Vec(n)`'s
 // own parser sugar is hard-coded to wrap `Type::List(Dyn)` only) -- and
 // drive `check_against` on it directly, mirroring this file's own
 // existing `extend_generalized_and_lookup_mint_a_fresh_index_variable...`
@@ -1337,7 +1320,7 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
     }
     match relate(from, to, env.infer) {
         Rel::Proven => Ok(e),
-        Rel::Refuted(why) => Err(refuted_error(from, to, &why, &env.infer.named_types, span)),
+        Rel::Refuted(why) => Err(refuted_error(from, to, &why, span)),
         Rel::Unknown(res, _) if res.undecided() => Err(cannot_tell(from, to, span)),
         // Left to coerce_cast (a function wrapper) or unify_fits (an index equation).
         Rel::Unknown(res, _) if !res.needs_test() => Ok(e),
@@ -1433,14 +1416,13 @@ fn cannot_tell(from: &Type, to: &Type, span: Span) -> TypeError {
 
 // The message for a Refuted pair: an index pair the old gate passed to the unifier keeps the
 // unifier's text; an Indexed target on a non-indexable alias says so; otherwise the raw types.
-fn refuted_error(from: &Type, to: &Type, why: &Why, named_types: &HashMap<String, Type>, span: Span) -> TypeError {
+fn refuted_error(from: &Type, to: &Type, why: &Why, span: Span) -> TypeError {
     if let Why::Index { msg, bare: true } = why {
         return TypeError(msg.clone(), span);
     }
     if let Type::Indexed(wrapped, _) = to {
         let indexable = match &**wrapped {
             Type::List(_) | Type::Var(_) | Type::Dyn => true,
-            Type::Named(id) => qualifying_named_alternatives(id, named_types).is_some(),
             Type::Rec(g, i) => qualifying_rec_alternatives(g, *i).is_some(),
             _ => false,
         };
@@ -1529,23 +1511,19 @@ fn cast_binder(base: &str) -> String {
     fresh_index_name(base)
 }
 
-// The (parameter, result) types a cast aims at: those of a Fun target (a Named one
+// The (parameter, result) types a cast aims at: those of a Fun target (a Rec one
 // unfolded a step, a Union with exactly one Fun alternative aimed at it), Dyn for both otherwise.
-fn cast_targets(to: &Type, infer: &InferCtx) -> (Type, Type) {
+fn cast_targets(to: &Type) -> (Type, Type) {
     match to {
         Type::Fun(a2, _, b2) => ((**a2).clone(), (**b2).clone()),
-        Type::Named(id) => match infer.named_types.get(id) {
-            Some(raw) if !matches!(raw, Type::Named(_)) => cast_targets(raw, infer),
-            _ => (Type::Dyn, Type::Dyn),
-        },
         Type::Rec(g, i) => match unfold(g, *i) {
             Type::Rec(..) => (Type::Dyn, Type::Dyn),
-            raw => cast_targets(&raw, infer),
+            raw => cast_targets(&raw),
         },
         Type::Union(alts) => {
             let mut funs = alts.iter().filter(|t| matches!(t, Type::Fun(..)));
             match (funs.next(), funs.next()) {
-                (Some(f), None) => cast_targets(f, infer),
+                (Some(f), None) => cast_targets(f),
                 _ => (Type::Dyn, Type::Dyn),
             }
         }
@@ -1579,7 +1557,7 @@ fn index_witnessed<'a>(env: &'a CheckEnv<'a>) -> impl Fn(&str) -> bool + 'a {
 fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let Expr::Lambda(param, _, body) = arena[e].clone() else { unreachable!("build_literal_cast takes a Lambda") };
     let Type::Fun(a, _, b) = from else { unreachable!("build_literal_cast takes a Fun source") };
-    let (a_target, b_target) = cast_targets(to, env.infer);
+    let (a_target, b_target) = cast_targets(to);
     let up_body = cast_up(arena, body, b, &b_target, env, true);
     if relate_cast(&a_target, a, env.infer) == Rel::Proven {
         let ann = type_lit(arena, a_target);
@@ -1647,7 +1625,7 @@ fn cast_up(arena: &mut Arena, res: ExprRef, b: &Type, b_target: &Type, env: &Che
 // `a_monomorphic_vec_n_witness_checks_list_shape_only_in_the_closure_form_known_limitation`.
 fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let Type::Fun(a, _, b) = from else { unreachable!("build_cast takes a Fun source") };
-    let (a_target, b_target) = cast_targets(to, env.infer);
+    let (a_target, b_target) = cast_targets(to);
     let cf = cast_binder("__cf");
     let ca = cast_binder("__ca");
     let witnessed = index_witnessed(env);
@@ -1710,7 +1688,7 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
 //
 // Every function-free shape (Int/Float/Bool/Str/Token, Vec(k) and Vec(n),
 // and List/Tuple/Record of those checked element by element, a union of
-// those, a Named alias through any depth) is ONE native Expr::Check node
+// those, a recursive type through any depth) is ONE native Expr::Check node
 // (build_shape_check): no let, no env frame, no builtin call; a Vec(n)
 // length is read from a length slot the Check evaluates on entry. A
 // function, or a union with a function alternative, is one trusted
@@ -1720,7 +1698,7 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
 // the same "type error: expected X, found Y" text, or the "index variable n
 // has no runtime value" text when a length slot had no value.
 fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> ExprRef {
-    match boundary(to, &env.infer.named_types, &mut Visiting::default()) {
+    match boundary(to, &mut Visiting::default()) {
         Boundary::None => e,
         Boundary::Shape(shape) => build_shape_check(arena, e, &shape, env),
         Boundary::Fun(..) | Boundary::Union(_) => static_contract(arena, e, to, env),
@@ -1766,7 +1744,7 @@ fn static_contract(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> 
         index_names.push(name);
         lens.push(slot);
     }
-    let spec = ConformSpec { index_names, lens, named: env.infer.registry.clone(), memo: RefCell::new(None), span: env.span, trusted: true };
+    let spec = ConformSpec { index_names, lens, memo: RefCell::new(None), span: env.span, trusted: true };
     let ty = arena.push(Expr::TypeLit(Rc::new(ty)));
     arena.push(Expr::Conform(e, ty, Rc::new(spec)))
 }
@@ -1782,7 +1760,6 @@ fn static_contract(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> 
 // by group pointer and member; the Rc is kept so the pointer stays unique.
 #[derive(Default)]
 struct Seen {
-    named: HashSet<String>,
     rec: HashSet<(*const RecGroup, usize)>,
     keep: Vec<RecRef>,
 }
@@ -1802,13 +1779,6 @@ fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool,
         Type::Union(alts) => {
             for alt in alts.iter() {
                 checked_index_vars(alt, infer, seen, spine, in_contract, out);
-            }
-        }
-        Type::Named(id) => {
-            if let Some(raw) = infer.named_types.get(id)
-                && seen.named.insert(id.clone())
-            {
-                checked_index_vars(raw, infer, seen, spine, in_contract, out);
             }
         }
         Type::Rec(g, i) => {
@@ -1838,13 +1808,17 @@ fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool,
     }
 }
 
-// `to` with every alias wrapper and Named alias above its first real shape
-// unfolded, each Named added to `visiting`.
-fn boundary(to: &Type, named: &HashMap<String, Type>, visiting: &mut Visiting) -> Boundary {
+// `to` with every alias wrapper and recursive type above its first real shape
+// unfolded, each one added to `visiting`: checked exactly as if `to` had been
+// written directly as that unfolded shape. A recursive type nested inside a
+// container of that shape is checked by the native deep test (shape_of's
+// `Ref`s); one reached only through a Fun position stays unresolved -- checked
+// later, lazily, only if something else separately touches that position.
+fn boundary(to: &Type, visiting: &mut Visiting) -> Boundary {
     match to {
         Type::Int | Type::Float | Type::Bool | Type::Str | Type::List(_) | Type::Token(_) | Type::Tuple(_) | Type::Record(_) => Boundary::Shape(to.clone()),
         Type::Fun(param_ty, _row, ret_ty) => Boundary::Fun(to.clone(), param_ty.clone(), ret_ty.clone()),
-        Type::Union(_) if needs_contract(to, named, visiting) => Boundary::Union(to.clone()),
+        Type::Union(_) if needs_contract(to, visiting) => Boundary::Union(to.clone()),
         Type::Union(_) => Boundary::Shape(to.clone()),
         // Dyn accepts everything, so a check against it is the identity. Not
         // unreachable: a contract checks a call's result against the Fun's
@@ -1856,36 +1830,20 @@ fn boundary(to: &Type, named: &HashMap<String, Type>, visiting: &mut Visiting) -
         // is part of its one native test.
         Type::Indexed(w, _) if matches!(**w, Type::List(_)) => Boundary::Shape(to.clone()),
         // An alias (or Dyn/Var) wrapper: no runtime length to compare, but the shape is checked.
-        Type::Indexed(wrapped, _) => boundary(wrapped, named, visiting),
-        // Look up what this id unfolds to and check THAT, exactly as if `to`
-        // had been written directly as that unfolded shape. A Type::Named
-        // nested inside a container of that shape is checked by the native
-        // deep test (shape_of's `Ref`s); one reached only through a Fun
-        // position stays unresolved -- checked later, lazily, only if
-        // something else separately touches that position.
-        // A missing registry entry is not reachable from source:
-        // recursive_type_group registers an id before any use of it. Keep
-        // the permissive fallback anyway, degrading the same way the
-        // Type::Var(_) arm above does for "no information here" -- nothing
-        // to check -- rather than panicking.
-        //
-        // If `id` is already an ancestor in THIS unfold chain, stop instead
-        // of unfolding again, and check nothing (matching the Type::Var(_)
-        // arm above): `let rec A = Union(A, Fun(Int, Int))` would otherwise unfold
-        // forever. A contract's result is a Lazy of its own (shared with every
-        // equal type of the same lowering, Lazy::child), so a self-reference
-        // there (`let rec F = Fun(Dyn, F)`) is checked at each call.
-        Type::Named(id) => match named.get(id) {
-            Some(raw) if visiting.named.insert(id.clone()) => boundary(raw, named, visiting),
-            _ => Boundary::None,
-        },
-        // The same chain-ancestor stop, by group pointer and member.
+        Type::Indexed(wrapped, _) => boundary(wrapped, visiting),
+        // If this member is already an ancestor in THIS unfold chain (by group
+        // pointer and member), stop instead of unfolding again, and check nothing
+        // (matching the Type::Var(_) arm above): `let rec A = Union(A, Fun(Int,
+        // Int))` would otherwise unfold forever. A contract's result is a Lazy of
+        // its own (shared with every equal type of the same lowering,
+        // Lazy::child), so a self-reference there (`let rec F = Fun(Dyn, F)`) is
+        // checked at each call.
         Type::Rec(g, i) => {
             if visiting.has_rec(g, *i) {
                 return Boundary::None;
             }
             visiting.rec.push((g.clone(), *i));
-            boundary(&unfold(g, *i), named, visiting)
+            boundary(&unfold(g, *i), visiting)
         }
     }
 }
@@ -1893,18 +1851,16 @@ fn boundary(to: &Type, named: &HashMap<String, Type>, visiting: &mut Visiting) -
 // An Unknown site's type value, lowered when the run time reaches the site
 // (spec 11.5), and a static function boundary's likewise (static_contract):
 // the checks build_boundary_check builds for any other type, with the same
-// failure messages; `named` is the program's recursive types. None: nothing
-// to check. A function is checked for callability and wrapped in the site's
+// failure messages. None: nothing to check. A function is checked for callability and wrapped in the site's
 // contract; a union with a function alternative picks the first alternative
 // whose shape holds, and its check is the failure when none does.
-pub(crate) fn lower_conform(lazy: &Lazy, named: &Rc<HashMap<String, Type>>, span: Option<Span>) -> Option<Rc<Lowered>> {
+pub(crate) fn lower_conform(lazy: &Lazy, span: Option<Span>) -> Option<Rc<Lowered>> {
     let ty = &*lazy.ty;
-    let mut infer = InferCtx::new();
-    infer.named_types = named.clone();
+    let infer = InferCtx::new();
     let env = CheckEnv { defer: false, span, ..CheckEnv::new(&infer) };
     let mut visiting = Visiting::default();
     let mut defs = Defs::default();
-    let (test, to, then) = match boundary(ty, named, &mut visiting) {
+    let (test, to, then) = match boundary(ty, &mut visiting) {
         Boundary::None => return None,
         Boundary::Shape(to) => (shape_test(&to, &env, &mut defs, &Visiting::default()), to, Then::Done),
         Boundary::Fun(fun_ty, param, ret) => (Test::Fun, fun_ty, Then::Wrap(lazy.child(param), lazy.child(ret))),
@@ -1926,12 +1882,11 @@ fn pick(lazy: &Lazy, to: &Type, env: &CheckEnv, defs: &mut Defs, visiting: &Visi
     let Type::Union(alts) = to else { unreachable!("pick is only ever called with a Union target") };
     let pick_one = |alt: &Type, defs: &mut Defs| {
         let test = match alt {
-            Type::Named(id) if visiting.named.contains(id) => Test::Never,
             Type::Rec(g, i) if visiting.has_rec(g, *i) => Test::Never,
             _ => shape_test(alt, env, defs, &Visiting::default()),
         };
         let mut visiting = visiting.clone();
-        let then = match boundary(alt, &env.infer.named_types, &mut visiting) {
+        let then = match boundary(alt, &mut visiting) {
             Boundary::Fun(_, param, ret) => Then::Wrap(lazy.child(param), lazy.child(ret)),
             Boundary::Union(nested) => pick(lazy, &nested, env, defs, &visiting),
             Boundary::None | Boundary::Shape(_) => Then::Done,
@@ -2098,7 +2053,7 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
 }
 
 // What the runtime-check builders (build_boundary_check and friends) need:
-// the type registry and index state (InferCtx, as of where the check is
+// the index state (InferCtx, as of where the check is
 // spliced); `local` holds witnesses bound inside synthesized code
 // (a cast's parameter alias). `defer` is false inside a cast's synthesized body
 // (build_cast, cast_up) and in resolve_obligations, which record no obligations.
@@ -2190,11 +2145,10 @@ impl Shape {
     }
 }
 
-// What shape_test accumulates: each Named alias body (None while it is being
+// What shape_test accumulates: each recursive type's body (None while it is being
 // built) and the length slots.
 #[derive(Default)]
 struct Defs {
-    ids: HashMap<String, usize>,
     // A Rec's body, by group pointer and member (a global memo: each pointer is unfolded once);
     // `keep` holds the groups so the pointers stay unique.
     rec_ids: HashMap<(*const RecGroup, usize), usize>,
@@ -2215,12 +2169,12 @@ fn shape_of(ty: &Type, env: &CheckEnv) -> Shape {
 // (function-free types; a Fun position is only a callability tag). A Vec(n)
 // whose index is not a literal reads its length from a slot (len_slot).
 // `unguarded` holds
-// the Named aliases unfolded since the last container: meeting one again
+// the recursive types unfolded since the last container: meeting one again
 // there would loop without consuming the value, so it is `Never` (making
-// `let rec A = Union(Int, A)` behave as plain Int). Past a container, a Named alias
-// becomes one `Ref` into `defs`, whose body is built once, so a recursive
-// alias terminates because the value does. An unregistered Named is `Any`
-// ("no information here").
+// `let rec A = Union(Int, A)` behave as plain Int). Past a container, a recursive
+// type becomes one `Ref` into `defs`, whose body is built once, so it
+// terminates because the value does. A placeholder is `Any` ("no information
+// here"; machine::pure_type keeps it out of every check).
 fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &Visiting) -> Test {
     let element = |t: &Type, defs: &mut Defs| shape_test(t, env, defs, &Visiting::default());
     match ty {
@@ -2242,22 +2196,6 @@ fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &Visiting) 
         // comment for why nothing downstream can ever observe them.
         Type::Record(fields) => Test::RecordOf(fields.iter().map(|(name, t)| (name.clone(), element(t, defs))).collect()),
         Type::Union(alts) => Test::Or(alts.iter().map(|alt| shape_test(alt, env, defs, unguarded)).collect()),
-        Type::Named(id) if unguarded.named.contains(id) => Test::Never,
-        Type::Named(id) => match env.infer.named_types.get(id) {
-            None => Test::Any,
-            Some(raw) if !unguarded.is_empty() => shape_test(raw, env, defs, &unguarded.with_named(id)),
-            Some(raw) => match defs.ids.get(id) {
-                Some(&i) => Test::Ref(i),
-                None => {
-                    let i = defs.bodies.len();
-                    defs.bodies.push(None);
-                    defs.ids.insert(id.clone(), i);
-                    let body = shape_test(raw, env, defs, &unguarded.with_named(id));
-                    defs.bodies[i] = Some(body);
-                    Test::Ref(i)
-                }
-            },
-        },
         Type::Rec(g, k) if unguarded.has_rec(g, *k) => Test::Never,
         Type::Rec(g, k) if !unguarded.is_empty() => shape_test(&unfold(g, *k), env, defs, &unguarded.with_rec(g, *k)),
         Type::Rec(g, k) => match defs.rec_ids.get(&(Rc::as_ptr(&g.0), *k)) {
@@ -2305,12 +2243,11 @@ fn len_slot(index: &IndexExpr, env: &CheckEnv, defs: &mut Defs) -> usize {
 // Does checking `ty` do more than its shape test -- is a Fun reachable, so a
 // matching value must also get its per-call contract? Decides whether a
 // union check picks its alternative (Boundary::Union).
-fn needs_contract(ty: &Type, named: &HashMap<String, Type>, visiting: &Visiting) -> bool {
+fn needs_contract(ty: &Type, visiting: &Visiting) -> bool {
     match ty {
         Type::Fun(..) => true,
-        Type::Union(alts) => alts.iter().any(|alt| needs_contract(alt, named, visiting)),
-        Type::Named(id) if !visiting.named.contains(id) => named.get(id).is_some_and(|raw| needs_contract(raw, named, &visiting.with_named(id))),
-        Type::Rec(g, i) if !visiting.has_rec(g, *i) => needs_contract(&unfold(g, *i), named, &visiting.with_rec(g, *i)),
+        Type::Union(alts) => alts.iter().any(|alt| needs_contract(alt, visiting)),
+        Type::Rec(g, i) if !visiting.has_rec(g, *i) => needs_contract(&unfold(g, *i), &visiting.with_rec(g, *i)),
         _ => false,
     }
 }
@@ -2337,7 +2274,7 @@ fn build_check_node(arena: &mut Arena, value_ref: ExprRef, shape: Shape, to: &Ty
 
 // The one native check: `e` evaluated once and tested against `to`'s whole
 // deep shape (shape_of) -- every list element, tuple position and record
-// field, through Named aliases. A failure names the innermost offender
+// field, through recursive types. A failure names the innermost offender
 // (machine::explain).
 fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> ExprRef {
     let shape = shape_of(to, env);
@@ -2384,7 +2321,7 @@ fn build_str_call(arena: &mut Arena, builtin: &str, value_ref: ExprRef, str_arg:
 // Check-mode arm.
 //
 // Invariant for future maintainers: any FUTURE Check-mode arm added here
-// over an `Indexed(Named(_))` expected type must also be added to
+// over an `Indexed(Rec(_))` expected type must also be added to
 // `case_b_base_candidate`'s own exclusion list (this file) -- that
 // function's own tail-dispatch hook has a Mode::Synth-only fallback path
 // for its own "not a recognized special shape" case, and a new Check-mode
@@ -2409,7 +2346,7 @@ enum PendingElab {
     // inferred/annotated type, row, and elaborated value), folding back
     // into a single Expr::LetRec.
     // `sites`: the members' kept annotations, evaluated before the group.
-    LetRec { bindings: Vec<(String, Type, EffectRow, ExprRef)>, def: Rc<CheckDef>, sites: Vec<(String, Site)> },
+    LetRec { bindings: Vec<(String, Type, EffectRow, ExprRef)>, def: Rc<CheckDef>, sites: Vec<(String, Site)>, kind: GroupKind },
     // `witness`: this Lambda pushed an infer.index_witness entry (its
     // parameter is Vec(n)), popped when the frame unwinds. `site`: its
     // parameter's kept annotation; `direct`: it is a recursive group's value.
@@ -2523,27 +2460,18 @@ fn record_field_type(ty: &Type, name: &str) -> Option<Type> {
 // any one of which might supply it), everything else falls back to the
 // ordinary consistent()-based question.
 // The recursive types being unfolded somewhere above a point in a walk (an ancestor chain, not
-// a global memo): Named by id, Rec by group pointer and member (the Rc is kept so the pointer
-// stays unique).
+// a global memo), by group pointer and member (the Rc is kept so the pointer stays unique).
 #[derive(Clone, Default)]
 struct Visiting {
-    named: HashSet<String>,
     rec: Vec<(RecRef, usize)>,
 }
 
 impl Visiting {
     fn of(rec: &Type) -> Visiting {
         match rec {
-            Type::Named(id) => Visiting::default().with_named(id),
             Type::Rec(g, i) => Visiting::default().with_rec(g, *i),
             _ => Visiting::default(),
         }
-    }
-
-    fn with_named(&self, id: &str) -> Visiting {
-        let mut v = self.clone();
-        v.named.insert(id.to_string());
-        v
     }
 
     fn with_rec(&self, g: &RecRef, i: usize) -> Visiting {
@@ -2557,28 +2485,28 @@ impl Visiting {
     }
 
     fn is_empty(&self) -> bool {
-        self.named.is_empty() && self.rec.is_empty()
+        self.rec.is_empty()
     }
 }
 
 // `visiting` is the same ancestor-tracking device `boundary` uses:
-// the set of Type::Named ids currently being unfolded somewhere ABOVE
+// the recursive types currently being unfolded somewhere ABOVE
 // this call in the SAME unfold chain, empty at the one genuine entry
-// point (the Expr::Match call site below) and extended by exactly one id
-// each time the Type::Named arm actually descends into an unfold. Needed
-// for the same reason it's needed there: a self-referential alias whose
+// point (the Expr::Match call site below) and extended by exactly one member
+// each time the Type::Rec arm actually descends into an unfold. Needed
+// for the same reason it's needed there: a self-referential type whose
 // recursive occurrence is a BARE Union alternative (`let rec A = Union(Int, A)`)
-// unfolds to the exact same Union([Int, Named(id)]) every time, and a
+// unfolds to the exact same Union([Int, A]) every time, and a
 // Record/List pattern's own Union arm just below fans out into EVERY
-// alternative (including that same Named(id) again) -- without this,
+// alternative (including that same A again) -- without this,
 // that's genuine infinite recursion in this function's own call stack,
 // not just a runtime concern.
-fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, Type>, visiting: &Visiting) -> bool {
+fn pattern_could_match(pat: &Pattern, ty: &Type, visiting: &Visiting) -> bool {
     match (pat, ty) {
         (Pattern::Record(fields), Type::Record(type_fields)) => {
             fields.iter().all(|(name, _)| find_field(type_fields, name).is_some())
         }
-        (Pattern::Record(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt, named_types, visiting)),
+        (Pattern::Record(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt, visiting)),
         (Pattern::Record(_), Type::Dyn | Type::Var(_)) => true,
         (Pattern::Record(_), _) => false,
         // Same story as Record just above, for the same reason: a fixed-
@@ -2591,39 +2519,25 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
         // consistent()-based catch-all below, correctly: an actual List
         // type has no fixed arity to check a pattern's length against.
         (Pattern::List(subpats), Type::Tuple(items)) => subpats.len() == items.len(),
-        (Pattern::List(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt, named_types, visiting)),
+        (Pattern::List(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt, visiting)),
         (Pattern::List(_), Type::Dyn | Type::Var(_)) => true,
-        // One level only, matching every other consumer of Type::Named
-        // in this file: unfold what this id stands for and ask the SAME
-        // question about that shape instead. A missing registry entry is
-        // not reachable from source (recursive_type_group registers an id
-        // before any use of it); keep the permissive fallback, degrading
-        // the same way this function's own Type::Dyn/Var(_) arms above do
-        // for "no information here" -- answer `true` -- rather than
-        // panicking.
+        // One level only, matching every other consumer of Type::Rec in this
+        // file: unfold what this member stands for and ask the SAME question
+        // about that shape instead.
         //
-        // Ancestor-tracking cycle break, same as `boundary`'s own Named
-        // arm: if `id` is already being unfolded somewhere
-        // above this call, stop and answer `false` instead of unfolding
-        // again -- re-trying the same id against the same pattern gives
-        // no new information beyond what the non-recursive alternatives
-        // already cover (the `any()` fan-out above already tried them),
-        // so this correctly makes e.g. `let rec A = Union(Int, A)` behave
-        // equivalently to plain `Int` for reachability purposes instead
-        // of recursing forever.
-        (_, Type::Named(id)) => {
-            if visiting.named.contains(id) {
-                return false;
-            }
-            let Some(unfolded) = named_types.get(id) else { return true };
-            pattern_could_match(pat, unfolded, named_types, &visiting.with_named(id))
-        }
-        // The same ancestor-tracking cycle break, by pointer.
+        // Ancestor-tracking cycle break (by group pointer and member), same as
+        // `boundary`'s own Rec arm: if the member is already being unfolded
+        // somewhere above this call, stop and answer `false` instead of
+        // unfolding again -- re-trying the same member against the same pattern
+        // gives no new information beyond what the non-recursive alternatives
+        // already cover (the `any()` fan-out above already tried them), so this
+        // correctly makes e.g. `let rec A = Union(Int, A)` behave equivalently
+        // to plain `Int` for reachability purposes instead of recursing forever.
         (_, Type::Rec(g, i)) => {
             if visiting.has_rec(g, *i) {
                 return false;
             }
-            pattern_could_match(pat, &unfold(g, *i), named_types, &visiting.with_rec(g, *i))
+            pattern_could_match(pat, &unfold(g, *i), &visiting.with_rec(g, *i))
         }
         // An Indexed-typed scrutinee is, at runtime, just its wrapped
         // type's own value (Vec(n) sugars over this) -- coverage of
@@ -2631,7 +2545,7 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
         // index is (see the design spec's own §5 note that exhaustiveness
         // is unaffected by Vec). Delegate straight to the wrapped type,
         // mirroring shape_test's own Type::Indexed arm.
-        (_, Type::Indexed(wrapped, _)) => pattern_could_match(pat, wrapped, named_types, visiting),
+        (_, Type::Indexed(wrapped, _)) => pattern_could_match(pat, wrapped, visiting),
         _ => consistent(ty, &pattern_type(pat)),
     }
 }
@@ -2641,9 +2555,9 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
 // loop knows how to derive a base/step hypothesis from, whose own index
 // expression (already resolved via infer.resolve_index_deep) is a BARE
 // variable? Two wrapped shapes qualify -- Case A, a plain Type::List
-// (the fixed []/:: rule), and Case B, a qualifying Type::Named+
-// Type::Union pair (the rule derived from THAT type's own structure,
-// see `qualifying_named_alternatives`) -- anything else (a non-Indexed
+// (the fixed []/:: rule), and Case B, a qualifying recursive Union
+// (the rule derived from THAT type's own structure,
+// see `qualifying_rec_alternatives`) -- anything else (a non-Indexed
 // scrutinee, a wrapped shape neither case recognizes, a literal or
 // compound index expression with no single name to bind a hypothesis
 // under) returns None: the safe "not applicable" fallback used
@@ -2652,7 +2566,7 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
 // too.
 enum IndexedRefinementTarget {
     List { index_var: String, elem_ty: Rc<Type> },
-    // `rec` is the recursive type the Indexed wraps (a Type::Named or a Type::Rec);
+    // `rec` is the recursive type (a Type::Rec) the Indexed wraps;
     // `base_alt`/`step_alt` are the two alternatives
     // `qualifying_alternatives` already sorted out -- the SAME
     // per-alternative shapes Match's own arm loop re-checks a pattern
@@ -2671,22 +2585,16 @@ enum SelfRef {
     Deep,
 }
 
-fn indexed_refinement_target(
-    resolved_scrut_ty: &Type,
-    resolved_index: Option<&IndexExpr>,
-    named_types: &HashMap<String, Type>,
-) -> Option<IndexedRefinementTarget> {
+fn indexed_refinement_target(resolved_scrut_ty: &Type, resolved_index: Option<&IndexExpr>) -> Option<IndexedRefinementTarget> {
     match (resolved_scrut_ty, resolved_index) {
         (Type::Indexed(wrapped, _), Some(IndexExpr::Var(name))) => match &**wrapped {
             Type::List(elem_ty) => Some(IndexedRefinementTarget::List { index_var: name.clone(), elem_ty: elem_ty.clone() }),
-            rec @ (Type::Named(_) | Type::Rec(..)) => qualifying_alternatives(rec, named_types).map(|(base_alt, step_alt, self_ref)| {
-                IndexedRefinementTarget::Rec {
-                    index_var: name.clone(),
-                    rec: rec.clone(),
-                    base_alt: Rc::new(base_alt),
-                    step_alt: Rc::new(step_alt),
-                    self_ref,
-                }
+            rec @ Type::Rec(g, i) => qualifying_rec_alternatives(g, *i).map(|(base_alt, step_alt, self_ref)| IndexedRefinementTarget::Rec {
+                index_var: name.clone(),
+                rec: rec.clone(),
+                base_alt: Rc::new(base_alt),
+                step_alt: Rc::new(step_alt),
+                self_ref,
             }),
             _ => None,
         },
@@ -2694,27 +2602,14 @@ fn indexed_refinement_target(
     }
 }
 
-// Case B eligibility for either kind of recursive type: (base_alt, step_alt, self_ref), the
-// alternatives unfolded one step.
-fn qualifying_alternatives(rec: &Type, named_types: &HashMap<String, Type>) -> Option<(Type, Type, SelfRef)> {
-    match rec {
-        Type::Named(id) => {
-            let (base, step) = qualifying_named_alternatives(id, named_types)?;
-            let self_ref = match &step {
-                Type::Named(n) if n == id => SelfRef::Whole,
-                Type::Tuple(items) => items.iter().position(|t| matches!(t, Type::Named(n) if n == id)).map_or(SelfRef::Deep, SelfRef::Item),
-                _ => SelfRef::Deep,
-            };
-            Some((base, step, self_ref))
-        }
-        Type::Rec(g, i) => qualifying_rec_alternatives(g, *i),
-        _ => None,
-    }
-}
-
-// qualifying_named_alternatives for member `i` of a group: the raw body is a Union of exactly
-// two alternatives, one mentioning the member not at all and the other exactly once (at any
-// depth, nested groups included). The alternatives come back unfolded; `self_ref` is read off
+// Case B eligibility (spec section 5 points 1-2) for member `i` of a group: the raw body
+// is a Union of EXACTLY two alternatives, one mentioning the member not at all (the base
+// case, 0 occurrences) and the other exactly once (the step case, at any depth, nested groups
+// included -- not zero, not two-or-more: a binary tree's `Node(Tree, Tree)` step deliberately
+// doesn't qualify, per the spec's own Non-goals). Anything else is not eligible: the same
+// safe "not applicable" fallback used throughout this design. Returns
+// (base_alt, step_alt, self_ref) in that fixed order regardless of which one the body
+// stores first. The alternatives come back unfolded; `self_ref` is read off
 // the raw step, where the member is still a Bound.
 fn qualifying_rec_alternatives(g: &RecRef, i: usize) -> Option<(Type, Type, SelfRef)> {
     let Type::Union(raw) = &g.0.bodies[i] else { return None };
@@ -2749,34 +2644,12 @@ fn count_bound(t: &Type, nest: u32, member: usize) -> usize {
     }
 }
 
-// Case B eligibility, spec section 5 points 1-2: does `named_types[id]`
-// resolve to a Type::Union of EXACTLY two alternatives, one that
-// doesn't structurally contain `Named(id)` at all (the base case, 0
-// occurrences) and one that contains it EXACTLY once (the step case --
-// not zero, not two-or-more: a step alternative referencing the id
-// twice or more, e.g. a binary tree's `Node(Tree, Tree)` shape,
-// deliberately doesn't qualify either, per the spec's own Non-goals).
-// Anything else -- missing id, wrong alternative count, any other
-// occurrence-count pairing -- isn't eligible: the same safe "not
-// applicable" fallback used throughout this design. Returns
-// (base_alt, step_alt) in that fixed order regardless of which one
-// `named_types` happens to store first.
-fn qualifying_named_alternatives(id: &str, named_types: &HashMap<String, Type>) -> Option<(Type, Type)> {
-    let Type::Union(alts) = named_types.get(id)? else { return None };
-    let [a, b] = alts.as_slice() else { return None };
-    match (count_named(a, id), count_named(b, id)) {
-        (0, 1) => Some((a.clone(), b.clone())),
-        (1, 0) => Some((b.clone(), a.clone())),
-        _ => None,
-    }
-}
-
 // Case B's own analog of Case A's `Pattern::Cons(_, tail)` tail-position
 // check (spec section 5 point 3): locates the sub-pattern bound at the
 // step alternative's own single self-referential position -- guaranteed
-// to exist and be unique by `qualifying_named_alternatives`'s own
+// to exist and be unique by `qualifying_rec_alternatives`'s own
 // occurrence-count check -- so the caller can retype it as
-// `Type::Indexed(Named(id), fresh)`, the same override Case A already
+// `Type::Indexed(rec, fresh)`, the same override Case A already
 // does for a Cons's own tail. Only the spec's own worked shape is
 // recognized: the self-reference IS the whole alternative (`let rec X =
 // Union(Y, X)`), or the alternative is a Tuple with the self-reference as one
@@ -2798,7 +2671,7 @@ fn self_ref_pattern<'a>(pat: &'a Pattern, step_alt: &Type, self_ref: SelfRef) ->
 // Tuple's items instead of a &Pattern, since a Tuple literal's items
 // at a construction site are ExprRefs, not Patterns to recurse into.
 // Deliberately does NOT also mirror self_ref_pattern's separate
-// top-level `Type::Named(n) if n == id` case (for a degenerate `let rec X
+// `SelfRef::Whole` case (for a degenerate `let rec X
 // = Union(Y, X)` shape, the self-reference IS the whole alternative) -- not
 // an oversight, just unreachable from this function's only call site,
 // which has already matched `step_alt` as a `Type::Tuple` (the
@@ -2812,8 +2685,8 @@ fn self_ref_position(step_alt: &Type, self_ref: SelfRef) -> Option<usize> {
 
 // Case B construction, base-case detection for elaborate_mode's own
 // tail dispatch (design spec 2026-09-20 sec 4): `expected` must
-// resolve to Indexed(Named(id), idx) with a qualifying 2-alternative
-// union (qualifying_named_alternatives), and `cur_expr` must NOT
+// resolve to Indexed(rec, idx) with a qualifying 2-alternative
+// union (qualifying_rec_alternatives), and `cur_expr` must NOT
 // already be a step-shaped Tuple literal -- that case is handled
 // entirely inside Expr::Tuple's own Mode::Check arm below, dispatched
 // normally; treating it as a base-case candidate here too would
@@ -2831,13 +2704,14 @@ fn self_ref_position(step_alt: &Type, self_ref: SelfRef) -> Option<usize> {
 // `case_b_step_case_hypothesis_and_retyping_enable_a_real_recursive_proof`
 // (a pre-existing, passing Phase 4 test) when the brief's version was
 // tried verbatim: the match's own step-arm hypothesis (`t`'s retyped
-// `Indexed(Named(id), m)`) never got computed under Synth, so checking
-// its body against `Indexed(Named(id), n - 1)` failed. Excluding
+// `Indexed(rec, m)`) never got computed under Synth, so checking
+// its body against `Indexed(rec, n - 1)` failed. Excluding
 // If/Match here, exactly like Tuple's own step-shape exclusion, lets
 // elaborate_node's normal dispatch handle them and fixes it.
 fn case_b_base_candidate(arena: &Arena, cur_expr: ExprRef, expected: &Type, infer: &InferCtx) -> Option<(Type, Type, SelfRef, Rc<IndexExpr>)> {
     let Type::Indexed(wrapped, idx) = infer.resolve_deep(expected) else { return None };
-    let (base_alt, step_alt, self_ref) = qualifying_alternatives(&wrapped, &infer.named_types)?;
+    let Type::Rec(g, i) = &*wrapped else { return None };
+    let (base_alt, step_alt, self_ref) = qualifying_rec_alternatives(g, *i)?;
     match &arena[cur_expr] {
         Expr::If(..) | Expr::Match(..) => return None,
         Expr::Tuple(items) => {
@@ -2883,7 +2757,7 @@ fn const_index(e: &IndexExpr) -> Option<i64> {
 // Type-level mirror of Expr::Tuple's Case B step arm, for a value whose
 // synthesized type is already a plain `Type::Tuple` (e.g. read back from
 // an unannotated `let`) rather than a literal: is `actual` a legitimate
-// `Named(id)(idx)` step value? Only decided when `idx` is a known
+// `rec(idx)` step value? Only decided when `idx` is a known
 // positive constant -- a symbolic or zero index keeps the base-case
 // treatment, since a Dyn base alternative would also accept the tuple
 // there. Non-recursive positions must be consistent with the step
@@ -2912,7 +2786,7 @@ fn is_step_shaped_tuple(actual: &Type, base_alt: &Type, step_alt: &Type, self_re
 // Pattern::List's own positions to its own independent fresh var.
 // Factored out of what used to be three separate, identically-bodied
 // arms in bind_pattern_vars's own Pattern::List match (Type::Var, the
-// final catch-all, and now the two new Type::Named/Type::Union arms'
+// final catch-all, and now the Type::Rec/Type::Union arms'
 // own "no matching alternative found" cases below) -- same fallback,
 // same reasoning, one copy.
 fn bind_fresh_positions(
@@ -2935,7 +2809,7 @@ fn bind_fresh_positions(
 // keyed by that field's own name (matching this function's own existing
 // per-field fallback). Same "nothing real to correlate against"
 // fallback, factored out for the same reason -- Finding 6's new
-// Type::Indexed/Named/Union delegation arms below need this same
+// Type::Indexed/Rec/Union delegation arms below need this same
 // fallback for their own "no matching alternative found" cases, not
 // just the catch-all.
 fn bind_fresh_record_fields(
@@ -2968,16 +2842,15 @@ fn bind_fresh_record_fields(
 //
 // Fix round 1 (critical review finding): `visiting` mirrors
 // pattern_could_match's own parameter of the same name/position exactly
-// -- an accumulated set of Type::Named ids already being unfolded on
+// -- an accumulated set of recursive types already being unfolded on
 // THIS recursion path, threaded unchanged through every existing arm
-// below and only ever grown by the Type::Named arm itself. Without this,
+// below and only ever grown by the Type::Rec arm itself. Without this,
 // the Type::Union arm's own `pattern_could_match` probe used a fresh,
-// empty set on every call, with no memory of an enclosing Type::Named
+// empty set on every call, with no memory of an enclosing Type::Rec
 // arm's own unfolding -- letting a Union alternative that is itself a
 // bare self-reference (e.g. `let rec List = Union(List, Tuple(Int, List))`, where the
-// FIRST alternative is `Named("List")` verbatim) look "reachable" via
-// its own fresh probe forever, recursing without end. See this task's
-// own fix-round-1 report entry for the traced counterexample.
+// FIRST alternative is `List` itself) look "reachable" via
+// its own fresh probe forever, recursing without end.
 fn bind_pattern_vars(
     ctx: &Ctx,
     pat: &Pattern,
@@ -3053,59 +2926,38 @@ fn bind_pattern_vars(
             // forcing List costs nothing there.
             Type::Var(_) => bind_fresh_positions(ctx, pats, infer, span, visiting),
             // A Type::Indexed-wrapped scrutinee (Vec(n)-style, or Case
-            // B's own Named-wrapped analog per §2's generalization) --
+            // B's own recursive-type analog per §2's generalization) --
             // correlate against the WRAPPED type directly, "forgetting"
             // the index the same way Pattern::Cons's own arm below
             // already does via forget_index, and pattern_could_match's
             // own Type::Indexed arm mirrors exactly. Needed for Case B:
             // a Case-B-eligible scrutinee's own real stored type is
-            // `Type::Indexed(Type::Named(id), n)`, still wrapped, by the
+            // `Type::Indexed(Type::Rec(..), n)`, still wrapped, by the
             // time a match arm's own pattern (e.g. the tagged-tuple-style
             // `(h, t)`) gets here -- without this arm it fell into the
             // generic catch-all below, no correlation at all.
             Type::Indexed(wrapped, _) => bind_pattern_vars(ctx, pat, wrapped, infer, span, visiting),
-            // A Type::Named scrutinee (a recursive `let rec X = ... in` type
-            // reference) -- unfold ONE level via infer.named_types and
-            // recurse, mirroring pattern_could_match's own Type::Named
-            // arm exactly (including its "unknown id" permissive
-            // fallback: nothing registered to unfold into means nothing
-            // real to correlate against, same as the generic catch-all).
-            // This is Case B's own real prerequisite, found and fixed by
-            // this task's own investigation (see its report): without
-            // it, a Case-B-style scrutinee's own Type::Named(id) never
-            // even reaches the Type::Union arm just below -- it's still
-            // nominally Named at this point, not yet unfolded to a
-            // Union at all.
+            // A Type::Rec scrutinee (a recursive `let rec X = ... in` type
+            // reference) -- unfold ONE level and recurse, mirroring
+            // pattern_could_match's own Type::Rec arm exactly. This is
+            // Case B's own real prerequisite: without it, a Case-B-style
+            // scrutinee's own Type::Rec never even reaches the Type::Union
+            // arm just below -- it's still a Rec at this point, not yet
+            // unfolded to a Union at all.
             //
-            // Fix round 1: a cycle guard IS needed here after all -- the
-            // "only ever recurses into an already-proved-reachable
-            // shape" argument this comment used to make was wrong
-            // because the Type::Union arm just below used to run its own
-            // reachability probe with a FRESH, empty visiting set every
-            // time, disconnected from whatever this arm had already
-            // unfolded -- so a Union alternative that is ITSELF a bare
-            // self-reference (`let rec List = Union(List, Tuple(Int, List))`) could
-            // look reachable forever, recursing without end (see this
-            // task's own fix-round-1 report entry for the traced
-            // repro). Mirrors pattern_could_match's own Type::Named arm
-            // exactly: if `id` is already being unfolded on this path,
-            // stop and fall back to the safe fresh-vars-per-position
-            // behavior instead of unfolding again; otherwise recurse
-            // with `id` added to the accumulated set.
+            // A cycle guard is needed: the Type::Union arm just below runs
+            // its reachability probe with this same `visiting` set, so a
+            // Union alternative that is ITSELF a bare self-reference
+            // (`let rec List = Union(List, Tuple(Int, List))`) cannot look
+            // reachable forever. If the member is already being unfolded on
+            // this path, stop and fall back to the safe
+            // fresh-vars-per-position behavior instead of unfolding again;
+            // otherwise recurse with it added to the accumulated set.
             Type::Rec(g, i) => {
                 if visiting.has_rec(g, *i) {
                     return bind_fresh_positions(ctx, pats, infer, span, visiting);
                 }
                 bind_pattern_vars(ctx, pat, &unfold(g, *i), infer, span, &visiting.with_rec(g, *i))
-            }
-            Type::Named(id) => {
-                if visiting.named.contains(id) {
-                    return bind_fresh_positions(ctx, pats, infer, span, visiting);
-                }
-                match infer.named_types.get(id).cloned() {
-                    Some(unfolded) => bind_pattern_vars(ctx, pat, &unfolded, infer, span, &visiting.with_named(id)),
-                    None => bind_fresh_positions(ctx, pats, infer, span, visiting),
-                }
             }
             // A Type::Union scrutinee (a resolved alias's own RHS, or an
             // ordinary Union type written directly) -- Case B's own
@@ -3128,21 +2980,20 @@ fn bind_pattern_vars(
             // deterministic, same "best effort, not exhaustive" stance
             // pattern_could_match's own Union arm already takes.
             //
-            // Fix round 1: this arm's own `pattern_could_match` probe
-            // must reuse the SAME accumulated `visiting` set passed into
-            // this arm -- not a fresh `&HashSet::new()` -- and the
+            // This arm's own `pattern_could_match` probe must reuse the SAME
+            // accumulated `visiting` set passed into this arm, and the
             // subsequent recursive call into whichever alternative
             // `.find()` picks must also pass that same set through
-            // unchanged (this arm never adds to it; only the Type::Named
-            // arm above does). A fresh set here was the actual bug: it
-            // let this arm "forget" that an enclosing Type::Named arm was
-            // already unfolding `id`, so a bare self-referential
-            // alternative could look reachable again and again forever.
-            Type::Union(alts) => match alts.iter().find(|alt| pattern_could_match(pat, alt, &infer.named_types, visiting)) {
+            // unchanged (this arm never adds to it; only the Type::Rec
+            // arm above does). A fresh set would let this arm "forget"
+            // that an enclosing Type::Rec arm was already unfolding the
+            // member, so a bare self-referential alternative could look
+            // reachable again and again forever.
+            Type::Union(alts) => match alts.iter().find(|alt| pattern_could_match(pat, alt, visiting)) {
                 Some(matching_alt) => bind_pattern_vars(ctx, pat, matching_alt, infer, span, visiting),
                 None => bind_fresh_positions(ctx, pats, infer, span, visiting),
             },
-            // A concrete, non-Tuple, non-List, non-Indexed/Named/Union
+            // A concrete, non-Tuple, non-List, non-Indexed/Rec/Union
             // scrutinee against a List pattern: pattern_could_match's
             // own existing check (called by Expr::Match before this
             // function ever runs) already rejects this case statically
@@ -3173,11 +3024,11 @@ fn bind_pattern_vars(
                 }
                 Ok(c)
             }
-            // Finding 6 (final review): the same Type::Indexed/Named/Union
+            // Finding 6 (final review): the same Type::Indexed/Rec/Union
             // delegation Pattern::List already got from Task 3's own Case B
             // prerequisite fix, mirrored here for Record so a Record
             // pattern matched against a Vec(n)-of-records or a Case-B-
-            // eligible Named/Union scrutinee gets real per-field
+            // eligible Rec/Union scrutinee gets real per-field
             // correlation too, instead of always falling back to
             // `infer.fresh_var` per field (the same "zero correlation" gap
             // Task 3 closed for List).
@@ -3188,16 +3039,7 @@ fn bind_pattern_vars(
                 }
                 bind_pattern_vars(ctx, pat, &unfold(g, *i), infer, span, &visiting.with_rec(g, *i))
             }
-            Type::Named(id) => {
-                if visiting.named.contains(id) {
-                    return bind_fresh_record_fields(ctx, fields, infer, span, visiting);
-                }
-                match infer.named_types.get(id).cloned() {
-                    Some(unfolded) => bind_pattern_vars(ctx, pat, &unfolded, infer, span, &visiting.with_named(id)),
-                    None => bind_fresh_record_fields(ctx, fields, infer, span, visiting),
-                }
-            }
-            Type::Union(alts) => match alts.iter().find(|alt| pattern_could_match(pat, alt, &infer.named_types, visiting)) {
+            Type::Union(alts) => match alts.iter().find(|alt| pattern_could_match(pat, alt, visiting)) {
                 Some(matching_alt) => bind_pattern_vars(ctx, pat, matching_alt, infer, span, visiting),
                 None => bind_fresh_record_fields(ctx, fields, infer, span, visiting),
             },
@@ -3547,15 +3389,13 @@ fn conform_spec(arena: &mut Arena, names: &BTreeSet<String>, blame: Span, ctx: &
         }
         lens.push(slot);
     }
-    Rc::new(ConformSpec { index_names: names, lens, named: infer.registry.clone(), memo: RefCell::new(None), span: Some(blame), trusted: false })
+    Rc::new(ConformSpec { index_names: names, lens, memo: RefCell::new(None), span: Some(blame), trusted: false })
 }
 
 // A check-time evaluation that finished, replayed by settle_erasure. Each holds
 // the definitions the evaluation read directly (indices); the ones they read
 // are reached by the sweep.
 enum Proof {
-    // A type let's or a recursive type's definitions.
-    Defs(Vec<usize>),
     // A Confirm site: the definitions it read, its elaborated annotation, and
     // its node.
     Site(Vec<usize>, ExprRef, Rc<AnnotSpec>),
@@ -3586,9 +3426,6 @@ enum Erasable {
 fn settle_erasure(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx) {
     for proof in std::mem::take(&mut infer.proofs) {
         match proof {
-            Proof::Defs(reads) => {
-                note_evaluation(arena, spans, infer, &reads);
-            }
             Proof::Site(reads, elaborated, spec) => {
                 let clean = note_evaluation(arena, spans, infer, &reads);
                 if clean && !fallible_check(arena, elaborated, spans, infer) {
@@ -3894,84 +3731,6 @@ fn eval_annotation(arena: &mut Arena, ann: ExprRef, reads: &[Read], spans: &Span
     }
 }
 
-// Mints a globally-unique id for a recursive type's Named leaf: a monotonic
-// counter appended to the binder's name, in its own namespace (typecheck's
-// fresh_row_name/fresh_type_name keep their own counters).
-fn fresh_named_type_id(base: &str) -> String {
-    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{base}#{n}")
-}
-
-// How many Type::Named leaves carrying exactly `id` does `ty` contain? A
-// plain structural walk that never unfolds a Named reference, so it
-// terminates on a finished recursive type. recursive_type_group asks
-// whether the count is nonzero (did the type reference itself?); Case B
-// eligibility (`qualifying_named_alternatives`) needs "exactly once" apart
-// from zero or two-and-more (a binary tree's `Node(Tree, Tree)` step
-// deliberately does not qualify).
-fn count_named(ty: &Type, id: &str) -> usize {
-    match ty {
-        Type::Named(n) => usize::from(n == id),
-        Type::List(elem) => count_named(elem, id),
-        Type::Fun(param, _row, ret) => count_named(param, id) + count_named(ret, id),
-        Type::Tuple(items) | Type::Union(items) => items.iter().map(|t| count_named(t, id)).sum(),
-        Type::Record(fields) => fields.iter().map(|(_, t)| count_named(t, id)).sum(),
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::Var(_) | Type::Rec(..) | Type::RecVar(_) => 0,
-        Type::Indexed(wrapped, _) => count_named(wrapped, id),
-    }
-}
-
-// A `let rec` group whose values are type constructor applications is a
-// recursive type (spec section 1): each name is a fresh Named leaf while the
-// values are evaluated, and a name whose leaf occurs in the results is
-// registered in named_types. None when some value does not evaluate to a type
-// at check time, or evaluates to a bare name of the group (`T = (fun u ->
-// u)(T)` builds no type): the group is then an ordinary `let rec`.
-fn recursive_type_group(
-    arena: &mut Arena,
-    bindings: &[(String, Option<ExprRef>, ExprRef)],
-    ctx: &Ctx,
-    spans: &SpanMap,
-    infer: &mut InferCtx,
-) -> Option<Vec<Type>> {
-    if !bindings.iter().all(|(_, ann, v)| ann.is_none() && matches!(arena[*v], Expr::App(..))) {
-        return None;
-    }
-    let names: Vec<String> = bindings.iter().map(|(n, _, _)| n.clone()).collect();
-    let ids: Vec<String> = names.iter().map(|n| fresh_named_type_id(n)).collect();
-    let mut results = Vec::with_capacity(bindings.len());
-    for (_, _, v) in bindings {
-        let (reads, direct_stuck) = reads_in(arena, &[*v], &names, ctx, infer);
-        if direct_stuck || reads.iter().any(|r| def_deps(arena, infer, r.def).stuck) {
-            return None;
-        }
-        let roots: Vec<usize> = reads.iter().map(|r| r.def).collect();
-        ensure_values(arena, spans, infer, &roots);
-        // The group's names are bound to their leaves, then the values read.
-        let (read_names, read_values) = read_frame(infer, &reads).ok()?;
-        let frame_names: Vec<String> = names.iter().cloned().chain(read_names).collect();
-        let leaves = ids.iter().map(|id| Value::Type(Rc::new(Type::Named(id.clone()))));
-        let frame_values: Vec<Value> = leaves.chain(read_values).collect();
-        let ty = (*pure_type(eval_pure_in(arena, *v, &frame_names, frame_values, &mut infer.resolved, spans, ANNOTATION_FUEL)).ok()?).clone();
-        if matches!(&ty, Type::Named(n) if ids.contains(n)) {
-            return None;
-        }
-        infer.proofs.push(Proof::Defs(roots));
-        results.push(ty);
-    }
-    let mut values = Vec::with_capacity(results.len());
-    for (ty, id) in results.iter().zip(&ids) {
-        if results.iter().any(|r| count_named(r, id) > 0) {
-            Rc::make_mut(&mut infer.named_types).insert(id.clone(), ty.clone());
-            values.push(Type::Named(id.clone()));
-        } else {
-            values.push(ty.clone());
-        }
-    }
-    Some(values)
-}
-
 // The annotation slot typecheck re-emits for a binder whose type it knows.
 fn type_lit(arena: &mut Arena, ty: Type) -> ExprRef {
     arena.push(Expr::TypeLit(Rc::new(ty)))
@@ -4058,61 +3817,16 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // just g's annotation-or-Dyn) would wrongly depend on
             // which one happens to come first in the `and` chain.
             Expr::LetRec(bindings, body) => {
-                // A recursive type: the names are type values (Dyn), each
-                // bound to the type its value built.
-                if let Some(types) = recursive_type_group(arena, &bindings, &cur_ctx, spans, infer) {
-                    let lits: Rc<Vec<(String, Option<ExprRef>, ExprRef)>> = Rc::new(
-                        bindings.iter().zip(&types).map(|((name, _, _), ty)| (name.clone(), None, type_lit(arena, ty.clone()))).collect(),
-                    );
-                    // Each value is elaborated once, with the names bound to
-                    // their types (a definition of its own, so an annotation
-                    // inside a value can name the group): its type errors are
-                    // reported and its run-time checks kept.
-                    let inner = infer.new_def(DefNode::Group(lits.clone()), Vec::new(), &cur_ctx);
-                    let mut val_ctx = cur_ctx.clone();
-                    for (name, _, _) in lits.iter() {
-                        val_ctx = extend_generalized(&val_ctx, name, Type::Dyn, infer, Some(inner.clone()));
-                    }
-                    let mut vals = Vec::with_capacity(bindings.len());
-                    for (_, _, v) in bindings.iter() {
-                        vals.push(elaborate(arena, *v, &val_ctx, spans, infer)?.2);
-                    }
-                    // The run time binds each name to its type. If a check in
-                    // a value could fail, the value still runs first, with
-                    // the names bound to their types, and is then dropped.
-                    let fallible = vals.iter().any(|v| fallible_check(arena, *v, spans, infer));
-                    let values: Vec<ExprRef> = vals
-                        .iter()
-                        .zip(&types)
-                        .map(|(v, ty)| {
-                            let lit = type_lit(arena, ty.clone());
-                            if !fallible {
-                                return lit;
-                            }
-                            let run = arena.push(Expr::Let("_".to_string(), None, *v, lit));
-                            types.iter().zip(lits.iter()).rev().fold(run, |inner, (t, (name, _, _))| {
-                                let t = type_lit(arena, t.clone());
-                                arena.push(Expr::Let(name.clone(), None, t, inner))
-                            })
-                        })
-                        .collect();
-                    let def = infer.new_def(DefNode::Group(lits.clone()), values.clone(), &cur_ctx);
-                    infer.proofs.push(Proof::Defs(vec![def.idx]));
-                    let mut elaborated = Vec::with_capacity(lits.len());
-                    for ((name, _, _), value) in lits.iter().zip(values) {
-                        cur_ctx = extend_generalized(&cur_ctx, name, Type::Dyn, infer, Some(def.clone()));
-                        elaborated.push((name.clone(), Type::Dyn, EffectRow::pure(), value));
-                    }
-                    pending.push(PendingElab::LetRec { bindings: elaborated, def, sites: Vec::new() });
-                    cur_expr = body;
-                    continue;
-                }
                 // The values are checked in the scope the run time evaluates
                 // them in (machine.rs's LetRec): a group of direct `fun`s sees
                 // its own names, bound to its closures (a definition of their
-                // own, so an annotation naming one evaluates it); any other
-                // group's values see the outer scope only.
-                let group = crate::resolve::is_direct_group(arena, &bindings).then(|| {
+                // own, so an annotation naming one evaluates it); a type group
+                // (rule P) sees them as placeholders for the types it is
+                // building, which no annotation can name (stuck, then an error
+                // at the annotation); any other group's values see the outer
+                // scope only.
+                let kind = group_kind(arena, &bindings);
+                let group = (kind == GroupKind::Functions).then(|| {
                     let def = infer.new_def(DefNode::Group(bindings.clone()), Vec::new(), &cur_ctx);
                     // Its values are not elaborated yet: count them fallible,
                     // so no evaluation that reads it counts as clean
@@ -4147,8 +3861,16 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     });
                 }
                 for ((name, _, _), ann) in bindings.iter().zip(&opened) {
-                    // A non-recursive group binds nothing for its values.
-                    let Some(group) = &group else { break };
+                    // A plain group binds nothing for its values.
+                    if kind == GroupKind::Plain {
+                        break;
+                    }
+                    // A type group has no annotations: its names are Dyn, and stuck
+                    // (no definition) for an annotation inside a value.
+                    let Some(group) = &group else {
+                        val_ctx = val_ctx.bind(name, Scheme::mono(Type::Dyn));
+                        continue;
+                    };
                     val_ctx = match ann {
                         // Generalized, not plain extend: a fully-given
                         // annotation makes checking mode against it
@@ -4195,7 +3917,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 for (name, bound_ty, _, _) in elaborated.iter() {
                     cur_ctx = extend_generalized(&cur_ctx, name, bound_ty.clone(), infer, Some(def.clone()));
                 }
-                pending.push(PendingElab::LetRec { bindings: elaborated, def, sites });
+                pending.push(PendingElab::LetRec { bindings: elaborated, def, sites, kind });
                 cur_expr = body;
             }
             Expr::Lambda(param, ann, body) => {
@@ -4330,7 +4052,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // be Dyn/Var (e.g. `let rec T = Union(Dyn, Tuple(Int, T))`) makes
                 // `consistent(actual_ty, base_alt)` trivially true for ANY
                 // `actual_ty`, including a genuinely step-shaped one (a
-                // `w: T(2) = v` reference to an already-Indexed(Named(T),
+                // `w: T(2) = v` reference to an already-Indexed(Rec(T),
                 // 2) value) -- force-asserting index 0 against an index
                 // that's already known to be 2, a genuine conflict.
                 //
@@ -4343,7 +4065,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // at all) -- there `consistent`'s Dyn-side permissiveness
                 // is exactly correct, not a false signal, since nothing
                 // else in this codebase can ever prove a plain Int equals
-                // an Indexed(Named(id), _) type otherwise (consistent()
+                // an Indexed(Rec(..), _) type otherwise (consistent()
                 // has no Indexed-vs-non-Indexed arm at all -- see
                 // types::consistent). Excluding Dyn/Var base_alt
                 // unconditionally throws that legitimate case out with the
@@ -4366,11 +4088,11 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // Dyn/Var -- an Indexed actual_ty against a concrete,
                 // non-Dyn/Var base_alt (e.g. `let rec T = Union(Vec(3), Tuple(Int, T))`)
                 // still gets a chance here, since the generic fallback's
-                // `consistent` has no Indexed-vs-Named arm to catch that
+                // `consistent` has no Indexed-vs-Rec arm to catch that
                 // case on its own.
                 //
                 // Confirmed by direct repro: `w: T(2) = v` (actual_ty =
-                // Indexed(Named(T), 2), base_alt = Dyn) now falls through
+                // Indexed(Rec(T), 2), base_alt = Dyn) now falls through
                 // to the trailing unify_fits, which already has full,
                 // correct Indexed-vs-Indexed handling via unify() -- while
                 // `let x: T(0) = 5 in x` and the deeper `let v: T(2) =
@@ -4418,15 +4140,20 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 result_expr = arena.push(Expr::Let(var, Some(ann), val, body));
                 infer.splices.push(Splice { outer: result_expr, inner: body, what: Erasable::Binder(def) });
             }
-            PendingElab::LetRec { bindings, def, sites } => {
+            PendingElab::LetRec { bindings, def, sites, kind } => {
                 // Matches the original LetRec arm: body's type propagates
                 // through unchanged, row is the union of every binding's
                 // plus body's.
                 for (_, _, val_row, _) in &bindings {
                     result_row = EffectRow::union(val_row, &result_row);
                 }
-                let group: Vec<(String, Option<ExprRef>, ExprRef)> =
-                    bindings.into_iter().map(|(name, ty, _, val)| (name, Some(type_lit(arena, ty)), val)).collect();
+                // A type group stays annotation-free: rule P (resolve::group_kind) reads
+                // the elaborated tree too, and a TypeLit annotation would make it Plain.
+                let group: Vec<(String, Option<ExprRef>, ExprRef)> = bindings
+                    .into_iter()
+                    .map(|(name, ty, _, val)| (name, (kind != GroupKind::Types).then(|| type_lit(arena, ty)), val))
+                    .collect();
+                debug_assert_eq!(group_kind(arena, &group), kind, "elaboration changed what the `let rec` builds");
                 // An Unknown member is checked once the group is built, and
                 // that check reads it.
                 let mut body = result_expr;
@@ -4629,18 +4356,21 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         // not widened to `List(Dyn)`.
         Expr::Tuple(items) => {
             // Case B construction, step case (design spec 2026-09-20
-            // sec 4): checked against an Indexed(Named(id), idx) type
-            // whose named union qualifies and whose step alternative
+            // sec 4): checked against an Indexed(Rec(..), idx) type
+            // whose union qualifies and whose step alternative
             // is a same-arity Tuple, check each non-recursive item
             // against its corresponding step_alt element and the
             // recursive item (self_ref_position) against
-            // Named(id)(idx - 1) -- Case A's Cons arm (Task 2),
+            // the Rec at idx - 1 -- Case A's Cons arm (Task 2),
             // generalized from a fixed List/Cons shape to an
-            // arbitrary 2-alternative named union.
+            // arbitrary 2-alternative recursive union.
             if let Mode::Check(expected) = mode {
                 if let Type::Indexed(wrapped, idx) = infer.resolve_deep(expected) {
                     {
-                        if let Some((_, step_alt, self_ref)) = qualifying_alternatives(&wrapped, &infer.named_types) {
+                        if let Some((_, step_alt, self_ref)) = match &*wrapped {
+                            Type::Rec(g, i) => qualifying_rec_alternatives(g, *i),
+                            _ => None,
+                        } {
                             if let Type::Tuple(step_items) = &step_alt {
                                 if step_items.len() == items.len() {
                                     if let Some(rec_pos) = self_ref_position(&step_alt, self_ref) {
@@ -4813,7 +4543,6 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let mut f_ty = infer.resolve(&f_ty);
             // A callee typed by a (recursive) alias is called through its body, one step.
             let unfolded = match &f_ty {
-                Type::Named(id) => infer.named_types.get(id).filter(|raw| !matches!(raw, Type::Named(_))).cloned(),
                 Type::Rec(g, i) => Some(unfold(g, *i)).filter(|raw| !matches!(raw, Type::Rec(..))),
                 _ => None,
             };
@@ -5236,7 +4965,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 _ => None,
             };
             let refinement_target = match mode {
-                Mode::Check(_) => indexed_refinement_target(&resolved_scrut_ty, resolved_index.as_ref(), &infer.named_types),
+                Mode::Check(_) => indexed_refinement_target(&resolved_scrut_ty, resolved_index.as_ref()),
                 Mode::Synth => None,
             };
             // Scope the eventual restore to the ONE key this mechanism is
@@ -5283,7 +5012,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let mut new_arms = Vec::with_capacity(arms.len());
             let mut arm_tys = Vec::with_capacity(arms.len());
             for (pat, (_, guard, body)) in pats.iter().copied().zip(arms.iter()) {
-                if !pattern_could_match(pat, &scrut_ty, &infer.named_types, &Visiting::default()) {
+                if !pattern_could_match(pat, &scrut_ty, &Visiting::default()) {
                     return Err(TypeError(
                         format!(
                             "match: pattern of type {} can never match scrutinee of type {scrut_ty}",
@@ -5331,7 +5060,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // bind_pattern_vars's own plain binding via a second
                 // `extend` call), and hypothesizes the scrutinee's own
                 // index is `fresh + 1`. Case A (List) derives base/step
-                // from the fixed []/:: patterns directly; Case B (Named+
+                // from the fixed []/:: patterns directly; Case B (Rec+
                 // Union) derives the SAME shape of fact by asking which
                 // of the type's own two alternatives this specific arm's
                 // pattern corresponds to (reusing pattern_could_match's
@@ -5369,23 +5098,23 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         },
                         IndexedRefinementTarget::Rec { index_var: n_name, rec, base_alt, step_alt, self_ref } => {
                             // `base_alt`/`step_alt` are themselves already-
-                            // unfolded alternatives of `id` (see
-                            // `qualifying_named_alternatives`), so this
+                            // unfolded alternatives of the recursive type (see
+                            // `qualifying_rec_alternatives`), so this
                             // probe is conceptually already mid-unfold of
-                            // `id` -- pass `{id}`, not an empty set, for
+                            // the member -- pass its own visiting entry, not an empty set, for
                             // consistency with the `visiting`-threading
                             // discipline the rest of this phase established
                             // (the exact shape whose absence caused
                             // bind_pattern_vars's own fix-round-1 bug).
                             // Doesn't change behavior today (verified by
                             // trace: neither alternative can itself unfold
-                            // back to `id` without violating
-                            // `qualifying_named_alternatives`'s own
+                            // back to the member without violating
+                            // `qualifying_rec_alternatives`'s own
                             // occurrence-count check), just defense in
                             // depth.
                             let visiting_id = Visiting::of(rec);
-                            let matches_base = pattern_could_match(pat, base_alt, &infer.named_types, &visiting_id);
-                            let matches_step = pattern_could_match(pat, step_alt, &infer.named_types, &visiting_id);
+                            let matches_base = pattern_could_match(pat, base_alt, &visiting_id);
+                            let matches_step = pattern_could_match(pat, step_alt, &visiting_id);
                             if matches_base && !matches_step {
                                 infer.index_subst.insert(n_name.clone(), IndexExpr::Lit(0));
                             } else if matches_step && !matches_base {
@@ -5544,7 +5273,6 @@ pub fn check(arena: &mut Arena, root: ExprRef, spans: &SpanMap) -> Result<ExprRe
     resolve_pendings(arena, &infer);
     resolve_obligations(arena, &infer);
     settle_erasure(arena, spans, &mut infer);
-    let _ = infer.registry.set(std::mem::take(&mut infer.named_types));
     match row {
         EffectRow::Closed(unhandled) if !unhandled.is_empty() => {
             let names: Vec<_> = unhandled.into_iter().collect();

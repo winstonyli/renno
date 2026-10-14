@@ -111,7 +111,7 @@ pub enum BinOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Test {
     // Dyn/Var: everything passes. Never: nothing does (a failing branch, or a
-    // Named alias already being unfolded with no container in between).
+    // recursive type already being unfolded with no container in between).
     Any,
     Never,
     Int,
@@ -136,7 +136,7 @@ pub enum Test {
     // A record with at least these fields, each field's value passing its
     // test (width-tolerant: other fields are never looked at).
     RecordOf(Vec<(String, Test)>),
-    // `CheckSpec::defs[i]`: a Named alias's body, reached only through a
+    // `CheckSpec::defs[i]`: a recursive type's body, reached only through a
     // container so the recursion consumes value structure.
     Ref(usize),
     // Any alternative passes (a union, first match wins).
@@ -147,7 +147,7 @@ pub enum Test {
 pub struct CheckSpec {
     pub test: Test,
     // The bodies `Test::Ref(i)` indexes; empty unless the target reaches a
-    // recursive Named alias.
+    // recursive type.
     pub defs: Vec<Test>,
     // The length slots `Test::ListLenArg` reads, each an `Expr::Len` node. A
     // node rather than a field here, so resolve_obligations patches it in
@@ -227,8 +227,6 @@ pub struct ConformSpec {
     // the Expr::Len slot holding its run-time value (spec 11.4).
     pub index_names: Vec<String>,
     pub lens: Vec<ExprRef>,
-    // The recursive types' bodies, set when checking finishes.
-    pub named: Rc<std::cell::OnceCell<Rc<HashMap<String, Type>>>>,
     pub memo: std::cell::RefCell<Option<Rc<Lazy>>>,
     // The source span a failure blames (None keeps whatever span ran last).
     pub span: Option<Span>,
