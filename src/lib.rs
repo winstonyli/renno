@@ -126,17 +126,12 @@ mod tests {
     }
 
     // Walks the elaborated tree looking for a runtime boundary check: a
-    // native Expr::Check, or a union check with a Fun alternative (still
-    // desugared into `let __check_tmp = ... in if ... then ... else ...`,
-    // detected by that Let's fixed binder name). Needed because arena-indexed Expr's derived
+    // native Expr::Check, or an Expr::Residual (a function or a union with a
+    // function alternative). Needed because arena-indexed Expr's derived
     // Debug only prints the immediate node (children are plain ExprRef
     // indices, so Debug does not recurse through them).
     fn contains_check(arena: &expr::Arena, root: expr::ExprRef) -> bool {
-        tree_any(arena, root, &|n| match n {
-            expr::Expr::Check(..) => true,
-            expr::Expr::Let(var, ..) => var.starts_with("__check_tmp#"),
-            _ => false,
-        })
+        tree_any(arena, root, &|n| matches!(n, expr::Expr::Check(..) | expr::Expr::Residual(..)))
     }
 
     // Does any node of the (elaborated) tree under `root` satisfy `pred`?
@@ -1349,7 +1344,7 @@ mod tests {
     #[test]
     fn passthrough_fun_typed_alias_still_gets_a_real_contract() {
         // Same root cause, a second symptom: an annotated Fun-typed
-        // alias used to skip wrap_fun_contract entirely (the Type::Var
+        // alias used to skip the function contract entirely (the Type::Var
         // from-side bypassed coerce's check-building for ANY concrete
         // to-side, not just primitives), silently losing the per-call
         // contract a (Int -> Int)-annotated value is supposed to get.
@@ -1854,11 +1849,10 @@ mod tests {
 
     #[test]
     fn union_type_fun_alternative_gets_a_real_per_call_contract_not_just_is_fun() {
-        // Regression: build_union_check used to only run each
+        // Regression: a union check used to only run each
         // alternative's bare shape predicate (is_fun for a Fun
-        // alternative), never the full build_boundary_check that
-        // installs wrap_fun_contract's real per-call argument/return
-        // checking. `y` is callable (Int -> Int) but doesn't match F's
+        // alternative), never the full check that installs the real
+        // per-call argument/return checking. `y` is callable (Int -> Int) but doesn't match F's
         // own (Int -> Bool) alternative's RETURN type -- only reachable
         // via map's native `apply` (a statically Union-typed value can't
         // be called directly -- App's typecheck only knows Fun/Dyn
@@ -2435,11 +2429,12 @@ let r = f(5) in
 r + 1").unwrap_err();
         assert!(err.starts_with("line 2, column 9:"), "unexpected message: {err}");
         assert!(err.contains("len expects a string or list"), "unexpected message: {err}");
-        // Passed as an argument, `len` is called through the wrapper built at the call site, so
-        // the blame is that site's `len`, not an unlocated fallback.
+        // Passed as an argument, `len` is called through the contract built at the call site,
+        // which synthesizes no call node of its own: the blame is the callee `f` of the call
+        // made, not an unlocated fallback.
         let err = run_source("let g = fun f -> f(5) in
 g(len)").unwrap_err();
-        assert!(err.starts_with("line 2, column 3:"), "unexpected message: {err}");
+        assert!(err.starts_with("line 1, column 18:"), "unexpected message: {err}");
     }
 
     #[test]
@@ -2453,7 +2448,7 @@ g(len)").unwrap_err();
         let five = arena.push(Expr::Int(5));
         spans.push(Span { start: 10, end: 11 });
         // Synthesized after parsing: a Check around `f`, a spanless leaf, and the App over both.
-        let spec = std::rc::Rc::new(crate::expr::CheckSpec { test: crate::expr::Test::Fun, defs: vec![], lens: vec![], mode: crate::expr::CheckMode::Assert, to: String::new(), span: None });
+        let spec = std::rc::Rc::new(crate::expr::CheckSpec { test: crate::expr::Test::Fun, defs: vec![], lens: vec![], to: String::new(), span: None });
         let check = arena.push(Expr::Check(f, spec));
         let leaf = arena.push(Expr::Bool(true));
         let pair = arena.push(Expr::Tuple(vec![check, five]));
@@ -2738,7 +2733,7 @@ g(len)").unwrap_err();
         // Type::Fun regardless of its actual signature, so a Dyn-origin
         // closure with the wrong return type would silently pass the
         // boundary check and only fail later with an unrelated panic (or
-        // not at all). wrap_fun_contract now re-checks the result of every
+        // not at all). The function contract now re-checks the result of every
         // call through the boundary, so this fails right at the call site.
         let src = r#"
             handle
@@ -3063,7 +3058,7 @@ g(len)").unwrap_err();
         // Type::Fun arm) hands coerce a REAL, resolved Fun(Var, _, Var)
         // shape once a callee's own parameter position has been learned
         // via unification -- coerce's own Type::Fun branch of
-        // build_boundary_check recurses into wrap_fun_contract, which
+        // build_boundary_check recurses into the function contract, which
         // recurses again for the return type, landing on a bare
         // Type::Var. build_boundary_check's own Type::Var arm was still
         // `unreachable!()` (a leftover from when Type::Var could never
@@ -3475,7 +3470,7 @@ g(len)").unwrap_err();
         // above, whose Tuple shape check never inspects element types and
         // so never revisits the Named leaf. Unfolding Type::Named(id) here
         // reproduces the exact same Union([Int, Named(id)]) again, which
-        // used to send build_union_check/build_shape_predicate/
+        // used to send the union check/shape builders/
         // build_boundary_check into genuine infinite recursion in THIS
         // PROCESS's own call stack during elaboration (a real stack
         // overflow, not a graceful type error). g's own parameter is
@@ -3541,7 +3536,7 @@ g(len)").unwrap_err();
     fn pattern_could_match_does_not_infinite_loop_on_a_bare_union_self_reference() {
         // A's own recursive occurrence is a BARE Union alternative (not
         // wrapped in a Tuple the way List = (Int, List) | Bool is
-        // above), same shape as build_shape_predicate's own regression
+        // above), same shape as shape_test's own regression
         // at a_bare_union_self_reference_does_not_infinite_loop_at_a_dyn_boundary.
         // A List pattern against a Named(A) scrutinee unfolds to
         // Union([Int, Named(A)]), and Pattern::List's own Union arm fans
@@ -3598,16 +3593,13 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn wrap_fun_contract_return_position_self_reference_does_not_always_fail() {
-        // F's own return type is F again -- wrap_fun_contract's contract
-        // closure, checking its own call's return value against F, hits
-        // build_boundary_check's "already visiting F" branch on every
-        // single call, since there's no predicate gating it here (unlike
-        // build_union_check's own use of the same branch, which is always
-        // dead code behind a hard-coded-false predicate). Before the fix,
-        // this branch unconditionally failed -- every call through such a
-        // contract-wrapped closure panicked, even when the real return
-        // value (42 here) never needed checking at all.
+    fn a_static_recursive_fun_contract_checks_callability_at_the_boundary() {
+        // F's own return type is F again: the contract checks its call's
+        // result against F, a fresh unfolding each call (never an
+        // unconditional failure, and never a skipped check). The result 42
+        // is not a function, so F's callability check fails at the call.
+        // (This program used to run and return 42, the self-reference
+        // checking nothing.)
         let src = r#"
             type F = (Dyn -> F) in
             let make: (Dyn -> Dyn) = fun v -> (fun y -> 42) in
@@ -3615,10 +3607,19 @@ g(len)").unwrap_err();
             let y: Dyn = x in
             y(opaque)
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
-        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
-        assert_eq!(result.as_int(), 42);
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("type error: expected (Dyn -> F), found Int"), "{err}");
+        // A result that is a function of the right shape all the way down still passes.
+        let ok = r#"
+            type F = (Dyn -> F) in
+            let rec loop = fun y -> loop in
+            let make: (Dyn -> Dyn) = fun v -> loop in
+            let x: F = make(opaque) in
+            let y: Dyn = x in
+            let z = y(opaque)(opaque) in
+            7
+        "#;
+        assert_eq!(run_source(ok).unwrap().as_int(), 7);
     }
 
     #[test]
@@ -3644,7 +3645,7 @@ g(len)").unwrap_err();
         // dyn_to_fun_boundary_rejects_closure_with_wrong_return_type and
         // dyn_sourced_call_falls_back_permissively above). Exercises
         // pattern_could_match (the `match xs` arms), build_boundary_check/
-        // build_shape_predicate (the Dyn-to-List crossing at `f(v)`), and
+        // shape_test (the Dyn-to-List crossing at `f(v)`), and
         // coerce (the literal tuple argument to `f`) all in one program,
         // to cover as many of the (five, not four) `expect` sites as one
         // source string reasonably can.
@@ -3680,7 +3681,7 @@ g(len)").unwrap_err();
         // `A`-typed annotation completely inert. With the fix, the
         // self-referential alternative is dropped instead (Union([Int,
         // Dyn]) -> Union([Int])), agreeing with the runtime path
-        // (build_shape_predicate's own ancestor-guard correctly reduces
+        // (shape_test's own ancestor-guard correctly reduces
         // `A` to just `Int` for a re-encountered self-reference). A `Str`
         // argument must be statically rejected -- this is coerce()'s own
         // STATIC check (relate) specifically (both `xs`/the argument are fully
@@ -3765,7 +3766,7 @@ g(len)").unwrap_err();
         // Deliberately returns `c` directly rather than calling
         // `len(c)`: `len` is an unbound builtin (Type::Dyn in the static
         // ctx), so App's own Type::Dyn arm splices in an unconditional
-        // is_fun/wrap_fun_contract check on EVERY call to it, regardless
+        // is_fun/function-contract check on EVERY call to it, regardless
         // of Vec/Indexed at all -- that would contaminate contains_check
         // with a check unrelated to what this test is trying to isolate.
         let src = r#"
@@ -3838,14 +3839,14 @@ g(len)").unwrap_err();
 
     #[test]
     fn a_union_containing_a_vec_alternative_falls_through_to_the_other_alternative() {
-        // Final review Finding 3: before the fix, build_shape_predicate's
+        // Final review Finding 3: before the fix, the shape predicate's
         // Type::Indexed arm checked shape only (is_list), not length --
         // so a length-5 list's shape predicate for the Vec(3) alternative
         // wrongly reported "yes, matches," routing it into Vec(3)'s own
         // full check (which then correctly rejects the length) instead
         // of falling through to try the [Int] alternative next. With the
         // fix, the Vec(3) alternative's own shape predicate correctly
-        // reports "no" for a length-5 value, and build_union_check falls
+        // reports "no" for a length-5 value, and the union check falls
         // through to [Int], which accepts it.
         let src = r#"
             type T = Vec(3) | [Int] in
@@ -4232,9 +4233,8 @@ g(len)").unwrap_err();
     }
 
     // A function-typed Unknown site checks callability at once, then wraps its
-    // value in the site's contract (spec 11.6), which checks every call as
-    // wrap_fun_contract does: the argument and the result (itself wrapped if a
-    // function), blaming the site. A union with a function alternative picks the first
+    // value in the site's contract (spec 11.6), which checks every call: the
+    // argument and the result (itself wrapped if a function), blaming the site. A union with a function alternative picks the first
     // alternative whose shape holds.
     #[test]
     fn a_function_typed_unknown_site_checks_callability_at_the_boundary() {
@@ -4577,7 +4577,14 @@ g(len)").unwrap_err();
         for (name, src) in programs {
             let (mut arena, spans, root, named_types) = parser::parse_with_named_types(&src).unwrap();
             let Ok(elaborated) = typecheck::check_with_named_types(&mut arena, root, &spans, named_types) else { continue };
-            assert!(!tree_any(&arena, elaborated, &|e| matches!(e, expr::Expr::Annot(..) | expr::Expr::Residual(..))), "{name}");
+            // A static function boundary is a Residual too, over a type literal; an
+            // annotation's site holds its type in a variable.
+            let site = |e: &expr::Expr| match e {
+                expr::Expr::Annot(..) => true,
+                expr::Expr::Residual(_, ty, _) => matches!(arena[*ty], expr::Expr::Var(_)),
+                _ => false,
+            };
+            assert!(!tree_any(&arena, elaborated, &site), "{name}");
         }
     }
 
@@ -4756,7 +4763,7 @@ g(len)").unwrap_err();
     #[test]
     fn a_dyn_sourced_non_list_crossing_into_vec_fails_at_runtime_not_via_a_bare_len_panic() {
         // Must go through the SAME is_list-then-len composition Tuple's own
-        // arity check already uses (typecheck.rs's build_shape_predicate,
+        // arity check already uses (typecheck.rs's shape_test,
         // Type::Tuple arm) -- never a bare len() call that could panic
         // internally on a non-list Value before the type-error path runs.
         let src = r#"
@@ -7582,7 +7589,7 @@ g(len)").unwrap_err();
 
     #[test]
     fn a_dyn_function_contract_wrapper_keeps_the_clean_error_for_an_unbound_n() {
-        // wrap_fun_contract's wrapper runs on every call, so its return check
+        // A function contract runs on every call, so its return check
         // is inside a function body: k(1) and k(2) share the one unbound n.
         let src = "let h: Dyn = fun i -> if i < 2 then [1,2] else [1,2,3] in \
                    let k: (Int -> Vec(n)) = h in \
@@ -7971,14 +7978,14 @@ g(len)").unwrap_err();
     #[test]
     fn synthesized_check_temporaries_are_not_captured_by_user_variables() {
         for (src, want) in [
-            ("let __check_tmp = 10 in let d: Dyn = 3 in let y: Int = d in y + __check_tmp", 13),
-            ("let __check_tmp = 10 in let d: Dyn = 3 in let y: Int | Bool = d in __check_tmp", 10),
-            ("let __check_tmp = 10 in let d: Dyn = [1, 2] in let y: (Int, Int) = d in len(y) + __check_tmp", 12),
-            ("let __contract_fn = 10 in let d: Dyn = fun x: Int -> x in d(1) + __contract_fn", 11),
-            ("let __contract_arg = 10 in let d: Dyn = fun x: Int -> x in d(1) + __contract_arg", 11),
-            ("let __contract_arg = 10 in let __contract_fn = 20 in let f = fun a: Vec(n) -> 7 in let d: Dyn = f in d([1]) + __contract_arg + __contract_fn", 37),
-            ("let d: Dyn = fun __contract_arg: Int -> fun __contract_fn: Int -> __contract_arg + __contract_fn in d(1)(2)", 3),
-            ("let d: Dyn = fun __check_tmp: Int -> __check_tmp in d(4)", 4),
+            ("let __ca = 10 in let d: Dyn = 3 in let y: Int = d in y + __ca", 13),
+            ("let __ca = 10 in let d: Dyn = 3 in let y: Int | Bool = d in __ca", 10),
+            ("let __ca = 10 in let d: Dyn = [1, 2] in let y: (Int, Int) = d in len(y) + __ca", 12),
+            ("let __cf = 10 in let d: Dyn = fun x: Int -> x in d(1) + __cf", 11),
+            ("let __cg = 10 in let d: Dyn = fun x: Int -> x in d(1) + __cg", 11),
+            ("let __cg = 10 in let __cf = 20 in let f = fun a: Vec(n) -> 7 in let d: Dyn = f in d([1]) + __cg + __cf", 37),
+            ("let d: Dyn = fun __cg: Int -> fun __cf: Int -> __cg + __cf in d(1)(2)", 3),
+            ("let d: Dyn = fun __ca: Int -> __ca in d(4)", 4),
         ] {
             assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
         }
@@ -7992,10 +7999,10 @@ g(len)").unwrap_err();
         (arena, out)
     }
 
-    // An Assert Check with exactly this test is somewhere in the tree.
+    // A Check with exactly this test is somewhere in the tree.
     fn has_assert_check(src: &str, test: expr::Test) -> bool {
         let (arena, root) = elaborated_tree(src);
-        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(_, s) if s.test == test && s.mode == expr::CheckMode::Assert))
+        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(_, s) if s.test == test))
     }
 
     // A synthesized call to one of the prelude predicates a check used to
@@ -8008,8 +8015,9 @@ g(len)").unwrap_err();
     type ShapeCase = (&'static str, Vec<&'static str>, Vec<(&'static str, &'static str)>, bool);
 
     // (annotation, accepted Dyn values, rejected Dyn values with the expected
-    // message fragment, is one native Assert Check -- false when the crossing
-    // stays desugared). Every shape the old builders produced.
+    // message fragment, is one native check node: a Check, or for a function or a
+    // union with a function alternative, a Residual). Every shape the old
+    // builders produced.
     fn native_check_shapes() -> Vec<ShapeCase> {
         vec![
             ("Int", vec!["3"], vec![("true", "type error: expected Int, found Bool")], true),
@@ -8039,14 +8047,14 @@ g(len)").unwrap_err();
             ),
             ("Vec(2)", vec!["[1, 2]"], vec![("[1]", "expected [Dyn](2), found List"), ("3", "found Int")], false),
             ("Int | Vec(2)", vec!["3", "[1, 2]"], vec![("[1]", "found List"), ("true", "found Bool")], false),
-            ("Int | (Int -> Int)", vec!["3", "fun x: Int -> x"], vec![("\"a\"", "type error: expected Int | (Int -> Int), found Str")], false),
+            ("Int | (Int -> Int)", vec!["3", "fun x: Int -> x"], vec![("\"a\"", "type error: expected Int | (Int -> Int), found Str")], true),
         ]
     }
 
-    // Some Assert Check (whatever its test) is somewhere in the tree.
+    // Some native check (a Check or a Residual, whatever its test) is somewhere in the tree.
     fn has_native_assert_check(src: &str) -> bool {
         let (arena, root) = elaborated_tree(src);
-        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(_, s) if s.mode == expr::CheckMode::Assert))
+        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(..) | expr::Expr::Residual(..)))
     }
 
     // A bare Fun crossing is a per-call contract: it is only exercised by calling.
@@ -8077,7 +8085,7 @@ g(len)").unwrap_err();
             if native {
                 assert!(has_native_assert_check(&src), "{src}: no native Check");
                 let (arena, root) = elaborated_tree(&src);
-                assert!(!has_let_named(&arena, root, "__check_tmp#"), "{src}: still desugared");
+                assert!(!tree_any(&arena, root, &|n| matches!(n, expr::Expr::If(..))), "{src}: still desugared");
             }
             assert!(!calls_a_check_predicate(&src), "{src}: still calls a prelude predicate");
         }
@@ -8095,8 +8103,6 @@ g(len)").unwrap_err();
     fn a_numeric_operand_of_unknown_type_is_one_native_int_or_float_check() {
         let src = "let f = fun x -> x + 1 in f(2)";
         assert!(has_assert_check(src, expr::Test::Or(vec![expr::Test::Int, expr::Test::Float])));
-        let (arena, root) = elaborated_tree(src);
-        assert!(!has_let_named(&arena, root, "__check_tmp#"));
         assert_eq!(run_source(src).unwrap().as_int(), 3);
         let err = run_source("let f = fun x -> x + 1 in f(true)").unwrap_err();
         assert!(err.contains("type error: expected Int | Float, found Bool"), "{err}");
@@ -8106,8 +8112,6 @@ g(len)").unwrap_err();
     fn an_annotated_callback_check_is_native_and_allocation_free() {
         let src = "map(fun x: Int -> x + 1)([1, 2])";
         assert!(has_assert_check(src, expr::Test::Int));
-        let (arena, root) = elaborated_tree(src);
-        assert!(!has_let_named(&arena, root, "__check_tmp#"));
         assert!(!calls_a_check_predicate(src));
         assert_clean_rejection("map(fun x: Int -> x + 1)([true])", BAD_INT);
     }
@@ -8127,7 +8131,6 @@ g(len)").unwrap_err();
         let src = "let f = fun v: Vec(n) -> let d: Dyn = [1, 2] in let y: Vec(n) = d in 1 in f([1, 2])";
         assert!(has_assert_check(src, expr::Test::ListLenArg(Box::new(expr::Test::Any), 0)));
         let (arena, root) = elaborated_tree(src);
-        assert!(!has_let_named(&arena, root, "__check_tmp#"));
         assert!(tree_any(&arena, root, &|n| matches!(n, expr::Expr::Len(expr::LenExpr::Witness(..)))));
         assert!(!tree_any(&arena, root, &|n| matches!(n, expr::Expr::Var(v) if v == "#len" || v == "#fail")));
         assert!(!calls_a_check_predicate(src));
@@ -8136,8 +8139,6 @@ g(len)").unwrap_err();
         // A literal length is one native test.
         let lit = "let d: Dyn = [1, 2] in let y: Vec(2) = d in 1";
         assert!(has_assert_check(lit, expr::Test::ListLen(Box::new(expr::Test::Any), 2)));
-        let (arena, root) = elaborated_tree(lit);
-        assert!(!has_let_named(&arena, root, "__check_tmp#"));
         assert_clean_rejection("let d: Dyn = [1, 2, 3] in let y: Vec(2) = d in 1", "type error: expected [Dyn](2), found List");
     }
 
@@ -8172,8 +8173,6 @@ g(len)").unwrap_err();
         let union = within("Vec(n) | Bool", "true");
         let slot = expr::Test::ListLenArg(Box::new(expr::Test::Any), 0);
         assert!(has_assert_check(&union, expr::Test::Or(vec![slot, expr::Test::Bool])));
-        let (arena, root) = elaborated_tree(&union);
-        assert!(!has_let_named(&arena, root, "__check_tmp#"));
         assert_eq!(run_source(&union).unwrap().as_int(), 1);
         assert_eq!(run_source(&within("Vec(n) | Bool", "[3, 4]")).unwrap().as_int(), 1);
         rejects(&within("Vec(n) | Bool", "[1]"), "type error: expected [Dyn](n) | Bool, found List");
@@ -8202,13 +8201,13 @@ g(len)").unwrap_err();
         // Spec section 8, test 5. A typed program cannot pass a non-list for a
         // witness (the parameter's own check runs first), so the Check is built
         // by hand: `let h = 5 in <[1, 2] checked against Vec(n), n read from h>`.
-        use crate::expr::{CheckMode, CheckSpec, Expr, LenExpr, Test};
+        use crate::expr::{CheckSpec, Expr, LenExpr, Test};
         let (mut arena, mut spans, root) = parser::parse("let h = 5 in [1, 2]").unwrap();
         let Expr::Let(name, ann, val, body) = arena[root].clone() else { panic!("not a let") };
         let witness = arena.push(Expr::Var("h".into()));
         let slot = arena.push(Expr::Len(LenExpr::Witness(witness, "n".into())));
         let test = Test::ListLenArg(Box::new(Test::Any), 0);
-        let spec = CheckSpec { test, defs: vec![], lens: vec![slot], mode: CheckMode::Assert, to: "[Dyn](n)".into(), span: None };
+        let spec = CheckSpec { test, defs: vec![], lens: vec![slot], to: "[Dyn](n)".into(), span: None };
         let check = arena.push(Expr::Check(body, std::rc::Rc::new(spec)));
         let top = arena.push(Expr::Let(name, ann, val, check));
         expr::fill_synthesized_spans(&arena, top, &mut spans);
@@ -8224,10 +8223,13 @@ g(len)").unwrap_err();
         // its slots across scopes. Casts and pending casts copy only a cast's
         // top node, never a Check: every slot has exactly one reachable owner.
         fn owners(arena: &expr::Arena, r: expr::ExprRef, out: &mut std::collections::HashMap<expr::ExprRef, usize>) {
-            if let expr::Expr::Check(_, spec) = &arena[r] {
-                for slot in &spec.lens {
-                    *out.entry(*slot).or_insert(0) += 1;
-                }
+            let lens = match &arena[r] {
+                expr::Expr::Check(_, spec) => &spec.lens[..],
+                expr::Expr::Residual(_, _, spec) => &spec.lens[..],
+                _ => &[],
+            };
+            for slot in lens {
+                *out.entry(*slot).or_insert(0) += 1;
             }
             let mut kids = Vec::new();
             arena[r].children(&mut kids);

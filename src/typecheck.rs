@@ -1,9 +1,9 @@
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, Lazy, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test, Then};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test, Then};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::plist::PList;
 use crate::span::Span;
@@ -18,7 +18,7 @@ pub(crate) use self::relate::{Cause, Rel, Residual, Why};
 // (elaborate_node's own `expr` parameter, or a child ExprRef it destructured
 // from that same original node) at the point of construction. typecheck
 // never needs to invent a span for a node IT synthesizes (a boundary check,
-// a wrap_fun_contract chain): every error path returns before any such node
+// a static contract): every error path returns before any such node
 // is built.
 #[derive(Debug)]
 pub struct TypeError(pub String, pub Span);
@@ -152,7 +152,7 @@ fn settled(arena: &Arena, mut n: ExprRef) -> ExprRef {
 // too. That decides the shape guard on a prelude constructor (`List` in
 // `List(Int)`) and leaves every check on a parameter or a `let` fallible.
 // `bound_names` comes from the parsed tree, so a binder elaboration adds
-// (`__check_tmp`, `__contract_fn`) looks closed; evaluated alone it is unbound,
+// (`__ca`, `__cf`) looks closed; evaluated alone it is unbound,
 // so such a check counts as fallible, which is the safe answer.
 // Each check is decided on its own: one inside a closed operand (in a function
 // body, say) did not necessarily run when the outer one passed.
@@ -251,7 +251,7 @@ pub(crate) struct InferCtx {
     // Every genuinely self-referential type alias this program's own
     // parse registered (parser::Parser's own `named_types`, handed in
     // once at construction) -- consulted on demand by
-    // build_boundary_check/build_shape_predicate/pattern_could_match
+    // build_boundary_check/shape_test/pattern_could_match
     // whenever they encounter a Type::Named reference, to unfold it
     // exactly one level. A recursive `let rec` type group adds its ids
     // when it is checked (recursive_type_group), before any use of them.
@@ -1296,7 +1296,7 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
         return Ok(e);
     }
     if matches!(from, Type::Var(_)) {
-        return Ok(if *to == Type::Dyn { e } else { build_boundary_check(arena, e, to, &env, &HashSet::new()) });
+        return Ok(if *to == Type::Dyn { e } else { build_boundary_check(arena, e, to, &env) });
     }
     match relate(from, to, env.infer) {
         Rel::Proven => Ok(e),
@@ -1320,7 +1320,7 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
             // obligations). Any other source's only where the index has a runtime value
             // (erase_open_indexed); the rest are the unifier's.
             let target = if *from == Type::Dyn { to.clone() } else { erase_open_indexed(to, &env) };
-            Ok(build_boundary_check(arena, e, &target, &env, &HashSet::new()))
+            Ok(build_boundary_check(arena, e, &target, &env))
         }
     }
 }
@@ -1545,7 +1545,7 @@ fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env
     // the value.
     let ca = cast_binder("__ca");
     let ca_ref = arena.push(Expr::Var(ca.clone()));
-    let checked = build_boundary_check(arena, ca_ref, &erase_open_indexed(a, env), env, &HashSet::new());
+    let checked = build_boundary_check(arena, ca_ref, &erase_open_indexed(a, env), env);
     let body = arena.push(Expr::Let(param, None, checked, up_body));
     let ann = type_lit(arena, a_target);
     arena.push(Expr::Lambda(ca, Some(ann), body))
@@ -1579,7 +1579,7 @@ fn cast_up(arena: &mut Arena, res: ExprRef, b: &Type, b_target: &Type, env: &Che
         _ => {
             let body_env = CheckEnv { infer: env.infer, local: env.local.clone(), defer: false, repeatable: true, span: env.span };
             let target = erase_open_indexed(b_target, &body_env);
-            build_boundary_check(arena, res, &target, &body_env, &HashSet::new())
+            build_boundary_check(arena, res, &target, &body_env)
         }
     }
 }
@@ -1616,7 +1616,7 @@ fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Check
     let body_env = CheckEnv { infer: env.infer, local, defer: false, repeatable: true, span: env.span };
     let ca_ref = arena.push(Expr::Var(ca.clone()));
     let arg = if relate_cast(&a_target, a, env.infer) != Rel::Proven {
-        build_boundary_check(arena, ca_ref, &erase_open_indexed(a, env), &body_env, &HashSet::new())
+        build_boundary_check(arena, ca_ref, &erase_open_indexed(a, env), &body_env)
     } else {
         ca_ref
     };
@@ -1648,7 +1648,7 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
         Type::Int | Type::Float => Ok(e),
         Type::Dyn | Type::Var(_) => {
             let numeric = Type::Union(Rc::new(vec![Type::Int, Type::Float]));
-            Ok(build_check_node(arena, e, Shape::plain(Test::Or(vec![Test::Int, Test::Float])), CheckMode::Assert, &numeric, &env.with_span(span)))
+            Ok(build_check_node(arena, e, Shape::plain(Test::Or(vec![Test::Int, Test::Float])), &numeric, &env.with_span(span)))
         }
         other => Err(TypeError(format!("type mismatch: expected Int or Float, found {other}"), span)),
     }
@@ -1656,44 +1656,27 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
 
 // Builds the actual runtime check for a definitely-Dyn-origin value
 // against concrete target type `to` -- shared between coerce's own
-// Dyn-to-concrete crossings and wrap_fun_contract's return-type check (a
-// higher-order contract's return value is ALSO always Dyn-origin, calling
-// an unknown wrapped function). Infallible: by the time this runs, `to`
-// is just "what runtime check to build," no static consistency question
-// left open (that's coerce's own job, checked before this is ever
-// called).
+// Dyn-to-concrete crossings and a cast's synthesized parameter and result
+// checks. Infallible: by the time this runs, `to` is just "what runtime
+// check to build," no static consistency question left open (that's
+// coerce's own job, checked before this is ever called).
 //
 // Every function-free shape (Int/Float/Bool/Str/Token, Vec(k) and Vec(n),
 // and List/Tuple/Record of those checked element by element, a union of
 // those, a Named alias through any depth) is ONE native Expr::Check node
 // (build_shape_check): no let, no env frame, no builtin call; a Vec(n)
-// length is read from a length slot the Check evaluates on entry. Fun gets
-// a real per-call contract (wrap_fun_contract, since a bare callability tag
-// can't see inside a closure -- "callable" isn't "callable with this
-// exact signature"). A union with a Fun alternative stays desugared
-// (build_union_check, which picks the alternative with Probe checks). Every
-// failure panics with the same "type error: expected X, found Y" text, or
-// the "index variable n has no runtime value" text when a length slot had
-// no value.
-// `visiting` is the set of Named ids currently being unfolded somewhere
-// ABOVE this call in the SAME unfold chain (an ancestor set, not a global
-// history) -- empty at every genuinely fresh entry point (coerce's own
-// Dyn-boundary crossing, coerce_numeric, the FieldAccess call site), and
-// extended by exactly one id each time the Type::Named arm below actually
-// descends into an unfold. Needed because a self-referential alias whose
-// recursive occurrence is a BARE Union alternative (e.g. `type A = Int |
-// A`, contrast with `List = (Int, List) | Bool`, where the Tuple's own
-// shape test reaches the recursion through a `Test::Ref` alias-table entry,
-// so this function never unfolds the Named leaf again) would otherwise unfold to the exact same Union([Int,
-// Named(id)]) forever -- genuine infinite recursion in THIS function's own
-// call stack during elaboration, not a runtime concern.
-fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
-    let mut visiting = visiting.clone();
-    match boundary(to, &env.infer.named_types, &mut visiting) {
+// length is read from a length slot the Check evaluates on entry. A
+// function, or a union with a function alternative, is one trusted
+// Expr::Residual (static_contract): callability is checked at once and the
+// value is wrapped in a contract that checks each call's result, since a
+// bare callability tag can't see inside a closure. Every failure panics with
+// the same "type error: expected X, found Y" text, or the "index variable n
+// has no runtime value" text when a length slot had no value.
+fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> ExprRef {
+    match boundary(to, &env.infer.named_types, &mut HashSet::new()) {
         Boundary::None => e,
-        Boundary::Shape(to) => build_shape_check(arena, e, to, env),
-        Boundary::Fun(fun_ty, param_ty, ret_ty) => wrap_fun_contract(arena, e, fun_ty, param_ty.clone(), ret_ty.clone(), env, &visiting),
-        Boundary::Union(to) => build_union_check(arena, e, to, env, &visiting),
+        Boundary::Shape(shape) => build_shape_check(arena, e, shape, env),
+        Boundary::Fun(..) | Boundary::Union(_) => static_contract(arena, e, to, env),
     }
 }
 
@@ -1704,11 +1687,91 @@ enum Boundary<'t> {
     None,
     // One native check of this function-free type (build_shape_check).
     Shape(&'t Type),
-    // A per-call contract (wrap_fun_contract) on a callable value: the unfolded
-    // Fun type, its parameter and its result.
+    // A contract on a callable value: the unfolded Fun type, its parameter
+    // and its result.
     Fun(&'t Type, &'t Rc<Type>, &'t Rc<Type>),
-    // A union with a Fun alternative (build_union_check).
+    // A union with a Fun alternative: the first alternative that holds is
+    // picked, and a Fun one gets its contract.
     Union(&'t Type),
+}
+
+// A static boundary that needs a contract: `e` checked against `to` by an
+// Expr::Residual the run time lowers as it does an Unknown site's (the same
+// machinery, with `trusted`: the site's binder is typed, so callers already
+// enforce a function's parameter). `to` is read now (snapshot_type); the
+// length slots are the index variables the check can read, each an
+// obligation like any other crossing's.
+fn static_contract(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> ExprRef {
+    let vars: Vec<&str> = env.local.iter().copied().chain(env.infer.index_witness.iter()).map(|w| w.var.as_str()).collect();
+    let ty = snapshot_type(to, env.infer, &vars);
+    let mut read = BTreeMap::new();
+    checked_index_vars(&ty, env.infer, &mut HashSet::new(), true, false, &mut read);
+    let (mut index_names, mut lens) = (Vec::with_capacity(read.len()), Vec::with_capacity(read.len()));
+    for (name, repeatable) in read {
+        let index = IndexExpr::Var(name.clone());
+        let term = index_len_term(arena, &index, env);
+        let slot = arena.push(Expr::Len(term));
+        if env.defer {
+            record_obligation(slot, &index, &CheckEnv { infer: env.infer, local: env.local.clone(), defer: env.defer, repeatable: env.repeatable || repeatable, span: env.span });
+        }
+        index_names.push(name);
+        lens.push(slot);
+    }
+    let spec = ResidualSpec { index_names, lens, named: env.infer.registry.clone(), memo: RefCell::new(None), span: env.span, trusted: true };
+    let ty = arena.push(Expr::TypeLit(Rc::new(ty)));
+    arena.push(Expr::Residual(e, ty, Rc::new(spec)))
+}
+
+// The index variables a check against `ty` can read when it runs, each with
+// whether it is read inside a contract (so once per call). `spine` is where
+// the check follows a Fun into its result: the target itself, a union
+// alternative, an alias, a contract's result. A function's own parameter
+// variable is bound by each call to its argument's length, not read from the
+// site; a parameter itself is not checked (the site is trusted), and a
+// function inside a container is only a callability tag.
+fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut HashSet<String>, spine: bool, in_contract: bool, out: &mut BTreeMap<String, bool>) {
+    match ty {
+        Type::Fun(param, _, ret) if spine => {
+            let mut inner = BTreeMap::new();
+            checked_index_vars(ret, infer, seen, true, true, &mut inner);
+            if let Some(own) = list_length_var(param, infer) {
+                inner.remove(&own);
+            }
+            for (name, repeatable) in inner {
+                *out.entry(name).or_insert(false) |= repeatable;
+            }
+        }
+        Type::Union(alts) => {
+            for alt in alts.iter() {
+                checked_index_vars(alt, infer, seen, spine, in_contract, out);
+            }
+        }
+        Type::Named(id) => {
+            if let Some(raw) = infer.named_types.get(id)
+                && seen.insert(id.clone())
+            {
+                checked_index_vars(raw, infer, seen, spine, in_contract, out);
+            }
+        }
+        Type::Indexed(wrapped, index) => {
+            for name in free_index_vars(index) {
+                *out.entry(name).or_insert(false) |= in_contract;
+            }
+            checked_index_vars(wrapped, infer, seen, spine && !matches!(**wrapped, Type::List(_)), in_contract, out);
+        }
+        Type::List(elem) => checked_index_vars(elem, infer, seen, false, in_contract, out),
+        Type::Tuple(items) => {
+            for t in items.iter() {
+                checked_index_vars(t, infer, seen, false, in_contract, out);
+            }
+        }
+        Type::Record(fields) => {
+            for (_, t) in fields.iter() {
+                checked_index_vars(t, infer, seen, false, in_contract, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 // `to` with every alias wrapper and Named alias above its first real shape
@@ -1720,9 +1783,8 @@ fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut H
         Type::Union(_) if needs_contract(to, named, visiting) => Boundary::Union(to),
         Type::Union(_) => Boundary::Shape(to),
         // Dyn accepts everything, so a check against it is the identity. Not
-        // unreachable: wrap_fun_contract checks a call's result against the
-        // Fun's return type, which is Dyn for `Dyn -> Dyn` (and nested
-        // builders reach it through tuple/union alternatives).
+        // unreachable: a contract checks a call's result against the Fun's
+        // return type, which is Dyn for `Dyn -> Dyn`.
         Type::Dyn | Type::Var(_) => Boundary::None,
         // A list's length, literal or read at run time from a length slot,
         // is part of its one native test.
@@ -1744,23 +1806,11 @@ fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut H
         // Type::Var(_) arm above does for "no information here" -- nothing
         // to check -- rather than panicking.
         //
-        // If `id` is already an ancestor in THIS unfold chain, stop
-        // instead of unfolding again -- but check nothing (matching the
-        // Type::Var(_) arm above) rather than failing unconditionally. Two
-        // different callers reach this branch, and only ONE of them makes a
-        // failure safe: build_union_check's own use is always gated behind
-        // build_shape_predicate's matching arm, which hard-codes `false` for
-        // this exact alternative (see its doc comment) -- so
-        // build_union_check's own `If(pred, checked, ...)` can never actually
-        // select this branch at runtime, and a failure there was always dead
-        // code no matter what sat in it. wrap_fun_contract's own call (a
-        // self-reference in a Fun's RETURN position, e.g. `type F = Dyn ->
-        // F`) is NOT gated by any predicate -- it's spliced directly into a
-        // contract-wrapped closure's own body, so a failure there ran
-        // unconditionally on EVERY call through that closure, even when the
-        // real return value never needed checking at all. No check is
-        // correct for both: harmless where it's dead code anyway, and the
-        // right "checked later, lazily" answer where it actually runs.
+        // If `id` is already an ancestor in THIS unfold chain, stop instead
+        // of unfolding again, and check nothing (matching the Type::Var(_)
+        // arm above): `type A = A | (Int -> Int)` would otherwise unfold
+        // forever. A contract's result is a fresh chain (its own Lazy), so a
+        // self-reference there (`type F = Dyn -> F`) is checked at each call.
         Type::Named(id) => match named.get(id) {
             Some(raw) if visiting.insert(id.clone()) => boundary(raw, named, visiting),
             _ => Boundary::None,
@@ -1769,16 +1819,15 @@ fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut H
 }
 
 // An Unknown site's type value, lowered when the run time reaches the site
-// (spec 11.5): the checks build_boundary_check would build for it at check
-// time, with the same failure messages; `named` is the program's recursive
-// types. None: nothing to check. A function is wrapped in the site's
-// contract (its check passes anything: callability is checked at each call,
-// as wrap_fun_contract's is); a union with a function alternative picks the
-// first alternative whose shape holds, as build_union_check does, and its
-// check is the failure when none does.
-pub(crate) fn lower_residual(ty: &Type, named: &Rc<HashMap<String, Type>>, span: Span) -> Option<Rc<Lowered>> {
+// (spec 11.5), and a static function boundary's likewise (static_contract):
+// the checks build_boundary_check builds for any other type, with the same
+// failure messages; `named` is the program's recursive types. None: nothing
+// to check. A function is checked for callability and wrapped in the site's
+// contract; a union with a function alternative picks the first alternative
+// whose shape holds, and its check is the failure when none does.
+pub(crate) fn lower_residual(ty: &Type, named: &Rc<HashMap<String, Type>>, span: Option<Span>) -> Option<Rc<Lowered>> {
     let infer = InferCtx::new(named.clone());
-    let env = CheckEnv { defer: false, ..CheckEnv::at(&infer, span) };
+    let env = CheckEnv { defer: false, span, ..CheckEnv::new(&infer) };
     let mut visiting = HashSet::new();
     let mut defs = Defs::default();
     let (test, to, then) = match boundary(ty, named, &mut visiting) {
@@ -1788,13 +1837,13 @@ pub(crate) fn lower_residual(ty: &Type, named: &Rc<HashMap<String, Type>>, span:
         Boundary::Union(to) => (Test::Never, to, pick(to, &env, &mut defs, &visiting)),
     };
     let bodies = defs.bodies.into_iter().map(|body| body.expect("every alias body is built before shape_test returns")).collect();
-    let check = CheckSpec { test, defs: bodies, lens: Vec::new(), mode: CheckMode::Assert, to: to.to_string(), span: Some(span) };
+    let check = CheckSpec { test, defs: bodies, lens: Vec::new(), to: to.to_string(), span };
     Some(Rc::new(Lowered { check: Rc::new(check), slots: defs.lens, then }))
 }
 
 // A union's alternatives as lower_residual's Pick: each one's shape test
-// (one already being unfolded above never holds, as in
-// build_shape_predicate) and what a value passing it still needs. Every
+// (one already being unfolded above never holds) and what a value passing it
+// still needs. Every
 // alternative shares one alias table and one set of length slots.
 fn pick(to: &Type, env: &CheckEnv, defs: &mut Defs, visiting: &HashSet<String>) -> Then {
     let Type::Union(alts) = to else { unreachable!("pick is only ever called with a Union target") };
@@ -1973,14 +2022,14 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
 // What the runtime-check builders (build_boundary_check and friends) need:
 // the type registry and index state (InferCtx, as of where the check is
 // spliced); `local` holds witnesses bound inside synthesized code
-// (wrap_fun_contract). `defer` is false inside a cast's synthesized body
+// (a cast's parameter alias). `defer` is false inside a cast's synthesized body
 // (build_cast, cast_up) and in resolve_obligations, which record no obligations.
 struct CheckEnv<'a> {
     infer: &'a InferCtx,
     local: Vec<&'a IndexWitness>,
     defer: bool,
-    // Building inside a synthesized function body (wrap_fun_contract's
-    // wrapper), which runs on every call of the wrapped function.
+    // Building inside a synthesized function body (a cast's wrapper), which
+    // runs on every call of the wrapped function.
     repeatable: bool,
     // The cast site a failing native check blames (CheckSpec::span); None
     // where no source span is at hand (a join arm).
@@ -2045,37 +2094,6 @@ fn index_len_term(arena: &mut Arena, e: &IndexExpr, env: &CheckEnv) -> LenExpr {
         IndexExpr::Sub(a, b) => LenExpr::Sub(go(a), go(b)),
         IndexExpr::Mul(a, b) => LenExpr::Mul(go(a), go(b)),
     }
-}
-
-// The union check for a union a single Check can't express (needs_contract:
-// a Fun alternative):
-// `let __check_tmp = e in if <alt1-shape> then <alt1's OWN full check>
-// else if <alt2-shape> then <alt2's OWN full check> else ... else
-// <failing Check>` -- tries each alternative's shape predicate
-// (build_shape_predicate) in turn, and only once ONE of them matches,
-// runs that SPECIFIC alternative's full build_boundary_check -- so a Fun
-// alternative gets its real per-call contract (wrap_fun_contract), the same
-// rigor that type would get as a plain (non-union) annotation, not just
-// "shaped like something callable." Can't simply call build_boundary_check
-// per alternative and fall through on its own failure -- it would abort the
-// whole check on the first non-matching alternative instead of trying the
-// next one -- so the shape predicate decides WHICH alternative's full check
-// to run. An alternative with no contract needs no second check: its shape
-// predicate IS its full check.
-fn build_union_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
-    let alts: Rc<Vec<Type>> = match to {
-        Type::Union(alts) => alts.clone(),
-        _ => unreachable!("build_union_check is only ever called with a Union target"),
-    };
-    let tmp = fresh_index_name("__check_tmp");
-    let tmp_ref = arena.push(Expr::Var(tmp.clone()));
-    let mut result = build_type_error(arena, tmp_ref, to, env);
-    for alt in alts.iter().rev() {
-        let pred = build_shape_predicate(arena, tmp_ref, alt, env, visiting);
-        let checked = if needs_contract(alt, &env.infer.named_types, visiting) { build_boundary_check(arena, tmp_ref, alt, env, visiting) } else { tmp_ref };
-        result = arena.push(Expr::If(pred, checked, result));
-    }
-    arena.push(Expr::Let(tmp, None, e, result))
 }
 
 // A native Test plus the alias table its `Test::Ref`s index and the length
@@ -2196,7 +2214,7 @@ fn extend_visiting(visiting: &HashSet<String>, id: &str) -> HashSet<String> {
 
 // Does checking `ty` do more than its shape test -- is a Fun reachable, so a
 // matching value must also get its per-call contract? Decides whether a
-// union check needs build_union_check's pick-then-check order.
+// union check picks its alternative (Boundary::Union).
 fn needs_contract(ty: &Type, named: &HashMap<String, Type>, visiting: &HashSet<String>) -> bool {
     match ty {
         Type::Fun(..) => true,
@@ -2206,28 +2224,13 @@ fn needs_contract(ty: &Type, named: &HashMap<String, Type>, visiting: &HashSet<S
     }
 }
 
-// The bare boolean half of build_boundary_check's per-type dispatch --
-// "does `value_ref` match `ty`'s deep shape," a native Probe with no failure
-// of its own, so build_union_check can try several of these in turn before
-// deciding anything. A Named already being unfolded above (`type A = A |
-// (Int -> Int)`) answers false: its other alternatives are tried separately,
-// and build_boundary_check's Named arm relies on this alternative never
-// being selected.
-fn build_shape_predicate(arena: &mut Arena, value_ref: ExprRef, ty: &Type, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
-    let shape = match ty {
-        Type::Named(id) if visiting.contains(id) => Shape::plain(Test::Never),
-        _ => shape_of(ty, env),
-    };
-    build_probe(arena, value_ref, shape, ty, env)
-}
-
-// An Expr::Check of `value_ref` against `test` in the given mode, blaming
+// An Expr::Check of `value_ref` against `test`, blaming
 // the cast site `env.span`; `to` is the type whose display text a failure
 // reports. Each length slot becomes an `Expr::Len` node (index_len_term);
 // with `env.defer`, one whose index has a variable with no run-time value
 // here records an obligation (record_obligation), which resolve_obligations
 // patches in place.
-fn build_check_node(arena: &mut Arena, value_ref: ExprRef, shape: Shape, mode: CheckMode, to: &Type, env: &CheckEnv) -> ExprRef {
+fn build_check_node(arena: &mut Arena, value_ref: ExprRef, shape: Shape, to: &Type, env: &CheckEnv) -> ExprRef {
     let mut lens = Vec::with_capacity(shape.lens.len());
     for index in &shape.lens {
         let term = index_len_term(arena, index, env);
@@ -2237,19 +2240,8 @@ fn build_check_node(arena: &mut Arena, value_ref: ExprRef, shape: Shape, mode: C
         }
         lens.push(slot);
     }
-    let spec = CheckSpec { test: shape.test, defs: shape.defs, lens, mode, to: to.to_string(), span: env.span };
+    let spec = CheckSpec { test: shape.test, defs: shape.defs, lens, to: to.to_string(), span: env.span };
     arena.push(Expr::Check(value_ref, Rc::new(spec)))
-}
-
-// The Bool outcome of `shape`: a union picking its alternative.
-fn build_probe(arena: &mut Arena, value_ref: ExprRef, shape: Shape, to: &Type, env: &CheckEnv) -> ExprRef {
-    build_check_node(arena, value_ref, shape, CheckMode::Probe, to, env)
-}
-
-// A check that always fails with "type error: expected {to}, found
-// {type of value_ref}" -- the else-branch of every desugared check.
-fn build_type_error(arena: &mut Arena, value_ref: ExprRef, to: &Type, env: &CheckEnv) -> ExprRef {
-    build_check_node(arena, value_ref, Shape::plain(Test::Never), CheckMode::Assert, to, env)
 }
 
 // The one native check: `e` evaluated once and tested against `to`'s whole
@@ -2258,7 +2250,7 @@ fn build_type_error(arena: &mut Arena, value_ref: ExprRef, to: &Type, env: &Chec
 // (machine::explain).
 fn build_shape_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> ExprRef {
     let shape = shape_of(to, env);
-    build_check_node(arena, e, shape, CheckMode::Assert, to, env)
+    build_check_node(arena, e, shape, to, env)
 }
 
 // A synthesized reference to the prelude builtin `name`. Spelled `#name`,
@@ -2277,51 +2269,6 @@ fn build_str_call(arena: &mut Arena, builtin: &str, value_ref: ExprRef, str_arg:
     let applied = arena.push(Expr::App(f, value_ref));
     let arg_lit = arena.push(Expr::Str(str_arg.to_string()));
     arena.push(Expr::App(applied, arg_lit))
-}
-
-// Wraps a Dyn-origin value in a fresh closure that, on every call: checks
-// the argument matches param_ty (via the wrapper's own declared param type
-// -- ordinary App-site coercion at the wrapper's call sites handles that),
-// confirms the wrapped value is actually callable, applies it, then checks
-// the result against ret_ty (via build_boundary_check, recursively -- a
-// higher-order function returning another Tuple/Union/Fun value gets that
-// same value's own proper check, not just a shallow tag test). This is a
-// real higher-order contract (each call re-validated), not a one-time tag
-// check -- a value that merely looks like a function can't smuggle a
-// wrong return type through it. Built entirely from existing Expr nodes
-// (Let/Lambda/If/App/Var/BinOp), no new Value representation needed. No
-// span bookkeeping here: these nodes are synthesized, not sourced from
-// the program text, and typecheck never looks up a span for them (see
-// TypeError's doc comment).
-// A Vec(n) parameter makes `n` the argument's length for the return check
-// (a local witness, bound inside the wrapper only if that check reads it).
-fn wrap_fun_contract(arena: &mut Arena, e: ExprRef, fun_ty: &Type, param_ty: Rc<Type>, ret_ty: Rc<Type>, env: &CheckEnv, visiting: &HashSet<String>) -> ExprRef {
-    let fn_var = fresh_index_name("__contract_fn");
-    let arg_var = fresh_index_name("__contract_arg");
-    let fn_var_ref = arena.push(Expr::Var(fn_var.clone()));
-    let arg_var_ref = arena.push(Expr::Var(arg_var.clone()));
-    // Callability is checked once, where the value crosses the boundary.
-    let e = build_shape_check(arena, e, fun_ty, env);
-    let call = arena.push(Expr::App(fn_var_ref, arg_var_ref));
-    let witness = list_length_var(&param_ty, env.infer).map(|var| IndexWitness::new(var, &arg_var));
-    let checked_call = match &witness {
-        Some(w) => {
-            let mut local = env.local.clone();
-            local.push(w);
-            build_boundary_check(arena, call, &ret_ty, &CheckEnv { infer: env.infer, local, defer: env.defer, repeatable: true, span: env.span }, visiting)
-        }
-        None => {
-            let env = CheckEnv { infer: env.infer, local: env.local.clone(), defer: env.defer, repeatable: true, span: env.span };
-            build_boundary_check(arena, call, &ret_ty, &env, visiting)
-        }
-    };
-    let checked_call = match &witness {
-        Some(w) if w.used.get() => w.bind(arena, &arg_var, checked_call),
-        _ => checked_call,
-    };
-    let ann = type_lit(arena, (*param_ty).clone());
-    let lambda = arena.push(Expr::Lambda(arg_var, Some(ann), checked_call));
-    arena.push(Expr::Let(fn_var, None, e, lambda))
 }
 
 // The bidirectional-checking mode a call to `elaborate_mode`/`elaborate_node`
@@ -2484,8 +2431,7 @@ fn record_field_type(ty: &Type, name: &str) -> Option<Type> {
 // exist in the scrutinee type (recursing into a Union's alternatives,
 // any one of which might supply it), everything else falls back to the
 // ordinary consistent()-based question.
-// `visiting` is the same ancestor-tracking device build_boundary_check/
-// build_shape_predicate use (see build_boundary_check's own doc comment):
+// `visiting` is the same ancestor-tracking device `boundary` uses:
 // the set of Type::Named ids currently being unfolded somewhere ABOVE
 // this call in the SAME unfold chain, empty at the one genuine entry
 // point (the Expr::Match call site below) and extended by exactly one id
@@ -2528,8 +2474,8 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
         // this function's own Type::Dyn/Var(_) arms above do for "no
         // information here" -- answer `true` -- rather than panicking.
         //
-        // Ancestor-tracking cycle break, same as build_shape_predicate's
-        // own Named arm: if `id` is already being unfolded somewhere
+        // Ancestor-tracking cycle break, same as `boundary`'s own Named
+        // arm: if `id` is already being unfolded somewhere
         // above this call, stop and answer `false` instead of unfolding
         // again -- re-trying the same id against the same pattern gives
         // no new information beyond what the non-recursive alternatives
@@ -2551,7 +2497,7 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
         // []/:: is a purely structural question, independent of what the
         // index is (see the design spec's own §5 note that exhaustiveness
         // is unaffected by Vec). Delegate straight to the wrapped type,
-        // mirroring build_shape_predicate's own Type::Indexed arm exactly.
+        // mirroring shape_test's own Type::Indexed arm.
         (_, Type::Indexed(wrapped, _)) => pattern_could_match(pat, wrapped, named_types, visiting),
         _ => consistent(ty, &pattern_type(pat)),
     }
@@ -3404,7 +3350,7 @@ fn residual_spec(arena: &mut Arena, root: ExprRef, blame: Span, infer: &InferCtx
         }
         lens.push(slot);
     }
-    Rc::new(ResidualSpec { index_names: names, lens, named: infer.registry.clone(), memo: RefCell::new(None), span: blame, trusted: false })
+    Rc::new(ResidualSpec { index_names: names, lens, named: infer.registry.clone(), memo: RefCell::new(None), span: Some(blame), trusted: false })
 }
 
 // A check-time evaluation that finished, replayed by settle_erasure.
@@ -3884,7 +3830,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // universally consistent with anything (types.rs's own
                 // doc comment) -- exactly the "no real information here"
                 // signal this codebase treats specially everywhere else
-                // (pattern_could_match, build_shape_predicate, etc.), not
+                // (pattern_could_match, shape_test, etc.), not
                 // proof that a value genuinely IS the base alternative.
                 // Firing unify_index_expr(idx, 0) on that trivial
                 // consistency force-committed the scrutinee's index to 0

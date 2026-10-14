@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::{Env, PRELUDE};
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test, Then};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test, Then};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::resolve::{is_direct_group, resolve, Resolved, VarRef};
@@ -260,7 +260,14 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                     }
                 },
                 Expr::Residual(operand, ty, spec) => {
-                    let Value::Type(t) = local(&env, resolved, *ty) else { panic!("internal: a residual's type variable holds no type") };
+                    // A static site's type is a literal; an Unknown site's is the value of its annotation's binder.
+                    let t = match &arena[*ty] {
+                        Expr::TypeLit(t) => t.clone(),
+                        _ => match local(&env, resolved, *ty) {
+                            Value::Type(t) => t,
+                            _ => panic!("internal: a residual's type variable holds no type"),
+                        },
+                    };
                     let lazy = residual_lazy(spec, t);
                     if let Some(lowered) = lazy_lowered(&lazy, spec) {
                         let table = site_table(arena, spec, &lowered, &env, resolved);
@@ -641,16 +648,12 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                         // Decided while `frame` is still borrowed (nothing
                         // is cloned); `cont` is reassigned after its last use.
                         Frame::Check { spec, lens } => {
-                            let holds = test_holds(&spec.test, &spec.defs, lens, &value);
-                            if !holds {
+                            if !test_holds(&spec.test, &spec.defs, lens, &value) {
                                 no_value_error(&spec.test, spec, lens, &value);
-                                if spec.mode == CheckMode::Assert {
-                                    check_failed(spec, lens, &value)
-                                }
+                                check_failed(spec, lens, &value)
                             }
-                            let probe = spec.mode == CheckMode::Probe;
                             cont = rest;
-                            control = Control::Apply(if probe { Value::Bool(holds) } else { value });
+                            control = Control::Apply(value);
                         }
                         Frame::Annot { spec } => {
                             let t = annotation_value(spec, Ok(value));
@@ -738,7 +741,7 @@ fn leaf(t: &Test, v: &Value) -> Option<bool> {
         Test::Str => matches!(v, Value::Str(_)),
         Test::List => matches!(v, Value::List(_)),
         // A representation, not a signature: the higher-order contract
-        // (typecheck::wrap_fun_contract) re-checks each call separately.
+        // (Value::Contract) re-checks each call separately.
         Test::Fun => {
             matches!(v, Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) | Value::Contract(_))
         }
@@ -912,7 +915,7 @@ fn enter_contract(c: &Contract, arg: Value) -> (Value, Rc<SiteCtx>) {
 }
 
 // A failing test that reached a length nothing at run time holds, on a list:
-// that is the failure, whatever the check's mode.
+// that is the failure.
 fn no_value_error(test: &Test, spec: &CheckSpec, lens: &[Len], value: &Value) {
     if let Some(name) = reached_no_value(test, &spec.defs, lens, value) {
         set_current_span(spec.span);

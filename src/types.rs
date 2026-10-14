@@ -74,7 +74,7 @@ pub enum Type {
     // needed anywhere in this file's own structural recursion, even
     // though a registry entry for a genuinely recursive alias
     // structurally contains this SAME leaf pointing at itself.
-    // build_shape_predicate/build_boundary_check/pattern_could_match/
+    // shape_test/build_boundary_check/pattern_could_match/
     // relate/unify_fits (typecheck.rs) are the consumers that ever look
     // up what a Named id stands for, and only one level at a time -- see
     // their own doc comments.

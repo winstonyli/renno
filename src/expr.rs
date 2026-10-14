@@ -29,7 +29,7 @@ pub type Arena = PrimaryMap<ExprRef, Expr>;
 // The byte-span of each Arena node's ORIGINAL source text, indexed by the
 // same ExprRef -- built by the parser in lockstep with Arena (see
 // parser::Parser::push_spanned) so the two never desync. A node typecheck
-// synthesizes (a Check, a wrap_fun_contract chain, a re-emitted Let with a
+// synthesizes (a Check, a Residual, a re-emitted Let with a
 // resolved type) gets no entry here; typecheck never needs one, since every
 // error it reports uses the span of an ORIGINAL (pre-elaboration) ExprRef
 // that was already in scope before any such node was built -- see
@@ -107,7 +107,7 @@ pub enum BinOp {
 // derived from the target type. It follows the VALUE (finite, immutable,
 // acyclic), so a deep test of a function-free type always terminates. A
 // function position is only a callability tag (the per-call contract is
-// typecheck::wrap_fun_contract's job, and only for a bare Fun target).
+// an Expr::Residual's job, and only for a Fun target or a union alternative).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Test {
     // Dyn/Var: everything passes. Never: nothing does (a failing branch, or a
@@ -143,15 +143,6 @@ pub enum Test {
     Or(Vec<Test>),
 }
 
-// What Expr::Check does with the test's outcome.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CheckMode {
-    // Return the value, or panic `type error: expected {to}, found {type}`.
-    Assert,
-    // Return the Bool outcome (a union picking its alternative).
-    Probe,
-}
-
 #[derive(Debug)]
 pub struct CheckSpec {
     pub test: Test,
@@ -162,8 +153,8 @@ pub struct CheckSpec {
     // node rather than a field here, so resolve_obligations patches it in
     // place and every copy of this Check (Pending, a finished cast) sees it.
     pub lens: Vec<ExprRef>,
-    pub mode: CheckMode,
-    // The type's display text, for the Assert message.
+    // The type's display text, for the failure message `type error: expected
+    // {to}, found {type}`.
     pub to: String,
     // The cast site a failure blames (the node itself has no span in the
     // parser's SpanMap); None keeps whatever span ran last.
@@ -239,8 +230,8 @@ pub struct ResidualSpec {
     // The recursive types' bodies, set when checking finishes.
     pub named: Rc<std::cell::OnceCell<Rc<HashMap<String, Type>>>>,
     pub memo: std::cell::RefCell<Option<Rc<Lazy>>>,
-    // The source span a failure blames.
-    pub span: Span,
+    // The source span a failure blames (None keeps whatever span ran last).
+    pub span: Option<Span>,
     // The site's own binder is typed to the checker (a static boundary), so
     // callers already enforce a function's parameter: its contract checks
     // only callability and the result, not each argument.
