@@ -3641,6 +3641,27 @@ g(len)").unwrap_err();
         assert!(Hc::ptr_eq(left, right), "both children of a node are one node");
     }
 
+    // A query over a 2^60-leaf DAG costs its distinct nodes, and one over a subtree its summary
+    // rules out costs nothing.
+    #[test]
+    fn query_walkers_visit_shared_nodes_once() {
+        use types::Type;
+        let dag = |leaf: Type| {
+            let mut t = leaf;
+            for _ in 0..60 {
+                t = rec_tup(vec![t.clone(), t]);
+            }
+            t
+        };
+        assert_eq!(typecheck::vars_in(&dag(Type::Var("a".into()))).len(), 1);
+        assert!(typecheck::vars_in(&dag(Type::Int)).is_empty());
+        assert_eq!(types::first_free(&dag(rec_free(7, "X"))).as_deref(), Some("X"));
+        assert!(types::first_free(&dag(Type::Int)).is_none());
+        // The same shape, but with the placeholder only at the far end of a path no walk can skip.
+        let mixed = rec_tup(vec![dag(Type::Int), dag(Type::Var("b".into()))]);
+        assert_eq!(typecheck::vars_in(&mixed).len(), 1);
+    }
+
     // Building the same structure twice gives one node; anything that prints or compares
     // differently (a variable's name, a token, a row, an index) is a different node.
     #[test]

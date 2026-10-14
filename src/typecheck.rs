@@ -10,7 +10,7 @@ use crate::resolve::{group_kind, GroupKind, Resolved};
 use crate::span::Span;
 use crate::value::Value;
 use rpds::{HashTrieMap, HashTrieSet};
-use crate::types::{consistent, each_child, row_consistent, unfold, EffectRow, Hc, NodeMemo, RecGroup, RecRef, RecVar, Rebuild, Summary, Type};
+use crate::types::{consistent, each_child, is_big, row_consistent, unfold, ById, EffectRow, Hc, Interned, NodeMemo, RecGroup, RecRef, RecVar, Rebuild, Summary, Type, Visited};
 use crate::util::find_field;
 mod relate;
 use self::relate::{relate, relate_cast};
@@ -79,7 +79,10 @@ pub(crate) enum TyVar {
 // Every variable of every sort `ty` mentions, as written: no substitution
 // is consulted (callers resolve first, or reopen the names later).
 pub(crate) fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
-    fn go(ty: &Type, out: &mut BTreeSet<TyVar>) {
+    fn go(ty: &Type, out: &mut BTreeSet<TyVar>, seen: &mut Visited) {
+        if !ty.summary().any(Summary::VAR | Summary::ROWVAR | Summary::INDEXED) || !seen.first(ty) {
+            return;
+        }
         match ty {
             Type::Var(name) => {
                 out.insert(TyVar::Type(name.clone()));
@@ -88,26 +91,22 @@ pub(crate) fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
                 if let EffectRow::Var(name) = row {
                     out.insert(TyVar::Row(name.clone()));
                 }
-                go(param, out);
-                go(ret, out);
+                go(param, out, seen);
+                go(ret, out, seen);
             }
-            Type::List(elem) => go(elem, out),
-            Type::Tuple(items) | Type::Union(items) => items.iter().for_each(|t| go(t, out)),
-            Type::Record(fields) => fields.iter().for_each(|(_, t)| go(t, out)),
+            Type::List(elem) => go(elem, out, seen),
+            Type::Tuple(items) | Type::Union(items) => items.iter().for_each(|t| go(t, out, seen)),
+            Type::Record(fields) => fields.iter().for_each(|(_, t)| go(t, out, seen)),
             Type::Indexed(wrapped, index) => {
-                go(wrapped, out);
+                go(wrapped, out, seen);
                 out.extend(free_index_vars(index).into_iter().map(TyVar::Index));
             }
-            Type::Rec(g, _) => {
-                if !g.0.plain {
-                    g.0.bodies.iter().for_each(|b| go(b, out));
-                }
-            }
+            Type::Rec(g, _) => g.0.bodies.iter().for_each(|b| go(b, out, seen)),
             Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::RecVar(_) => {}
         }
     }
     let mut out = BTreeSet::new();
-    go(ty, &mut out);
+    go(ty, &mut out, &mut Visited::new());
     out
 }
 
@@ -688,19 +687,27 @@ impl Rebuild for ResolveDeep<'_> {
 // Called from unify(), itself called unconditionally from Expr::App/
 // BinOp::Cons/If/Match/ListLit (Tasks 4-6) -- live on every elaboration.
 fn occurs_in(name: &str, ty: &Type, infer: &InferCtx) -> bool {
-    match infer.resolve(ty) {
-        Type::Var(n) => n == name,
-        Type::List(elem) => occurs_in(name, &elem, infer),
-        Type::Fun(param, _row, ret) => occurs_in(name, &param, infer) || occurs_in(name, &ret, infer),
-        Type::Tuple(items) | Type::Union(items) => items.iter().any(|t| occurs_in(name, t, infer)),
-        Type::Record(fields) => fields.iter().any(|(_, t)| occurs_in(name, t, infer)),
-        Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::RecVar(_) => false,
-        Type::Rec(g, _) => !g.0.plain && g.0.bodies.iter().any(|b| occurs_in(name, b, infer)),
-        // Wraps one nested Type (the index expression is never itself a
-        // Type::Var) -- same recurse-into-the-wrapped-type precedent as
-        // List's own arm just above.
-        Type::Indexed(wrapped, _) => occurs_in(name, &wrapped, infer),
+    // A node with no variable in it has nothing to find; a node already walked (this call, the
+    // substitution constant meanwhile) found nothing, else the walk would have stopped there.
+    fn go(name: &str, ty: &Type, infer: &InferCtx, seen: &mut Visited) -> bool {
+        if !ty.summary().any(Summary::VAR) || !seen.first(ty) {
+            return false;
+        }
+        match infer.resolve(ty) {
+            Type::Var(n) => n == name,
+            Type::List(elem) => go(name, &elem, infer, seen),
+            Type::Fun(param, _row, ret) => go(name, &param, infer, seen) || go(name, &ret, infer, seen),
+            Type::Tuple(items) | Type::Union(items) => items.iter().any(|t| go(name, t, infer, seen)),
+            Type::Record(fields) => fields.iter().any(|(_, t)| go(name, t, infer, seen)),
+            Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::RecVar(_) => false,
+            Type::Rec(g, _) => g.0.bodies.iter().any(|b| go(name, b, infer, seen)),
+            // Wraps one nested Type (the index expression is never itself a
+            // Type::Var) -- same recurse-into-the-wrapped-type precedent as
+            // List's own arm just above.
+            Type::Indexed(wrapped, _) => go(name, &wrapped, infer, seen),
+        }
     }
+    go(name, ty, infer, &mut Visited::new())
 }
 
 // IndexExpr's own analog of occurs_in -- does `name` appear free
@@ -1305,15 +1312,22 @@ impl Rebuild for SubstType<'_> {
 // that substitution to the call's return type (and its own row) so the
 // variable's meaning flows out of this one application.
 fn bind_row_vars(param: &Type, arg: &Type, subst: &mut HashMap<String, EffectRow>) {
-    if let (Type::Fun(p1, r1, p2), Type::Fun(a1, r2, a2)) = (param, arg) {
-        if let EffectRow::Var(name) = r1 {
-            if !matches!(r2, EffectRow::Var(_)) {
-                subst.entry(name.clone()).or_insert_with(|| r2.clone());
-            }
+    // Binding is first-wins, so a pair already walked adds nothing.
+    fn go(param: &Type, arg: &Type, subst: &mut HashMap<String, EffectRow>, seen: &mut HashSet<(ById, ById)>) {
+        if !param.summary().any(Summary::ROWVAR) || (is_big(param) && !seen.insert((ById(param.clone()), ById(arg.clone())))) {
+            return;
         }
-        bind_row_vars(p1, a1, subst);
-        bind_row_vars(p2, a2, subst);
+        if let (Type::Fun(p1, r1, p2), Type::Fun(a1, r2, a2)) = (param, arg) {
+            if let EffectRow::Var(name) = r1 {
+                if !matches!(r2, EffectRow::Var(_)) {
+                    subst.entry(name.clone()).or_insert_with(|| r2.clone());
+                }
+            }
+            go(p1, a1, subst, seen);
+            go(p2, a2, subst, seen);
+        }
     }
+    go(param, arg, subst, &mut HashSet::new());
 }
 
 // "must be callable" -- the shape used wherever we need to check a value is
@@ -1860,9 +1874,15 @@ fn static_contract(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> 
 struct Seen {
     rec: HashSet<(*const RecGroup, usize)>,
     keep: Vec<RecRef>,
+    // The big nodes already walked in this mode: a second walk would add the same names.
+    nodes: HashSet<(ById, bool, bool)>,
 }
 
 fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool, in_contract: bool, out: &mut BTreeMap<String, bool>) {
+    // Only an Indexed names a variable.
+    if !ty.summary().any(Summary::INDEXED) || (is_big(ty) && !seen.nodes.insert((ById(ty.clone()), spine, in_contract))) {
+        return;
+    }
     match ty {
         Type::Fun(param, _, ret) if spine => {
             let mut inner = BTreeMap::new();
@@ -2343,11 +2363,45 @@ fn len_slot(index: &IndexExpr, env: &CheckEnv, defs: &mut Defs) -> usize {
 // matching value must also get its per-call contract? Decides whether a
 // union check picks its alternative (Boundary::Union).
 fn needs_contract(ty: &Type, visiting: &Visiting) -> bool {
-    match ty {
-        Type::Fun(..) => true,
-        Type::Union(alts) => alts.iter().any(|alt| needs_contract(alt, visiting)),
-        Type::Rec(g, i) if !visiting.has_rec(g, *i) => needs_contract(&unfold(g, *i), &visiting.with_rec(g, *i)),
-        _ => false,
+    fn go(ty: &Type, visiting: &Visiting, memo: &mut StackMemo) -> bool {
+        let key = memo.key(ty, 0, visiting);
+        if let Some(done) = key.as_ref().and_then(|k| memo.map.get(k)) {
+            return *done;
+        }
+        let result = match ty {
+            Type::Fun(..) => true,
+            Type::Union(alts) => alts.iter().any(|alt| go(alt, visiting, memo)),
+            Type::Rec(g, i) if !visiting.has_rec(g, *i) => go(&unfold(g, *i), &visiting.with_rec(g, *i), memo),
+            _ => false,
+        };
+        memo.put(key, visiting, result);
+        result
+    }
+    go(ty, visiting, &mut StackMemo::default())
+}
+
+// A walk's answers for big nodes, valid for one call: keyed by the node, a caller-chosen
+// number (the address of a pattern, else 0) and the recursive types being unfolded above it
+// (`Visiting`), since the answer may depend on any of them.
+#[derive(Default)]
+struct StackMemo {
+    map: HashMap<(ById, usize, Vec<(*const RecGroup, usize)>), bool>,
+    // The groups the keys point at, kept so an address is never reused within the call.
+    keep: Vec<RecRef>,
+}
+
+type StackKey = (ById, usize, Vec<(*const RecGroup, usize)>);
+
+impl StackMemo {
+    fn key(&self, ty: &Type, extra: usize, visiting: &Visiting) -> Option<StackKey> {
+        is_big(ty).then(|| (ById(ty.clone()), extra, visiting.rec.iter().map(|(g, i)| (Rc::as_ptr(&g.0), *i)).collect()))
+    }
+
+    fn put(&mut self, key: Option<StackKey>, visiting: &Visiting, result: bool) {
+        if let Some(key) = key {
+            self.keep.extend(visiting.rec.iter().map(|(g, _)| g.clone()));
+            self.map.insert(key, result);
+        }
     }
 }
 
@@ -2505,11 +2559,15 @@ fn pattern_type(pat: &Pattern) -> Type {
 // both are just `.field` being rejected, the same way a Fun-annotation
 // mismatch and a wrong-argument-type mismatch are worded differently.
 fn record_shaped(ty: &Type) -> bool {
-    match ty {
-        Type::Record(_) => true,
-        Type::Union(alts) => alts.iter().all(record_shaped),
-        _ => false,
+    // A node walked before answered true (else the walk would have stopped there).
+    fn go(ty: &Type, seen: &mut Visited) -> bool {
+        match ty {
+            Type::Record(_) => true,
+            Type::Union(alts) => !seen.first(ty) || alts.iter().all(|alt| go(alt, seen)),
+            _ => false,
+        }
     }
+    go(ty, &mut Visited::new())
 }
 
 // The type `.field` access on a record_shaped `ty` returns, if `ty`
@@ -2524,22 +2582,38 @@ fn record_shaped(ty: &Type) -> bool {
 // shaped like a record" separately, so this only ever needs to answer
 // the narrower "does it have GOT this one" question.
 fn record_field_type(ty: &Type, name: &str) -> Option<Type> {
-    match ty {
-        Type::Record(fields) => find_field(fields, name).cloned(),
-        Type::Union(alts) => {
-            let mut result: Option<Type> = None;
-            for alt in alts.iter() {
-                let t = record_field_type(alt, name)?;
-                result = Some(match &result {
-                    Some(prev) if *prev == t => t,
-                    Some(_) => Type::Dyn,
-                    None => t,
-                });
+    fn go(ty: &Type, name: &str, memo: &mut HashMap<ById, Option<Type>>) -> Option<Type> {
+        match ty {
+            Type::Record(fields) => find_field(fields, name).cloned(),
+            Type::Union(alts) => {
+                if is_big(ty)
+                    && let Some(done) = memo.get(&ById(ty.clone()))
+                {
+                    return done.clone();
+                }
+                let mut result: Option<Type> = None;
+                let mut missing = false;
+                for alt in alts.iter() {
+                    let Some(t) = go(alt, name, memo) else {
+                        missing = true;
+                        break;
+                    };
+                    result = Some(match &result {
+                        Some(prev) if *prev == t => t,
+                        Some(_) => Type::Dyn,
+                        None => t,
+                    });
+                }
+                let result = if missing { None } else { result };
+                if is_big(ty) {
+                    memo.insert(ById(ty.clone()), result.clone());
+                }
+                result
             }
-            result
+            _ => None,
         }
-        _ => None,
     }
+    go(ty, name, &mut HashMap::new())
 }
 
 // Does `pat` have ANY chance of matching a value of type `ty`? For every
@@ -2601,11 +2675,19 @@ impl Visiting {
 // that's genuine infinite recursion in this function's own call stack,
 // not just a runtime concern.
 fn pattern_could_match(pat: &Pattern, ty: &Type, visiting: &Visiting) -> bool {
-    match (pat, ty) {
+    could_match(pat, ty, visiting, &mut StackMemo::default())
+}
+
+fn could_match(pat: &Pattern, ty: &Type, visiting: &Visiting, memo: &mut StackMemo) -> bool {
+    let key = memo.key(ty, pat as *const Pattern as usize, visiting);
+    if let Some(done) = key.as_ref().and_then(|k| memo.map.get(k)) {
+        return *done;
+    }
+    let result = match (pat, ty) {
         (Pattern::Record(fields), Type::Record(type_fields)) => {
             fields.iter().all(|(name, _)| find_field(type_fields, name).is_some())
         }
-        (Pattern::Record(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt, visiting)),
+        (Pattern::Record(_), Type::Union(alts)) => alts.iter().any(|alt| could_match(pat, alt, visiting, memo)),
         (Pattern::Record(_), Type::Dyn | Type::Var(_)) => true,
         (Pattern::Record(_), _) => false,
         // Same story as Record just above, for the same reason: a fixed-
@@ -2618,7 +2700,7 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, visiting: &Visiting) -> bool {
         // consistent()-based catch-all below, correctly: an actual List
         // type has no fixed arity to check a pattern's length against.
         (Pattern::List(subpats), Type::Tuple(items)) => subpats.len() == items.len(),
-        (Pattern::List(_), Type::Union(alts)) => alts.iter().any(|alt| pattern_could_match(pat, alt, visiting)),
+        (Pattern::List(_), Type::Union(alts)) => alts.iter().any(|alt| could_match(pat, alt, visiting, memo)),
         (Pattern::List(_), Type::Dyn | Type::Var(_)) => true,
         // One level only, matching every other consumer of Type::Rec in this
         // file: unfold what this member stands for and ask the SAME question
@@ -2636,7 +2718,7 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, visiting: &Visiting) -> bool {
             if visiting.has_rec(g, *i) {
                 return false;
             }
-            pattern_could_match(pat, &unfold(g, *i), &visiting.with_rec(g, *i))
+            could_match(pat, &unfold(g, *i), &visiting.with_rec(g, *i), memo)
         }
         // An Indexed-typed scrutinee is, at runtime, just its wrapped
         // type's own value (Vec(n) sugars over this) -- coverage of
@@ -2644,9 +2726,11 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, visiting: &Visiting) -> bool {
         // index is (see the design spec's own §5 note that exhaustiveness
         // is unaffected by Vec). Delegate straight to the wrapped type,
         // mirroring shape_test's own Type::Indexed arm.
-        (_, Type::Indexed(wrapped, _)) => pattern_could_match(pat, wrapped, visiting),
+        (_, Type::Indexed(wrapped, _)) => could_match(pat, wrapped, visiting, memo),
         _ => consistent(ty, &pattern_type(pat)),
-    }
+    };
+    memo.put(key, visiting, result);
+    result
 }
 
 // Eligibility (spec section 5): is `scrut_ty` (already resolved via
@@ -2730,17 +2814,32 @@ fn qualifying_rec_alternatives(g: &RecRef, i: usize) -> Option<(Type, Type, Self
 
 // How many references to member `member` of the group whose body is being walked does `t`
 // hold? `nest` counts the groups entered since.
+// Saturated at 2: callers only ask for none, one, or more.
 fn count_bound(t: &Type, nest: u32, member: usize) -> usize {
-    match t {
-        Type::RecVar(RecVar::Bound { depth, member: m }) => usize::from(*depth == nest && *m as usize == member),
-        Type::Rec(h, _) if h.0.escape > nest => h.0.bodies.iter().map(|b| count_bound(b, nest + 1, member)).sum(),
-        Type::Rec(..) => 0,
-        _ => {
-            let mut n = 0;
-            each_child(t, &mut |c| n += count_bound(c, nest, member));
-            n
+    fn go(t: &Type, nest: u32, member: usize, memo: &mut NodeMemo<usize>) -> usize {
+        // No reference leaves a subtree whose reach is within `nest`.
+        if t.summary().reach() <= nest {
+            return 0;
         }
+        let key = is_big(t).then(|| (ById(t.clone()), nest));
+        if let Some(done) = key.as_ref().and_then(|k| memo.get(k)) {
+            return *done;
+        }
+        let result = match t {
+            Type::RecVar(RecVar::Bound { depth, member: m }) => usize::from(*depth == nest && *m as usize == member),
+            Type::Rec(h, _) => h.0.bodies.iter().map(|b| go(b, nest + 1, member, memo)).sum::<usize>().min(2),
+            _ => {
+                let mut n = 0;
+                each_child(t, &mut |c| n = (n + go(c, nest, member, memo)).min(2));
+                n
+            }
+        };
+        if let Some(key) = key {
+            memo.insert(key, result);
+        }
+        result
     }
+    go(t, nest, member, &mut NodeMemo::new())
 }
 
 // Case B's own analog of Case A's `Pattern::Cons(_, tail)` tail-position
@@ -2831,14 +2930,21 @@ fn case_b_base_candidate(arena: &Arena, cur_expr: ExprRef, expected: &Type, infe
 // checking every item would insert runtime casts for Dyn items that the
 // whole-literal coerce deliberately leaves alone.
 fn contains_indexed(ty: &Type) -> bool {
-    match ty {
-        Type::Indexed(..) => true,
-        Type::List(t) => contains_indexed(t),
-        Type::Tuple(ts) | Type::Union(ts) => ts.iter().any(contains_indexed),
-        Type::Record(fs) => fs.iter().any(|(_, t)| contains_indexed(t)),
-        Type::Fun(p, _, r) => contains_indexed(p) || contains_indexed(r),
-        _ => false,
+    // A node walked before held none (else the walk would have stopped there).
+    fn go(ty: &Type, seen: &mut Visited) -> bool {
+        if !ty.summary().any(Summary::INDEXED) || !seen.first(ty) {
+            return false;
+        }
+        match ty {
+            Type::Indexed(..) => true,
+            Type::List(t) => go(t, seen),
+            Type::Tuple(ts) | Type::Union(ts) => ts.iter().any(|t| go(t, seen)),
+            Type::Record(fs) => fs.iter().any(|(_, t)| go(t, seen)),
+            Type::Fun(p, _, r) => go(p, seen) || go(r, seen),
+            _ => false,
+        }
     }
+    go(ty, &mut Visited::new())
 }
 
 // A closed-form value for an index expression with no free variables,

@@ -670,6 +670,28 @@ pub type NodeMemo<V> = HashMap<(ById, u32), V>;
 // A node smaller than this is walked again rather than looked up.
 const MEMO_MIN: u16 = 24;
 
+// The nodes a query walk has been through, so a shared node is walked once. Like a memo it
+// lives for one call, and a node smaller than MEMO_MIN is never recorded.
+#[derive(Default)]
+pub struct Visited(HashSet<ById>);
+
+impl Visited {
+    pub fn new() -> Visited {
+        Visited::default()
+    }
+
+    // True the first time `t` is offered (always, for a small node).
+    pub fn first(&mut self, t: &Type) -> bool {
+        !is_big(t) || self.0.insert(ById(t.clone()))
+    }
+}
+
+// Big enough for a walk to remember (a memo or visited-set entry costs more than walking a
+// small node again).
+pub fn is_big(t: &Type) -> bool {
+    t.summary().size >= MEMO_MIN
+}
+
 // A walk that rebuilds a type, returning None where nothing changed. Subtrees the walker says
 // it would not change are skipped in O(1) (`skip`, from the node's summary), and the result for
 // each big enough node is remembered, so the cost is the number of DISTINCT nodes, not the size
@@ -789,20 +811,26 @@ fn replace_free(t: &Type, depth: u32, f: &dyn Fn(u64, u32) -> Option<Type>) -> O
 // The name of the first placeholder `t` still contains (a type the machine built while a
 // group's values were running and that escaped before the group closed).
 pub fn first_free(t: &Type) -> Option<Rc<str>> {
-    match t {
-        Type::RecVar(RecVar::Free { name, .. }) => Some(name.clone()),
-        Type::Rec(h, _) if !h.0.plain => h.0.bodies.iter().find_map(first_free),
-        Type::Rec(..) => None,
-        _ => {
-            let mut found = None;
-            each_child(t, &mut |c| {
-                if found.is_none() {
-                    found = first_free(c);
-                }
-            });
-            found
+    fn go(t: &Type, seen: &mut Visited) -> Option<Rc<str>> {
+        // A node already walked found nothing (else the walk would have stopped there).
+        if !t.summary().any(Summary::FREE) || !seen.first(t) {
+            return None;
+        }
+        match t {
+            Type::RecVar(RecVar::Free { name, .. }) => Some(name.clone()),
+            Type::Rec(h, _) => h.0.bodies.iter().find_map(|b| go(b, seen)),
+            _ => {
+                let mut found = None;
+                each_child(t, &mut |c| {
+                    if found.is_none() {
+                        found = go(c, seen);
+                    }
+                });
+                found
+            }
         }
     }
+    go(t, &mut Visited::new())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -929,15 +957,17 @@ pub fn close_group(names: &[Rc<str>], ids: &[u64], results: &[Option<Type>]) -> 
 
 // The indices (into `index`) of the group members whose placeholder `t` mentions, with repeats.
 fn collect_free(t: &Type, index: &HashMap<u64, usize>, found: &mut Vec<usize>) {
-    match t {
-        Type::RecVar(RecVar::Free { id, .. }) => found.extend(index.get(id)),
-        Type::Rec(h, _) => {
-            if !h.0.plain {
-                h.0.bodies.iter().for_each(|b| collect_free(b, index, found));
-            }
+    fn go(t: &Type, index: &HashMap<u64, usize>, found: &mut Vec<usize>, seen: &mut Visited) {
+        if !t.summary().any(Summary::FREE) || !seen.first(t) {
+            return;
         }
-        _ => each_child(t, &mut |c| collect_free(c, index, found)),
+        match t {
+            Type::RecVar(RecVar::Free { id, .. }) => found.extend(index.get(id)),
+            Type::Rec(h, _) => h.0.bodies.iter().for_each(|b| go(b, index, found, seen)),
+            _ => each_child(t, &mut |c| go(c, index, found, seen)),
+        }
     }
+    go(t, index, found, &mut Visited::new());
 }
 
 // Tarjan's algorithm, iterative: the components of the graph `succ`, each after every component
@@ -998,28 +1028,39 @@ fn strongly_connected(succ: &[Vec<usize>]) -> Vec<Vec<usize>> {
 // depends on it.
 fn canonical_order(comp: &mut [usize], bodies: &HashMap<usize, Type>, index: &HashMap<u64, usize>, scc_of: &[usize], c: usize) {
     use std::hash::{Hash, Hasher};
-    fn skeleton(t: &Type, colour: &dyn Fn(u64) -> Option<u64>, h: &mut std::collections::hash_map::DefaultHasher) {
+    // A node's hash is built from its children's, each hashed once per walk (`memo`).
+    fn skeleton(t: &Type, colour: &dyn Fn(u64) -> Option<u64>, memo: &mut HashMap<ById, u64>) -> u64 {
+        let big = t.summary().size >= MEMO_MIN;
+        if big && let Some(done) = memo.get(&ById(t.clone())) {
+            return *done;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
         match t {
             Type::RecVar(RecVar::Free { id, .. }) => match colour(*id) {
-                Some(k) => (1u8, k).hash(h),
+                Some(k) => (1u8, k).hash(&mut h),
                 // An enclosing group's placeholder: its id is fresh per evaluation, so only
                 // the fact that it is one may enter the hash.
-                None => 2u8.hash(h),
+                None => 2u8.hash(&mut h),
             },
-            Type::RecVar(RecVar::Bound { depth, member }) => (3u8, depth, member).hash(h),
+            Type::RecVar(RecVar::Bound { depth, member }) => (3u8, depth, member).hash(&mut h),
             Type::Rec(g, k) => {
-                (4u8, k, g.0.bodies.len()).hash(h);
+                (4u8, k, g.0.bodies.len()).hash(&mut h);
                 if !g.0.plain {
-                    g.0.bodies.iter().for_each(|b| skeleton(b, colour, h));
+                    g.0.bodies.iter().for_each(|b| skeleton(b, colour, memo).hash(&mut h));
                 }
             }
-            Type::Token(id) => (5u8, id).hash(h),
-            Type::Record(fields) => (6u8, fields.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()).hash(h),
-            _ => std::mem::discriminant(t).hash(h),
+            Type::Token(id) => (5u8, id).hash(&mut h),
+            Type::Record(fields) => (6u8, fields.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()).hash(&mut h),
+            _ => std::mem::discriminant(t).hash(&mut h),
         }
         if !matches!(t, Type::Rec(..)) {
-            each_child(t, &mut |ch| skeleton(ch, colour, h));
+            each_child(t, &mut |ch| skeleton(ch, colour, memo).hash(&mut h));
         }
+        let hash = h.finish();
+        if big {
+            memo.insert(ById(t.clone()), hash);
+        }
+        hash
     }
     let mut colours: HashMap<usize, u64> = comp.iter().map(|&m| (m, 0)).collect();
     let mut distinct = 1;
@@ -1027,10 +1068,8 @@ fn canonical_order(comp: &mut [usize], bodies: &HashMap<usize, Type>, index: &Ha
         let next: HashMap<usize, u64> = comp
             .iter()
             .map(|&m| {
-                let mut h = std::collections::hash_map::DefaultHasher::new();
                 let of = |id: u64| index.get(&id).filter(|&&j| scc_of[j] == c).map(|j| colours[j]);
-                skeleton(&bodies[&m], &of, &mut h);
-                (m, h.finish())
+                (m, skeleton(&bodies[&m], &of, &mut HashMap::new()))
             })
             .collect();
         let count = next.values().collect::<HashSet<_>>().len();
