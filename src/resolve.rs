@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use cranelift_entity::EntityRef;
 
 use crate::env::PRELUDE;
@@ -132,14 +135,15 @@ pub fn free_vars(arena: &Arena, root: ExprRef) -> Vec<String> {
 // Every Var node under `root` with where it lives, in visit order.
 fn walk(arena: &Arena, root: ExprRef, outer: &[String]) -> Vec<(ExprRef, VarRef)> {
     let mut found: Vec<(ExprRef, VarRef)> = Vec::new();
-    let mut scopes: Vec<Vec<String>> = if outer.is_empty() { Vec::new() } else { vec![outer.to_vec()] };
+    let mut scopes = Scopes::default();
+    if !outer.is_empty() {
+        scopes.push(outer.to_vec());
+    }
     let mut work = vec![Work::Visit(root)];
     while let Some(item) = work.pop() {
         match item {
             Work::Push(names) => scopes.push(names),
-            Work::Pop => {
-                scopes.pop();
-            }
+            Work::Pop => scopes.pop(),
             Work::Visit(id) => visit(arena, id, &scopes, &mut found, &mut work),
         }
     }
@@ -149,24 +153,62 @@ fn walk(arena: &Arena, root: ExprRef, outer: &[String]) -> Vec<(ExprRef, VarRef)
 // A name spelled `#builtin` (never lexable) is a synthesized reference to a
 // prelude builtin: it ignores the lexical scope, so no user binding can capture
 // it (typecheck::prelude_var builds these).
-fn lookup(scopes: &[Vec<String>], name: &str) -> VarRef {
+fn lookup(scopes: &Scopes, name: &str) -> VarRef {
     if let Some(builtin) = name.strip_prefix('#') {
-        return match PRELUDE.iter().position(|(n, _)| *n == builtin) {
-            Some(i) => VarRef::Prelude(i as u32),
-            None => VarRef::Unbound,
-        };
+        return prelude_ref(builtin);
     }
-    for (hops, frame) in scopes.iter().rev().enumerate() {
-        // Last slot wins: preserves today's shadowing for a duplicate
-        // binder in one frame, e.g. the pattern `(x, x)`.
-        if let Some(slot) = frame.iter().rposition(|n| n == name) {
-            return VarRef::Local { hops: hops as u32, slot: slot as u32 };
+    if let Some(&(frame, slot)) = scopes.index.get(name).and_then(|s| s.last()) {
+        return VarRef::Local { hops: (scopes.frames.len() - 1 - frame) as u32, slot };
+    }
+    prelude_ref(name)
+}
+
+// First PRELUDE entry of that name, else Unbound (not an error here: see
+// VarRef::Unbound).
+fn prelude_ref(name: &str) -> VarRef {
+    static INDEX: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
+    let index = INDEX.get_or_init(|| {
+        let mut m = HashMap::new();
+        for (i, (n, _)) in PRELUDE.iter().enumerate() {
+            m.entry(*n).or_insert(i as u32);
         }
-    }
-    match PRELUDE.iter().position(|(n, _)| *n == name) {
-        Some(i) => VarRef::Prelude(i as u32),
-        // Not an error here: see VarRef::Unbound.
+        m
+    });
+    match index.get(name) {
+        Some(&i) => VarRef::Prelude(i),
         None => VarRef::Unbound,
+    }
+}
+
+// The enclosing frames' binders: `frames` keeps each frame's names (to undo a
+// push), `index` the stack of bindings per name, innermost frame and last slot
+// on top, so a lookup is O(1) however deep the scope.
+#[derive(Default)]
+struct Scopes {
+    frames: Vec<Vec<String>>,
+    index: HashMap<String, Vec<(usize, u32)>>,
+}
+
+impl Scopes {
+    fn push(&mut self, names: Vec<String>) {
+        let frame = self.frames.len();
+        // Later slot pushed last, so the last slot wins: preserves shadowing
+        // for a duplicate binder in one frame, e.g. the pattern `(x, x)`.
+        for (slot, n) in names.iter().enumerate() {
+            self.index.entry(n.clone()).or_default().push((frame, slot as u32));
+        }
+        self.frames.push(names);
+    }
+
+    fn pop(&mut self) {
+        let names = self.frames.pop().expect("pop of an empty scope stack");
+        for n in names.iter().rev() {
+            let stack = self.index.get_mut(n).expect("binder indexed at push");
+            stack.pop();
+            if stack.is_empty() {
+                self.index.remove(n);
+            }
+        }
     }
 }
 
@@ -191,7 +233,7 @@ pub fn is_direct_group(arena: &Arena, bindings: &[(String, Option<ExprRef>, Expr
 fn visit(
     arena: &Arena,
     id: ExprRef,
-    scopes: &[Vec<String>],
+    scopes: &Scopes,
     found: &mut Vec<(ExprRef, VarRef)>,
     work: &mut Vec<Work>,
 ) {
@@ -314,6 +356,52 @@ mod tests {
         let Expr::LetRec(bindings, _) = &arena[root] else { panic!("expected LetRec") };
         let bindings = bindings.as_ref().clone();
         (arena, bindings)
+    }
+
+    // The linear scan `Scopes` replaced, kept as the reference.
+    fn naive_lookup(scopes: &[Vec<String>], name: &str) -> VarRef {
+        let prelude = |n: &str| match PRELUDE.iter().position(|(p, _)| *p == n) {
+            Some(i) => VarRef::Prelude(i as u32),
+            None => VarRef::Unbound,
+        };
+        if let Some(builtin) = name.strip_prefix('#') {
+            return prelude(builtin);
+        }
+        for (hops, frame) in scopes.iter().rev().enumerate() {
+            if let Some(slot) = frame.iter().rposition(|n| n == name) {
+                return VarRef::Local { hops: hops as u32, slot: slot as u32 };
+            }
+        }
+        prelude(name)
+    }
+
+    #[test]
+    fn scopes_lookup_matches_the_naive_scan() {
+        let mut names: Vec<String> = ["a", "b", "c", "x", "len", "Int", "nope"].iter().map(|s| s.to_string()).collect();
+        names.extend(["#len", "#Int", "#nope", "#a"].iter().map(|s| s.to_string()));
+        let mut seed = 12345u64;
+        let mut rnd = move |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n
+        };
+        let mut scopes = Scopes::default();
+        let mut naive: Vec<Vec<String>> = Vec::new();
+        // Frame 0 plays the outer frame; duplicates and shadowing come from
+        // the small name pool.
+        for step in 0..4000 {
+            if naive.is_empty() || (rnd(10) < 5 && naive.len() < 40) {
+                let n = rnd(4);
+                let frame: Vec<String> = (0..n).map(|_| names[rnd(5)].clone()).collect();
+                scopes.push(frame.clone());
+                naive.push(frame);
+            } else {
+                scopes.pop();
+                naive.pop();
+            }
+            for name in &names {
+                assert_eq!(lookup(&scopes, name), naive_lookup(&naive, name), "step {step}, name {name}");
+            }
+        }
     }
 
     #[test]
