@@ -229,10 +229,23 @@ pub(crate) struct CheckDef {
     values: Vec<ExprRef>,
     // Memo of CheckDef::fallible.
     fallible: OnceCell<bool>,
+    // Memo: this definition or one it reaches is fallible (trans_fallible).
+    trans_fallible: OnceCell<bool>,
+    // The index variables written in this definition and the ones it reaches
+    // (def_index_names).
+    index_names: OnceCell<Rc<BTreeSet<String>>>,
+    // Settling erasure: a finished check-time evaluation's closure holds this
+    // definition (`reached`), a clean one does (`reached_clean`), a kept
+    // annotation's closure does (`kept`). Set on what the evaluation read,
+    // carried along the reads by settle_definitions.
+    reached: Cell<bool>,
+    reached_clean: Cell<bool>,
+    kept: Cell<bool>,
     // An annotation's evaluation finished with this definition, and its
-    // binding cannot fail at run time (mark_proven).
+    // binding cannot fail at run time (settle_definitions).
     proven: Cell<bool>,
-    // Something named the binder at value position (lookup).
+    // Something named the binder at value position (lookup), or a kept
+    // annotation reads it.
     used: Cell<bool>,
 }
 
@@ -523,6 +536,11 @@ impl InferCtx {
             ctx: ctx.clone(),
             values,
             fallible: OnceCell::new(),
+            trans_fallible: OnceCell::new(),
+            index_names: OnceCell::new(),
+            reached: Cell::new(false),
+            reached_clean: Cell::new(false),
+            kept: Cell::new(false),
             proven: Cell::new(false),
             used: Cell::new(false),
         });
@@ -3282,8 +3300,8 @@ fn annotation_type(arena: &mut Arena, ann: ExprRef, blame: Span, ctx: &Ctx, span
     }
     let err = |msg: String| TypeError(msg, spans[ann]);
     let (reads, direct_stuck) = reads_in(arena, &[ann], &[], ctx, infer);
-    let (defs, stuck) = close_over(arena, infer, &reads, direct_stuck);
-    if defs.is_empty() && !stuck {
+    let stuck = direct_stuck || reads.iter().any(|r| def_deps(arena, infer, r.def).stuck);
+    if reads.is_empty() && !stuck {
         // Only prelude constructors: closed and never fallible.
         let ty = pure_type(eval_annotation(arena, ann, &reads, spans, infer)).map_err(err)?;
         return Ok(Annotation { ty: (*ty).clone(), site: None });
@@ -3303,42 +3321,31 @@ fn annotation_type(arena: &mut Arena, ann: ExprRef, blame: Span, ctx: &Ctx, span
         }
     };
     let conform = matches!(kind, AnnotKind::Unknown).then(|| {
-        let roots = std::iter::once(ann).chain(defs.iter().flat_map(|d| d.sources())).collect::<Vec<_>>();
-        conform_spec(arena, &roots, blame, ctx, infer)
+        let names = written_index_names(arena, infer, ann, &reads);
+        conform_spec(arena, &names, blame, ctx, infer)
     });
     let spec = Rc::new(AnnotSpec::new(kind, spans[ann]));
+    let read_defs: Vec<usize> = reads.iter().map(|r| r.def).collect();
     if matches!(spec.kind, AnnotKind::Confirm(_)) {
-        infer.proofs.push(Proof::Site(defs, elaborated, spec.clone()));
+        infer.proofs.push(Proof::Site(read_defs, elaborated, spec.clone()));
     } else {
         // The run time evaluates the annotation, so it keeps every binding it reads.
-        for def in &defs {
-            def.used.set(true);
-        }
+        read_defs.iter().for_each(|i| infer.defs[*i].kept.set(true));
     }
     let annot = arena.push(Expr::Annot(elaborated, spec.clone()));
     Ok(Annotation { ty, site: Some(Site { name: fresh_index_name("__rt"), annot, spec, conform }) })
 }
 
 // An Unknown site's check (spec 11.4). The index variables its run-time type
-// can mention are those written in the annotation `root` (wrapped in the
-// definitions it reads): an index term is not a value, so it reaches a type
-// value only from a TypeLit. Each gets a length slot read in the binder's
-// scope, as a Check's would be; one nothing here binds is the annotation's
-// own, and matches any length. Unlike the binder that introduces it
-// statically, repeated occurrences do not share it (parked, spec 11.13). The
+// can mention are `names`, those written in the annotation and in the
+// definitions it reads (written_index_names): an index term is not a value, so
+// it reaches a type value only from a TypeLit. Each gets a length slot read in
+// the binder's scope, as a Check's would be; one nothing here binds is the
+// annotation's own, and matches any length. Unlike the binder that introduces
+// it statically, repeated occurrences do not share it (parked, spec 11.13). The
 // site's contract checks read the same table.
-fn conform_spec(arena: &mut Arena, roots: &[ExprRef], blame: Span, ctx: &Ctx, infer: &InferCtx) -> Rc<ConformSpec> {
-    let mut names = BTreeSet::new();
-    let (mut work, mut kids) = (roots.to_vec(), Vec::new());
-    while let Some(n) = work.pop() {
-        if let Expr::TypeLit(t) = &arena[n] {
-            names.extend(index_names(vars_in(t)));
-        }
-        kids.clear();
-        arena[n].children(&mut kids);
-        work.extend(&kids);
-    }
-    let names: Vec<String> = names.into_iter().collect();
+fn conform_spec(arena: &mut Arena, names: &BTreeSet<String>, blame: Span, ctx: &Ctx, infer: &InferCtx) -> Rc<ConformSpec> {
+    let names: Vec<String> = names.iter().cloned().collect();
     // The table is read by the site's contract calls too, so its obligations
     // are repeatable.
     let env = CheckEnv { repeatable: true, ..CheckEnv::at(infer, blame) };
@@ -3367,13 +3374,15 @@ fn conform_spec(arena: &mut Arena, roots: &[ExprRef], blame: Span, ctx: &Ctx, in
     Rc::new(ConformSpec { index_names: names, lens, named: infer.registry.clone(), memo: RefCell::new(None), span: Some(blame), trusted: false })
 }
 
-// A check-time evaluation that finished, replayed by settle_erasure.
+// A check-time evaluation that finished, replayed by settle_erasure. Each holds
+// the definitions the evaluation read directly (indices); the ones they read
+// are reached by the sweep.
 enum Proof {
-    // A type let's or a recursive type's definitions (mark_proven).
-    Defs(Vec<Rc<CheckDef>>),
+    // A type let's or a recursive type's definitions.
+    Defs(Vec<usize>),
     // A Confirm site: the definitions it read, its elaborated annotation, and
     // its node.
-    Site(Vec<Rc<CheckDef>>, ExprRef, Rc<AnnotSpec>),
+    Site(Vec<usize>, ExprRef, Rc<AnnotSpec>),
 }
 
 // A node erasure may remove: `outer` becomes a copy of `inner` when `what`
@@ -3393,26 +3402,29 @@ enum Erasable {
 // has run, a cast slot counts as fallible, and nearly every type function's
 // body holds one (`a` in `fun a -> List(a)` goes to a Dyn parameter). The
 // evaluations replay in order, so the sites inside a definition are decided
-// before an annotation that reads it. Then each erased node is overwritten
-// by its replacement, in ascending order: a node's children come before it
-// in the arena, so a replacement is copied only after its own removals.
+// before an annotation that reads it. A definition's flags then follow the
+// reads, once, from the newest definition to the oldest (settle_definitions).
+// Then each erased node is overwritten by its replacement, in ascending order:
+// a node's children come before it in the arena, so a replacement is copied
+// only after its own removals.
 fn settle_erasure(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx) {
     for proof in std::mem::take(&mut infer.proofs) {
         match proof {
-            Proof::Defs(defs) => mark_proven(arena, &defs, spans, infer),
-            Proof::Site(defs, elaborated, spec) => {
-                mark_proven(arena, &defs, spans, infer);
-                if !defs.iter().any(|d| d.fallible(arena, spans, infer)) && !fallible_check(arena, elaborated, spans, infer) {
+            Proof::Defs(reads) => {
+                note_evaluation(arena, spans, infer, &reads);
+            }
+            Proof::Site(reads, elaborated, spec) => {
+                let clean = note_evaluation(arena, spans, infer, &reads);
+                if clean && !fallible_check(arena, elaborated, spans, infer) {
                     spec.erased.set(true);
                 } else {
                     // The run time evaluates the annotation, so it keeps every binding it reads.
-                    for def in &defs {
-                        def.used.set(true);
-                    }
+                    reads.iter().for_each(|i| infer.defs[*i].kept.set(true));
                 }
             }
         }
     }
+    settle_definitions(arena, infer);
     let mut splices = std::mem::take(&mut infer.splices);
     splices.retain(|s| match &s.what {
         Erasable::Site(spec) => spec.erased.get(),
@@ -3424,38 +3436,141 @@ fn settle_erasure(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx) {
     }
 }
 
-// `defs` took part in a check-time evaluation that finished. The evaluation
-// ran their parsed values, without the checks elaboration added, so a
-// definition is proven only if its run-time binding cannot fail: it is
-// inert, or no definition in `defs` holds a check that could fail (the
-// binding may call any of them).
-fn mark_proven(arena: &Arena, defs: &[Rc<CheckDef>], spans: &SpanMap, infer: &InferCtx) {
-    let clean = !defs.iter().any(|d| d.fallible(arena, spans, infer));
-    for def in defs {
-        if clean || def.inert(arena) {
+// An evaluation that finished read `reads` directly, and through them every
+// definition they reach (its closure). The evaluation ran their parsed values,
+// without the checks elaboration added, so a definition is proven only if its
+// run-time binding cannot fail: it is inert, or nothing in the closure holds a
+// check that could fail (the binding may call any of it). Marks the definitions
+// it read as reached, and clean ones as reached clean; settle_definitions
+// carries both along the reads. Returns whether the closure is clean.
+fn note_evaluation(arena: &Arena, spans: &SpanMap, infer: &InferCtx, reads: &[usize]) -> bool {
+    let clean = !reads.iter().any(|i| trans_fallible(arena, spans, infer, *i));
+    for i in reads {
+        let def = &infer.defs[*i];
+        def.reached.set(true);
+        if clean {
+            def.reached_clean.set(true);
+        }
+    }
+    clean
+}
+
+// Some definition in the closure of `i` (its own included) holds a run-time
+// check that could fail, memoized. Iterative, oldest definition first, like
+// def_deps. Each `fallible` is first computed by a proof whose closure
+// contains it, and the sites inside a definition are decided before any proof
+// that reads it.
+fn trans_fallible(arena: &Arena, spans: &SpanMap, infer: &InferCtx, i: usize) -> bool {
+    if infer.defs[i].trans_fallible.get().is_none() {
+        let mut todo: Vec<usize> = Vec::new();
+        let mut queued: HashSet<usize> = HashSet::new();
+        let mut work = vec![i];
+        while let Some(j) = work.pop() {
+            if infer.defs[j].trans_fallible.get().is_some() || !queued.insert(j) {
+                continue;
+            }
+            work.extend(def_deps(arena, infer, j).reads.iter().map(|r| r.def));
+            todo.push(j);
+        }
+        todo.sort_unstable();
+        for j in todo {
+            let def = &infer.defs[j];
+            let fallible = def.fallible(arena, spans, infer) || def_deps(arena, infer, j).reads.iter().any(|r| infer.defs[r.def].trans_fallible.get() == Some(&true));
+            let _ = def.trans_fallible.set(fallible);
+        }
+    }
+    *infer.defs[i].trans_fallible.get().expect("computed above")
+}
+
+// Carries the flags note_evaluation and the kept sites set along the reads,
+// from the newest definition to the oldest (a definition reads only older
+// ones), and settles each: `proven` if some finished evaluation whose closure
+// has it was clean, or it is inert and some finished evaluation has it;
+// `used` also if a kept annotation's closure has it.
+fn settle_definitions(arena: &Arena, infer: &InferCtx) {
+    for i in (0..infer.defs.len()).rev() {
+        let def = &infer.defs[i];
+        if !(def.reached.get() || def.kept.get()) {
+            continue;
+        }
+        if def.reached_clean.get() || (def.reached.get() && def.inert(arena)) {
             def.proven.set(true);
+        }
+        if def.kept.get() {
+            def.used.set(true);
+        }
+        for read in &def_deps(arena, infer, i).reads {
+            let dep = &infer.defs[read.def];
+            dep.reached.set(dep.reached.get() || def.reached.get());
+            dep.reached_clean.set(dep.reached_clean.get() || def.reached_clean.get());
+            dep.kept.set(dep.kept.get() || def.kept.get());
         }
     }
 }
 
-// The definitions an expression that reads `reads` (`stuck`: and a value that
-// exists only at run time) depends on, directly or through other definitions,
-// oldest first, and whether it is stuck (spec section 2's stuck rule), so only
-// the run time can evaluate it.
-fn close_over(arena: &Arena, infer: &InferCtx, reads: &[Read], mut stuck: bool) -> (Vec<Rc<CheckDef>>, bool) {
-    let mut seen: HashSet<usize> = HashSet::new();
-    let mut work: Vec<usize> = reads.iter().map(|r| r.def).collect();
-    while let Some(i) = work.pop() {
-        if !seen.insert(i) {
-            continue;
+// The index variables written in `ann` and in every definition it reaches
+// through `reads`: what a TypeLit in any of them mentions.
+fn written_index_names(arena: &Arena, infer: &InferCtx, ann: ExprRef, reads: &[Read]) -> Rc<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    collect_index_names(arena, &[ann], &mut names);
+    let sets: Vec<Rc<BTreeSet<String>>> = reads.iter().map(|r| def_index_names(arena, infer, r.def)).collect();
+    union_names(names, sets)
+}
+
+// The names of `own` and every set in `sets`, reusing the largest set's `Rc`
+// when the rest add nothing to it: a definition that writes no index variable
+// of its own shares its reads'.
+fn union_names(own: BTreeSet<String>, mut sets: Vec<Rc<BTreeSet<String>>>) -> Rc<BTreeSet<String>> {
+    sets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    let mut sets = sets.into_iter();
+    let mut acc = sets.next().unwrap_or_default();
+    for set in sets {
+        if !set.is_subset(&acc) {
+            Rc::make_mut(&mut acc).extend(set.iter().cloned());
         }
-        let deps = def_deps(arena, infer, i);
-        stuck |= deps.stuck;
-        work.extend(deps.reads.iter().map(|r| r.def));
     }
-    let mut used: Vec<usize> = seen.into_iter().collect();
-    used.sort_unstable();
-    (used.into_iter().map(|i| infer.defs[i].clone()).collect(), stuck)
+    if !own.is_subset(&acc) {
+        Rc::make_mut(&mut acc).extend(own);
+    }
+    acc
+}
+
+// What index variables the TypeLits under `roots` mention.
+fn collect_index_names(arena: &Arena, roots: &[ExprRef], names: &mut BTreeSet<String>) {
+    let (mut work, mut kids) = (roots.to_vec(), Vec::new());
+    while let Some(n) = work.pop() {
+        if let Expr::TypeLit(t) = &arena[n] {
+            names.extend(index_names(vars_in(t)));
+        }
+        kids.clear();
+        arena[n].children(&mut kids);
+        work.extend(&kids);
+    }
+}
+
+// The index variables written in definition `i` and in the ones it reaches,
+// memoized. Iterative, oldest first, like def_deps.
+fn def_index_names(arena: &Arena, infer: &InferCtx, i: usize) -> Rc<BTreeSet<String>> {
+    if infer.defs[i].index_names.get().is_none() {
+        let mut todo: Vec<usize> = Vec::new();
+        let mut queued: HashSet<usize> = HashSet::new();
+        let mut work = vec![i];
+        while let Some(j) = work.pop() {
+            if infer.defs[j].index_names.get().is_some() || !queued.insert(j) {
+                continue;
+            }
+            work.extend(def_deps(arena, infer, j).reads.iter().map(|r| r.def));
+            todo.push(j);
+        }
+        todo.sort_unstable();
+        for j in todo {
+            let mut own = BTreeSet::new();
+            collect_index_names(arena, &infer.defs[j].sources(), &mut own);
+            let sets = def_deps(arena, infer, j).reads.iter().map(|r| infer.defs[r.def].index_names.get().expect("a dependency has a smaller index").clone()).collect();
+            let _ = infer.defs[j].index_names.set(union_names(own, sets));
+        }
+    }
+    infer.defs[i].index_names.get().expect("computed above").clone()
 }
 
 // The definitions `roots` (resolved in `ctx`, with `skip` bound around them)
@@ -3650,8 +3765,7 @@ fn recursive_type_group(
     let mut results = Vec::with_capacity(bindings.len());
     for (_, _, v) in bindings {
         let (reads, direct_stuck) = reads_in(arena, &[*v], &names, ctx, infer);
-        let (defs, stuck) = close_over(arena, infer, &reads, direct_stuck);
-        if stuck {
+        if direct_stuck || reads.iter().any(|r| def_deps(arena, infer, r.def).stuck) {
             return None;
         }
         let roots: Vec<usize> = reads.iter().map(|r| r.def).collect();
@@ -3670,7 +3784,7 @@ fn recursive_type_group(
         if matches!(&ty, Type::Named(n) if ids.contains(n)) {
             return None;
         }
-        infer.proofs.push(Proof::Defs(defs));
+        infer.proofs.push(Proof::Defs(roots));
         results.push(ty);
     }
     let mut values = Vec::with_capacity(results.len());
@@ -3810,7 +3924,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         })
                         .collect();
                     let def = infer.new_def(DefNode::Group(lits.clone()), values.clone(), &cur_ctx);
-                    infer.proofs.push(Proof::Defs(vec![def.clone()]));
+                    infer.proofs.push(Proof::Defs(vec![def.idx]));
                     let mut elaborated = Vec::with_capacity(lits.len());
                     for ((name, _, _), value) in lits.iter().zip(values) {
                         cur_ctx = extend_generalized(&cur_ctx, name, Type::Dyn, infer, Some(def.clone()));
