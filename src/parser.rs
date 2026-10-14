@@ -1173,7 +1173,7 @@ impl<'a> Parser<'a> {
         loop {
             match self.peek() {
                 Some(Token::TypeKw) => {
-                    // `type Name = TypeExpr in body` -- a pure compile-time
+                    // The `type` form (Name, `=`, TypeExpr, `in`, body) -- a pure compile-time
                     // directive: no wrapped AST node, no PendingBinder
                     // entry (nothing to fold back), just a scoped update to
                     // `type_aliases` before continuing this same peeling

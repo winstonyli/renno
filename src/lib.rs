@@ -1745,40 +1745,21 @@ mod tests {
 
     #[test]
     fn type_alias_names_an_arbitrary_type_expression() {
-        let src = "type MyInt = Int in let f = fun x: MyInt -> x in f(5)";
-        assert_eq!(run_source(src).unwrap().as_int(), 5);
-    }
-
-    #[test]
-    fn type_alias_stays_in_scope_across_sibling_atoms_not_just_the_first_one() {
-        // Regression: `type` pushes nothing to `atom`'s own `pending`
-        // (unlike `let`/`fun`/`data`, which always do), so without
-        // `saw_type_alias` tracking this separately, `type X = ... in
-        // BODY` parsed BODY as a single atom_leaf() atom instead of a
-        // full expr() whenever `type` was the chain's only prefix --
-        // meaning the alias got restored the moment the FIRST atom
-        // finished, before a LATER sibling atom in the same expression
-        // (here, the juxtaposed argument) ever saw it. Both lambdas below
-        // reference `MyInt`; the second is parsed in a SEPARATE atom()
-        // call from the first (as the application's argument) -- if the
-        // scope were too narrow, `MyInt` there would silently fall back
-        // to an undeclared Data type, and the two (Int -> Int) function
-        // types would then fail to unify.
-        let src = "type MyInt = Int in (fun f: (MyInt -> Int) -> f(5)) (fun x: MyInt -> x)";
+        let src = "let MyInt = Int in let f = fun x: MyInt -> x in f(5)";
         assert_eq!(run_source(src).unwrap().as_int(), 5);
     }
 
     #[test]
     fn union_type_annotation_accepts_either_alternative() {
-        let src = "type IntOrStr = Int | Str in let f = fun x: IntOrStr -> x in f(5)";
+        let src = "let IntOrStr = Union(Int, Str) in let f = fun x: IntOrStr -> x in f(5)";
         assert_eq!(run_source(src).unwrap().as_int(), 5);
-        let src2 = r#"type IntOrStr = Int | Str in let f = fun x: IntOrStr -> x in f("hi")"#;
+        let src2 = r#"let IntOrStr = Union(Int, Str) in let f = fun x: IntOrStr -> x in f("hi")"#;
         assert_eq!(run_source(src2).unwrap().to_string(), "hi");
     }
 
     #[test]
     fn union_type_annotation_rejects_neither_alternative_statically() {
-        let src = "type IntOrStr = Int | Str in let f = fun x: IntOrStr -> x in f(true)";
+        let src = "let IntOrStr = Union(Int, Str) in let f = fun x: IntOrStr -> x in f(true)";
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let err = typecheck::check(&mut arena, root, &spans).unwrap_err();
         assert!(err.0.contains("expected Int | Str, found Bool"), "unexpected message: {}", err.0);
@@ -1787,7 +1768,7 @@ mod tests {
     #[test]
     fn union_type_dyn_boundary_accepts_a_matching_alternative_at_runtime() {
         let src = r#"
-            type IntOrStr = Int | Str in
+            let IntOrStr = Union(Int, Str) in
             handle
               let y = perform choose(0) in
               let f = fun x: IntOrStr -> x in
@@ -1800,7 +1781,7 @@ mod tests {
     #[test]
     fn union_type_dyn_boundary_rejects_no_matching_alternative_at_runtime() {
         let src = r#"
-            type IntOrStr = Int | Str in
+            let IntOrStr = Union(Int, Str) in
             handle
               let y = perform choose(0) in
               let f = fun x: IntOrStr -> x in
@@ -1822,7 +1803,7 @@ mod tests {
         // only each alternative's arity (see missing_case's own doc
         // comment).
         let src = r#"
-            type Pair = (Int,) | (Int, Int) in
+            let Pair = Union(Tuple((Int,)), Tuple(Int, Int)) in
             let f = fun p: Pair ->
               match p
               | (n,) -> n
@@ -1836,7 +1817,7 @@ mod tests {
     #[test]
     fn union_of_tuples_exhaustive_when_every_alternative_is_covered() {
         let src = r#"
-            type Pair = (Int,) | (Int, Int) in
+            let Pair = Union(Tuple((Int,)), Tuple(Int, Int)) in
             let f = fun p: Pair ->
               match p
               | (n,) -> n
@@ -1858,7 +1839,7 @@ mod tests {
         // callees), which is exactly why the mismatch used to slip
         // through silently instead of being caught at the boundary.
         let src = r#"
-            type F = (Int -> Bool) | Str in
+            let F = Union(Fun(Int, Bool), Str) in
             handle
               let y = perform choose(0) in
               let g = fun h: F -> h in
@@ -2035,7 +2016,7 @@ mod tests {
         // regardless of what else that type's own alternatives carry --
         // no second arm needed the way exact-arity Tuple matching would.
         let src = r#"
-            type R = {x: Int} | {x: Int, y: Int} in
+            let R = Union(Record({x: Int}), Record({x: Int, y: Int})) in
             let f = fun p: R -> match p | {x: a} -> a
             in f({x: 1, y: 2}) + f({x: 5})
         "#;
@@ -2050,7 +2031,7 @@ mod tests {
         // Union genuinely needs one arm per alternative, same as any
         // other Union whose alternatives don't overlap.
         let src = r#"
-            type Shape = {kind: Str, radius: Int} | {kind: Str, side: Int} in
+            let Shape = Union(Record({kind: Str, radius: Int}), Record({kind: Str, side: Int})) in
             let area = fun p: Shape ->
               match p
               | {radius: r} -> r * r * 3
@@ -2063,7 +2044,7 @@ mod tests {
     #[test]
     fn non_exhaustive_record_union_match_rejected_statically() {
         let src = r#"
-            type Shape = {kind: Str, radius: Int} | {kind: Str, side: Int} in
+            let Shape = Union(Record({kind: Str, radius: Int}), Record({kind: Str, side: Int})) in
             let area = fun p: Shape -> match p | {radius: r} -> r * r * 3
             in area({kind: "circle", radius: 2})
         "#;
@@ -2165,7 +2146,7 @@ mod tests {
         // undiagnosed as dead code even though width-tolerant matching
         // guarantees the earlier arm already covers it.
         let src = r#"
-            type R = {x: Int} | {x: Int, y: Int} in
+            let R = Union(Record({x: Int}), Record({x: Int, y: Int})) in
             let f = fun p: R -> match p | {x: a} -> a | {x: a, y: b} -> a + b
             in f({x: 5})
         "#;
@@ -2763,7 +2744,7 @@ g(len)").unwrap_err();
         let t16 = "let h = handler op(p, resume) -> resume(p) in handle (perform op(1)) with h";
         assert_eq!(run_source(t16).unwrap(), Outcome::Int(1));
         // t18: a callee typed by a recursive alias.
-        let t18 = "type F = Dyn -> F in let rec g: F = fun x -> g in g(1)(2)";
+        let t18 = "let rec F = Fun(Dyn, F) in let rec g: F = fun x -> g in g(1)(2)";
         assert!(run_source(t18).is_ok());
         // A handler that does not catch the effect still reaches the run-time error.
         let miss = "let h = handler other(p, resume) -> resume(p) in handle (perform op(1)) with h";
@@ -3288,99 +3269,18 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn a_self_referential_type_alias_parses_successfully() {
-        // This used to be a parse error ("unknown type: List") --
-        // List wasn't in scope yet while its own RHS was being parsed.
-        // (Bool stands in for a Unit-style base case here -- this
-        // grammar has no builtin Unit type; any non-recursive
-        // alternative demonstrates the same self-reference detection.)
-        let src = r#"
-            type List = (Int, List) | Bool in
-            5
-        "#;
-        assert!(parser::parse(src).is_ok());
-    }
-
-    #[test]
-    fn a_non_recursive_alias_is_completely_unaffected() {
-        // Same alias mechanism, but this one never references itself
-        // -- must behave EXACTLY as before this whole feature: fully
-        // expanded, no Type::Named anywhere, no registry entry.
-        let src = r#"
-            type Pair = (Int, Int) in
-            let p: Pair = (1, 2) in
-            p
-        "#;
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
-        let result = machine::run(&arena, elaborated, Env::prelude(), &spans);
-        match result {
-            Value::List(items) => assert_eq!(items[0].as_int(), 1),
-            other => panic!("expected a tuple, got {other}"),
-        }
-    }
-
-    #[test]
-    fn parse_with_named_types_registers_a_self_referential_alias() {
-        use types::Type;
-        let src = r#"
-            type List = (Int, List) | Bool in
-            5
-        "#;
-        let (_, _, _, named_types) = parser::parse_with_named_types(src).unwrap();
-        assert_eq!(named_types.len(), 1);
-        let def = named_types.values().next().unwrap();
-        // The registered definition is List's own one-level structure
-        // -- a Union of a Tuple (whose second element is the SAME
-        // Named id, pointing back at this very entry) and a plain
-        // Bool base case. Confirm it's a Union containing a Tuple
-        // whose second element is a Type::Named.
-        match def {
-            Type::Union(alts) => {
-                let has_self_ref_tuple = alts.iter().any(|alt| {
-                    matches!(alt, Type::Tuple(items) if items.len() == 2 && matches!(items[1], Type::Named(_)))
-                });
-                assert!(has_self_ref_tuple, "expected a Tuple alternative whose 2nd element is Type::Named, got {def:?}");
-            }
-            other => panic!("expected a Union, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn two_recursive_aliases_sharing_a_surface_name_in_different_scopes_do_not_collide() {
-        use types::Type;
-        // Parenthesized grouping + sequential `let _ = ... in ...`,
-        // not a tuple literal -- both are definitely-valid constructs
-        // in this grammar, avoiding any risk that a tuple element
-        // doesn't accept a full `type ... in ...` prefix chain (this
-        // plan never verified that either way, and there's no reason
-        // to depend on it here).
-        let src = r#"
-            let _ = (type List = (Int, List) | Bool in 1) in
-            let _ = (type List = (Str, List) | Bool in 2) in
-            3
-        "#;
-        let (_, _, _, named_types) = parser::parse_with_named_types(src).unwrap();
-        // Two SEPARATE registrations, each with its own gensym'd id --
-        // not one clobbering the other.
-        assert_eq!(named_types.len(), 2);
-        let mut sees_int_tuple = false;
-        let mut sees_str_tuple = false;
-        for def in named_types.values() {
-            if let Type::Union(alts) = def {
-                for alt in alts.iter() {
-                    if let Type::Tuple(items) = alt {
-                        if items[0] == Type::Int {
-                            sees_int_tuple = true;
-                        }
-                        if items[0] == Type::Str {
-                            sees_str_tuple = true;
-                        }
-                    }
-                }
-            }
-        }
-        assert!(sees_int_tuple && sees_str_tuple, "expected both scopes' own definitions preserved independently");
+        // Each `List` is its own `let rec`, so each mints its own Named id; the
+        // second scope's `("s", true)` must be checked against ITS List, not the first.
+        let scope = |elem: &str, v: &str, n: i64| {
+            format!(
+                "(let rec List = Union(Tuple({elem}, List), Bool) in let d: Dyn = {v} in let x: List = d in {n})"
+            )
+        };
+        let src = format!("let a = {} in let b = {} in a + b", scope("Int", "(1, true)", 1), scope("Str", "(\"s\", true)", 2));
+        assert_eq!(run_source(&src).unwrap().as_int(), 3);
+        let bad = format!("let a = {} in let b = {} in a + b", scope("Int", "(1, true)", 1), scope("Str", "(1, true)", 2));
+        rejects(&bad, "type error: expected (Str, List) | Bool, found Int at element 0");
     }
 
     #[test]
@@ -3395,7 +3295,7 @@ g(len)").unwrap_err();
         // static "type mismatch" error from check_with_named_types
         // instead.
         let src = r#"
-            type List = (Int, List) | Bool in
+            let rec List = Union(Tuple(Int, List), Bool) in
             let f = fun xs: List -> xs in
             f((1, (2, true)))
         "#;
@@ -3420,7 +3320,7 @@ g(len)").unwrap_err();
         // path), not a static proof by relate. The check follows the whole
         // value, through every level of the recursive alias.
         let src = r#"
-            type List = (Int, List) | Bool in
+            let rec List = Union(Tuple(Int, List), Bool) in
             let f = fun xs: List -> xs in
             let g = fun v: Dyn -> f(v) in
             g((1, (2, true)))
@@ -3440,7 +3340,7 @@ g(len)").unwrap_err();
     #[test]
     fn a_dyn_sourced_value_is_rejected_deep_inside_a_named_recursive_type() {
         let src = r#"
-            type List = (Int, List) | Bool in
+            let rec List = Union(Tuple(Int, List), Bool) in
             let f = fun xs: List -> xs in
             let g = fun v: Dyn -> f(v) in
             g((1, (2, 3)))
@@ -3451,17 +3351,12 @@ g(len)").unwrap_err();
     #[test]
     fn a_genuinely_dyn_sourced_value_with_the_wrong_shape_is_rejected_at_runtime() {
         let src = r#"
-            type List = (Int, List) | Bool in
+            let rec List = Union(Tuple(Int, List), Bool) in
             let f = fun xs: List -> xs in
             let g = fun v: Dyn -> f(v) in
             g("not a list at all")
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        let elaborated = typecheck::check_with_named_types(&mut arena, root, &spans, named_types).unwrap();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            machine::run(&arena, elaborated, Env::prelude(), &spans)
-        }));
-        assert!(outcome.is_err(), "expected the runtime boundary check to reject a Str where List is required");
+        rejects(src, "expected (Int, List) | Bool, found Str");
     }
 
     #[test]
@@ -3479,7 +3374,7 @@ g(len)").unwrap_err();
         // real runtime boundary check against A, not coerce's own static
         // rescue (mirrors a_genuinely_dyn_sourced_value_is_checked_at_runtime_against_a_named_type_all_the_way_down
         // above). With the ancestor-tracking fix, `A`'s own self-reference
-        // contributes nothing new to the check -- `type A = Int | A`
+        // contributes nothing new to the check -- `let rec A = Union(Int, A)`
         // behaves exactly like plain `Int`, the only alternative that can
         // ever actually match -- so this is expected to type-check and RUN
         // TO COMPLETION (not hang or crash) for a genuine Int value. The
@@ -3487,7 +3382,7 @@ g(len)").unwrap_err();
         // itself the primary evidence a stack-overflow bug can't be caught
         // by a plain pass/fail assertion.
         let src = r#"
-            type A = Int | A in
+            let rec A = Union(Int, A) in
             let f = fun xs: A -> xs in
             let g = fun v: Dyn -> f(v) in
             g(1)
@@ -3503,12 +3398,8 @@ g(len)").unwrap_err();
     // unfolding it forever (once overflowed the elaborator's own stack).
     #[test]
     fn a_vec_n_union_self_reference_does_not_infinite_loop_at_a_dyn_boundary() {
-        assert_eq!(run_source("type A = Vec(2) | A in let d: Dyn = [1, 2] in let l: A = d in 1").unwrap().as_int(), 1);
-        rejects("type A = Vec(2) | A in let d: Dyn = 3 in let l: A = d in 1", "type error: expected [Dyn](2) | A, found Int");
-        // A variable length too (index names are program-wide, so the alias's n is xs's).
-        let var = |v: &str| format!("type A = Vec(n) | A in let f = fun xs: Vec(n) -> let d: Dyn = {v} in let l: A = d in 1 in f([1, 2])");
-        assert_eq!(run_source(&var("[3, 4]")).unwrap().as_int(), 1);
-        rejects(&var("[3]"), "type error: expected [Dyn](n) | A, found List");
+        assert_eq!(run_source("let rec A = Union(Vec(2), A) in let d: Dyn = [1, 2] in let l: A = d in 1").unwrap().as_int(), 1);
+        rejects("let rec A = Union(Vec(2), A) in let d: Dyn = 3 in let l: A = d in 1", "type error: expected [Dyn](2) | A, found Int");
     }
 
     #[test]
@@ -3519,7 +3410,7 @@ g(len)").unwrap_err();
         // structural pattern type), making this a static error instead
         // of running to completion.
         let src = r#"
-            type List = (Int, List) | Bool in
+            let rec List = Union(Tuple(Int, List), Bool) in
             let f = fun xs: List ->
                 match xs
                 | (h, _) -> h
@@ -3554,7 +3445,7 @@ g(len)").unwrap_err();
         // primary evidence a stack-overflow bug can't be caught by a
         // plain pass/fail assertion.
         let src = r#"
-            type A = Int | A in
+            let rec A = Union(Int, A) in
             let f = fun xs: A ->
                 match xs
                 | (h, t) -> h
@@ -3564,18 +3455,8 @@ g(len)").unwrap_err();
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
         let result = typecheck::check_with_named_types(&mut arena, root, &spans, named_types);
-        assert!(result.is_err(), "a List pattern can never match an Int-or-A scrutinee");
-    }
-
-    #[test]
-    fn a_non_recursive_alias_still_produces_no_registry_entries() {
-        let src = r#"
-            type Pair = (Int, Int) in
-            type Triple = (Int, Int, Int) in
-            5
-        "#;
-        let (_, _, _, named_types) = parser::parse_with_named_types(src).unwrap();
-        assert!(named_types.is_empty(), "non-recursive aliases must never populate the registry, got {named_types:?}");
+        let err = result.unwrap_err();
+        assert!(err.0.contains("pattern of type [Dyn] can never match scrutinee of type A"), "unexpected message: {}", err.0);
     }
 
     #[test]
@@ -3583,8 +3464,8 @@ g(len)").unwrap_err();
         // Two SEPARATE recursive aliases with IDENTICAL structure --
         // nominal comparison means they're still not interchangeable.
         let src = r#"
-            type IntList = (Int, IntList) | Bool in
-            type OtherIntList = (Int, OtherIntList) | Bool in
+            let rec IntList = Union(Tuple(Int, IntList), Bool) in
+            let rec OtherIntList = Union(Tuple(Int, OtherIntList), Bool) in
             let f = fun xs: IntList -> xs in
             let make_other: (Dyn -> OtherIntList) = fun _ -> (1, (2, opaque)) in
             f(make_other(opaque))
@@ -3602,7 +3483,7 @@ g(len)").unwrap_err();
         // (This program used to run and return 42, the self-reference
         // checking nothing.)
         let src = r#"
-            type F = (Dyn -> F) in
+            let rec F = Fun(Dyn, F) in
             let make: (Dyn -> Dyn) = fun v -> (fun y -> 42) in
             let x: F = make(opaque) in
             let y: Dyn = x in
@@ -3612,7 +3493,7 @@ g(len)").unwrap_err();
         assert!(err.contains("type error: expected (Dyn -> F), found Int"), "{err}");
         // A result that is a function of the right shape all the way down still passes.
         let ok = r#"
-            type F = (Dyn -> F) in
+            let rec F = Fun(Dyn, F) in
             let rec loop = fun y -> loop in
             let make: (Dyn -> Dyn) = fun v -> loop in
             let x: F = make(opaque) in
@@ -3621,53 +3502,6 @@ g(len)").unwrap_err();
             7
         "#;
         assert_eq!(run_source(ok).unwrap().as_int(), 7);
-    }
-
-    #[test]
-    fn plain_parse_and_check_do_not_panic_on_a_self_referential_type_alias() {
-        // Regression test for the final fix wave's Defect 1:
-        // parser::parse (the ORIGINAL, unchanged signature) builds its
-        // own named_types registry internally (Parser's own field) but
-        // discards it rather than returning it, so pairing plain parse()
-        // with plain typecheck::check() (also unchanged, defaults to an
-        // EMPTY registry) used to reach one of Type::Named's several
-        // consumers' own `.expect("Type::Named with no registry entry --
-        // internal bug")` and PANIC, aborting the whole process --
-        // reachable by any caller (in this repo or a library consumer of
-        // this crate) who uses the preserved parse()/check() pair
-        // instead of the _with_named_types pair on a program using a
-        // self-referential type alias, not an internal-bug-only
-        // condition as the old comments claimed. Every such call site
-        // now degrades gracefully instead of panicking (matching each
-        // function's own existing Dyn/Var-permissive fallback), so
-        // check() below is expected to return a plain Result either way
-        // -- proven here via catch_unwind, mirroring this file's own
-        // existing "prove no panic occurs" style (see
-        // dyn_to_fun_boundary_rejects_closure_with_wrong_return_type and
-        // dyn_sourced_call_falls_back_permissively above). Exercises
-        // pattern_could_match (the `match xs` arms), build_boundary_check/
-        // shape_test (the Dyn-to-List crossing at `f(v)`), and
-        // coerce (the literal tuple argument to `f`) all in one program,
-        // to cover as many of the (five, not four) `expect` sites as one
-        // source string reasonably can.
-        let src = r#"
-            type List = (Int, List) | Bool in
-            let f = fun xs: List ->
-                match xs
-                | (h, _) -> h
-                | _ -> 0
-            in
-            let g = fun v: Dyn -> f(v) in
-            g((1, true))
-        "#;
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (mut arena, spans, root) = parser::parse(src).unwrap();
-            typecheck::check(&mut arena, root, &spans)
-        }));
-        assert!(
-            outcome.is_ok(),
-            "plain parse()+check() must never panic on a self-referential type alias, just possibly error"
-        );
     }
 
     #[test]
@@ -3691,7 +3525,7 @@ g(len)").unwrap_err();
         // test above, or pattern_could_match's own bare-Union coverage in
         // pattern_could_match_does_not_infinite_loop_on_a_bare_union_self_reference).
         let src = r#"
-            type A = Int | A in
+            let rec A = Union(Int, A) in
             let f = fun xs: A -> xs in
             f("wrong")
         "#;
@@ -3703,14 +3537,14 @@ g(len)").unwrap_err();
     #[test]
     fn coerce_accepts_a_bare_union_self_reference_given_the_reachable_alternative() {
         // The accept-side counterpart to the rejection test just above --
-        // an Int literal is exactly the one alternative `type A = Int |
-        // A` can ever actually reduce to (its own self-reference
+        // an Int literal is exactly the one alternative `let rec A =
+        // Union(Int, A)` can ever actually reduce to (its own self-reference
         // contributes nothing new), so coerce()'s static check (relate)
         // must still accept it, the same
         // way it did before (this direction was never broken -- the bug
         // was only ever "accepts too much," never "accepts too little").
         let src = r#"
-            type A = Int | A in
+            let rec A = Union(Int, A) in
             let f = fun xs: A -> xs in
             f(5)
         "#;
@@ -3850,7 +3684,7 @@ g(len)").unwrap_err();
         // reports "no" for a length-5 value, and the union check falls
         // through to [Int], which accepts it.
         let src = r#"
-            type T = Vec(3) | [Int] in
+            let T = Union(Vec(3), List(Int)) in
             let x: Dyn = [1, 2, 3, 4, 5] in
             let y: T = x in
             len(y)
@@ -3886,48 +3720,6 @@ g(len)").unwrap_err();
     fn vec_without_an_index_argument_is_a_parse_error() {
         assert!(parser::parse_type_string("Vec").is_err());
         assert!(parser::parse_type_string("Vec()").is_err());
-    }
-
-    #[test]
-    fn type_alias_cannot_redefine_vec() {
-        // Same guard as `type Int = ... in ...` etc: parse_type's `Vec(`
-        // recognition (see the Vec tests above) runs before the
-        // type_aliases lookup, so a `type Vec = ... in ...` alias would
-        // otherwise parse fine but be silently discarded the moment it's
-        // used as `Vec(...)` -- reject it at the binder instead.
-        let err = parser::parse("type Vec = Int in 5").unwrap_err();
-        assert!(
-            err.contains("cannot redefine builtin type Vec"),
-            "expected a redefine-builtin error mentioning Vec, got: {err}"
-        );
-    }
-
-    #[test]
-    fn indexed_syntax_generalizes_to_a_user_defined_alias() {
-        use expr::Expr;
-        use types::Type;
-        use index_expr::IndexExpr;
-        let src = r#"
-            type List = (Int, List) | Bool in
-            let _x: Indexed(List, 2) = (1, (2, false)) in
-            5
-        "#;
-        let (arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        // Scoped to the parser change alone: inspect the parsed annotation
-        // directly rather than running typecheck (Task 6 -- not yet
-        // implemented -- owns whether a value can actually be CONSTRUCTED
-        // against this type).
-        // The annotation is a call of the prelude's Indexed; it evaluates to
-        // the alias at index 2.
-        let Expr::Let(_, Some(ann), ..) = &arena[root] else { panic!("expected an annotated Let, got {:?}", arena[root]) };
-        match machine::eval_type(&arena, *ann, &spans) {
-            Ok(Type::Indexed(wrapped, idx)) => {
-                assert!(matches!(wrapped.as_ref(), Type::Named(_)), "expected the wrapped type to be Type::Named, got {wrapped:?}");
-                assert_eq!(*idx, IndexExpr::Lit(2));
-            }
-            other => panic!("expected an Indexed(Named(_), 2) annotation, got {other:?}"),
-        }
-        assert_eq!(named_types.len(), 1);
     }
 
     // Types are values (spec 2026-10-10, Stage A): every annotation form is
@@ -4056,19 +3848,17 @@ g(len)").unwrap_err();
     #[test]
     fn indexed_replaces_alias_indexing_and_a_call_is_application() {
         let ok = |src: &str| run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string();
-        assert_eq!(ok("type L = Bool | (Int, L) in let x: Indexed(L, 2) = (1, (2, false)) in 0"), "0");
+        assert_eq!(ok("let rec L = Union(Bool, Tuple(Int, L)) in let x: Indexed(L, 2) = (1, (2, false)) in 0"), "0");
         assert_eq!(ok("let xs: List(Int) = [1] in xs"), "[1]");
         // The arguments are parsed as types, so `(Int, Str)` inside a call in
         // an annotation is the tuple type, not a tuple of two types.
         assert_eq!(ok("let p: Tuple(Int, Str) = (1, \"a\") in p"), "[1, a]");
         let err = run_source("let p: Tuple((Int, Str)) = (1, \"a\") in p").unwrap_err();
         assert!(err.contains("Tuple cannot take a Type"), "{err}");
-        let err = run_source("type Pair = (Int, Int) in let x: Pair(3) = (1, 2) in x").unwrap_err();
+        let err = run_source("let Pair = Tuple(Int, Int) in let x: Pair(3) = (1, 2) in x").unwrap_err();
         assert!(err.contains("attempt to call a non-function value"), "{err}");
         let err = run_source("let x: Nope = 1 in x").unwrap_err();
         assert!(err.contains("unbound variable: Nope"), "{err}");
-        let err = run_source("type Indexed = Int in 0").unwrap_err();
-        assert!(err.contains("cannot redefine builtin type Indexed as an alias"), "{err}");
     }
 
     // Stage B: a `let` whose value is a type names it in annotations, in the
@@ -6412,7 +6202,7 @@ g(len)").unwrap_err();
         // against a required `Bool` is a genuine, provable mismatch,
         // correctly rejected.
         let src = r#"
-            type List = (Int, List) | Bool in
+            let rec List = Union(Tuple(Int, List), Bool) in
             let v: List = (1, false) in
             match v
             | (h, t) -> let proof: Bool = t in 0
@@ -6420,11 +6210,11 @@ g(len)").unwrap_err();
         "#;
         let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
         let result = typecheck::check_with_named_types(&mut arena, root, &spans, named_types);
-        assert!(
-            result.is_err(),
+        let err = result.expect_err(
             "t's real type, if correctly correlated, is Type::Named(id) (a List), which must reject a Bool \
-             annotation -- got Ok, meaning bind_pattern_vars fell back to an unconstrained type instead: {result:?}"
+             annotation -- got Ok, meaning bind_pattern_vars fell back to an unconstrained type instead",
         );
+        assert!(err.0.contains("type mismatch: expected Bool, found List"), "unexpected message: {}", err.0);
     }
 
     // --- Task 3, Case B: Named+Union-derived pattern-match index refinement ---
@@ -6478,20 +6268,16 @@ g(len)").unwrap_err();
         use types::Type;
 
         let src = r#"
-            type List = (Int, List) | Bool in
             match v
             | (h, t) -> let x: Dyn = 0 in x
             | true -> v
             | false -> v
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        // Look up the specific "List" alias's own minted id directly,
-        // rather than relying on `HashMap` iteration order (fragile the
-        // moment a second `type` declaration exists in the same source)
-        // -- `fresh_named_type_id` (parser.rs) mints ids as `"{name}#{n}"`,
-        // so the surface name is always the part before the first `#`.
-        let id = named_types.keys().find(|k| k.split('#').next() == Some("List")).unwrap().clone();
-        let mut infer = InferCtx::new(named_types);
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        // The registry is built by hand: `List = (Int, List) | Bool`.
+        let id = "List#0".to_string();
+        let def = Type::Union(Rc::new(vec![Type::Tuple(Rc::new(vec![Type::Int, Type::Named(id.clone())])), Type::Bool]));
+        let mut infer = InferCtx::new(std::collections::HashMap::from([(id.clone(), def)]));
         let scrut_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend(&Ctx::empty(), "v", scrut_ty);
         let expected = Type::Indexed(Rc::new(Type::Named(id)), Rc::new(IndexExpr::Lit(1)));
@@ -6524,18 +6310,16 @@ g(len)").unwrap_err();
         use types::Type;
 
         let src = r#"
-            type List = (Int, List) | Bool in
             match v
             | (h, t) -> t
             | true -> let x: Dyn = 0 in x
             | false -> let x: Dyn = 0 in x
         "#;
-        let (mut arena, spans, root, named_types) = parser::parse_with_named_types(src).unwrap();
-        // Same fragility fix as the base-case test just above: look up
-        // "List"'s own minted id directly instead of relying on
-        // `HashMap` iteration order.
-        let id = named_types.keys().find(|k| k.split('#').next() == Some("List")).unwrap().clone();
-        let mut infer = InferCtx::new(named_types);
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        // The registry is built by hand: `List = (Int, List) | Bool`.
+        let id = "List#0".to_string();
+        let def = Type::Union(Rc::new(vec![Type::Tuple(Rc::new(vec![Type::Int, Type::Named(id.clone())])), Type::Bool]));
+        let mut infer = InferCtx::new(std::collections::HashMap::from([(id.clone(), def)]));
         let scrut_ty = Type::Indexed(Rc::new(Type::Named(id.clone())), Rc::new(IndexExpr::Var("n".to_string())));
         let ctx = extend(&Ctx::empty(), "v", scrut_ty);
         let expected = Type::Indexed(
@@ -6599,7 +6383,7 @@ g(len)").unwrap_err();
         // to make this test genuinely exercise the fix -- re-verified
         // below.
         let src = r#"
-            type List = List | (Int, List) in
+            let rec List = Union(List, Tuple(Int, List)) in
             let f: (List -> Int) = fun v ->
                 match v
                 | (h, t) -> 0
@@ -6670,7 +6454,7 @@ g(len)").unwrap_err();
         // `bind_pattern_vars_union_arm_does_not_infinite_loop_on_a_bare_self_referential_alternative`
         // test, for the same finding.
         let src = r#"
-            type List = List | (Int, List) in
+            let rec List = Union(List, Tuple(Int, List)) in
             let f: (List -> Int) = fun v ->
                 match v
                 | (h, (h2, t2)) -> let proof: Bool = h2 in 0
@@ -6907,7 +6691,7 @@ g(len)").unwrap_err();
         // deliberately-unrelated exhaustiveness rule without touching
         // what this test actually exercises (Case B step construction).
         let src = r#"
-            type List = (Int, List) | Bool in
+            let rec List = Union(Tuple(Int, List), Bool) in
             let f: (Int -> Indexed(List, 1)) = fun n -> (n, false) in
             match f(9)
             | (h, t) -> h
@@ -6922,7 +6706,7 @@ g(len)").unwrap_err();
     #[test]
     fn tuple_checked_against_case_b_indexed_rejects_wrong_arity() {
         let src = r#"
-            type List = (Int, List) | Bool in
+            let rec List = Union(Tuple(Int, List), Bool) in
             let f: (Int -> Indexed(List, 1)) = fun n -> (n, n, false) in
             f(9)
         "#;
@@ -6944,7 +6728,7 @@ g(len)").unwrap_err();
     #[test]
     fn base_case_construction_against_case_b_indexed_unifies_index_to_zero() {
         let src = r#"
-            type List = (Int, List) | Bool in
+            let rec List = Union(Tuple(Int, List), Bool) in
             let f: (Int -> Indexed(List, 0)) = fun n -> false in
             f(9)
         "#;
@@ -6972,7 +6756,7 @@ g(len)").unwrap_err();
         // length-indexed List(n), needing Task 5 (syntax), Task 6
         // (construction) and Task 3 (LetRec) all together.
         let src = r#"
-            type List = (Int, List) | Bool in
+            let rec List = Union(Tuple(Int, List), Bool) in
             let rec same_length: (Indexed(List, n) -> Indexed(List, n)) = fun v ->
                 match v
                 | (h, t) -> (h, same_length(t))
@@ -7015,7 +6799,7 @@ g(len)").unwrap_err();
         // ordinary trailing unify_fits check instead, which correctly
         // confirms `w`'s type is still T(2).
         let src = r#"
-            type T = Dyn | (Int, T) in
+            let rec T = Union(Dyn, Tuple(Int, T)) in
             let v: Indexed(T, 2) = (1, (2, 5)) in
             let w: Indexed(T, 2) = v in
             0
@@ -7037,7 +6821,7 @@ g(len)").unwrap_err();
         // fallback (which has no Indexed-vs-Named consistent arm and
         // would reject it).
         let src = r#"
-            type T = Vec(3) | (Int, T) in
+            let rec T = Union(Vec(3), Tuple(Int, T)) in
             let v: Vec(3) = [1, 2, 3] in
             let b: Indexed(T, 0) = v in
             0
@@ -7126,20 +6910,20 @@ g(len)").unwrap_err();
 
     #[test]
     fn indexing_a_non_indexable_alias_reports_it_is_not_indexable() {
-        let err = run_source("type Pair = (Int, Int) in let x: Indexed(Pair, 3) = (1, 2) in x").unwrap_err();
+        let err = run_source("let Pair = Tuple(Int, Int) in let x: Indexed(Pair, 3) = (1, 2) in x").unwrap_err();
         assert!(err.contains("(Int, Int) is not an indexable type"), "unexpected message: {err}");
     }
 
     #[test]
     fn step_shaped_tuple_through_a_let_keeps_its_index() {
-        let t = "type T = Dyn | (Int, T) in\n";
+        let t = "let rec T = Union(Dyn, Tuple(Int, T)) in\n";
         assert!(run_source(&format!("{t}let p = (1, 5) in let w: Indexed(T, 1) = p in 0")).is_ok());
         assert!(run_source(&format!("{t}let p = (1, (2, 5)) in let w: Indexed(T, 2) = p in 0")).is_ok());
         assert!(run_source(&format!("{t}let p = (1, 5) in let w: Indexed(T, 0) = p in 0")).is_ok());
-        assert!(run_source(&format!("{t}let p = (1, 5) in let w: Indexed(T, 2) = p in 0")).is_err());
+        rejects(&format!("{t}let p = (1, 5) in let w: Indexed(T, 2) = p in 0"), "index 2 does not unify with index 0");
         // Dyn base alternative: the inner (2, 5) is a valid T(0).
         assert!(run_source(&format!("{t}let p = (1, (2, 5)) in let w: Indexed(T, 1) = p in 0")).is_ok());
-        assert!(run_source(&format!("{t}let p = (true, 5) in let w: Indexed(T, 1) = p in 0")).is_err());
+        rejects(&format!("{t}let p = (true, 5) in let w: Indexed(T, 1) = p in 0"), "index 1 does not unify with index 0");
     }
 
     #[test]
@@ -7810,7 +7594,7 @@ g(len)").unwrap_err();
     #[test]
     fn a_named_return_through_dyn_terminates_without_upcast() {
         // Only an annotated binding gives a source Fun a recursive Named return that typechecks today.
-        assert_eq!(run_source("type F = Int | (Int, F) in let mk: (Int -> F) = fun a: Int -> a in let d: Dyn = mk in d(1)").unwrap().as_int(), 1);
+        assert_eq!(run_source("let rec F = Union(Int, Tuple(Int, F)) in let mk: (Int -> F) = fun a: Int -> a in let d: Dyn = mk in d(1)").unwrap().as_int(), 1);
     }
 
     #[test]
@@ -7948,7 +7732,7 @@ g(len)").unwrap_err();
 
     #[test]
     fn a_function_into_a_recursive_alias_it_does_not_satisfy_is_rejected() {
-        let src = "type F = Dyn -> F in let g: F = fun x: Int -> fun y: Int -> y in let d: Dyn = g in d(true)";
+        let src = "let rec F = Fun(Dyn, F) in let g: F = fun x: Int -> fun y: Int -> y in let d: Dyn = g in d(true)";
         // relate unfolds F: the depth-2 result Int is not an F, so this is Refuted (S0 finding 1).
         assert!(run_source(src).unwrap_err().contains("type mismatch"));
     }
@@ -8238,13 +8022,14 @@ g(len)").unwrap_err();
         assert_eq!(run_source(&within("[Vec(n)]", "[[1, 2], [3, 4]]")).unwrap().as_int(), 1);
         // A Dyn parameter crossed into [Vec(n)] on a call.
         rejects("let g = fun xs: Vec(n) -> fun d: Dyn -> let ys: [Vec(n)] = d in len(ys) in g([1, 2])([[1, 2], [3]])", "found List at element 1");
-        // Tuple, record, and through a recursive alias (index names are program-wide).
+        // Tuple, record, and through a type function (index names are program-wide).
         rejects(&within("(Vec(n), Int)", "([1], 3)"), "type error: expected ([Dyn](n), Int), found List at element 0");
         assert_eq!(run_source(&within("(Vec(n), Int)", "([1, 2], 3)")).unwrap().as_int(), 1);
         rejects(&within("{a: Vec(n)}", "{a: [1]}"), "type error: expected {a: [Dyn](n)}, found List at field a");
-        let alias = |v: &str| format!("type T = (Vec(n), T) | Bool in {}", within("T", v));
-        rejects(&alias("([1, 2], ([1], true))"), "found List at element 1, element 0");
-        assert_eq!(run_source(&alias("([1, 2], ([3, 4], true))")).unwrap().as_int(), 1);
+        let alias = |v: &str| format!("let T = fun v -> Union(Tuple(v, Bool), Bool) in {}", within("T(Vec(n))", v));
+        rejects(&alias("([1], true)"), "found List at element 0");
+        rejects(&alias("([1], true)"), "expected ([Dyn](n), Bool) | Bool");
+        assert_eq!(run_source(&alias("([3, 4], true)")).unwrap().as_int(), 1);
         // Index arithmetic over the slot.
         rejects(&within("[Vec(n + 1)]", "[[1, 2]]"), "type error: expected [[Dyn](n + 1)], found List at element 0");
         assert_eq!(run_source(&within("[Vec(n + 1)]", "[[1, 2, 3]]")).unwrap().as_int(), 1);
@@ -8322,7 +8107,7 @@ g(len)").unwrap_err();
         let programs = [
             within("[Vec(n)]", "[[1, 2]]"),
             within("Vec(n) | (Int -> Int)", "[1, 2]"),
-            format!("type T = (Vec(n), T) | Bool in {}", within("T", "true")),
+            format!("let T = fun v -> Union(Tuple(v, Bool), Bool) in {}", within("T(Vec(n))", "true")),
             // a closure-form cast to Dyn: the inner wrapper checks ys against the witness of xs
             "let f = fun xs: Vec(n) -> fun ys: Vec(n) -> len(ys) in let d: Dyn = f in d([1, 2])([3, 4])".to_string(),
             // a pending (sink-then-call) cast next to a slot
@@ -8802,9 +8587,9 @@ g(len)").unwrap_err();
 
     #[test]
     fn deep_unions_check_inside_the_alternatives() {
-        rejects("type IS = Int | Str in let d: Dyn = [1, true] in let xs: [IS] = d in xs", "found Bool at element 1");
+        rejects("let IS = Union(Int, Str) in let d: Dyn = [1, true] in let xs: [IS] = d in xs", "found Bool at element 1");
         rejects("let u: [Int] | [Str] = map(fun x -> x)([true]) in u", "expected [Int] | [Str], found Bool at element 0");
-        assert_eq!(run_source("type IS = Int | Str in let d: Dyn = [1, \"a\"] in let xs: [IS] = d in len(xs)").unwrap().as_int(), 2);
+        assert_eq!(run_source("let IS = Union(Int, Str) in let d: Dyn = [1, \"a\"] in let xs: [IS] = d in len(xs)").unwrap().as_int(), 2);
     }
 
     #[test]
@@ -8814,9 +8599,9 @@ g(len)").unwrap_err();
 
     #[test]
     fn deep_recursive_aliases_are_checked_through_the_container() {
-        rejects("type L = (Int, L) | Bool in let d: Dyn = (1, (2, 3)) in let t: L = d in t", "at element 1, element 1");
-        rejects("type T = Int | [T] in let d: Dyn = [1, [2, true]] in let t: T = d in t", "found Bool at element 1, element 1");
-        let ok = "type L = (Int, L) | Bool in let rec mk = fun n -> if n == 0 then true else (n, mk(n - 1)) in let l: L = mk(2000) in 1";
+        rejects("let rec L = Union(Tuple(Int, L), Bool) in let d: Dyn = (1, (2, 3)) in let t: L = d in t", "at element 1, element 1");
+        rejects("let rec T = Union(Int, List(T)) in let d: Dyn = [1, [2, true]] in let t: T = d in t", "found Bool at element 1, element 1");
+        let ok = "let rec L = Union(Tuple(Int, L), Bool) in let rec mk = fun n -> if n == 0 then true else (n, mk(n - 1)) in let l: L = mk(2000) in 1";
         assert_eq!(run_source(ok).unwrap().as_int(), 1);
     }
 
@@ -8840,10 +8625,10 @@ g(len)").unwrap_err();
             "let f = fun s: {a: Int} -> s.a + 1 in let r: {a: Dyn, b: Int} = {a: true, b: 2} in f(r)",
             "found Bool at field a",
         );
-        rejects("type L = (Int, L) | Bool in let p: (Int, Dyn) = (1, 2) in let l: L = p in 1", "found Int at element 1");
-        rejects("type T = {v: Int, kids: [T]} in let d: Dyn = [true] in let t: T = {v: 1, kids: d} in 1", "at field kids, element 0");
+        rejects("let rec L = Union(Tuple(Int, L), Bool) in let p: (Int, Dyn) = (1, 2) in let l: L = p in 1", "found Int at element 1");
+        rejects("let rec T = Record({v: Int, kids: List(T)}) in let d: Dyn = [true] in let t: T = {v: 1, kids: d} in 1", "at field kids, element 0");
         // pure literals stay free and accepted
-        assert_eq!(run_source("type L = (Int, L) | Bool in let l: L = (1, (2, true)) in 1").unwrap().as_int(), 1);
+        assert_eq!(run_source("let rec L = Union(Tuple(Int, L), Bool) in let l: L = (1, (2, true)) in 1").unwrap().as_int(), 1);
         assert_eq!(run_source("let s: {a: Int} = {a: 1, b: true} in s.a").unwrap().as_int(), 1);
     }
 
@@ -8852,8 +8637,8 @@ g(len)").unwrap_err();
     // and in the failing case.
     #[test]
     fn deep_union_alternatives_sharing_a_prefix_do_not_blow_up() {
-        let rec = "type T = {k: [T], v: Int} | {k: [T], v: Str} in let rec mk = fun n: Int -> fun leaf: Dyn -> if n == 0 then {k: [], v: leaf} else {k: [mk(n - 1)(leaf)], v: \"s\"}";
-        let tup = "type T = (T, Int) | (T, Bool) | Bool in let rec mk = fun n: Int -> fun leaf: Dyn -> if n == 0 then leaf else (mk(n - 1)(leaf), true)";
+        let rec = "let rec T = Union(Record({k: List(T), v: Int}), Record({k: List(T), v: Str})) in let rec mk = fun n: Int -> fun leaf: Dyn -> if n == 0 then {k: [], v: leaf} else {k: [mk(n - 1)(leaf)], v: \"s\"}";
+        let tup = "let rec T = Union(Tuple(T, Int), Tuple(T, Bool), Bool) in let rec mk = fun n: Int -> fun leaf: Dyn -> if n == 0 then leaf else (mk(n - 1)(leaf), true)";
         for (head, ok_leaf, bad_leaf, at) in [(rec, "\"s\"", "1.5", "field k"), (tup, "true", "7", "element 0")] {
             let started = std::time::Instant::now();
             let ok = format!("{head} in let d: Dyn = mk(22)({ok_leaf}) in let t: T = d in 1");
@@ -8891,7 +8676,7 @@ g(len)").unwrap_err();
     // which would abort the test binary first.
     #[test]
     fn deep_a_very_deep_recursive_value_is_checked_without_overflowing() {
-        let src = "type L = (Int, L) | Bool in let rec mk = fun n -> if n == 0 then true else (n, mk(n - 1)) in let l: L = mk(200000) in 1";
+        let src = "let rec L = Union(Tuple(Int, L), Bool) in let rec mk = fun n -> if n == 0 then true else (n, mk(n - 1)) in let l: L = mk(200000) in 1";
         assert_eq!(run_source(src).unwrap().as_int(), 1);
     }
 
@@ -8900,7 +8685,7 @@ g(len)").unwrap_err();
     // a minute at this depth); the walker's tracked re-run is linear.
     #[test]
     fn deep_a_failing_check_at_depth_is_linear_and_names_the_whole_path() {
-        let src = "type L = (Int, L) | Bool in let rec mk = fun n -> if n == 0 then 7 else (n, mk(n - 1)) in let d: Dyn = mk(20000) in let l: L = d in 1";
+        let src = "let rec L = Union(Tuple(Int, L), Bool) in let rec mk = fun n -> if n == 0 then 7 else (n, mk(n - 1)) in let d: Dyn = mk(20000) in let l: L = d in 1";
         let started = std::time::Instant::now();
         let err = run_source(src).unwrap_err();
         assert!(err.contains("type error: expected (Int, L) | Bool, found Int at element 1, element 1, element 1"), "{}", &err[..err.len().min(160)]);
@@ -8933,9 +8718,9 @@ g(len)").unwrap_err();
         rejects("let d: Dyn = [[1, 2], [3]] in let xs: [Vec(2)] = d in len(xs)", "type error: expected [[Dyn](2)], found List at element 1");
         assert_eq!(run_source("let d: Dyn = [[1, 2], [3, 4]] in let xs: [Vec(2)] = d in len(xs)").unwrap().as_int(), 2);
         // ...through an alias too (a pair is a Vec(2), so this one passes)...
-        let alias = "type A = (Int, [A]) | Vec(2) in let d: Dyn = (1, [[1, 2, 3]]) in let a: A = d in 1";
+        let alias = "let rec A = Union(Tuple(Int, List(A)), Vec(2)) in let d: Dyn = (1, [[1, 2, 3]]) in let a: A = d in 1";
         assert_eq!(run_source(alias).unwrap().as_int(), 1);
-        rejects("type A = (Int, [A]) | Vec(3) in let d: Dyn = (1, [[1, 2]]) in let a: A = d in 1", "at element 1, element 0");
+        rejects("let rec A = Union(Tuple(Int, List(A)), Vec(3)) in let d: Dyn = (1, [[1, 2]]) in let a: A = d in 1", "at element 1, element 0");
         // ...and so is a nested Vec(n) whose n has a run-time value (here v's length)...
         let var = |d: &str| format!("let f = fun v: Vec(n) -> let d: Dyn = {d} in let xs: [Vec(n)] = d in len(xs) in f([1, 2])");
         rejects(&var("[[1, 2], [3]]"), "type error: expected [[Dyn](n)], found List at element 1");
@@ -8947,18 +8732,18 @@ g(len)").unwrap_err();
 
     #[test]
     fn deep_literal_into_a_recursive_alias_is_checked_at_every_level() {
-        let err = run_source("type L = (Int, L) | Bool in let l: L = (1, (2, 3)) in 1").unwrap_err();
+        let err = run_source("let rec L = Union(Tuple(Int, L), Bool) in let l: L = (1, (2, 3)) in 1").unwrap_err();
         assert!(err.contains("type mismatch"), "unexpected message: {err}");
-        assert_eq!(run_source("type L = (Int, L) | Bool in let l: L = (1, (2, true)) in 1").unwrap().as_int(), 1);
+        assert_eq!(run_source("let rec L = Union(Tuple(Int, L), Bool) in let l: L = (1, (2, true)) in 1").unwrap().as_int(), 1);
     }
 
     #[test]
     fn dyn_into_an_indexed_alias_is_checked_against_the_alias() {
         // The index is dropped (no runtime length for an alias); the alias shape is not.
-        let err = run_source("type N = (Int, N) | Bool in let d: Dyn = 5 in let x: Indexed(N, 1) = d in x").unwrap_err();
+        let err = run_source("let rec N = Union(Tuple(Int, N), Bool) in let d: Dyn = 5 in let x: Indexed(N, 1) = d in x").unwrap_err();
         // Verified text: a run-time check, not a static mismatch.
         assert!(err.contains("type error: expected (Int, N) | Bool, found Int"), "unexpected message: {err}");
-        assert_eq!(run_source("type N = (Int, N) | Bool in let d: Dyn = true in let x: Indexed(N, 1) = d in 1").unwrap().as_int(), 1);
+        assert_eq!(run_source("let rec N = Union(Tuple(Int, N), Bool) in let d: Dyn = true in let x: Indexed(N, 1) = d in 1").unwrap().as_int(), 1);
     }
 
     #[test]
@@ -8978,7 +8763,7 @@ g(len)").unwrap_err();
     #[test]
     fn an_empty_list_literal_into_an_alias_or_union_is_checked_at_run_time() {
         // Regression for the empty-literal shortcut in coerce_check: these must not be accepted unchecked.
-        let err = run_source("type L = (Int, L) | Bool in let s: L = [] in s").unwrap_err();
+        let err = run_source("let rec L = Union(Tuple(Int, L), Bool) in let s: L = [] in s").unwrap_err();
         assert!(err.contains("type error: expected (Int, L) | Bool, found List"), "unexpected message: {err}");
         let err = run_source("let s: (Int, Int) | Bool = [] in s").unwrap_err();
         assert!(err.contains("type error: expected (Int, Int) | Bool, found List"), "unexpected message: {err}");
@@ -9026,7 +8811,7 @@ g(len)").unwrap_err();
     #[test]
     fn a_function_into_a_recursive_alias_it_may_satisfy_is_wrapped() {
         // Unknown, not Refuted: wrapped against the unfolding, so `true` meets the Int parameter.
-        let err = run_source("type G = Dyn -> (G | Int) in let g: G = fun x: Int -> x in let d: Dyn = g in d(true)").unwrap_err();
+        let err = run_source("let rec G = Fun(Dyn, Union(G, Int)) in let g: G = fun x: Int -> x in let d: Dyn = g in d(true)").unwrap_err();
         assert!(err.contains("expected Int"), "unexpected message: {err}");
     }
 
@@ -9059,7 +8844,7 @@ g(len)").unwrap_err();
     #[test]
     fn a_function_returning_a_function_into_a_recursive_alias_is_wrapped_at_each_level() {
         // Baseline rejected both (fits could not unfold G); relate says Unknown, so the pair is wrapped.
-        let head = "type G = Dyn -> (G | Int) in let g: G = fun x: Int -> fun y: Int -> y in let d: Dyn = g in ";
+        let head = "let rec G = Fun(Dyn, Union(G, Int)) in let g: G = fun x: Int -> fun y: Int -> y in let d: Dyn = g in ";
         assert_eq!(run_source(&format!("{head}d(1)(2)")).unwrap().as_int(), 2);
         let err = run_source(&format!("{head}d(1)(true)")).unwrap_err();
         assert!(err.contains("expected Int, found Bool"), "unexpected message: {err}");

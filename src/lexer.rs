@@ -23,7 +23,7 @@ pub enum Token {
     // with a same-shaped tuple carrying a DIFFERENT `opaque`'s.
     #[token("opaque")]
     Opaque,
-    // `type Name = TypeExpr in body` -- names a type expression (see
+    // The `type` form (Name, `=`, TypeExpr, `in`, body) -- names a type expression (see
     // parser::Parser::type_aliases), a pure compile-time directive with
     // no runtime effect of its own.
     #[token("type")]

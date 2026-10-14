@@ -244,7 +244,7 @@ pub struct ConformSpec {
 // keeps the type's address from being reused by another type), and a Lowered's
 // function contract holds one for its parameter and one for its result.
 // Those are drawn from the root's `family`: a type already in it is reused,
-// so a recursive type (`type F = Dyn -> F`) lowers to a finite cyclic graph
+// so a recursive type (`let rec F = Fun(Dyn, F)`) lowers to a finite cyclic graph
 // once, not a fresh chain per call. The family lists its members weakly, so
 // only the graph itself keeps them alive.
 #[derive(Debug)]

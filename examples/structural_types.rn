@@ -1,12 +1,12 @@
-// Tuple types are STRUCTURAL by default: two DIFFERENTLY-named `type`
-// aliases for the same shape unify freely -- Meters and Seconds below are
-// both just aliases for (Int,), so a plain (Int,) value satisfies either
+// Tuple types are STRUCTURAL by default: two DIFFERENTLY-named type `let`s
+// for the same shape unify freely -- Meters and Seconds below are
+// both just names for (Int,), so a plain (Int,) value satisfies either
 // annotation with no cast or conversion needed. (types::consistent needs
 // no cycle-guard for this: Type::Tuple/Type::Union are always finite
-// trees -- an alias name is resolved once, at parse time, to the type
-// expression it names, not to a type that can refer back to itself.)
-type Meters = (Int,) in
-type Seconds = (Int,) in
+// trees -- a non-recursive type `let` names a finite type expression,
+// not a type that can refer back to itself.)
+let Meters = Tuple((Int,)) in
+let Seconds = Tuple((Int,)) in
 
 let identity_meters = fun x: Meters -> x in
 let five = identity_meters((5,)) in   // (5,) freely satisfies either alias

@@ -239,7 +239,7 @@ fn go(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, depth: usize) -> 
         }
         (_, Type::Named(id)) => match infer.named_types.get(id) {
             // Unfolding the same alias against the same source again is a cycle with no new evidence
-            // (`type A = Int | A`): no finite derivation, so Refuted rather than Lazy.
+            // (`let rec A = Union(Int, A)`): no finite derivation, so Refuted rather than Lazy.
             Some(_) if fuel.unfolding.borrow().iter().any(|(f, i)| i == id && *f == from) => Rel::refuted("named: cyclic unfolding"),
             Some(raw) => {
                 fuel.unfolding.borrow_mut().push((from.clone(), id.clone()));
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn relate_terminates_on_degenerate_aliases() {
-        // type A = A | A | Bool (2^64 steps by depth alone), type B = B, type C = Int | C: unfolding the
+        // let rec A = Union(A, A, Bool) (2^64 steps by depth alone), let rec B = B, let rec C = Union(Int, C): unfolding the
         // same alias against the same source again is a cycle, so these are Refuted, not Lazy.
         let reg = HashMap::from([
             ("A#1".to_string(), uni(&[named("A#1"), named("A#1"), Type::Bool])),

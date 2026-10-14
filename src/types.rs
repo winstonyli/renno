@@ -53,10 +53,10 @@ pub enum Type {
     // identity using nothing but ordinary structural comparison -- no
     // separate name-registry/brand-comparison mechanism needed.
     Token(u64),
-    // A reference to a genuinely self-referential `type` alias's own
-    // definition -- `type List = (Int, List) | Bool in ...` -- rather
+    // A reference to a genuinely self-referential type's own
+    // definition -- `let rec List = Union(Tuple(Int, List), Bool) in ...` -- rather
     // than the ordinary, fully-expanded structural value every OTHER
-    // (non-recursive) alias resolves to directly. The string is always
+    // (non-recursive) type resolves to directly. The string is always
     // a gensym'd unique id in the shape "Base#N" (see parser::atom's
     // own `Token::TypeKw` arm), never the bare user-typed name --
     // aliases in different, unrelated scopes can share a surface name,
@@ -108,7 +108,7 @@ pub enum Type {
     // distinct Token (a hand-rolled sum: `Type::Union([Tuple([
     // Token(id_none)]), Tuple([Token(id_some), Int])])`), but nothing
     // here requires that shape -- any two types can be unioned. Named via
-    // `type Name = A | B in ...` (Parser::type_aliases); the union itself
+    // `let Name = Union(A, B) in ...`; the union itself
     // has no runtime representation of its own, only whatever VALUE
     // actually flows through ends up being one alternative's own shape.
     Union(Rc<Vec<Type>>),

@@ -1189,7 +1189,7 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
                 // No element to check, but no tuple of positive arity is empty (relate sees `[a]`).
                 // Only a list target is trusted without a test: `[]` is not an alias, union or record
                 // value. (Returning `Ok(e)` for every other target was a soundness hole found in round
-                // 1: `let s: L = []` with `type L = (Int, L) | Bool` ran unchecked.)
+                // 1: `let s: L = []` with `let rec L = Union(Tuple(Int, L), Bool)` ran unchecked.)
                 match strip_indexed(&env.infer.resolve_deep(to)) {
                     Type::Tuple(ts) if !ts.is_empty() => return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span)),
                     Type::List(_) => return Ok(e),
@@ -1689,10 +1689,10 @@ fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut H
         //
         // If `id` is already an ancestor in THIS unfold chain, stop instead
         // of unfolding again, and check nothing (matching the Type::Var(_)
-        // arm above): `type A = A | (Int -> Int)` would otherwise unfold
+        // arm above): `let rec A = Union(A, Fun(Int, Int))` would otherwise unfold
         // forever. A contract's result is a Lazy of its own (shared with every
         // equal type of the same lowering, Lazy::child), so a self-reference
-        // there (`type F = Dyn -> F`) is checked at each call.
+        // there (`let rec F = Fun(Dyn, F)`) is checked at each call.
         Type::Named(id) => match named.get(id) {
             Some(raw) if visiting.insert(id.clone()) => boundary(raw, named, visiting),
             _ => Boundary::None,
@@ -2018,7 +2018,7 @@ fn shape_of(ty: &Type, env: &CheckEnv) -> Shape {
 // `unguarded` holds
 // the Named aliases unfolded since the last container: meeting one again
 // there would loop without consuming the value, so it is `Never` (making
-// `type A = Int | A` behave as plain Int). Past a container, a Named alias
+// `let rec A = Union(Int, A)` behave as plain Int). Past a container, a Named alias
 // becomes one `Ref` into `defs`, whose body is built once, so a recursive
 // alias terminates because the value does. An unregistered Named is `Any`
 // ("no information here").
@@ -2320,7 +2320,7 @@ fn record_field_type(ty: &Type, name: &str) -> Option<Type> {
 // point (the Expr::Match call site below) and extended by exactly one id
 // each time the Type::Named arm actually descends into an unfold. Needed
 // for the same reason it's needed there: a self-referential alias whose
-// recursive occurrence is a BARE Union alternative (`type A = Int | A`)
+// recursive occurrence is a BARE Union alternative (`let rec A = Union(Int, A)`)
 // unfolds to the exact same Union([Int, Named(id)]) every time, and a
 // Record/List pattern's own Union arm just below fans out into EVERY
 // alternative (including that same Named(id) again) -- without this,
@@ -2363,7 +2363,7 @@ fn pattern_could_match(pat: &Pattern, ty: &Type, named_types: &HashMap<String, T
         // again -- re-trying the same id against the same pattern gives
         // no new information beyond what the non-recursive alternatives
         // already cover (the `any()` fan-out above already tried them),
-        // so this correctly makes e.g. `type A = Int | A` behave
+        // so this correctly makes e.g. `let rec A = Union(Int, A)` behave
         // equivalently to plain `Int` for reachability purposes instead
         // of recursing forever.
         (_, Type::Named(id)) => {
@@ -2461,8 +2461,8 @@ fn qualifying_named_alternatives(id: &str, named_types: &HashMap<String, Type>) 
 // occurrence-count check -- so the caller can retype it as
 // `Type::Indexed(Named(id), fresh)`, the same override Case A already
 // does for a Cons's own tail. Only the spec's own worked shape is
-// recognized: the self-reference IS the whole alternative (`type X = Y
-// | X`), or the alternative is a Tuple with the self-reference as one
+// recognized: the self-reference IS the whole alternative (`let rec X =
+// Union(Y, X)`), or the alternative is a Tuple with the self-reference as one
 // bare item (the spec's own `(Int, List)`) -- mirroring Case A's own
 // "bare Var tail only" v1 restriction, anything with the self-reference
 // nested deeper (inside a further Tuple/List/Record) returns None, the
@@ -2489,8 +2489,8 @@ fn self_ref_pattern<'a>(pat: &'a Pattern, step_alt: &Type, id: &str) -> Option<&
 // Tuple's items instead of a &Pattern, since a Tuple literal's items
 // at a construction site are ExprRefs, not Patterns to recurse into.
 // Deliberately does NOT also mirror self_ref_pattern's separate
-// top-level `Type::Named(n) if n == id` case (for a degenerate `type X
-// = Y | X` shape, the self-reference IS the whole alternative) -- not
+// top-level `Type::Named(n) if n == id` case (for a degenerate `let rec X
+// = Union(Y, X)` shape, the self-reference IS the whole alternative) -- not
 // an oversight, just unreachable from this function's only call site,
 // which has already matched `step_alt` as a `Type::Tuple` (the
 // step-shaped-literal check) before ever calling this.
@@ -2666,7 +2666,7 @@ fn bind_fresh_record_fields(
 // the Type::Union arm's own `pattern_could_match` probe used a fresh,
 // empty set on every call, with no memory of an enclosing Type::Named
 // arm's own unfolding -- letting a Union alternative that is itself a
-// bare self-reference (e.g. `type List = List | (Int, List)`, where the
+// bare self-reference (e.g. `let rec List = Union(List, Tuple(Int, List))`, where the
 // FIRST alternative is `Named("List")` verbatim) look "reachable" via
 // its own fresh probe forever, recursing without end. See this task's
 // own fix-round-1 report entry for the traced counterexample.
@@ -2756,7 +2756,7 @@ fn bind_pattern_vars(
             // `(h, t)`) gets here -- without this arm it fell into the
             // generic catch-all below, no correlation at all.
             Type::Indexed(wrapped, _) => bind_pattern_vars(ctx, pat, wrapped, infer, span, visiting),
-            // A Type::Named scrutinee (a `type X = ... in` alias
+            // A Type::Named scrutinee (a recursive `let rec X = ... in` type
             // reference) -- unfold ONE level via infer.named_types and
             // recurse, mirroring pattern_could_match's own Type::Named
             // arm exactly (including its "unknown id" permissive
@@ -2776,7 +2776,7 @@ fn bind_pattern_vars(
             // reachability probe with a FRESH, empty visiting set every
             // time, disconnected from whatever this arm had already
             // unfolded -- so a Union alternative that is ITSELF a bare
-            // self-reference (`type List = List | (Int, List)`) could
+            // self-reference (`let rec List = Union(List, Tuple(Int, List))`) could
             // look reachable forever, recursing without end (see this
             // task's own fix-round-1 report entry for the traced
             // repro). Mirrors pattern_could_match's own Type::Named arm
@@ -3028,7 +3028,7 @@ fn missing_case(patterns: &[&Pattern], scrut_ty: &Type) -> Option<String> {
     // A Union's alternatives are independent -- unlike Tuple, no SINGLE
     // pattern needs to cover the whole thing; exhaustive means every
     // alternative has SOME pattern (not necessarily the same one) that
-    // fully covers it. `type Pair = (Int,) | (Int, Int) in ... | (n,) ->
+    // fully covers it. `let Pair = Union(Tuple((Int,)), Tuple(Int, Int)) in ... | (n,) ->
     // ... | (n, m) -> ...` is exhaustive this way even though neither arm
     // alone would satisfy Tuple's own single-pattern check.
     if let Type::Union(alts) = scrut_ty {
@@ -3736,7 +3736,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // what counts as "universally consistent" -- Dyn/Var is
                 // permissive on EITHER side, not just `actual_ty`'s. A
                 // qualifying named union whose BASE alternative happens to
-                // be Dyn/Var (e.g. `type T = Dyn | (Int, T)`) makes
+                // be Dyn/Var (e.g. `let rec T = Union(Dyn, Tuple(Int, T))`) makes
                 // `consistent(actual_ty, base_alt)` trivially true for ANY
                 // `actual_ty`, including a genuinely step-shaped one (a
                 // `w: T(2) = v` reference to an already-Indexed(Named(T),
@@ -3773,7 +3773,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // that motivated the original Dyn/Var exclusion). The
                 // Indexed exclusion only applies when base_alt is itself
                 // Dyn/Var -- an Indexed actual_ty against a concrete,
-                // non-Dyn/Var base_alt (e.g. `type T = Vec(3) | (Int, T)`)
+                // non-Dyn/Var base_alt (e.g. `let rec T = Union(Vec(3), Tuple(Int, T))`)
                 // still gets a chance here, since the generic fallback's
                 // `consistent` has no Indexed-vs-Named arm to catch that
                 // case on its own.
@@ -3785,8 +3785,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // `let x: T(0) = 5 in x` and the deeper `let v: T(2) =
                 // (1, (2, 5))` (whose innermost `5` is checked against a
                 // still-symbolic `T(2 - 1 - 1)`) both keep working, since
-                // Int is never Type::Indexed; and `type T = Vec(3) |
-                // (Int, T) in let b: T(0) = [1,2,3] in ...` (actual_ty =
+                // Int is never Type::Indexed; and `let rec T = Union(Vec(3),
+                // Tuple(Int, T)) in let b: T(0) = [1,2,3] in ...` (actual_ty =
                 // Indexed(List,3), base_alt = Indexed(List,3), not
                 // Dyn/Var) still unifies index 0 correctly.
                 let actual_is_indexed = matches!(actual_ty, Type::Indexed(..));

@@ -1894,7 +1894,7 @@ mod tests {
         assert_eq!(explain(&nested, &[], &[], &record, &mut path).type_name(), "Bool");
         assert_eq!(path, ["field b", "element 1"]);
 
-        // type L = (Int, L) | Bool: the alias body is defs[0], reached through Ref(0).
+        // let rec L = Union(Tuple(Int, L), Bool): the type body is defs[0], reached through Ref(0).
         let defs = [Test::Or(vec![Test::TupleOf(vec![Test::Int, Test::Ref(0)]), Test::Bool])];
         let pair = |a: Value, b: Value| Value::List(Rc::new(vec![a, b]));
         let good = pair(Value::Int(1), pair(Value::Int(2), Value::Bool(true)));
