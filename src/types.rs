@@ -418,10 +418,12 @@ pub fn close_group(names: &[Rc<str>], ids: &[u64], results: &[Option<Type>]) -> 
             }
         };
         let outside = |id: u64, _: u32, closed: &[Option<Type>]| index.get(&id).and_then(|&m| if scc_of[m] == c { None } else { closed[m].clone() });
-        if !referenced[comp[0]] {
-            // A lone member nothing mentions (a cycle would mention itself): no group.
+        if comp.len() == 1 && !succ[comp[0]].contains(&comp[0]) {
+            // A lone member that is not on a cycle (others may mention it): no group, just its
+            // type with the finished members it reaches.
             let m = comp[0];
             out[m] = results[m].as_ref().map(|t| replace_free(t, 0, &|id, d| outside(id, d, &closed)).unwrap_or_else(|| t.clone()));
+            closed[m] = out[m].clone();
             continue;
         }
         let mut types: Vec<Type> = Vec::with_capacity(comp.len());
@@ -547,7 +549,9 @@ fn canonical_order(comp: &mut [usize], bodies: &HashMap<usize, Type>, index: &Ha
         match t {
             Type::RecVar(RecVar::Free { id, .. }) => match colour(*id) {
                 Some(k) => (1u8, k).hash(h),
-                None => (2u8, id).hash(h),
+                // An enclosing group's placeholder: its id is fresh per evaluation, so only
+                // the fact that it is one may enter the hash.
+                None => 2u8.hash(h),
             },
             Type::RecVar(RecVar::Bound { depth, member }) => (3u8, depth, member).hash(h),
             Type::Rec(g, k) => {

@@ -3573,6 +3573,26 @@ g(len)").unwrap_err();
         assert_ne!(a1, b1);
     }
 
+    // A nested mutual component that mentions an enclosing placeholder: the placeholder's id is
+    // fresh per build and must not decide the member order.
+    #[test]
+    fn rec_close_order_ignores_the_ids_of_enclosing_placeholders() {
+        use std::rc::Rc;
+        use types::{close_group, fresh_rec_id, Type};
+        let n = |s: &str| -> Rc<str> { Rc::from(s) };
+        let build = || {
+            let (o, x, y) = (fresh_rec_id(), fresh_rec_id(), fresh_rec_id());
+            let xb = rec_uni(vec![Type::Int, rec_tup(vec![rec_free(y, "Y"), rec_free(o, "O")])]);
+            let yb = rec_uni(vec![Type::Str, rec_tup(vec![rec_free(x, "X"), rec_free(o, "O")])]);
+            let inner = close_group(&[n("X"), n("Y")], &[x, y], &[Some(xb), Some(yb)]).unwrap().remove(0).unwrap();
+            close_group(&[n("O")], &[o], &[Some(rec_uni(vec![Type::Bool, inner]))]).unwrap().remove(0).unwrap()
+        };
+        let first = build();
+        for _ in 0..16 {
+            assert_eq!(first, build());
+        }
+    }
+
     #[test]
     fn rec_types_are_equal_up_to_names() {
         use types::Type;
@@ -4969,6 +4989,28 @@ g(len)").unwrap_err();
                       let rec B2 = Union(Str, Tuple(Bool, A2)) and A2 = Union(Bool, Tuple(Int, B2)) in ";
         assert_eq!(run(&format!("{mutual}(A == A2, B == B2, A == B)")), "[true, true, false]");
         assert_eq!(run(&format!("{mutual}let x: A2 = (1, (true, false)) in let y: A = x in y")), "[1, [true, false]]");
+    }
+
+    // A nested mutual group inside a type function / an outer group: equal across builds.
+    #[test]
+    fn a_nested_mutual_recursive_type_is_equal_across_builds() {
+        let run = |s: &str| run_source(s).unwrap().to_string();
+        let w = "let W = fun v -> (let rec O = Union(v, (let rec X = Union(Int, Tuple(Y, O)) and Y = Union(Str, Tuple(X, O)) in X)) in O) in ";
+        assert_eq!(
+            run(&format!("{w}let x: W(Bool) = true in let y: W(Bool) = x in let z: W(Bool) = 3 in let f = fun a: W(Bool) -> a in (f(y), f(z), f((\"s\", true)))")),
+            "[true, 3, [s, true]]"
+        );
+        assert_eq!(run(&format!("{w}W(Bool) == W(Bool)")), "true");
+        let ok = |i: usize| format!("let rec Ok{i} = Union(Bool, (let rec X = Union(Int, Tuple(Y, Ok{i})) and Y = Union(Str, Tuple(X, Ok{i})) in X)) in ");
+        let src = format!("{}(Ok0 == Ok1, Ok0 == Ok2, Ok0 == Ok3, Ok0 == Ok4, Ok0 == Ok5)", (0..6).map(ok).collect::<String>());
+        assert_eq!(run(&src), "[true, true, true, true, true]");
+    }
+
+    // A member that is only referenced (not on a cycle) is not a group of its own.
+    #[test]
+    fn a_referenced_member_off_every_cycle_is_its_plain_type() {
+        let src = "let rec A = Union(Int, Tuple(A, Bool)) and B = List(A) and C = Tuple(B, A) in (B == List(A), C == Tuple(List(A), A))";
+        assert_eq!(run_source(src).unwrap().to_string(), "[true, true]");
     }
 
     // A ring of n mutually recursive types is one group; it builds in linear time and each
