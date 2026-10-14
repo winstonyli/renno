@@ -194,11 +194,17 @@ impl EffectRow {
     }
 }
 
+// The name the user wrote for an index, row or type variable: the part before the first `#`
+// (the rest is checker bookkeeping). Applied at message time only; stored names stay exact.
+pub(crate) fn surface_name(name: &str) -> &str {
+    name.split('#').next().unwrap_or(name)
+}
+
 impl fmt::Display for EffectRow {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             EffectRow::Dyn => write!(f, "Dyn"),
-            EffectRow::Var(name) => write!(f, "{{{name}}}"),
+            EffectRow::Var(name) => write!(f, "{{{}}}", surface_name(name)),
             EffectRow::Closed(s) => {
                 write!(f, "{{{}}}", s.iter().cloned().collect::<Vec<_>>().join(", "))
             }
@@ -356,7 +362,7 @@ impl fmt::Display for Type {
             // of not exposing machinery the user never wrote. The
             // surface name is always the part before the first "#" --
             // see the id's own construction in parser::atom.
-            Type::Named(id) => write!(f, "{}", id.split('#').next().unwrap_or(id)),
+            Type::Named(id) => write!(f, "{}", surface_name(id)),
             Type::Bool => write!(f, "Bool"),
             Type::Str => write!(f, "Str"),
             Type::List(elem) => write!(f, "[{elem}]"),

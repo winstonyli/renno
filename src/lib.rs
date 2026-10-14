@@ -8913,6 +8913,20 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn variables_print_as_written() {
+        // Checker bookkeeping (`n#0`, `e#0`) never reaches a message: the name is what the user wrote.
+        let src = "let f = fun v: Vec(n + 1) -> v in let x: Dyn = [1, 2] in len(f(x))";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("index variable n has no runtime value") && !err.contains('#'), "{err}");
+        let src = "let f: ((Dyn ->{e} Dyn) -> Int) = fun cb -> 1 in let x: Int = f in x";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("found ((Dyn ->{e} Dyn) -> Int)") && !err.contains('#'), "{err}");
+        let src = "let x = fun cb: (Dyn ->{e} Dyn) -> cb in let y: Int = x in y";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("{e}") && !err.contains('#'), "{err}");
+    }
+
+    #[test]
     fn a_large_literal_builds_in_linear_time_and_a_shared_one_stays_correct() {
         // 100k elements: the accumulator frame is moved, not cloned, so this is O(n) (the
         // cloning version took minutes). A literal whose frame a resumed continuation

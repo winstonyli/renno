@@ -919,6 +919,7 @@ fn enter_contract(c: &Contract, arg: Value) -> (Value, Rc<SiteCtx>) {
 fn no_value_error(test: &Test, spec: &CheckSpec, lens: &[Len], value: &Value) {
     if let Some(name) = reached_no_value(test, &spec.defs, lens, value) {
         set_current_span(spec.span);
+        let name = crate::types::surface_name(name);
         crate::run_error!("type error: index variable {name} has no runtime value to check a length against")
     }
 }

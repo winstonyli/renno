@@ -20,7 +20,7 @@ impl std::fmt::Display for IndexExpr {
         }
         let sum = |e: &IndexExpr| matches!(e, IndexExpr::Add(..) | IndexExpr::Sub(..));
         match self {
-            IndexExpr::Var(name) => write!(f, "{}", name.split('#').next().unwrap_or(name)),
+            IndexExpr::Var(name) => write!(f, "{}", crate::types::surface_name(name)),
             IndexExpr::Lit(n) => write!(f, "{n}"),
             IndexExpr::Add(a, b) => write!(f, "{a} + {b}"),
             IndexExpr::Sub(a, b) => {
