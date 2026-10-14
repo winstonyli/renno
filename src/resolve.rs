@@ -21,10 +21,14 @@ pub enum VarRef {
 
 // Side table keyed by the SAME ExprRef as the Arena (the SpanMap idiom):
 // only Expr::Var nodes get an entry (an unbound name gets VarRef::Unbound).
-// Dense over the range of Var nodes the walk met, `base..base + vars.len()`,
-// not over the whole arena prefix: machine::eval_type resolves each annotation
-// on its own, and a table sized to the annotation's position would make
-// checking quadratic in the program size.
+// Dense over the range of Var nodes the walks met, `base..base + vars.len()`,
+// not over the whole arena prefix: a table sized to a late subtree's position
+// would make checking quadratic in the program size. It grows as more subtrees
+// are resolved into it (`resolve_into`): the checker keeps one table for all
+// its check-time evaluations, since a closure built in one run is called in a
+// later one, and its body needs an entry whichever run resolved it. A node
+// must be resolved under one layout only.
+#[derive(Default)]
 pub struct Resolved {
     base: usize,
     vars: Vec<Option<VarRef>>,
@@ -33,6 +37,29 @@ pub struct Resolved {
 impl Resolved {
     pub fn get(&self, expr: ExprRef) -> Option<VarRef> {
         self.vars.get(expr.index().wrapping_sub(self.base)).copied().flatten()
+    }
+
+    // Records where `id` lives, growing the range to cover it. Growing at the
+    // front doubles, so a run of descending nodes stays linear overall.
+    fn insert(&mut self, id: ExprRef, r: VarRef) {
+        let i = id.index();
+        if self.vars.is_empty() {
+            self.base = i;
+        } else if i < self.base {
+            let grow = (self.base - i).max(self.vars.len()).min(self.base);
+            self.vars.splice(0..0, std::iter::repeat_n(None, grow));
+            self.base -= grow;
+        }
+        if i - self.base >= self.vars.len() {
+            self.vars.resize(i - self.base + 1, None);
+        }
+        let slot = &mut self.vars[i - self.base];
+        match *slot {
+            Some(prev) if prev != r => {
+                panic!("resolver: {id} reached under conflicting scopes ({prev:?} vs {r:?})")
+            }
+            _ => *slot = Some(r),
+        }
     }
 }
 
@@ -72,20 +99,18 @@ enum Work {
 // children in REVERSE of the order they must be processed in.
 // Never fails on a name: an unresolvable one becomes VarRef::Unbound.
 pub fn resolve(arena: &Arena, root: ExprRef) -> Resolved {
-    let found = walk(arena, root);
-    let base = found.iter().map(|(id, _)| id.index()).min().unwrap_or(0);
-    let end = found.iter().map(|(id, _)| id.index() + 1).max().unwrap_or(0);
-    let mut vars = vec![None; end.saturating_sub(base)];
-    for (id, r) in found {
-        let slot = &mut vars[id.index() - base];
-        match *slot {
-            Some(prev) if prev != r => {
-                panic!("resolver: {id} reached under conflicting scopes ({prev:?} vs {r:?})")
-            }
-            _ => *slot = Some(r),
-        }
+    let mut resolved = Resolved::default();
+    resolve_into(arena, root, &[], &mut resolved);
+    resolved
+}
+
+// `resolve`, adding to `resolved` and with `outer` as one enclosing frame
+// (none if empty) around `root`: the layout of a runtime env that holds those
+// names' values. A node `resolved` already holds must come out the same.
+pub fn resolve_into(arena: &Arena, root: ExprRef, outer: &[String], resolved: &mut Resolved) {
+    for (id, r) in walk(arena, root, outer) {
+        resolved.insert(id, r);
     }
-    Resolved { base, vars }
 }
 
 // The names `root` uses but does not bind (a prelude name counts as free; a
@@ -93,7 +118,7 @@ pub fn resolve(arena: &Arena, root: ExprRef) -> Resolved {
 // looks these up to find the `let`s an annotation depends on.
 pub fn free_vars(arena: &Arena, root: ExprRef) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for (id, r) in walk(arena, root) {
+    for (id, r) in walk(arena, root, &[]) {
         let Expr::Var(name) = &arena[id] else { unreachable!("only Var nodes are resolved") };
         if !matches!(r, VarRef::Local { .. }) && !name.starts_with('#') && !out.contains(name) {
             out.push(name.clone());
@@ -103,9 +128,9 @@ pub fn free_vars(arena: &Arena, root: ExprRef) -> Vec<String> {
 }
 
 // Every Var node under `root` with where it lives, in visit order.
-fn walk(arena: &Arena, root: ExprRef) -> Vec<(ExprRef, VarRef)> {
+fn walk(arena: &Arena, root: ExprRef, outer: &[String]) -> Vec<(ExprRef, VarRef)> {
     let mut found: Vec<(ExprRef, VarRef)> = Vec::new();
-    let mut scopes: Vec<Vec<String>> = Vec::new();
+    let mut scopes: Vec<Vec<String>> = if outer.is_empty() { Vec::new() } else { vec![outer.to_vec()] };
     let mut work = vec![Work::Visit(root)];
     while let Some(item) = work.pop() {
         match item {
@@ -460,6 +485,62 @@ mod tests {
         }
         let resolved = resolve(&arena, body);
         assert_eq!(resolved.get(last), Some(local(0, 0)));
+    }
+
+    // An outer frame is one runtime frame around the root: `resolve_into`
+    // numbers its names by slot, and what the root binds itself sits inside it.
+    #[test]
+    fn resolve_into_puts_the_outer_names_in_one_enclosing_frame() {
+        let mut arena = Arena::new();
+        let (a, b) = (arena.push(Expr::Var("a".into())), arena.push(Expr::Var("b".into())));
+        let pair = arena.push(Expr::Tuple(vec![a, b]));
+        let (c, a2) = (arena.push(Expr::Var("c".into())), arena.push(Expr::Var("a".into())));
+        let inner = arena.push(Expr::Tuple(vec![c, a2]));
+        let lam = arena.push(Expr::Lambda("c".into(), None, inner));
+        let mut resolved = Resolved::default();
+        resolve_into(&arena, pair, &["a".to_string(), "b".to_string()], &mut resolved);
+        resolve_into(&arena, lam, &["a".to_string()], &mut resolved);
+        assert_eq!((resolved.get(a), resolved.get(b)), (Some(local(0, 0)), Some(local(0, 1))));
+        assert_eq!((resolved.get(c), resolved.get(a2)), (Some(local(0, 0)), Some(local(1, 0))));
+        // No outer names: no frame, so a free name is the prelude's or unbound.
+        let mut bare = Resolved::default();
+        resolve_into(&arena, pair, &[], &mut bare);
+        assert_eq!(bare.get(a), Some(VarRef::Unbound));
+    }
+
+    // Subtrees resolved later, at smaller or larger positions, extend the table.
+    #[test]
+    fn the_table_grows_in_both_directions() {
+        let mut arena = Arena::new();
+        let vars: Vec<ExprRef> = (0..40).map(|_| arena.push(Expr::Var("#Int".into()))).collect();
+        let int = PRELUDE.iter().position(|(n, _)| *n == "Int").unwrap() as u32;
+        let mut resolved = Resolved::default();
+        for i in [20usize, 21, 10, 39, 0, 5, 30] {
+            resolve_into(&arena, vars[i], &[], &mut resolved);
+        }
+        for (i, v) in vars.iter().enumerate() {
+            let seen = [20usize, 21, 10, 39, 0, 5, 30].contains(&i);
+            assert_eq!(resolved.get(*v), seen.then_some(VarRef::Prelude(int)), "node {i}");
+        }
+        // Descending order stays linear in the range: the front doubles.
+        let mut down = Resolved::default();
+        for v in vars.iter().rev() {
+            resolve_into(&arena, *v, &[], &mut down);
+        }
+        assert!(down.vars.len() <= 2 * vars.len());
+    }
+
+    // The same node resolved again under the same layout is fine; under another
+    // layout it is the resolver's conflict panic, through a shared table too.
+    #[test]
+    #[should_panic(expected = "conflicting")]
+    fn a_node_in_a_shared_table_keeps_one_layout() {
+        let mut arena = Arena::new();
+        let a = arena.push(Expr::Var("a".into()));
+        let mut resolved = Resolved::default();
+        resolve_into(&arena, a, &["a".to_string()], &mut resolved);
+        resolve_into(&arena, a, &["a".to_string()], &mut resolved);
+        resolve_into(&arena, a, &["z".to_string(), "a".to_string()], &mut resolved);
     }
 
     #[test]
