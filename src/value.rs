@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::cont::Cont;
 use crate::env::Env;
-use crate::expr::ExprRef;
+use crate::expr::{ExprRef, Lazy, Len, ResidualSpec};
 use crate::types::Type;
 
 // A handler as data: which effect it handles, the clause body, the env it
@@ -265,6 +265,55 @@ pub enum Value {
     // A type as a value: what the prelude type constructors build and an
     // annotation evaluates to (machine::eval_pure).
     Type(Rc<Type>),
+    // A function checked against a function type (machine::conform): applying
+    // it checks the argument (at an untrusted site), applies `f` and checks the
+    // result. Immutable shared data, so a multi-shot resume replays it safely.
+    Contract(Rc<Contract>),
+}
+
+#[derive(Clone)]
+pub struct Contract {
+    pub f: Value,
+    pub param: Rc<Lazy>,
+    pub ret: Rc<Lazy>,
+    pub ctx: Rc<SiteCtx>,
+}
+
+// What a site's checks read the length of an index variable from: the site's
+// own table (its annotation's index names, valued where the site was reached)
+// and the witnesses contract calls have added since, innermost first.
+pub struct SiteCtx {
+    pub spec: Rc<ResidualSpec>,
+    pub table: Vec<Len>,
+    pub witness: Option<Rc<Witness>>,
+}
+
+pub struct Witness {
+    pub name: String,
+    pub len: Len,
+    pub parent: Option<Rc<Witness>>,
+}
+
+impl SiteCtx {
+    pub fn lookup(&self, name: &str) -> Option<Len> {
+        let mut w = self.witness.as_deref();
+        while let Some(node) = w {
+            if node.name == name {
+                return Some(node.len.clone());
+            }
+            w = node.parent.as_deref();
+        }
+        table_lookup(&self.spec.index_names, &self.table, name)
+    }
+
+    pub fn with_witness(&self, name: String, len: Len) -> SiteCtx {
+        SiteCtx { spec: self.spec.clone(), table: self.table.clone(), witness: Some(Rc::new(Witness { name, len, parent: self.witness.clone() })) }
+    }
+}
+
+// The site-table entry for index variable `name`, if the annotation writes it.
+pub fn table_lookup(names: &[String], table: &[Len], name: &str) -> Option<Len> {
+    names.iter().position(|n| n == name).map(|i| table[i].clone())
 }
 
 impl Value {
@@ -307,7 +356,7 @@ impl Value {
             Value::Token(id) => return std::borrow::Cow::Owned(format!("Token#{id}")),
             Value::List(_) => "List",
             Value::Record(_) => "Record",
-            Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => "Fun",
+            Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) | Value::Contract(_) => "Fun",
             Value::Handler(_) => "Handler",
             Value::Type(_) => "Type",
         })
@@ -357,7 +406,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
-            Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => {
+            Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) | Value::Contract(_) => {
                 write!(f, "<function>")
             }
             Value::Handler(_) => write!(f, "<handler>"),
@@ -429,7 +478,7 @@ impl From<&Value> for Outcome {
             Value::Record(fields) => {
                 Outcome::Record(fields.iter().map(|(n, v)| (n.clone(), Outcome::from(v))).collect())
             }
-            Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) => {
+            Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) | Value::Contract(_) => {
                 Outcome::Function
             }
             Value::Handler(_) => Outcome::Handler,

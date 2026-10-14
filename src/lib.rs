@@ -4266,6 +4266,29 @@ g(len)").unwrap_err();
         }
     }
 
+    // A nested contract's result reads the length its scope holds: `n` of an
+    // outer Vec(n) parameter is not forgotten between the two calls.
+    #[test]
+    fn a_run_time_contract_carries_the_outer_witness_into_a_nested_result() {
+        let src = "let f = fun T -> let d: Dyn = fun x -> fun y -> [1] in let g: (Indexed(List(T), n) -> Int -> Indexed(List(T), n)) = d in g([1, 2])(3) in f(Dyn)";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("column 117: type error: expected [Dyn](n), found List"), "{err}");
+    }
+
+    // A length the scope already holds is not rebound by a contract's argument:
+    // the argument and the result both answer to the scope's `n`.
+    #[test]
+    fn a_scope_length_is_not_rebound_by_a_contract_argument() {
+        let f = |body: &str, arg: &str| {
+            format!("let f = fun T -> fun ys: Vec(n) -> let d: Dyn = fun x -> {body} in let g: (Indexed(List(T), n) -> Indexed(List(T), n)) = d in g({arg}) in f(Dyn)([1, 2])")
+        };
+        let err = run_source(&f("x", "[1]")).unwrap_err();
+        assert!(err.contains("column 117: type error: expected [Dyn](n), found List"), "{err}");
+        assert_eq!(run_source(&f("x", "[3, 4]")).unwrap().to_string(), "[3, 4]");
+        let err = run_source(&f("[9]", "[3, 4]")).unwrap_err();
+        assert!(err.contains("column 119: type error: expected [Dyn](n), found List"), "{err}");
+    }
+
     // A function-typed Unknown site fails with the message the static
     // contract of the same type gives, including a Vec(n) parameter's length
     // for the result.

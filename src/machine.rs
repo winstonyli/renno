@@ -4,14 +4,14 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::{Env, PRELUDE};
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, Len, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test, Then};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test, Then};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::resolve::{is_direct_group, resolve, Resolved, VarRef};
 use crate::span::Span;
 use crate::types::{EffectRow, Type};
 use crate::util::find_field;
-use crate::value::{Builtin, HandlerData, TypeCtor, Value};
+use crate::value::{table_lookup, Builtin, Contract, HandlerData, SiteCtx, TypeCtor, Value};
 
 enum Control {
     Eval(ExprRef, Env),
@@ -261,11 +261,15 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                 },
                 Expr::Residual(operand, ty, spec) => {
                     let Value::Type(t) = local(&env, resolved, *ty) else { panic!("internal: a residual's type variable holds no type") };
-                    if let Some(lowered) = residual_check(spec, t) {
-                        let lens = residual_lens(arena, spec, &lowered, &env, resolved);
+                    let lazy = residual_lazy(spec, t);
+                    if let Some(lowered) = lazy_lowered(&lazy, spec) {
+                        let table = site_table(arena, spec, &lowered, &env, resolved);
                         cont = match lowered.then {
-                            Then::Done => Cont::cons(Frame::Check { spec: lowered.check.clone(), lens }, cont),
-                            _ => Cont::cons(Frame::Contract { lowered, lens, site: spec.clone(), env: env.up(spec.depth) }, cont),
+                            Then::Done => {
+                                let lens = lowered.slots.iter().map(|index| to_len(index_len(index, &|name| table_lookup(&spec.index_names, &table, name)))).collect();
+                                Cont::cons(Frame::Check { spec: lowered.check.clone(), lens }, cont)
+                            }
+                            _ => Cont::cons(Frame::Conform { lazy, ctx: Rc::new(SiteCtx { spec: spec.clone(), table, witness: None }) }, cont),
                         };
                     }
                     control = Control::Eval(*operand, env);
@@ -461,8 +465,18 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                         }
                         Frame::AppArg { func, callee_span } => {
                             let callee_span = *callee_span;
-                            let func = func.clone();
+                            let mut func = func.clone();
+                            let mut value = value;
                             cont = rest;
+                            // A contract checks the argument, then the result
+                            // once `f` returns, and applies `f`.
+                            while let Value::Contract(c) = &func {
+                                let c = c.clone();
+                                let (arg, ret_ctx) = enter_contract(&c, value);
+                                cont = Cont::cons(Frame::Conform { lazy: c.ret.clone(), ctx: ret_ctx }, cont);
+                                value = arg;
+                                func = c.f.clone();
+                            }
                             match func {
                                 Value::Closure(body, closure_env) => {
                                     control = Control::Eval(body, closure_env.push1(value));
@@ -643,12 +657,8 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                             cont = rest;
                             control = Control::Apply(Value::Type(t));
                         }
-                        Frame::Contract { lowered, lens, site, env } => {
-                            // A function type's callability is checked before the wrap.
-                            if matches!(lowered.then, Then::Wrap(..)) && !test_holds(&lowered.check.test, &lowered.check.defs, lens, &value) {
-                                check_failed(&lowered.check, lens, &value)
-                            }
-                            let value = contract_value(&lowered.then, &lowered.check, lens, value, site, env);
+                        Frame::Conform { lazy, ctx } => {
+                            let value = conform(lazy, ctx, value);
                             cont = rest;
                             control = Control::Apply(value);
                         }
@@ -730,7 +740,7 @@ fn leaf(t: &Test, v: &Value) -> Option<bool> {
         // A representation, not a signature: the higher-order contract
         // (typecheck::wrap_fun_contract) re-checks each call separately.
         Test::Fun => {
-            matches!(v, Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..))
+            matches!(v, Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) | Value::Contract(_))
         }
         Test::Token(id) => matches!(v, Value::Token(t) if t == id),
         Test::ListOf(_) | Test::ListLen(..) | Test::ListLenArg(..) | Test::TupleOf(_) | Test::RecordOf(_) | Test::Ref(_) | Test::Or(_) => return None,
@@ -808,28 +818,21 @@ fn local(env: &Env, resolved: &Resolved, var: ExprRef) -> Value {
     }
 }
 
-// The values of a lowered type's length slots at an Unknown site, read on
-// entry in `env` as a Check's are: the site's table, and on a contract's
-// result check its witness.
-fn residual_lens(arena: &Arena, spec: &ResidualSpec, lowered: &Lowered, env: &Env, resolved: &Resolved) -> Vec<Len> {
-    if lowered.slots.is_empty() {
+// The values of an Unknown site's length table, read on entry in `env` as a
+// Check's are. Empty when nothing the lowered type reads needs it: a plain
+// check with no length slots.
+fn site_table(arena: &Arena, spec: &ResidualSpec, lowered: &Lowered, env: &Env, resolved: &Resolved) -> Vec<Len> {
+    if matches!(lowered.then, Then::Done) && lowered.slots.is_empty() {
         return Vec::new();
     }
-    let table: Vec<Len> = spec.lens.iter().map(|slot| eval_slot(arena, *slot, env, resolved)).collect();
-    let witness = spec.witness.and_then(|(param, arg)| witness(local(env, resolved, param), local(env, resolved, arg)));
-    let value = |name: &str| match &witness {
-        Some((n, len)) if n == name => Some(len.clone()),
-        _ => spec.index_names.iter().position(|n| n == name).map(|i| table[i].clone()),
-    };
-    lowered.slots.iter().map(|index| to_len(index_len(index, &value))).collect()
+    spec.lens.iter().map(|slot| eval_slot(arena, *slot, env, resolved)).collect()
 }
 
 // A contract call's parameter type and argument: when the type is Vec(n),
-// `n` and the argument's length, as typecheck::wrap_fun_contract binds a
-// witness (a non-list has no length; the argument's own check rejects it).
-fn witness(param: Value, arg: Value) -> Option<(String, Len)> {
-    let Value::Type(t) = param else { return None };
-    let Type::Indexed(list, index) = &*t else { return None };
+// `n` and the argument's length (a non-list has no length; the argument's own
+// check rejects it).
+fn param_witness(param: &Type, arg: &Value) -> Option<(String, Len)> {
+    let Type::Indexed(list, index) = param else { return None };
     let (Type::List(_), IndexExpr::Var(n)) = (&**list, &**index) else { return None };
     let len = match arg {
         Value::List(items) => Len::Exact(items.len()),
@@ -838,42 +841,74 @@ fn witness(param: Value, arg: Value) -> Option<(String, Len)> {
     Some((n.clone(), len))
 }
 
-// An Unknown site's checks against type value `t` (None: nothing to check),
-// lowered once while the same value keeps coming back (spec 11.5).
-fn residual_check(spec: &ResidualSpec, t: Rc<Type>) -> Option<Rc<Lowered>> {
+// An Unknown site's checks against type value `t`, lowered once while the same
+// value keeps coming back (spec 11.5).
+fn residual_lazy(spec: &ResidualSpec, t: Rc<Type>) -> Rc<Lazy> {
     let mut memo = spec.memo.borrow_mut();
-    if let Some((seen, lowered)) = memo.as_ref()
-        && Rc::ptr_eq(seen, &t)
+    if let Some(seen) = memo.as_ref()
+        && Rc::ptr_eq(&seen.ty, &t)
     {
-        return lowered.clone();
+        return seen.clone();
     }
-    let named = spec.named.get().expect("internal: the registry is set when checking finishes");
-    let lowered = crate::typecheck::lower_residual(&t, named, spec.span);
-    *memo = Some((t, lowered.clone()));
-    lowered
+    let lazy = Lazy::new(t);
+    *memo = Some(lazy.clone());
+    lazy
 }
 
-// `value`, given what it still needs beyond `check` (spec 11.6): a function
-// wrapped in the site's contract, which checks every call (closing over the
-// site's env `env`), or for a union with a function alternative, the first
-// alternative that holds.
-fn contract_value(then: &Then, check: &CheckSpec, lens: &[Len], value: Value, site: &ResidualSpec, env: &Env) -> Value {
+// The checks for a type (None: nothing to check), lowered the first time they
+// are asked for: the registry and blame span are the site's.
+fn lazy_lowered(lazy: &Lazy, spec: &ResidualSpec) -> Option<Rc<Lowered>> {
+    lazy.lowered
+        .get_or_init(|| {
+            let named = spec.named.get().expect("internal: the registry is set when checking finishes");
+            crate::typecheck::lower_residual(&lazy.ty, named, spec.span)
+        })
+        .clone()
+}
+
+// `value` conformed to the type `lazy` holds, at the site `ctx` (spec 11.6): a
+// failing check is the site's failure; a function becomes a contract, and a
+// union with a function alternative picks the first alternative that holds.
+fn conform(lazy: &Lazy, ctx: &Rc<SiteCtx>, value: Value) -> Value {
+    let Some(lowered) = lazy_lowered(lazy, &ctx.spec) else { return value };
+    let lens: Vec<Len> = lowered.slots.iter().map(|index| to_len(index_len(index, &|name| ctx.lookup(name)))).collect();
+    let check = &*lowered.check;
+    // A union's own test is the failure when no alternative holds.
+    if !matches!(lowered.then, Then::Pick(_)) && !test_holds(&check.test, &check.defs, &lens, &value) {
+        no_value_error(&check.test, check, &lens, &value);
+        check_failed(check, &lens, &value)
+    }
+    conform_then(&lowered.then, check, &lens, value, ctx)
+}
+
+// What `value`, which passed its test, still needs.
+fn conform_then(then: &Then, check: &CheckSpec, lens: &[Len], value: Value, ctx: &Rc<SiteCtx>) -> Value {
     match then {
         Then::Done => value,
-        Then::Wrap(param, ret) => {
-            let body = *site.contract.get().expect("internal: a residual's contract is built with it");
-            Value::Closure(body, env.push1(value).push1(Value::Type(param.clone())).push1(Value::Type(ret.clone())))
-        }
+        Then::Wrap(param, ret) => Value::Contract(Rc::new(Contract { f: value, param: param.clone(), ret: ret.clone(), ctx: ctx.clone() })),
         Then::Pick(alternatives) => {
             for (test, then) in alternatives {
                 if test_holds(test, &check.defs, lens, &value) {
-                    return contract_value(then, check, lens, value, site, env);
+                    return conform_then(then, check, lens, value, ctx);
                 }
                 no_value_error(test, check, lens, &value);
             }
             check_failed(check, lens, &value)
         }
     }
+}
+
+// A call of a contract: the argument (checked against the parameter type at
+// an untrusted site) and the site the result is checked at. A Vec(n)
+// parameter binds `n` to the argument's length for the result, unless the
+// site already holds an exact length for `n` (the scope's, as build_cast does).
+fn enter_contract(c: &Contract, arg: Value) -> (Value, Rc<SiteCtx>) {
+    let ret_ctx = match param_witness(&c.param.ty, &arg) {
+        Some((n, len)) if !matches!(c.ctx.lookup(&n), Some(Len::Exact(_))) => Rc::new(c.ctx.with_witness(n, len)),
+        _ => c.ctx.clone(),
+    };
+    let arg = if c.ctx.spec.trusted { arg } else { conform(&c.param, &c.ctx, arg) };
+    (arg, ret_ctx)
 }
 
 // A failing test that reached a length nothing at run time holds, on a list:

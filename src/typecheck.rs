@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test, Then};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckMode, CheckSpec, Expr, ExprRef, Lazy, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test, Then};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::plist::PList;
 use crate::span::Span;
@@ -1784,7 +1784,7 @@ pub(crate) fn lower_residual(ty: &Type, named: &Rc<HashMap<String, Type>>, span:
     let (test, to, then) = match boundary(ty, named, &mut visiting) {
         Boundary::None => return None,
         Boundary::Shape(to) => (shape_test(to, &env, &mut defs, &HashSet::new()), to, Then::Done),
-        Boundary::Fun(fun_ty, param, ret) => (Test::Fun, fun_ty, Then::Wrap(param.clone(), ret.clone())),
+        Boundary::Fun(fun_ty, param, ret) => (Test::Fun, fun_ty, Then::Wrap(Lazy::new(param.clone()), Lazy::new(ret.clone()))),
         Boundary::Union(to) => (Test::Never, to, pick(to, &env, &mut defs, &visiting)),
     };
     let bodies = defs.bodies.into_iter().map(|body| body.expect("every alias body is built before shape_test returns")).collect();
@@ -1805,7 +1805,7 @@ fn pick(to: &Type, env: &CheckEnv, defs: &mut Defs, visiting: &HashSet<String>) 
         };
         let mut visiting = visiting.clone();
         let then = match boundary(alt, &env.infer.named_types, &mut visiting) {
-            Boundary::Fun(_, param, ret) => Then::Wrap(param.clone(), ret.clone()),
+            Boundary::Fun(_, param, ret) => Then::Wrap(Lazy::new(param.clone()), Lazy::new(ret.clone())),
             Boundary::Union(nested) => pick(nested, env, defs, &visiting),
             Boundary::None | Boundary::Shape(_) => Then::Done,
         };
@@ -3389,59 +3389,22 @@ fn residual_spec(arena: &mut Arena, root: ExprRef, blame: Span, infer: &InferCtx
         work.extend(&kids);
     }
     let names: Vec<String> = names.into_iter().collect();
-    let contract = Rc::new(OnceCell::new());
-    // A check of the site, `depth` frames inside its contract.
-    let check = |arena: &mut Arena, depth: u32, template| {
-        let env = CheckEnv { repeatable: depth > 0, ..CheckEnv::at(infer, blame) };
-        let mut lens = Vec::with_capacity(names.len());
-        for name in &names {
-            let var = infer.index_rename.get(name).unwrap_or(name);
-            let index = IndexExpr::Var(var.clone());
-            let bound = infer.index_witness.iter().any(|w| w.var == *var) || infer.index_subst.contains_key(var) || infer.rigid_index.contains(var);
-            let term = if bound { index_len_term(arena, &index, &env) } else { LenExpr::Any };
-            let slot = arena.push(Expr::Len(term));
-            if bound {
-                record_obligation(slot, &index, &env);
-            }
-            lens.push(slot);
+    // The table is read by the site's contract calls too, so its obligations
+    // are repeatable.
+    let env = CheckEnv { repeatable: true, ..CheckEnv::at(infer, blame) };
+    let mut lens = Vec::with_capacity(names.len());
+    for name in &names {
+        let var = infer.index_rename.get(name).unwrap_or(name);
+        let index = IndexExpr::Var(var.clone());
+        let bound = infer.index_witness.iter().any(|w| w.var == *var) || infer.index_subst.contains_key(var) || infer.rigid_index.contains(var);
+        let term = if bound { index_len_term(arena, &index, &env) } else { LenExpr::Any };
+        let slot = arena.push(Expr::Len(term));
+        if bound {
+            record_obligation(slot, &index, &env);
         }
-        ResidualSpec {
-            index_names: names.clone(),
-            lens,
-            named: infer.registry.clone(),
-            memo: RefCell::new(None),
-            span: blame,
-            template,
-            contract: contract.clone(),
-            depth,
-            witness: None,
-        }
-    };
-    let template = contract_template(arena, &contract, &|arena, depth| check(arena, depth, None));
-    Rc::new(check(arena, 0, Some(template)))
-}
-
-// An Unknown site's function contract (spec 11.6), the run-time twin of
-// wrap_fun_contract: `fun f -> fun p -> fun r -> fun a -> body`, where
-// `body` checks `a` against the type `p` holds, calls `f` (callability was
-// checked when the value reached the site) and checks the result against `r`, all blaming the
-// site. It sits in the site's scope, so its checks read the site's length
-// table: machine::contract_value enters `body` with the site's env plus `f`,
-// `p` and `r`, and `contract` is set to it. `check` builds one of its checks,
-// given its depth.
-fn contract_template(arena: &mut Arena, contract: &OnceCell<ExprRef>, check:&dyn Fn(&mut Arena, u32) -> ResidualSpec) -> ExprRef {
-    let [f, p, r, a] = ["__contract_fn", "__contract_param", "__contract_ret", "__contract_arg"].map(fresh_index_name);
-    // The body's checks run 4 frames inside the site's env: `f`, `p`, `r`, `a`.
-    let depth = 4;
-    let mut var = |name: &str| arena.push(Expr::Var(name.to_string()));
-    let (f_ref, a_ref, p_ref, r_ref, wp_ref, wa_ref) = (var(&f), var(&a), var(&p), var(&r), var(&p), var(&a));
-    let arg_check = check(arena, depth);
-    let checked_arg = arena.push(Expr::Residual(a_ref, p_ref, Rc::new(arg_check)));
-    let call = arena.push(Expr::App(f_ref, checked_arg));
-    let result_check = ResidualSpec { witness: Some((wp_ref, wa_ref)), ..check(arena, depth) };
-    let body = arena.push(Expr::Residual(call, r_ref, Rc::new(result_check)));
-    contract.set(body).expect("internal: a site's contract is built once");
-    [a, r, p, f].into_iter().fold(body, |inner, name| arena.push(Expr::Lambda(name, None, inner)))
+        lens.push(slot);
+    }
+    Rc::new(ResidualSpec { index_names: names, lens, named: infer.registry.clone(), memo: RefCell::new(None), span: blame, trusted: false })
 }
 
 // A check-time evaluation that finished, replayed by settle_erasure.

@@ -238,29 +238,31 @@ pub struct ResidualSpec {
     pub lens: Vec<ExprRef>,
     // The recursive types' bodies, set when checking finishes.
     pub named: Rc<std::cell::OnceCell<Rc<HashMap<String, Type>>>>,
-    pub memo: std::cell::RefCell<Option<LoweredType>>,
+    pub memo: std::cell::RefCell<Option<Rc<Lazy>>>,
     // The source span a failure blames.
     pub span: Span,
-    // The site's function contract (spec 11.6), `fun f -> fun p -> fun r ->
-    // fun a -> body`, on the site's own check only, so a walk meets it once.
-    pub template: Option<ExprRef>,
-    // Its `body`, shared by the site's checks: a function value checked
-    // against `p -> r` becomes Value::Closure(body, site env + [f, p, r]), so
-    // each call checks its argument against `p` and its result against `r`.
-    pub contract: Rc<std::cell::OnceCell<ExprRef>>,
-    // How many frames this check's env is inside the site's: 0 at the site,
-    // 4 in the contract's body (`f`, `p`, `r`, `a`).
-    pub depth: u32,
-    // On the contract's result check: the variables holding `p` and the
-    // argument. A Vec(n) parameter gives `n` the argument's length there,
-    // the run-time twin of typecheck::wrap_fun_contract's witness.
-    pub witness: Option<(ExprRef, ExprRef)>,
+    // The site's own binder is typed to the checker (a static boundary), so
+    // callers already enforce a function's parameter: its contract checks
+    // only callability and the result, not each argument.
+    pub trusted: bool,
 }
 
-// The type an Unknown site lowered last, and its check (None: nothing to
-// check). Reused while the same type comes back; holding the Rc keeps its
-// address from being reused by another type.
-pub type LoweredType = (Rc<Type>, Option<Rc<Lowered>>);
+// A type value's lowering (None: nothing to check), made the first time a
+// value is checked against it and shared by every use of this Lazy. The memo
+// of an Unknown site holds the Lazy of the type it last saw (holding the Rc
+// keeps the type's address from being reused by another type), and a Lowered's
+// function contract holds one for its parameter and one for its result.
+#[derive(Debug)]
+pub struct Lazy {
+    pub ty: Rc<Type>,
+    pub lowered: std::cell::OnceCell<Option<Rc<Lowered>>>,
+}
+
+impl Lazy {
+    pub fn new(ty: Rc<Type>) -> Rc<Lazy> {
+        Rc::new(Lazy { ty, lowered: std::cell::OnceCell::new() })
+    }
+}
 
 // A run-time type as checks: a native Check spec (its `lens` unused), for
 // each length slot its tests read the index whose value fills it, and what a
@@ -279,7 +281,7 @@ pub enum Then {
     // Nothing more.
     Done,
     // The site's contract, with these parameter and result types.
-    Wrap(Rc<Type>, Rc<Type>),
+    Wrap(Rc<Lazy>, Rc<Lazy>),
     // The first alternative whose test holds (against the Lowered's defs and
     // slots), then what that alternative needs; none holds: the Lowered's
     // check fails.
@@ -462,8 +464,6 @@ impl Expr {
             Expr::Residual(e, ty, spec) => {
                 out.extend([*e, *ty]);
                 out.extend(&spec.lens);
-                out.extend(spec.template);
-                out.extend(spec.witness.iter().flat_map(|(p, a)| [*p, *a]));
             }
             Expr::FieldAccess(e, _) | Expr::Perform(_, e) | Expr::Annot(e, _) => out.push(*e),
             Expr::Lambda(_, ann, body) => {

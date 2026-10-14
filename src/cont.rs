@@ -1,9 +1,9 @@
 use std::rc::Rc;
 
 use crate::env::Env;
-use crate::expr::{AnnotSpec, BinOp, CheckSpec, ExprRef, Len, Lowered, Pattern, ResidualSpec};
+use crate::expr::{AnnotSpec, BinOp, CheckSpec, ExprRef, Lazy, Len, Pattern};
 use crate::span::Span;
-use crate::value::{HandlerData, Value};
+use crate::value::{HandlerData, SiteCtx, Value};
 
 // One step of "what's left to do", defunctionalized so it can live as data
 // (not the native Rust call stack). This is what makes multi-shot resume
@@ -68,11 +68,11 @@ pub enum Frame {
     // The operand of an Expr::Check has just evaluated -- test it against
     // the spec, with the length slots read when the Check was entered.
     Check { spec: Rc<CheckSpec>, lens: Vec<Len> },
-    // The operand of an Unknown site whose type needs a contract (a function,
-    // or a union with a function alternative) has just evaluated:
-    // machine::contract_value checks it and wraps what it still needs, in
-    // the site's env `env`.
-    Contract { lowered: Rc<Lowered>, lens: Vec<Len>, site: Rc<ResidualSpec>, env: Env },
+    // A value that must conform to a type needing a contract (a function, or a
+    // union with a function alternative) has just evaluated, at a site, or as
+    // a contract call's result: machine::conform checks it and wraps what it
+    // still needs.
+    Conform { lazy: Rc<Lazy>, ctx: Rc<SiteCtx> },
     // A kept annotation reached inside a check-mode evaluation (a type
     // function's body) has just evaluated: machine::annotation_value takes it.
     Annot { spec: Rc<AnnotSpec> },
