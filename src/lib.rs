@@ -126,12 +126,12 @@ mod tests {
     }
 
     // Walks the elaborated tree looking for a runtime boundary check: a
-    // native Expr::Check, or an Expr::Residual (a function or a union with a
+    // native Expr::Check, or an Expr::Conform (a function or a union with a
     // function alternative). Needed because arena-indexed Expr's derived
     // Debug only prints the immediate node (children are plain ExprRef
     // indices, so Debug does not recurse through them).
     fn contains_check(arena: &expr::Arena, root: expr::ExprRef) -> bool {
-        tree_any(arena, root, &|n| matches!(n, expr::Expr::Check(..) | expr::Expr::Residual(..)))
+        tree_any(arena, root, &|n| matches!(n, expr::Expr::Check(..) | expr::Expr::Conform(..)))
     }
 
     // Does any node of the (elaborated) tree under `root` satisfy `pred`?
@@ -4439,7 +4439,7 @@ g(len)").unwrap_err();
     // one, the type Vec(n) (spec ruling 12.4): an index variable is not a
     // value. `Indexed` likewise receives (T, k) or (T, Vec(n)). The index
     // variable stays one variable through a let-bound user Vec (a parameter
-    // Vec makes the site a residual: see the next test), and a closed
+    // Vec makes the site a conform node: see the next test), and a closed
     // annotation calling the prelude Vec still leaves no run-time node.
     #[test]
     fn a_user_vec_receives_an_int_or_an_indexed_type() {
@@ -4577,11 +4577,11 @@ g(len)").unwrap_err();
         for (name, src) in programs {
             let (mut arena, spans, root, named_types) = parser::parse_with_named_types(&src).unwrap();
             let Ok(elaborated) = typecheck::check_with_named_types(&mut arena, root, &spans, named_types) else { continue };
-            // A static function boundary is a Residual too, over a type literal; an
+            // A static function boundary is a Conform too, over a type literal; an
             // annotation's site holds its type in a variable.
             let site = |e: &expr::Expr| match e {
                 expr::Expr::Annot(..) => true,
-                expr::Expr::Residual(_, ty, _) => matches!(arena[*ty], expr::Expr::Var(_)),
+                expr::Expr::Conform(_, ty, _) => matches!(arena[*ty], expr::Expr::Var(_)),
                 _ => false,
             };
             assert!(!tree_any(&arena, elaborated, &site), "{name}");
@@ -8016,7 +8016,7 @@ g(len)").unwrap_err();
 
     // (annotation, accepted Dyn values, rejected Dyn values with the expected
     // message fragment, is one native check node: a Check, or for a function or a
-    // union with a function alternative, a Residual). Every shape the old
+    // union with a function alternative, a Conform). Every shape the old
     // builders produced.
     fn native_check_shapes() -> Vec<ShapeCase> {
         vec![
@@ -8051,10 +8051,10 @@ g(len)").unwrap_err();
         ]
     }
 
-    // Some native check (a Check or a Residual, whatever its test) is somewhere in the tree.
+    // Some native check (a Check or a Conform, whatever its test) is somewhere in the tree.
     fn has_native_assert_check(src: &str) -> bool {
         let (arena, root) = elaborated_tree(src);
-        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(..) | expr::Expr::Residual(..)))
+        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(..) | expr::Expr::Conform(..)))
     }
 
     // A bare Fun crossing is a per-call contract: it is only exercised by calling.
@@ -8225,7 +8225,7 @@ g(len)").unwrap_err();
         fn owners(arena: &expr::Arena, r: expr::ExprRef, out: &mut std::collections::HashMap<expr::ExprRef, usize>) {
             let lens = match &arena[r] {
                 expr::Expr::Check(_, spec) => &spec.lens[..],
-                expr::Expr::Residual(_, _, spec) => &spec.lens[..],
+                expr::Expr::Conform(_, _, spec) => &spec.lens[..],
                 _ => &[],
             };
             for slot in lens {

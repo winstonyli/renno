@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test, Then};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::plist::PList;
 use crate::span::Span;
@@ -167,7 +167,7 @@ fn fallible_check(arena: &Arena, root: ExprRef, spans: &SpanMap, infer: &InferCt
         }
         match &arena[n] {
             Expr::Annot(_, spec) if spec.erased.get() => continue,
-            Expr::Annot(..) | Expr::Residual(..) => return true,
+            Expr::Annot(..) | Expr::Conform(..) => return true,
             _ => {}
         }
         if let Expr::Check(operand, spec) = &arena[n] {
@@ -1667,7 +1667,7 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
 // (build_shape_check): no let, no env frame, no builtin call; a Vec(n)
 // length is read from a length slot the Check evaluates on entry. A
 // function, or a union with a function alternative, is one trusted
-// Expr::Residual (static_contract): callability is checked at once and the
+// Expr::Conform (static_contract): callability is checked at once and the
 // value is wrapped in a contract that checks each call's result, since a
 // bare callability tag can't see inside a closure. Every failure panics with
 // the same "type error: expected X, found Y" text, or the "index variable n
@@ -1681,7 +1681,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
 }
 
 // The kind of check a boundary against a type needs (build_boundary_check's
-// dispatch, which lower_residual shares).
+// dispatch, which lower_conform shares).
 enum Boundary<'t> {
     // Nothing to check.
     None,
@@ -1696,7 +1696,7 @@ enum Boundary<'t> {
 }
 
 // A static boundary that needs a contract: `e` checked against `to` by an
-// Expr::Residual the run time lowers as it does an Unknown site's (the same
+// Expr::Conform the run time lowers as it does an Unknown site's (the same
 // machinery, with `trusted`: the site's binder is typed, so callers already
 // enforce a function's parameter). `to` is read now (snapshot_type); the
 // length slots are the index variables the check can read, each an
@@ -1717,9 +1717,9 @@ fn static_contract(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> 
         index_names.push(name);
         lens.push(slot);
     }
-    let spec = ResidualSpec { index_names, lens, named: env.infer.registry.clone(), memo: RefCell::new(None), span: env.span, trusted: true };
+    let spec = ConformSpec { index_names, lens, named: env.infer.registry.clone(), memo: RefCell::new(None), span: env.span, trusted: true };
     let ty = arena.push(Expr::TypeLit(Rc::new(ty)));
-    arena.push(Expr::Residual(e, ty, Rc::new(spec)))
+    arena.push(Expr::Conform(e, ty, Rc::new(spec)))
 }
 
 // The index variables a check against `ty` can read when it runs, each with
@@ -1825,7 +1825,7 @@ fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut H
 // to check. A function is checked for callability and wrapped in the site's
 // contract; a union with a function alternative picks the first alternative
 // whose shape holds, and its check is the failure when none does.
-pub(crate) fn lower_residual(ty: &Type, named: &Rc<HashMap<String, Type>>, span: Option<Span>) -> Option<Rc<Lowered>> {
+pub(crate) fn lower_conform(ty: &Type, named: &Rc<HashMap<String, Type>>, span: Option<Span>) -> Option<Rc<Lowered>> {
     let infer = InferCtx::new(named.clone());
     let env = CheckEnv { defer: false, span, ..CheckEnv::new(&infer) };
     let mut visiting = HashSet::new();
@@ -1841,7 +1841,7 @@ pub(crate) fn lower_residual(ty: &Type, named: &Rc<HashMap<String, Type>>, span:
     Some(Rc::new(Lowered { check: Rc::new(check), slots: defs.lens, then }))
 }
 
-// A union's alternatives as lower_residual's Pick: each one's shape test
+// A union's alternatives as lower_conform's Pick: each one's shape test
 // (one already being unfolded above never holds) and what a value passing it
 // still needs. Every
 // alternative shares one alias table and one set of length slots.
@@ -3206,12 +3206,12 @@ struct Annotation {
 // A kept annotation: `let name = Expr::Annot(..)`, placed in the scope the
 // checker evaluated the annotation in. The name is unlexable, so nothing in
 // the program can capture it. An Unknown site also checks its binder
-// (`residual`).
+// (`conform`).
 struct Site {
     name: String,
     annot: ExprRef,
     spec: Rc<AnnotSpec>,
-    residual: Option<Rc<ResidualSpec>>,
+    conform: Option<Rc<ConformSpec>>,
 }
 
 impl Site {
@@ -3221,18 +3221,18 @@ impl Site {
 
     // `operand` checked against the site's type, at an Unknown site.
     fn check(&self, arena: &mut Arena, operand: ExprRef) -> ExprRef {
-        match &self.residual {
+        match &self.conform {
             Some(spec) => {
                 let ty = arena.push(Expr::Var(self.name.clone()));
-                arena.push(Expr::Residual(operand, ty, spec.clone()))
+                arena.push(Expr::Conform(operand, ty, spec.clone()))
             }
             None => operand,
         }
     }
 
-    // `let name = Residual(name, ..) in body` at an Unknown site, else `body`.
+    // `let name = Conform(name, ..) in body` at an Unknown site, else `body`.
     fn rebind(&self, arena: &mut Arena, name: &str, body: ExprRef) -> ExprRef {
-        if self.residual.is_none() {
+        if self.conform.is_none() {
             return body;
         }
         let var = arena.push(Expr::Var(name.to_string()));
@@ -3301,7 +3301,7 @@ fn annotation_type(arena: &mut Arena, ann: ExprRef, blame: Span, ctx: &Ctx, span
             ((*ty).clone(), AnnotKind::Confirm(ty))
         }
     };
-    let residual = matches!(kind, AnnotKind::Unknown).then(|| residual_spec(arena, root, blame, infer));
+    let conform = matches!(kind, AnnotKind::Unknown).then(|| conform_spec(arena, root, blame, infer));
     let spec = Rc::new(AnnotSpec::new(kind, spans[ann]));
     if matches!(spec.kind, AnnotKind::Confirm(_)) {
         infer.proofs.push(Proof::Site(defs, elaborated, spec.clone()));
@@ -3312,7 +3312,7 @@ fn annotation_type(arena: &mut Arena, ann: ExprRef, blame: Span, ctx: &Ctx, span
         }
     }
     let annot = arena.push(Expr::Annot(elaborated, spec.clone()));
-    Ok(Annotation { ty, site: Some(Site { name: fresh_index_name("__rt"), annot, spec, residual }) })
+    Ok(Annotation { ty, site: Some(Site { name: fresh_index_name("__rt"), annot, spec, conform }) })
 }
 
 // An Unknown site's check (spec 11.4). The index variables its run-time type
@@ -3323,7 +3323,7 @@ fn annotation_type(arena: &mut Arena, ann: ExprRef, blame: Span, ctx: &Ctx, span
 // own, and matches any length. Unlike the binder that introduces it
 // statically, repeated occurrences do not share it (parked, spec 11.13). The
 // site's contract checks read the same table.
-fn residual_spec(arena: &mut Arena, root: ExprRef, blame: Span, infer: &InferCtx) -> Rc<ResidualSpec> {
+fn conform_spec(arena: &mut Arena, root: ExprRef, blame: Span, infer: &InferCtx) -> Rc<ConformSpec> {
     let mut names = BTreeSet::new();
     let (mut work, mut kids) = (vec![root], Vec::new());
     while let Some(n) = work.pop() {
@@ -3350,7 +3350,7 @@ fn residual_spec(arena: &mut Arena, root: ExprRef, blame: Span, infer: &InferCtx
         }
         lens.push(slot);
     }
-    Rc::new(ResidualSpec { index_names: names, lens, named: infer.registry.clone(), memo: RefCell::new(None), span: Some(blame), trusted: false })
+    Rc::new(ConformSpec { index_names: names, lens, named: infer.registry.clone(), memo: RefCell::new(None), span: Some(blame), trusted: false })
 }
 
 // A check-time evaluation that finished, replayed by settle_erasure.
@@ -3959,7 +3959,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 for (name, site) in sites.iter().rev() {
                     body = site.rebind(arena, name, body);
                 }
-                if sites.iter().any(|(_, site)| site.residual.is_some()) {
+                if sites.iter().any(|(_, site)| site.conform.is_some()) {
                     def.used.set(true);
                 }
                 result_expr = arena.push(Expr::LetRec(Rc::new(group), body));
@@ -4139,8 +4139,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     let node = arena[expr].clone();
     match node {
         // Emitted by elaboration itself (Dyn-boundary checks), never parsed.
-        Expr::Check(..) | Expr::Len(_) | Expr::Annot(..) | Expr::Residual(..) => {
-            unreachable!("Expr::Check, Expr::Len, Expr::Annot and Expr::Residual are typecheck output, never elaboration input")
+        Expr::Check(..) | Expr::Len(_) | Expr::Annot(..) | Expr::Conform(..) => {
+            unreachable!("Expr::Check, Expr::Len, Expr::Annot and Expr::Conform are typecheck output, never elaboration input")
         }
         Expr::Int(_) => Ok((Type::Int, EffectRow::pure(), expr)),
         Expr::Float(_) => Ok((Type::Float, EffectRow::pure(), expr)),

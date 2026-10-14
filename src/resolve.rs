@@ -192,8 +192,8 @@ fn visit(
                 work.push(Work::Visit(*slot));
             }
         }
-        // So are a Residual's, and the variable holding its type.
-        Expr::Residual(..) => {
+        // So are a Conform's, and the variable holding its type.
+        Expr::Conform(..) => {
             let mut kids = Vec::new();
             arena[id].children(&mut kids);
             for kid in kids.into_iter().rev() {

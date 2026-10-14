@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::{Env, PRELUDE};
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ResidualSpec, SpanMap, Test, Then};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::resolve::{is_direct_group, resolve, Resolved, VarRef};
@@ -259,16 +259,16 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                         }
                     }
                 },
-                Expr::Residual(operand, ty, spec) => {
+                Expr::Conform(operand, ty, spec) => {
                     // A static site's type is a literal; an Unknown site's is the value of its annotation's binder.
                     let t = match &arena[*ty] {
                         Expr::TypeLit(t) => t.clone(),
                         _ => match local(&env, resolved, *ty) {
                             Value::Type(t) => t,
-                            _ => panic!("internal: a residual's type variable holds no type"),
+                            _ => panic!("internal: a conform node's type variable holds no type"),
                         },
                     };
-                    let lazy = residual_lazy(spec, t);
+                    let lazy = conform_lazy(spec, t);
                     if let Some(lowered) = lazy_lowered(&lazy, spec) {
                         let table = site_table(arena, spec, &lowered, &env, resolved);
                         cont = match lowered.then {
@@ -812,19 +812,19 @@ fn index_len(index: &IndexExpr, value: &impl Fn(&str) -> Option<Len>) -> Result<
     }
 }
 
-// The value of a variable a synthesized node reads (a Residual's type, a
+// The value of a variable a synthesized node reads (a Conform's type, a
 // contract's witness): always a local.
 fn local(env: &Env, resolved: &Resolved, var: ExprRef) -> Value {
     match resolved.get(var) {
         Some(VarRef::Local { hops, slot }) => env.get(hops, slot),
-        other => panic!("internal: a residual's variable resolved to {other:?}"),
+        other => panic!("internal: a conform node's variable resolved to {other:?}"),
     }
 }
 
 // The values of an Unknown site's length table, read on entry in `env` as a
 // Check's are. Empty when nothing the lowered type reads needs it: a plain
 // check with no length slots.
-fn site_table(arena: &Arena, spec: &ResidualSpec, lowered: &Lowered, env: &Env, resolved: &Resolved) -> Vec<Len> {
+fn site_table(arena: &Arena, spec: &ConformSpec, lowered: &Lowered, env: &Env, resolved: &Resolved) -> Vec<Len> {
     if matches!(lowered.then, Then::Done) && lowered.slots.is_empty() {
         return Vec::new();
     }
@@ -846,7 +846,7 @@ fn param_witness(param: &Type, arg: &Value) -> Option<(String, Len)> {
 
 // An Unknown site's checks against type value `t`, lowered once while the same
 // value keeps coming back (spec 11.5).
-fn residual_lazy(spec: &ResidualSpec, t: Rc<Type>) -> Rc<Lazy> {
+fn conform_lazy(spec: &ConformSpec, t: Rc<Type>) -> Rc<Lazy> {
     let mut memo = spec.memo.borrow_mut();
     if let Some(seen) = memo.as_ref()
         && Rc::ptr_eq(&seen.ty, &t)
@@ -860,11 +860,11 @@ fn residual_lazy(spec: &ResidualSpec, t: Rc<Type>) -> Rc<Lazy> {
 
 // The checks for a type (None: nothing to check), lowered the first time they
 // are asked for: the registry and blame span are the site's.
-fn lazy_lowered(lazy: &Lazy, spec: &ResidualSpec) -> Option<Rc<Lowered>> {
+fn lazy_lowered(lazy: &Lazy, spec: &ConformSpec) -> Option<Rc<Lowered>> {
     lazy.lowered
         .get_or_init(|| {
             let named = spec.named.get().expect("internal: the registry is set when checking finishes");
-            crate::typecheck::lower_residual(&lazy.ty, named, spec.span)
+            crate::typecheck::lower_conform(&lazy.ty, named, spec.span)
         })
         .clone()
 }

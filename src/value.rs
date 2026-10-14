@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::cont::Cont;
 use crate::env::Env;
-use crate::expr::{ExprRef, Lazy, Len, ResidualSpec};
+use crate::expr::{ExprRef, Lazy, Len, ConformSpec};
 use crate::types::Type;
 
 // A handler as data: which effect it handles, the clause body, the env it
@@ -283,7 +283,7 @@ pub struct Contract {
 // own table (its annotation's index names, valued where the site was reached)
 // and the witnesses contract calls have added since, innermost first.
 pub struct SiteCtx {
-    pub spec: Rc<ResidualSpec>,
+    pub spec: Rc<ConformSpec>,
     pub table: Vec<Len>,
     pub witness: Option<Rc<Witness>>,
 }

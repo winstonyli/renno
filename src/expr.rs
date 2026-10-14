@@ -29,7 +29,7 @@ pub type Arena = PrimaryMap<ExprRef, Expr>;
 // The byte-span of each Arena node's ORIGINAL source text, indexed by the
 // same ExprRef -- built by the parser in lockstep with Arena (see
 // parser::Parser::push_spanned) so the two never desync. A node typecheck
-// synthesizes (a Check, a Residual, a re-emitted Let with a
+// synthesizes (a Check, a Conform, a re-emitted Let with a
 // resolved type) gets no entry here; typecheck never needs one, since every
 // error it reports uses the span of an ORIGINAL (pre-elaboration) ExprRef
 // that was already in scope before any such node was built -- see
@@ -107,7 +107,7 @@ pub enum BinOp {
 // derived from the target type. It follows the VALUE (finite, immutable,
 // acyclic), so a deep test of a function-free type always terminates. A
 // function position is only a callability tag (the per-call contract is
-// an Expr::Residual's job, and only for a Fun target or a union alternative).
+// an Expr::Conform's job, and only for a Fun target or a union alternative).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Test {
     // Dyn/Var: everything passes. Never: nothing does (a failing branch, or a
@@ -213,16 +213,16 @@ pub enum AnnotKind {
     // It ran out of fuel: reaching the site is the fuel error.
     Diverged,
     // It names a value only the run time has: the run time evaluates it
-    // every time the site is reached, and an Expr::Residual checks the
+    // every time the site is reached, and an Expr::Conform checks the
     // binder against the result.
     Unknown,
 }
 
-// An Unknown site's check (spec 11.2): Expr::Residual tests its operand
+// An Unknown site's check (spec 11.2): Expr::Conform tests its operand
 // against the type its `ty` variable holds, lowered at run time
-// (typecheck::lower_residual) with today's run-time check messages.
+// (typecheck::lower_conform) with today's run-time check messages.
 #[derive(Debug)]
-pub struct ResidualSpec {
+pub struct ConformSpec {
     // The index variable names the annotation's text writes, and for each
     // the Expr::Len slot holding its run-time value (spec 11.4).
     pub index_names: Vec<String>,
@@ -317,10 +317,10 @@ pub enum Expr {
     // evaluated in check mode to a Value::Type. Typecheck binds it to an
     // unlexable name just before the annotated binder.
     Annot(ExprRef, Rc<AnnotSpec>),
-    // An Unknown site's check (spec 11.2): the operand tested against the
-    // type value the second node (a variable bound to the site's Annot)
-    // holds. Typecheck-synthesized only.
-    Residual(ExprRef, ExprRef, Rc<ResidualSpec>),
+    // A site's check (spec 11.2): the operand conformed to the type value the
+    // second node holds -- a variable bound to an Unknown site's Annot, or a
+    // type literal at a static function boundary. Typecheck-synthesized only.
+    Conform(ExprRef, ExprRef, Rc<ConformSpec>),
     // A Check's length slot (CheckSpec::lens). Typecheck-synthesized only and
     // never evaluated on its own: the owning Check reads it on entry.
     Len(LenExpr),
@@ -452,7 +452,7 @@ impl Expr {
                 out.extend(&spec.lens);
             }
             Expr::Len(term) => term.witnesses(out),
-            Expr::Residual(e, ty, spec) => {
+            Expr::Conform(e, ty, spec) => {
                 out.extend([*e, *ty]);
                 out.extend(&spec.lens);
             }
