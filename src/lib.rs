@@ -8913,6 +8913,71 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn open_annotation_shares_introduces_and_shadows_by_the_binder_kind() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{open_annotation, Ctx, InferCtx, TyVar};
+        use std::rc::Rc;
+        use types::{EffectRow, Type};
+
+        // (Vec(n) ->{n} Dyn): an index variable and a row variable that share the spelling `n`.
+        let ann = Type::Fun(
+            Rc::new(Type::Indexed(Rc::new(Type::List(Rc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".into())))),
+            EffectRow::Var("n".into()),
+            Rc::new(Type::Dyn),
+        );
+        let names = |t: &Type| match t {
+            Type::Fun(p, EffectRow::Var(r), _) => match p.as_ref() {
+                Type::Indexed(_, i) => match i.as_ref() {
+                    IndexExpr::Var(i) => (i.clone(), r.clone()),
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        };
+        let infer = InferCtx::new();
+
+        // No entry: both are introduced, as two separate variables of their own sort.
+        let mut intro = Vec::new();
+        let first = open_annotation(&ann, &Ctx::empty(), false, &mut intro);
+        assert_eq!(intro.len(), 2);
+        assert!(intro.iter().any(|(w, e)| *w == TyVar::Index("n".into()) && matches!(&e.var, TyVar::Index(f) if f.starts_with("n#"))));
+        assert!(intro.iter().any(|(w, e)| *w == TyVar::Row("n".into()) && matches!(&e.var, TyVar::Row(f) if f.starts_with("n#"))));
+        assert!(intro.iter().all(|(_, e)| !e.universal));
+        let (i1, r1) = names(&first);
+        assert!(i1.starts_with("n#") && r1.starts_with("n#"));
+
+        // The scope with them open: an existential binder shares both, introducing nothing.
+        let ctx = Ctx::empty().with_annot(&intro);
+        assert!(intro.iter().all(|(_, e)| ctx.open_vars(&infer).contains(&e.var)));
+        let mut again = Vec::new();
+        assert_eq!(names(&open_annotation(&ann, &ctx, false, &mut again)), (i1.clone(), r1.clone()));
+        assert!(again.is_empty());
+
+        // A universal binder shadows an existential entry: fresh variables, universal.
+        let mut shadow = Vec::new();
+        let (i2, r2) = names(&open_annotation(&ann, &ctx, true, &mut shadow));
+        assert!(i2 != i1 && r2 != r1 && shadow.len() == 2 && shadow.iter().all(|(_, e)| e.universal));
+
+        // ...and shares a universal one, whatever the binder kind.
+        let inner = ctx.with_annot(&shadow);
+        for universal in [true, false] {
+            let mut none = Vec::new();
+            assert_eq!(names(&open_annotation(&ann, &inner, universal, &mut none)), (i2.clone(), r2.clone()));
+            assert!(none.is_empty());
+        }
+
+        // Annotations opened into one `introduced` vector share a name, and an existential
+        // binder makes the shared entry existential.
+        let mut group = Vec::new();
+        let a = names(&open_annotation(&ann, &Ctx::empty(), true, &mut group));
+        assert!(group.iter().all(|(_, e)| e.universal));
+        let b = names(&open_annotation(&ann, &Ctx::empty(), false, &mut group));
+        assert_eq!(a, b);
+        assert!(group.len() == 2 && group.iter().all(|(_, e)| !e.universal));
+    }
+
+    #[test]
     fn variables_print_as_written() {
         // Checker bookkeeping (`n#0`, `e#0`) never reaches a message: the name is what the user wrote.
         let src = "let f = fun v: Vec(n + 1) -> v in let x: Dyn = [1, 2] in len(f(x))";

@@ -143,11 +143,42 @@ pub(crate) struct Ctx {
     // through the substitution as it stands, so a rollback in `unify_trial`
     // or a match arm's hypotheses cannot leave it stale.
     open: HashTrieSet<TyVar>,
+    // The annotation variables in scope, keyed by the row or index name as the user wrote it
+    // (never a `TyVar::Type`): the fresh variable each denotes here (open_annotation). A scoped
+    // annotation variable is also in `open`: it is free in the context.
+    annot: HashTrieMap<TyVar, AnnotVar>,
+}
+
+// What a written annotation variable stands for in a scope. `universal`: a function
+// signature's or a lambda parameter's variable, one the body may not pin; otherwise an
+// existential, one the checked value fixes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct AnnotVar {
+    pub(crate) var: TyVar,
+    pub(crate) universal: bool,
 }
 
 impl Ctx {
     pub(crate) fn empty() -> Ctx {
-        Ctx { binds: HashTrieMap::new(), open: HashTrieSet::new() }
+        Ctx { binds: HashTrieMap::new(), open: HashTrieSet::new(), annot: HashTrieMap::new() }
+    }
+
+    // This scope with `entries` (as open_annotation introduced them) in scope and open.
+    #[allow(dead_code)]
+    pub(crate) fn with_annot(&self, entries: &[(TyVar, AnnotVar)]) -> Ctx {
+        let mut ctx = self.clone();
+        for (written, entry) in entries {
+            ctx.open = ctx.open.insert(entry.var.clone());
+            ctx.annot = ctx.annot.insert(written.clone(), entry.clone());
+        }
+        ctx
+    }
+
+    // The entry a written name has in this scope.
+    #[allow(dead_code)]
+    pub(crate) fn annot_var(&self, written: &TyVar) -> Option<&AnnotVar> {
+        self.annot.get(written)
     }
 
     fn get(&self, name: &str) -> Option<Rc<Scheme>> {
@@ -161,7 +192,7 @@ impl Ctx {
                 open = open.insert(var);
             }
         }
-        Ctx { binds: self.binds.insert(name.to_string(), Rc::new(scheme)), open }
+        Ctx { binds: self.binds.insert(name.to_string(), Rc::new(scheme)), open, annot: self.annot.clone() }
     }
 
     pub(crate) fn open_vars(&self, infer: &InferCtx) -> BTreeSet<TyVar> {
@@ -3962,7 +3993,7 @@ fn check_against_rigid(
     spans: &SpanMap,
     infer: &mut InferCtx,
 ) -> Result<(EffectRow, ExprRef), TypeError> {
-    let signature_vars = if matches!(ann, Type::Fun(..)) { index_names(vars_in(&infer.resolve_deep(ann))) } else { BTreeSet::new() };
+    let signature_vars = if is_signature(ann) { index_names(vars_in(&infer.resolve_deep(ann))) } else { BTreeSet::new() };
     let added: Vec<String> = signature_vars.into_iter().filter(|v| infer.rigid_index.insert(v.clone())).collect();
     let prior: Vec<(String, Option<String>)> =
         renames.iter().map(|(from, to)| (from.clone(), infer.index_rename.insert(from.clone(), to.clone()))).collect();
@@ -4018,6 +4049,59 @@ fn open_signature(ann: &Type, infer: &InferCtx) -> (Type, Renames) {
     }
     let map: HashMap<String, IndexExpr> = renames.iter().map(|(from, to)| (from.clone(), IndexExpr::Var(to.clone()))).collect();
     (subst_type(&ann, &HashMap::new(), &HashMap::new(), &map), renames)
+}
+
+// A function annotation is a signature: its variables are its own parameters (universal).
+// Any other annotation's variables are existentials the checked value fixes.
+pub(crate) fn is_signature(ty: &Type) -> bool {
+    matches!(ty, Type::Fun(..))
+}
+
+// Introduce the row and index variables a written annotation `ty` names, at its binder. Each
+// written variable shares the entry already in scope or mints a fresh `name#k` (recorded in
+// `introduced`, for Ctx::with_annot); `ty` is returned with the fresh names substituted.
+//   - A universal binder shares an in-scope universal entry and shadows an in-scope existential.
+//   - An existential binder shares any in-scope entry.
+//   - A name with no entry in scope (or, for a group of annotations opened against one scope,
+//     already in `introduced`) is introduced here; sharing an introduced entry through an
+//     existential binder makes it existential.
+#[allow(dead_code)]
+pub(crate) fn open_annotation(ty: &Type, ctx: &Ctx, universal: bool, introduced: &mut Vec<(TyVar, AnnotVar)>) -> Type {
+    let mut rows: HashMap<String, EffectRow> = HashMap::new();
+    let mut indices: HashMap<String, IndexExpr> = HashMap::new();
+    for written in vars_in(ty) {
+        if matches!(written, TyVar::Type(_)) {
+            continue;
+        }
+        let var = match ctx.annot_var(&written) {
+            Some(entry) if entry.universal || !universal => entry.var.clone(),
+            _ => match introduced.iter_mut().find(|(w, _)| *w == written) {
+                Some((_, entry)) => {
+                    entry.universal &= universal;
+                    entry.var.clone()
+                }
+                None => {
+                    let var = match &written {
+                        TyVar::Row(name) => TyVar::Row(fresh_row_name(name)),
+                        TyVar::Index(name) => TyVar::Index(fresh_index_name(name)),
+                        TyVar::Type(_) => unreachable!("type variables are skipped above"),
+                    };
+                    introduced.push((written.clone(), AnnotVar { var: var.clone(), universal }));
+                    var
+                }
+            },
+        };
+        match (written, var) {
+            (TyVar::Row(w), TyVar::Row(f)) => {
+                rows.insert(w, EffectRow::Var(f));
+            }
+            (TyVar::Index(w), TyVar::Index(f)) => {
+                indices.insert(w, IndexExpr::Var(f));
+            }
+            _ => unreachable!("an annotation variable keeps its sort"),
+        }
+    }
+    subst_type(ty, &rows, &HashMap::new(), &indices)
 }
 
 // The bidirectional-checking entry point (spec section 6): verify `expr`
