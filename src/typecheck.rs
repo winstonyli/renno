@@ -153,7 +153,6 @@ pub(crate) struct Ctx {
 // signature's or a lambda parameter's variable, one the body may not pin; otherwise an
 // existential, one the checked value fixes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct AnnotVar {
     pub(crate) var: TyVar,
     pub(crate) universal: bool,
@@ -165,7 +164,6 @@ impl Ctx {
     }
 
     // This scope with `entries` (as open_annotation introduced them) in scope and open.
-    #[allow(dead_code)]
     pub(crate) fn with_annot(&self, entries: &[(TyVar, AnnotVar)]) -> Ctx {
         let mut ctx = self.clone();
         for (written, entry) in entries {
@@ -176,7 +174,6 @@ impl Ctx {
     }
 
     // The entry a written name has in this scope.
-    #[allow(dead_code)]
     pub(crate) fn annot_var(&self, written: &TyVar) -> Option<&AnnotVar> {
         self.annot.get(written)
     }
@@ -336,11 +333,6 @@ pub(crate) struct InferCtx {
     // checked (spec 2026-10-07). Hypotheses injected by Match write
     // index_subst directly, so they are unaffected.
     pub(crate) rigid_index: HashSet<String>,
-    // Annotation index-variable names renamed while an annotated binding's
-    // value is checked (open_signature): written name -> fresh name. Applied
-    // to every annotation read inside that value (scoped_annotation), so a
-    // body annotation reusing the name denotes the signature's variable.
-    index_rename: HashMap<String, String>,
     // Runtime values for index variables, innermost last: while a Lambda
     // whose parameter is Vec(n) is elaborated, `n` is that parameter's
     // length. A Dyn-to-Vec(n) boundary check inside reads the length of a
@@ -408,7 +400,6 @@ impl InferCtx {
             subst: HashMap::new(),
             index_subst: HashMap::new(),
             rigid_index: HashSet::new(),
-            index_rename: HashMap::new(),
             index_witness: Vec::new(),
             obligations: RefCell::new(Vec::new()),
             pendings: RefCell::new(Vec::new()),
@@ -3209,7 +3200,7 @@ fn annotation_type(arena: &mut Arena, ann: ExprRef, blame: Span, ctx: &Ctx, span
             ((*ty).clone(), AnnotKind::Confirm(ty))
         }
     };
-    let conform = matches!(kind, AnnotKind::Unknown).then(|| conform_spec(arena, root, blame, infer));
+    let conform = matches!(kind, AnnotKind::Unknown).then(|| conform_spec(arena, root, blame, ctx, infer));
     let spec = Rc::new(AnnotSpec::new(kind, spans[ann]));
     if matches!(spec.kind, AnnotKind::Confirm(_)) {
         infer.proofs.push(Proof::Site(defs, elaborated, spec.clone()));
@@ -3231,7 +3222,7 @@ fn annotation_type(arena: &mut Arena, ann: ExprRef, blame: Span, ctx: &Ctx, span
 // own, and matches any length. Unlike the binder that introduces it
 // statically, repeated occurrences do not share it (parked, spec 11.13). The
 // site's contract checks read the same table.
-fn conform_spec(arena: &mut Arena, root: ExprRef, blame: Span, infer: &InferCtx) -> Rc<ConformSpec> {
+fn conform_spec(arena: &mut Arena, root: ExprRef, blame: Span, ctx: &Ctx, infer: &InferCtx) -> Rc<ConformSpec> {
     let mut names = BTreeSet::new();
     let (mut work, mut kids) = (vec![root], Vec::new());
     while let Some(n) = work.pop() {
@@ -3248,13 +3239,23 @@ fn conform_spec(arena: &mut Arena, root: ExprRef, blame: Span, infer: &InferCtx)
     let env = CheckEnv { repeatable: true, ..CheckEnv::at(infer, blame) };
     let mut lens = Vec::with_capacity(names.len());
     for name in &names {
-        let var = infer.index_rename.get(name).unwrap_or(name);
-        let index = IndexExpr::Var(var.clone());
-        let bound = infer.index_witness.iter().any(|w| w.var == *var) || infer.index_subst.contains_key(var) || infer.rigid_index.contains(var);
-        let term = if bound { index_len_term(arena, &index, &env) } else { LenExpr::Any };
+        // A name this scope introduced denotes its variable (if that has a value to read); any
+        // other is the annotation's own, and matches any length.
+        let bound = match ctx.annot_var(&TyVar::Index(name.clone())) {
+            Some(AnnotVar { var: TyVar::Index(var), .. })
+                if infer.index_witness.iter().any(|w| w.var == *var) || infer.index_subst.contains_key(var) || infer.rigid_index.contains(var) =>
+            {
+                Some(IndexExpr::Var(var.clone()))
+            }
+            _ => None,
+        };
+        let term = match &bound {
+            Some(index) => index_len_term(arena, index, &env),
+            None => LenExpr::Any,
+        };
         let slot = arena.push(Expr::Len(term));
-        if bound {
-            record_obligation(slot, &index, &env);
+        if let Some(index) = &bound {
+            record_obligation(slot, index, &env);
         }
         lens.push(slot);
     }
@@ -3497,6 +3498,10 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // come from, or change, whatever mode the ENCLOSING
                 // chain is running under, and the body/tail after this
                 // binding stays under that same enclosing mode.
+                // The variables a non-function annotation introduced: existential, so in scope
+                // (and open) for the value and the rest of the scope. A signature's are the
+                // value's alone: they are generalized at this let.
+                let mut existentials = Vec::new();
                 let (bound_ty, val_row, val3) = match ann {
                     // `check_against` folds today's coerce-then-unify_fits
                     // pair into one call, AND -- since val may itself be a
@@ -3510,8 +3515,13 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // the value's scope.
                     Some(ann) => {
                         let annotation = annotation_type(arena, ann, spans[val], &cur_ctx, spans, infer)?;
-                        let (t, renames) = open_signature(&annotation.ty, infer);
-                        let (val_row, val4) = check_against_rigid(arena, val, &t, &renames, &cur_ctx, spans, infer)?;
+                        let universal = is_signature(&annotation.ty);
+                        let mut introduced = Vec::new();
+                        let t = open_annotation(&annotation.ty, &cur_ctx, universal, &mut introduced);
+                        let (val_row, val4) = check_against_rigid(arena, val, &t, &cur_ctx.with_annot(&introduced), spans, infer)?;
+                        if !universal {
+                            existentials = introduced;
+                        }
                         (t, val_row, bind_site(arena, infer, &annotation.site, val4))
                     }
                     None => {
@@ -3520,7 +3530,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     }
                 };
                 let def = infer.new_def(DefNode::Let(var.clone(), val), vec![val3], &cur_ctx);
-                cur_ctx = extend_generalized(&cur_ctx, &var, bound_ty.clone(), infer, Some(def.clone()));
+                cur_ctx = extend_generalized(&cur_ctx.with_annot(&existentials), &var, bound_ty.clone(), infer, Some(def.clone()));
                 pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3, def });
                 cur_expr = body;
             }
@@ -3601,18 +3611,22 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     def
                 });
                 let mut val_ctx = cur_ctx.clone();
-                // Each annotation opened once (open_signature), so the
-                // pre-binding below and the value check share its renames.
-                // A kept one is evaluated before the group, in the scope its
-                // annotation was evaluated in.
-                let mut opened: Vec<Option<(Type, Renames)>> = Vec::with_capacity(bindings.len());
+                // Each annotation opened once, against the outer scope and
+                // into one `introduced` vector (a name two members write is
+                // one variable; written by both a function and a non-function
+                // member it is existential), so the pre-binding below and the
+                // value check share its variables. A kept one is evaluated
+                // before the group, in the scope its annotation was
+                // evaluated in.
+                let mut introduced = Vec::new();
+                let mut opened: Vec<Option<Type>> = Vec::with_capacity(bindings.len());
                 let mut sites = Vec::new();
                 for (name, ann, val) in bindings.iter() {
                     opened.push(match ann {
                         Some(ann) => {
                             let annotation = annotation_type(arena, *ann, spans[*val], &cur_ctx, spans, infer)?;
                             sites.extend(annotation.site.map(|site| (name.clone(), site)));
-                            Some(open_signature(&annotation.ty, infer))
+                            Some(open_annotation(&annotation.ty, &cur_ctx, is_signature(&annotation.ty), &mut introduced))
                         }
                         None => None,
                     });
@@ -3620,7 +3634,6 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 for ((name, _, _), ann) in bindings.iter().zip(&opened) {
                     // A non-recursive group binds nothing for its values.
                     let Some(group) = &group else { break };
-                    let ann = ann.as_ref().map(|(t, _)| t);
                     val_ctx = match ann {
                         // Generalized, not plain extend: a fully-given
                         // annotation makes checking mode against it
@@ -3634,6 +3647,10 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         None => val_ctx.bind(name, Scheme { def: Some(group.clone()), ..Scheme::mono(infer.fresh_var(name)) }),
                     };
                 }
+                // The pre-bindings above are built first: the group's own universals are
+                // not yet open there, so they are quantified and a recursive reference
+                // instantiates them afresh (polymorphic recursion).
+                val_ctx = val_ctx.with_annot(&introduced);
                 let mut elaborated = Vec::with_capacity(bindings.len());
                 for ((name, _, val), ann) in bindings.iter().zip(opened) {
                     // Same check_against restructuring as Expr::Let just
@@ -3644,8 +3661,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         infer.direct_value = Some(*val);
                     }
                     let (bound_ty, val_row, val3) = match ann {
-                        Some((t, renames)) => {
-                            let (val_row, val4) = check_against_rigid(arena, *val, &t, &renames, &val_ctx, spans, infer)?;
+                        Some(t) => {
+                            let (val_row, val4) = check_against_rigid(arena, *val, &t, &val_ctx, spans, infer)?;
                             (t, val_row, val4)
                         }
                         None => {
@@ -3657,6 +3674,9 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 }
                 let values = elaborated.iter().map(|(_, _, _, v)| *v).collect();
                 let def = infer.new_def(DefNode::Group(bindings.clone()), values, &cur_ctx);
+                // The group's existential variables stay in scope, and open, after it.
+                introduced.retain(|(_, entry)| !entry.universal);
+                cur_ctx = cur_ctx.with_annot(&introduced);
                 for (name, bound_ty, _, _) in elaborated.iter() {
                     cur_ctx = extend_generalized(&cur_ctx, name, bound_ty.clone(), infer, Some(def.clone()));
                 }
@@ -3667,11 +3687,14 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // Taken before the annotation is elaborated, which may elaborate lambdas of its own.
                 let direct = infer.direct_value.take() == Some(cur_expr);
                 let mut site = None;
+                // A parameter annotation's variables are universal, and in scope (and open)
+                // for the body.
+                let mut introduced = Vec::new();
                 let ann = match ann {
                     Some(ann) => {
                         let annotation = annotation_type(arena, ann, spans[ann], &cur_ctx, spans, infer)?;
                         site = annotation.site;
-                        Some(scoped_annotation(&annotation.ty, infer))
+                        Some(open_annotation(&annotation.ty, &cur_ctx, true, &mut introduced))
                     }
                     None => None,
                 };
@@ -3714,7 +3737,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     }
                     _ => (ann.unwrap_or_else(|| infer.fresh_var(&param)), Mode::Synth),
                 };
-                cur_ctx = extend(&cur_ctx, &param, param_ty.clone());
+                cur_ctx = extend(&cur_ctx.with_annot(&introduced), &param, param_ty.clone());
                 let witness = list_length_var(&param_ty, infer).map(|var| IndexWitness::new(var, &param));
                 let has_witness = witness.is_some();
                 infer.index_witness.extend(witness);
@@ -3982,73 +4005,14 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
 // compose. Non-function annotations (`let x: Vec(n) = [1, 2]`) keep their
 // flexible, binding-style variables: there `n` is an existential to be
 // inferred from the value, not a signature parameter. See spec 2026-10-07.
-// `renames` (from open_signature) are in force for the value only, then
-// restored, the same way the rigid set is.
-fn check_against_rigid(
-    arena: &mut Arena,
-    val: ExprRef,
-    ann: &Type,
-    renames: &[(String, String)],
-    ctx: &Ctx,
-    spans: &SpanMap,
-    infer: &mut InferCtx,
-) -> Result<(EffectRow, ExprRef), TypeError> {
+fn check_against_rigid(arena: &mut Arena, val: ExprRef, ann: &Type, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<(EffectRow, ExprRef), TypeError> {
     let signature_vars = if is_signature(ann) { index_names(vars_in(&infer.resolve_deep(ann))) } else { BTreeSet::new() };
     let added: Vec<String> = signature_vars.into_iter().filter(|v| infer.rigid_index.insert(v.clone())).collect();
-    let prior: Vec<(String, Option<String>)> =
-        renames.iter().map(|(from, to)| (from.clone(), infer.index_rename.insert(from.clone(), to.clone()))).collect();
     let result = check_against(arena, val, ann, ctx, spans, infer);
-    for (from, old) in prior.into_iter().rev() {
-        match old {
-            Some(old) => infer.index_rename.insert(from, old),
-            None => infer.index_rename.remove(&from),
-        };
-    }
     for v in &added {
         infer.rigid_index.remove(v);
     }
     result
-}
-
-// An annotation as read inside an annotated binding's value: names that an
-// enclosing open_signature renamed denote the renamed variable.
-fn scoped_annotation(ann: &Type, infer: &InferCtx) -> Type {
-    if infer.index_rename.is_empty() {
-        return ann.clone();
-    }
-    let map: HashMap<String, IndexExpr> =
-        infer.index_rename.iter().map(|(from, to)| (from.clone(), IndexExpr::Var(to.clone()))).collect();
-    subst_type(ann, &HashMap::new(), &HashMap::new(), &map)
-}
-
-// A function signature's index variables are its own parameters. Index
-// variable names are program-global strings, and a non-function annotation
-// (`let a: Vec(n) = [1, 2]`) binds its `n` existentially for the rest of the
-// program, so a later signature reusing the name would otherwise inherit
-// `n = 2` instead of quantifying. Rename such names (bound in index_subst,
-// and not an enclosing signature's own rigid variable, which a nested
-// signature deliberately shares) to fresh ones. Returns the renamed
-// annotation and the renames to scope over the value (check_against_rigid).
-type Renames = Vec<(String, String)>;
-
-fn open_signature(ann: &Type, infer: &InferCtx) -> (Type, Renames) {
-    let ann = scoped_annotation(ann, infer);
-    if !matches!(ann, Type::Fun(..)) {
-        return (ann, Vec::new());
-    }
-    let renames: Renames = index_names(vars_in(&ann))
-        .into_iter()
-        .filter(|v| infer.index_subst.contains_key(v) && !infer.rigid_index.contains(v))
-        .map(|v| {
-            let fresh = fresh_index_name(&v);
-            (v, fresh)
-        })
-        .collect();
-    if renames.is_empty() {
-        return (ann, renames);
-    }
-    let map: HashMap<String, IndexExpr> = renames.iter().map(|(from, to)| (from.clone(), IndexExpr::Var(to.clone()))).collect();
-    (subst_type(&ann, &HashMap::new(), &HashMap::new(), &map), renames)
 }
 
 // A function annotation is a signature: its variables are its own parameters (universal).
@@ -4065,7 +4029,6 @@ pub(crate) fn is_signature(ty: &Type) -> bool {
 //   - A name with no entry in scope (or, for a group of annotations opened against one scope,
 //     already in `introduced`) is introduced here; sharing an introduced entry through an
 //     existential binder makes it existential.
-#[allow(dead_code)]
 pub(crate) fn open_annotation(ty: &Type, ctx: &Ctx, universal: bool, introduced: &mut Vec<(TyVar, AnnotVar)>) -> Type {
     let mut rows: HashMap<String, EffectRow> = HashMap::new();
     let mut indices: HashMap<String, IndexExpr> = HashMap::new();

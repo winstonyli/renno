@@ -7765,14 +7765,15 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn a_monomorphic_vec_n_witness_checks_list_shape_only_in_the_closure_form_known_limitation() {
-        // `n` is bound by an earlier Dyn-to-Vec(n) check; the wrapper gets a
-        // per-call witness, so DOWN checks only that the argument is a list.
-        // The direct call f([1]) is rejected.
+    fn a_parameter_vec_n_shadows_an_earlier_existential_n() {
+        // `n` in `y: Vec(n)` is an existential bound by a Dyn-to-Vec check. The
+        // parameter annotation `w: Vec(n)` is universal and shadows it (rule S2),
+        // so `f` is polymorphic in its own `n` and both the direct call and the
+        // call through a Dyn wrapper accept a list of any length.
         let src = "let x: Dyn = [1, 2] in let y: Vec(n) = x in let f = fun w: Vec(n) -> len(w) in let d: Dyn = f in d([1])";
         assert_eq!(run_source(src).unwrap().as_int(), 1);
         let direct = "let x: Dyn = [1, 2] in let y: Vec(n) = x in let f = fun w: Vec(n) -> len(w) in f([1])";
-        assert!(run_source(direct).is_err());
+        assert_eq!(run_source(direct).unwrap().as_int(), 1);
     }
 
     #[test]
@@ -8975,6 +8976,67 @@ g(len)").unwrap_err();
         let b = names(&open_annotation(&ann, &Ctx::empty(), false, &mut group));
         assert_eq!(a, b);
         assert!(group.len() == 2 && group.iter().all(|(_, e)| !e.universal));
+    }
+
+    #[test]
+    fn annotation_variables_of_sibling_scopes_are_independent() {
+        for (src, want) in [
+            // P1: an inline lambda's n and a later signature's n are two variables.
+            ("let a = (fun x: Vec(n) -> x)([1]) in let idv = fun v: Vec(n) -> v in let b: Vec(2) = idv([1, 2]) in len(b)", "2"),
+            // P3: an existential inside a let value does not outlive it.
+            ("let p = (let y: Vec(n) = [1] in 0) in let z: Vec(n) = [1, 2] in len(z)", "2"),
+            // P4
+            ("let p = (let y: Vec(n) = [1] in 0) in let f = fun v: Vec(n) -> v in len(f([1, 2]))", "2"),
+            // P5: the same inside a function body.
+            ("let g = fun u -> (let a = (fun x: Vec(n) -> x)([1]) in let idv = fun v: Vec(n) -> v in len(idv([1, 2]))) in g(0)", "2"),
+            // P8: two parameters of one tuple.
+            ("let p = (fun x: Vec(n) -> x, fun y: Vec(n) -> y) in match p | (f, g) -> len(f([1])) + len(g([1, 2]))", "3"),
+            // P9
+            ("let a = (fun x: Vec(n) -> x)([1]) in let f = fun v -> let w: Vec(n) = v in w in len(f([1, 2]))", "2"),
+            // P10: a crossing's n has a run-time value of its own in each scope.
+            ("let p = (let x: Dyn = [1] in let y: Vec(n) = x in 0) in let x2: Dyn = [1, 2] in let z: Vec(n) = x2 in len(z)", "2"),
+        ] {
+            assert_eq!(run_source(src).unwrap_or_else(|e| panic!("{src}: {e}")).to_string(), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn param_annotation_shadows_an_existential() {
+        // P12: a parameter's n is its own, not the existential `let a: Vec(n)` fixed to 2.
+        let src = "let a: Vec(n) = [1, 2] in (fun v: Vec(n) -> v)([1, 2, 3])";
+        assert_eq!(run_source(src).unwrap().to_string(), "[1, 2, 3]");
+        let src = "let a: Vec(n) = [1, 2] in let f = fun v: Vec(n) -> v in len(f([1, 2, 3]))";
+        assert_eq!(run_source(src).unwrap().to_string(), "3");
+        // A signature, too (unchanged), and an existential still fixes n for a later existential.
+        let src = "let a: Vec(n) = [1, 2] in let f: (Vec(n) -> Vec(n)) = fun v -> v in f([1, 2, 3])";
+        assert_eq!(run_source(src).unwrap().to_string(), "[1, 2, 3]");
+        rejects("let a: Vec(n) = [1, 2] in let b: Vec(n) = [1, 2, 3] in 0", "type mismatch");
+    }
+
+    #[test]
+    fn signature_variables_do_not_reach_the_let_body() {
+        let src = "let f: (Vec(n) -> Int) = fun v -> 0 in let z: Vec(n) = [1] in len(z) + f([1, 2])";
+        assert_eq!(run_source(src).unwrap().to_string(), "1");
+        let src = "let f: (Vec(n) -> Vec(n)) = fun v -> v in let w: Vec(n) = [1, 2] in len(f([1, 2, 3]))";
+        assert_eq!(run_source(src).unwrap().to_string(), "3");
+    }
+
+    #[test]
+    fn scoped_annotation_variables_are_open_in_the_value() {
+        // P13: g's parameter n is free in f's value (the signature's n), so g's type is not
+        // generalized over it and `g([1, 2])` pins the signature's rigid n.
+        let src = "let f: (Int -> Vec(n)) = fun k -> let r: Dyn = [1] in let g = fun u: Vec(n) -> u in let a = g([1, 2]) in r in len(f(0))";
+        rejects(src, "index variable n is fixed by the signature and cannot equal 2");
+    }
+
+    #[test]
+    fn effect_row_variables_are_shared_when_nested_and_independent_when_siblings() {
+        // Nested: the inner `e` is the outer parameter's, so the row is not re-generalized.
+        let src = "let k = fun cb: (Dyn ->{e} Dyn) -> fun h: (Dyn ->{e} Dyn) -> h in handle k(fun y -> perform choose(y))(fun z -> z)(1) with handler choose(p, resume) -> resume(p)";
+        rejects(src, "type mismatch: expected (Dyn ->{choose} Dyn), found (Dyn ->{} Dyn)");
+        // Siblings: two lets each quantify their own `e`.
+        let src = "let k = fun cb: (Dyn ->{e} Dyn) -> cb in let m = fun cb: (Dyn ->{e} Dyn) -> cb in handle m(k(fun y -> perform choose(y)))(1) with handler choose(p, resume) -> resume(p)";
+        assert_eq!(run_source(src).unwrap().to_string(), "1");
     }
 
     #[test]
