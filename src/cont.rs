@@ -111,13 +111,13 @@ impl Cont {
         Cont(Rc::new(ContNode::Frame(frame, rest)))
     }
 
-    // The top frame and the rest, moved out, when the top frame is a ListElems or
-    // RecordElems that nothing else holds (the single-shot case); None otherwise,
-    // in particular when a captured continuation shares it and must keep its own
-    // copy. Lets those frames pass their accumulated elements on without cloning
-    // them, so a literal of n elements costs O(n), not O(n^2).
+    // The top frame and the rest, moved out, when the top frame is a ListElems,
+    // RecordElems or TypeGroupBody that nothing else holds (the single-shot case); None
+    // otherwise, in particular when a captured continuation shares it and must keep its
+    // own copy. Lets those frames pass their accumulated elements on without cloning
+    // them, so a literal (or type group) of n elements costs O(n), not O(n^2).
     pub fn take_unshared_elems(&mut self) -> Option<(Frame, Cont)> {
-        if !matches!(&*self.0, ContNode::Frame(Frame::ListElems { .. } | Frame::RecordElems { .. }, _)) || Rc::strong_count(&self.0) != 1 {
+        if !matches!(&*self.0, ContNode::Frame(Frame::ListElems { .. } | Frame::RecordElems { .. } | Frame::TypeGroupBody { .. }, _)) || Rc::strong_count(&self.0) != 1 {
             return None;
         }
         match Rc::try_unwrap(std::mem::replace(&mut self.0, Rc::new(ContNode::Nil))) {

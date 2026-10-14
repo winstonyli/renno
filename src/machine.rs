@@ -225,14 +225,14 @@ pub fn apply(arena: &Arena, func: Value, arg: Value, spans: &SpanMap, resolved: 
 // instance (`run_loop::<false>`) compiles without them: no cost on the hot path.
 fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap, resolved: &Resolved, mut fuel: u64) -> Result<Value, Stuck> {
     loop {
-        // A list or record literal's accumulator frame that only this evaluation holds is
+        // A list, record or type-group accumulator frame that only this evaluation holds is
         // moved, not cloned, so building n elements is O(n). A frame a captured
         // continuation shares falls through to the cloning arms below.
         if matches!(control, Control::Apply(_))
             && let Some((frame, rest)) = cont.take_unshared_elems()
         {
             let Control::Apply(value) = control else { unreachable!() };
-            (control, cont) = advance_elems(frame, rest, value);
+            (control, cont) = advance_elems(arena, spans, frame, rest, value);
             continue;
         }
         match control {
@@ -611,30 +611,12 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                                 }
                             }
                         }
+                        // The shared case (a captured continuation holds this frame): copy it.
+                        // The unshared one is moved by take_unshared_elems, so a group of n
+                        // values costs O(n), not O(n^2).
                         Frame::TypeGroupBody { group, ids, done, env, vals_env } => {
-                            let group = *group;
-                            let Expr::LetRec(bindings, body) = &arena[group] else { unreachable!("a type group frame names a LetRec") };
-                            let mut done = done.clone();
-                            done.push(value);
-                            let (ids, env, vals_env) = (ids.clone(), env.clone(), vals_env.clone());
-                            cont = rest;
-                            if done.len() < bindings.len() {
-                                let next = bindings[done.len()].2;
-                                cont = Cont::cons(Frame::TypeGroupBody { group, ids, done, env, vals_env: vals_env.clone() }, cont);
-                                control = Control::Eval(next, vals_env);
-                            } else {
-                                let results: Vec<Option<Type>> = done.iter().map(|v| if let Value::Type(t) = v { Some((**t).clone()) } else { None }).collect();
-                                let names: Vec<Rc<str>> = bindings.iter().map(|(n, _, _)| Rc::from(n.as_str())).collect();
-                                let closed = close_group(&names, &ids, &results).unwrap_or_else(|(i, _)| {
-                                    set_current_span(spans.get(bindings[i].2).copied());
-                                    crate::run_error!("recursive type {} is not built by a type constructor", names[i])
-                                });
-                                let mut frame = Bindings::default();
-                                for (v, c) in done.into_iter().zip(closed) {
-                                    frame.push(c.map_or(v, |t| Value::Type(Rc::new(t))));
-                                }
-                                control = Control::Eval(*body, frame.extend(&env));
-                            }
+                            (control, cont) =
+                                advance_type_group(arena, spans, *group, ids.clone(), done.clone(), env.clone(), vals_env.clone(), rest, value);
                         }
                         Frame::MatchArms { arms, env } => {
                             let (arms, env) = (arms.clone(), env.clone());
@@ -757,10 +739,46 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
     }
 }
 
-// The ListElems or RecordElems frame `frame` (popped, with `rest` below it) receives the
-// value of its next element. Same step as the borrowing arms in run_loop, on owned data.
-fn advance_elems(frame: Frame, rest: Cont, value: Value) -> (Control, Cont) {
+// A type group (`group`, a LetRec of unannotated calls) receives the value of its next member:
+// evaluate the next one in the placeholder frame, or, after the last, close the group and run
+// its body on the finished types (Frame::TypeGroupBody).
+#[allow(clippy::too_many_arguments)]
+fn advance_type_group(
+    arena: &Arena,
+    spans: &SpanMap,
+    group: ExprRef,
+    ids: Rc<[u64]>,
+    mut done: Vec<Value>,
+    env: Env,
+    vals_env: Env,
+    rest: Cont,
+    value: Value,
+) -> (Control, Cont) {
+    let Expr::LetRec(bindings, body) = &arena[group] else { unreachable!("a type group frame names a LetRec") };
+    done.push(value);
+    if done.len() < bindings.len() {
+        let next = bindings[done.len()].2;
+        let cont = Cont::cons(Frame::TypeGroupBody { group, ids, done, env, vals_env: vals_env.clone() }, rest);
+        return (Control::Eval(next, vals_env), cont);
+    }
+    let results: Vec<Option<Type>> = done.iter().map(|v| if let Value::Type(t) = v { Some((**t).clone()) } else { None }).collect();
+    let names: Vec<Rc<str>> = bindings.iter().map(|(n, _, _)| Rc::from(n.as_str())).collect();
+    let closed = close_group(&names, &ids, &results).unwrap_or_else(|(i, _)| {
+        set_current_span(spans.get(bindings[i].2).copied());
+        crate::run_error!("recursive type {} is not built by a type constructor", names[i])
+    });
+    let mut frame = Bindings::default();
+    for (v, c) in done.into_iter().zip(closed) {
+        frame.push(c.map_or(v, |t| Value::Type(Rc::new(t))));
+    }
+    (Control::Eval(*body, frame.extend(&env)), rest)
+}
+
+// The ListElems, RecordElems or TypeGroupBody frame `frame` (popped, with `rest` below it)
+// receives the value of its next element. Same step as the borrowing arms in run_loop, on owned data.
+fn advance_elems(arena: &Arena, spans: &SpanMap, frame: Frame, rest: Cont, value: Value) -> (Control, Cont) {
     match frame {
+        Frame::TypeGroupBody { group, ids, done, env, vals_env } => advance_type_group(arena, spans, group, ids, done, env, vals_env, rest, value),
         Frame::ListElems { mut remaining, mut done, env } => {
             done.push(value);
             match remaining.pop() {

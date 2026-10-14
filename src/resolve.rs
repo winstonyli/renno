@@ -304,15 +304,24 @@ fn visit(
         }
         Expr::LetRec(bindings, body) => {
             let names: Vec<String> = bindings.iter().map(|(n, _, _)| n.clone()).collect();
+            let kind = group_kind(arena, bindings);
+            if kind == GroupKind::Types {
+                // Type group: the values run in a frame of the group's own
+                // placeholders, the same layout [names…] as the body's, at the same
+                // depth, so ONE scope serves them all (a scope per value would cost
+                // O(names) each, quadratic in the group's size).
+                work.push(Work::Pop);
+                work.push(Work::Visit(*body));
+                for (_, _, v) in bindings.iter().rev() {
+                    work.push(Work::Visit(*v));
+                }
+                work.push(Work::Push(names));
+                return;
+            }
             // Reverse processing order: the body's frame [names…] comes last…
             scoped(work, names.clone(), *body);
-            let kind = group_kind(arena, bindings);
             for (_, _, v) in bindings.iter().rev() {
-                if kind == GroupKind::Types {
-                    // Type group: the values run in a frame of the group's own
-                    // placeholders, the same layout as the body's.
-                    scoped(work, names.clone(), *v);
-                } else if kind == GroupKind::Functions {
+                if kind == GroupKind::Functions {
                     // Direct-Lambda group: each function body runs in one
                     // frame [names…, param] (the Lambda node itself is never
                     // evaluated in the runtime's group form).

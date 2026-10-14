@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -318,18 +318,6 @@ pub fn unfold(g: &RecRef, i: usize) -> Type {
     subst_bound(&g.0.bodies[i], 0, g).unwrap_or_else(|| g.0.bodies[i].clone())
 }
 
-fn occurs_free(t: &Type, id: u64) -> bool {
-    match t {
-        Type::RecVar(RecVar::Free { id: i, .. }) => *i == id,
-        Type::Rec(h, _) => !h.0.plain && h.0.bodies.iter().any(|b| occurs_free(b, id)),
-        _ => {
-            let mut found = false;
-            each_child(t, &mut |c| found = found || occurs_free(c, id));
-            found
-        }
-    }
-}
-
 // `t` with each Free placeholder `f(id, depth)` answers for replaced; depth counts the groups
 // entered. None when nothing changed. Plain groups hold no placeholder and are skipped.
 fn replace_free(t: &Type, depth: u32, f: &dyn Fn(u64, u32) -> Option<Type>) -> Option<Type> {
@@ -375,59 +363,227 @@ pub enum CloseError {
 
 // Closes a `let rec` type group the machine just evaluated. `results[i]` is the value of
 // member i if it is a type (it mentions the group's members as Free placeholders with `ids`),
-// else None. Members some type mentions become a RecGroup, the rest keep their type with the
-// placeholders replaced by the closed members. Err is (member, why).
+// else None. Each strongly connected component of members that some type mentions becomes its
+// own RecGroup (holding only its own members, in a canonical order); the rest keep their type
+// with the placeholders replaced by the closed members. Err is (member, why).
 pub fn close_group(names: &[Rc<str>], ids: &[u64], results: &[Option<Type>]) -> Result<Vec<Option<Type>>, (usize, CloseError)> {
+    let n = ids.len();
+    let index: HashMap<u64, usize> = ids.iter().enumerate().map(|(j, id)| (*id, j)).collect();
     for (i, r) in results.iter().enumerate() {
         if let Some(Type::RecVar(RecVar::Free { id, .. })) = r
-            && ids.contains(id)
+            && index.contains_key(id)
         {
             return Err((i, CloseError::Bare));
         }
     }
-    let referenced: Vec<usize> =
-        (0..ids.len()).filter(|&j| results.iter().flatten().any(|t| occurs_free(t, ids[j]))).collect();
-    if let Some(&j) = referenced.iter().find(|&&j| results[j].is_none()) {
+    // succ[i]: the members whose placeholder member i's type mentions.
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut referenced = vec![false; n];
+    for (i, r) in results.iter().enumerate() {
+        if let Some(t) = r {
+            collect_free(t, &index, &mut succ[i]);
+            succ[i].sort_unstable();
+            succ[i].dedup();
+            for &j in &succ[i] {
+                referenced[j] = true;
+            }
+        }
+    }
+    if let Some(j) = (0..n).find(|&j| referenced[j] && results[j].is_none()) {
         return Err((j, CloseError::NotAType));
     }
-    if referenced.is_empty() {
+    if !referenced.contains(&true) {
         return Ok(results.to_vec());
     }
-    let pos = |id: u64| ids.iter().position(|x| *x == id).and_then(|j| referenced.iter().position(|r| *r == j));
-    let bodies: Vec<Type> = referenced
-        .iter()
-        .map(|&j| {
-            let t = results[j].as_ref().expect("checked above");
-            let bound = |id: u64, depth: u32| pos(id).map(|p| Type::RecVar(RecVar::Bound { depth, member: p as u32 }));
-            replace_free(t, 0, &bound).unwrap_or_else(|| t.clone())
-        })
-        .collect();
-    let g = RecRef(Rc::new(RecGroup::new(referenced.iter().map(|&j| names[j].clone()).collect(), bodies)));
-    let closed = |id: u64, _: u32| pos(id).map(|p| Type::Rec(g.clone(), p));
-    let out: Vec<Option<Type>> = results
-        .iter()
-        .enumerate()
-        .map(|(j, r)| {
-            r.as_ref().map(|t| match referenced.iter().position(|m| *m == j) {
-                Some(p) => Type::Rec(g.clone(), p),
-                None => replace_free(t, 0, &closed).unwrap_or_else(|| t.clone()),
-            })
-        })
-        .collect();
-    // Contractive: unfolding a member must reach a type constructor, never loop through members.
-    for (p, &j) in referenced.iter().enumerate() {
-        let mut keep = vec![g.clone()];
-        let mut seen = HashSet::from([(Rc::as_ptr(&g.0), p)]);
-        let mut cur = (g.clone(), p);
-        while let Type::Rec(h, k) = unfold(&cur.0, cur.1) {
-            if !seen.insert((Rc::as_ptr(&h.0), k)) {
-                return Err((j, CloseError::Bare));
+    // Each strongly connected component is its own group, built after every component it
+    // reaches (Tarjan emits them in that order), so a member of another component is just
+    // that component's finished Rec.
+    let mut scc_of = vec![0usize; n];
+    let components = strongly_connected(&succ);
+    for (c, comp) in components.iter().enumerate() {
+        for &m in comp {
+            scc_of[m] = c;
+        }
+    }
+    let mut slot = vec![0usize; n];
+    let mut closed: Vec<Option<Type>> = vec![None; n];
+    let mut out: Vec<Option<Type>> = vec![None; n];
+    for (c, mut comp) in components.into_iter().enumerate() {
+        let resolve = |id: u64, depth: u32, slot: &[usize], closed: &[Option<Type>]| {
+            let m = *index.get(&id)?;
+            if scc_of[m] == c {
+                Some(Type::RecVar(RecVar::Bound { depth, member: slot[m] as u32 }))
+            } else {
+                closed[m].clone()
             }
-            keep.push(h.clone());
-            cur = (h, k);
+        };
+        let outside = |id: u64, _: u32, closed: &[Option<Type>]| index.get(&id).and_then(|&m| if scc_of[m] == c { None } else { closed[m].clone() });
+        if !referenced[comp[0]] {
+            // A lone member nothing mentions (a cycle would mention itself): no group.
+            let m = comp[0];
+            out[m] = results[m].as_ref().map(|t| replace_free(t, 0, &|id, d| outside(id, d, &closed)).unwrap_or_else(|| t.clone()));
+            continue;
+        }
+        let mut types: Vec<Type> = Vec::with_capacity(comp.len());
+        if comp.len() == 1 {
+            slot[comp[0]] = 0;
+            let t = results[comp[0]].as_ref().expect("referenced members are types");
+            types.push(replace_free(t, 0, &|id, d| resolve(id, d, &slot, &closed)).unwrap_or_else(|| t.clone()));
+        } else {
+            // Members are listed in a canonical order, so equal structures give equal groups
+            // however the `let rec` was written (see canonical_order), then bound to it.
+            comp.sort_unstable();
+            let mut bodies: HashMap<usize, Type> = HashMap::new();
+            for &m in &comp {
+                let t = results[m].as_ref().expect("referenced members are types");
+                bodies.insert(m, replace_free(t, 0, &|id, d| outside(id, d, &closed)).unwrap_or_else(|| t.clone()));
+            }
+            canonical_order(&mut comp, &bodies, &index, &scc_of, c);
+            for (p, &m) in comp.iter().enumerate() {
+                slot[m] = p;
+            }
+            for &m in &comp {
+                let t = &bodies[&m];
+                types.push(replace_free(t, 0, &|id, d| resolve(id, d, &slot, &closed)).unwrap_or_else(|| t.clone()));
+            }
+        }
+        let g = RecRef(Rc::new(RecGroup::new(comp.iter().map(|&m| names[m].clone()).collect(), types)));
+        // Contractive: unfolding a member must reach a type constructor, never loop through members.
+        for (p, &m) in comp.iter().enumerate() {
+            if !matches!(g.0.bodies[p], Type::RecVar(_) | Type::Rec(..)) {
+                continue;
+            }
+            let mut keep = vec![g.clone()];
+            let mut seen = HashSet::from([(Rc::as_ptr(&g.0), p)]);
+            let mut cur = (g.clone(), p);
+            while let Type::Rec(h, k) = unfold(&cur.0, cur.1) {
+                if !seen.insert((Rc::as_ptr(&h.0), k)) {
+                    return Err((m, CloseError::Bare));
+                }
+                keep.push(h.clone());
+                cur = (h, k);
+            }
+        }
+        for (p, &m) in comp.iter().enumerate() {
+            closed[m] = Some(Type::Rec(g.clone(), p));
+            out[m] = closed[m].clone();
         }
     }
     Ok(out)
+}
+
+// The indices (into `index`) of the group members whose placeholder `t` mentions, with repeats.
+fn collect_free(t: &Type, index: &HashMap<u64, usize>, found: &mut Vec<usize>) {
+    match t {
+        Type::RecVar(RecVar::Free { id, .. }) => found.extend(index.get(id)),
+        Type::Rec(h, _) => {
+            if !h.0.plain {
+                h.0.bodies.iter().for_each(|b| collect_free(b, index, found));
+            }
+        }
+        _ => each_child(t, &mut |c| collect_free(c, index, found)),
+    }
+}
+
+// Tarjan's algorithm, iterative: the components of the graph `succ`, each after every component
+// it reaches.
+fn strongly_connected(succ: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    const UNSEEN: usize = usize::MAX;
+    let n = succ.len();
+    let (mut order, mut low, mut on_stack) = (vec![UNSEEN; n], vec![0usize; n], vec![false; n]);
+    let (mut stack, mut out, mut counter) = (Vec::new(), Vec::new(), 0usize);
+    for root in 0..n {
+        if order[root] != UNSEEN {
+            continue;
+        }
+        let mut work = vec![(root, 0usize)];
+        (order[root], low[root], counter) = (counter, counter, counter + 1);
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&(v, k)) = work.last() {
+            if k < succ[v].len() {
+                work.last_mut().expect("nonempty").1 += 1;
+                let w = succ[v][k];
+                if order[w] == UNSEEN {
+                    (order[w], low[w], counter) = (counter, counter, counter + 1);
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(order[w]);
+                }
+            } else {
+                work.pop();
+                if let Some(&(parent, _)) = work.last() {
+                    low[parent] = low[parent].min(low[v]);
+                }
+                if low[v] == order[v] {
+                    let mut comp = Vec::new();
+                    loop {
+                        let w = stack.pop().expect("v is on the stack");
+                        on_stack[w] = false;
+                        comp.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    out.push(comp);
+                }
+            }
+        }
+    }
+    out
+}
+
+// Orders the members of one mutually recursive component by what their types look like, not by
+// where they were written (colour refinement: a member's colour hashes its type's shape with
+// each reference to a member replaced by that member's colour, repeated until no more
+// members are told apart). Members that stay alike keep their written order, which is the
+// best a cheap pass can do; every order is a correct group, only equality across spellings
+// depends on it.
+fn canonical_order(comp: &mut [usize], bodies: &HashMap<usize, Type>, index: &HashMap<u64, usize>, scc_of: &[usize], c: usize) {
+    use std::hash::{Hash, Hasher};
+    fn skeleton(t: &Type, colour: &dyn Fn(u64) -> Option<u64>, h: &mut std::collections::hash_map::DefaultHasher) {
+        match t {
+            Type::RecVar(RecVar::Free { id, .. }) => match colour(*id) {
+                Some(k) => (1u8, k).hash(h),
+                None => (2u8, id).hash(h),
+            },
+            Type::RecVar(RecVar::Bound { depth, member }) => (3u8, depth, member).hash(h),
+            Type::Rec(g, k) => {
+                (4u8, k, g.0.bodies.len()).hash(h);
+                if !g.0.plain {
+                    g.0.bodies.iter().for_each(|b| skeleton(b, colour, h));
+                }
+            }
+            Type::Token(id) => (5u8, id).hash(h),
+            Type::Record(fields) => (6u8, fields.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()).hash(h),
+            _ => std::mem::discriminant(t).hash(h),
+        }
+        if !matches!(t, Type::Rec(..)) {
+            each_child(t, &mut |ch| skeleton(ch, colour, h));
+        }
+    }
+    let mut colours: HashMap<usize, u64> = comp.iter().map(|&m| (m, 0)).collect();
+    let mut distinct = 1;
+    for _ in 0..8 {
+        let next: HashMap<usize, u64> = comp
+            .iter()
+            .map(|&m| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                let of = |id: u64| index.get(&id).filter(|&&j| scc_of[j] == c).map(|j| colours[j]);
+                skeleton(&bodies[&m], &of, &mut h);
+                (m, h.finish())
+            })
+            .collect();
+        let count = next.values().collect::<HashSet<_>>().len();
+        colours = next;
+        if count <= distinct {
+            break;
+        }
+        distinct = count;
+    }
+    comp.sort_by_key(|m| colours[m]);
 }
 
 // The name the user wrote for an index, row or type variable: the part before the first `#`

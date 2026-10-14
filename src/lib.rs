@@ -3469,10 +3469,13 @@ g(len)").unwrap_err();
             close_group(&names, &ids, &[Some(a), Some(b)]).expect("a contractive group closes")
         };
         let out = build();
-        let (Some(Type::Rec(g, 0)), Some(Type::Rec(h, 1))) = (&out[0], &out[1]) else { panic!("both members became Rec: {out:?}") };
+        let (Some(Type::Rec(g, a)), Some(Type::Rec(h, b))) = (&out[0], &out[1]) else { panic!("both members became Rec: {out:?}") };
         assert!(Rc::ptr_eq(&g.0, &h.0));
-        assert_eq!(g.0.bodies[0], rec_tup(vec![Type::Int, rec_bound(0, 1)]));
-        assert_eq!(g.0.bodies[1], rec_uni(vec![Type::Bool, rec_bound(0, 0)]));
+        // The group lists its members in a canonical order (by shape), not as written.
+        assert_ne!(a, b);
+        assert_eq!(g.0.bodies[*a], rec_tup(vec![Type::Int, rec_bound(0, *b as u32)]));
+        assert_eq!(g.0.bodies[*b], rec_uni(vec![Type::Bool, rec_bound(0, *a as u32)]));
+        assert_eq!((&*g.0.names[*a], &*g.0.names[*b]), ("A", "B"));
         let again = build();
         assert_eq!(out, again, "two independent builds are equal");
         let Some(Type::Rec(g2, _)) = &again[0] else { panic!() };
@@ -3520,6 +3523,54 @@ g(len)").unwrap_err();
         // A = X, X = A where X is an inner group: unfolding A loops without reaching a constructor.
         let gx = RecRef(Rc::new(RecGroup::new(vec![Rc::from("X")], vec![rec_free(a, "A")])));
         assert_eq!(close_group(&an, &[a], &[Some(Type::Rec(gx, 0))]), Err((0, CloseError::Bare)));
+    }
+
+    // Each strongly connected component of one `let rec` is its own group, and a member that
+    // reaches another component refers to that component's finished type.
+    #[test]
+    fn rec_close_splits_unrelated_cycles_into_their_own_groups() {
+        use std::rc::Rc;
+        use types::{close_group, fresh_rec_id, Type};
+        let names: Vec<Rc<str>> = ["A", "Z", "U"].iter().map(|n| Rc::from(*n)).collect();
+        let ids: Vec<u64> = (0..3).map(|_| fresh_rec_id()).collect();
+        let a = rec_uni(vec![Type::Int, rec_tup(vec![rec_free(ids[0], "A")])]);
+        let z = rec_uni(vec![Type::Bool, rec_tup(vec![rec_free(ids[1], "Z")])]);
+        // U mentions A (a component of its own) but is not on a cycle.
+        let u = rec_tup(vec![rec_free(ids[0], "A"), Type::Str]);
+        let out = close_group(&names, &ids, &[Some(a.clone()), Some(z), Some(u)]).unwrap();
+        let (Some(Type::Rec(ga, 0)), Some(Type::Rec(gz, 0)), Some(Type::Tuple(items))) = (&out[0], &out[1], &out[2]) else { panic!("{out:?}") };
+        assert_eq!((ga.0.names.len(), gz.0.names.len()), (1, 1), "one group per cycle");
+        assert!(!Rc::ptr_eq(&ga.0, &gz.0));
+        assert_eq!(items[0], out[0].clone().unwrap(), "U refers to A's own group");
+        // A alone, with another cycle bundled beside it, is the same type.
+        let id = fresh_rec_id();
+        let alone = close_group(&[Rc::from("B")], &[id], &[Some(rec_uni(vec![Type::Int, rec_tup(vec![rec_free(id, "B")])]))]).unwrap();
+        assert_eq!(out[0], alone[0]);
+    }
+
+    // The members of a mutually recursive group are listed by what their types look like, so
+    // writing the same group in another order builds the same types.
+    #[test]
+    fn rec_close_orders_a_mutual_group_canonically() {
+        use std::rc::Rc;
+        use types::{close_group, fresh_rec_id, Type};
+        let build = |a_first: bool| {
+            let (ia, ib) = (fresh_rec_id(), fresh_rec_id());
+            let a = rec_uni(vec![Type::Bool, rec_tup(vec![Type::Int, rec_free(ib, "B")])]);
+            let b = rec_uni(vec![Type::Str, rec_tup(vec![Type::Bool, rec_free(ia, "A")])]);
+            let n = |s: &str| -> Rc<str> { Rc::from(s) };
+            if a_first {
+                let out = close_group(&[n("A"), n("B")], &[ia, ib], &[Some(a), Some(b)]).unwrap();
+                (out[0].clone().unwrap(), out[1].clone().unwrap())
+            } else {
+                let out = close_group(&[n("B"), n("A")], &[ib, ia], &[Some(b), Some(a)]).unwrap();
+                (out[1].clone().unwrap(), out[0].clone().unwrap())
+            }
+        };
+        let ((a1, b1), (a2, b2)) = (build(true), build(false));
+        assert_eq!(a1, a2);
+        assert_eq!(b1, b2);
+        assert_ne!(a1, b1);
     }
 
     #[test]
@@ -4904,6 +4955,33 @@ g(len)").unwrap_err();
         let head = "let L = fun V -> (let rec R = Union(Tuple(V, R), Bool) in R) in (fun v: Vec(n) -> fun d: Dyn -> (let x: L(Vec(n)) = d in x))([1, 2])";
         assert_eq!(run_source(&format!("{head}(([3, 4], ([5, 6], true)))")).unwrap().to_string(), "[[3, 4], [[5, 6], true]]");
         rejects(&format!("{head}(([3, 4], ([5], true)))"), "expected ([Dyn](n), R) | Bool, found List at element 1, element 0");
+    }
+
+    // E1 through the machine: a group's unrelated cycles, and the order its members are written
+    // in, do not change which types are equal.
+    #[test]
+    fn recursive_types_are_equal_whatever_else_shares_their_let_rec() {
+        let run = |s: &str| run_source(s).unwrap().to_string();
+        let bundled = "let rec A = Union(Int, Tuple(Bool, A)) and Z = Union(Bool, Tuple(Int, Z)) in let rec B = Union(Int, Tuple(Bool, B)) in ";
+        assert_eq!(run(&format!("{bundled}A == B")), "true");
+        assert_eq!(run(&format!("{bundled}A == Z")), "false");
+        let mutual = "let rec A = Union(Bool, Tuple(Int, B)) and B = Union(Str, Tuple(Bool, A)) in \
+                      let rec B2 = Union(Str, Tuple(Bool, A2)) and A2 = Union(Bool, Tuple(Int, B2)) in ";
+        assert_eq!(run(&format!("{mutual}(A == A2, B == B2, A == B)")), "[true, true, false]");
+        assert_eq!(run(&format!("{mutual}let x: A2 = (1, (true, false)) in let y: A = x in y")), "[1, [true, false]]");
+    }
+
+    // A ring of n mutually recursive types is one group; it builds in linear time and each
+    // member still accepts a value that follows the ring.
+    #[test]
+    fn a_ring_of_mutual_recursive_types_is_one_group() {
+        let n = 300;
+        let members: Vec<String> = (0..n).map(|i| format!("M{i} = Union(Tuple(Int, M{}), Bool)", (i + 1) % n)).collect();
+        let head = format!("let rec {} in ", members.join(" and "));
+        let run = |s: &str| run_source(&format!("{head}{s}")).unwrap().to_string();
+        assert_eq!(run("let x: M0 = (1, (2, true)) in x"), "[1, [2, true]]");
+        assert_eq!(run("(M0 == M0, M0 == M1, to_str(M7))"), "[true, false, M7]");
+        assert!(run_source(&format!("{head}let x: M5 = (1, (true, true)) in x")).is_err());
     }
 
     #[test]
