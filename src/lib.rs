@@ -2892,6 +2892,80 @@ g(len)").unwrap_err();
         // arena, and everything in it, drops normally here.
     }
 
+    // How many definitions the checker evaluated for `src` (typecheck::DEF_EVALS).
+    fn definitions_evaluated(src: &str) -> usize {
+        typecheck::DEF_EVALS.with(|c| c.set(0));
+        let (mut arena, spans, root) = parser::parse(src).expect("parse");
+        typecheck::check(&mut arena, root, &spans).expect("check");
+        typecheck::DEF_EVALS.with(|c| c.get())
+    }
+
+    // Each definition an annotation reaches is evaluated once, however many
+    // annotations read it and however deep the chain.
+    #[test]
+    fn every_type_definition_is_evaluated_once() {
+        let mut chain = String::from("let T0 = Int in ");
+        let mut fanin = String::from("let T0 = Int in let T1 = Int in ");
+        for i in 1..=60 {
+            chain.push_str(&format!("let T{i} = T{} in let x{i}: T{i} = 1 in let y{i}: T{i} = 2 in ", i - 1));
+        }
+        for i in 2..=60 {
+            fanin.push_str(&format!("let T{i} = (fun u -> T{})(T{}) in let x{i}: T{i} = 1 in ", i - 1, i - 2));
+        }
+        chain.push('0');
+        fanin.push('0');
+        assert_eq!(definitions_evaluated(&chain), 61);
+        assert_eq!(definitions_evaluated(&fanin), 61);
+        // A divergent definition read by two annotations runs out of fuel once.
+        let src = "let rec loop = fun n -> loop(n) in let D = loop(1) in let x: D = 1 in let y: D = 1 in 0";
+        assert_eq!(definitions_evaluated(src), 2);
+    }
+
+    // A long chain of annotated type lets checks, runs and drops on the default
+    // stack: dependencies are indices, not an `Rc` chain.
+    #[test]
+    fn annotated_type_let_chain_is_o1_stack_construction_and_teardown() {
+        let n = 50_000;
+        let mut src = String::from("let T0 = Int in ");
+        for i in 1..n {
+            src.push_str(&format!("let T{i} = T{} in let x{i}: T{i} = 1 in ", i - 1));
+        }
+        src.push('0');
+        let (mut arena, spans, root) = parser::parse(&src).expect("parse");
+        let elaborated = typecheck::check(&mut arena, root, &spans).expect("check");
+        assert_eq!(machine::run(&arena, elaborated, Env::prelude(), &spans).as_int(), 0);
+    }
+
+    // A definition that failed fails every annotation that reads it, and the
+    // earliest failure wins, as when the definitions were re-run in order.
+    #[test]
+    fn the_earliest_failing_definition_decides_the_error() {
+        let list_first = "let A = List(1) in let B = perform e(1) in let x: Tuple((A, B)) = 1 in x";
+        let effect_first = "let B = perform e(1) in let A = List(1) in let x: Tuple((A, B)) = 1 in x";
+        assert!(run_source(list_first).unwrap_err().contains("List cannot take a Int"));
+        assert!(run_source(effect_first).unwrap_err().contains("an annotation cannot perform an effect"));
+    }
+
+    // Each definition has a step budget of its own: two slow definitions that
+    // one annotation reads no longer add up to one budget.
+    #[test]
+    fn fuel_is_per_definition() {
+        let loop_ = "let rec loop = fun n -> if n == 0 then Int else loop(n - 1) in let K = fun a -> fun b -> a in";
+        let src = format!("{loop_} let A = loop(60000) in let B = loop(60000) in let x: K(A)(B) = 1 in x");
+        assert_eq!(run_source(&src).unwrap().as_int(), 1);
+    }
+
+    // A definition reads the binding in scope where it was written.
+    #[test]
+    fn definitions_keep_their_own_scope() {
+        let src = "let T = Int in let U = T in let T = Bool in let x: U = 1 in let y: T = true in (x, y)";
+        assert_eq!(run_source(src).unwrap().to_string(), "[1, true]");
+        // A group with a non-function member is not recursive: `T` in its own
+        // value is the outer one.
+        let src = "let T = Int in let rec T = (fun u -> u)(T) and k = 5 in let y: T = 1 in y";
+        assert_eq!(run_source(src).unwrap().as_int(), 1);
+    }
+
     #[test]
     fn deep_cont_chain_drops_without_overflowing_the_stack() {
         // Cont(Rc<ContNode>) is a struct wrapping an Rc pointing at
