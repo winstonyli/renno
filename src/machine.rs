@@ -864,7 +864,7 @@ fn lazy_lowered(lazy: &Lazy, spec: &ConformSpec) -> Option<Rc<Lowered>> {
     lazy.lowered
         .get_or_init(|| {
             let named = spec.named.get().expect("internal: the registry is set when checking finishes");
-            crate::typecheck::lower_conform(&lazy.ty, named, spec.span)
+            crate::typecheck::lower_conform(lazy, named, spec.span)
         })
         .clone()
 }

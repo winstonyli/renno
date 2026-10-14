@@ -3595,7 +3595,7 @@ g(len)").unwrap_err();
     #[test]
     fn a_static_recursive_fun_contract_checks_callability_at_the_boundary() {
         // F's own return type is F again: the contract checks its call's
-        // result against F, a fresh unfolding each call (never an
+        // result against F, the one Lazy F's own lowering shares (never an
         // unconditional failure, and never a skipped check). The result 42
         // is not a function, so F's callability check fails at the call.
         // (This program used to run and return 42, the self-reference
@@ -7976,15 +7976,33 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn a_recursive_function_type_lowers_to_one_shared_cyclic_graph() {
+        // F = Dyn -> F: the result of F's contract is F's own Lazy, at every
+        // depth, so a call chain allocates nothing per call (it used to build
+        // a fresh Lazy chain, held by the site's memo, one link per call).
+        use crate::types::{EffectRow, Type};
+        use std::{collections::HashMap, rc::Rc};
+        let f = Type::Named("F".into());
+        let named = Rc::new(HashMap::from([("F".to_string(), Type::Fun(Rc::new(Type::Dyn), EffectRow::Dyn, Rc::new(f.clone())))]));
+        let root = expr::Lazy::new(Rc::new(f));
+        let mut level = root.clone();
+        for _ in 0..3 {
+            let lowered = typecheck::lower_conform(&level, &named, None).expect("a function type is checked");
+            let expr::Then::Wrap(_, ret) = &lowered.then else { panic!("a function type wraps in a contract") };
+            assert!(Rc::ptr_eq(ret, &root), "the result's Lazy is F's own, not a fresh link");
+            level = ret.clone();
+        }
+    }
+
+    #[test]
     fn synthesized_check_temporaries_are_not_captured_by_user_variables() {
         for (src, want) in [
             ("let __ca = 10 in let d: Dyn = 3 in let y: Int = d in y + __ca", 13),
             ("let __ca = 10 in let d: Dyn = 3 in let y: Int | Bool = d in __ca", 10),
             ("let __ca = 10 in let d: Dyn = [1, 2] in let y: (Int, Int) = d in len(y) + __ca", 12),
             ("let __cf = 10 in let d: Dyn = fun x: Int -> x in d(1) + __cf", 11),
-            ("let __cg = 10 in let d: Dyn = fun x: Int -> x in d(1) + __cg", 11),
-            ("let __cg = 10 in let __cf = 20 in let f = fun a: Vec(n) -> 7 in let d: Dyn = f in d([1]) + __cg + __cf", 37),
-            ("let d: Dyn = fun __cg: Int -> fun __cf: Int -> __cg + __cf in d(1)(2)", 3),
+            ("let __cf = 20 in let f = fun a: Vec(n) -> 7 in let d: Dyn = f in d([1]) + __cf", 27),
+            ("let d: Dyn = fun __cf: Int -> fun __ca: Int -> __cf + __ca in d(1)(2)", 3),
             ("let d: Dyn = fun __ca: Int -> __ca in d(4)", 4),
         ] {
             assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");

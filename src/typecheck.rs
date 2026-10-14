@@ -1809,8 +1809,9 @@ fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut H
         // If `id` is already an ancestor in THIS unfold chain, stop instead
         // of unfolding again, and check nothing (matching the Type::Var(_)
         // arm above): `type A = A | (Int -> Int)` would otherwise unfold
-        // forever. A contract's result is a fresh chain (its own Lazy), so a
-        // self-reference there (`type F = Dyn -> F`) is checked at each call.
+        // forever. A contract's result is a Lazy of its own (shared with every
+        // equal type of the same lowering, Lazy::child), so a self-reference
+        // there (`type F = Dyn -> F`) is checked at each call.
         Type::Named(id) => match named.get(id) {
             Some(raw) if visiting.insert(id.clone()) => boundary(raw, named, visiting),
             _ => Boundary::None,
@@ -1825,7 +1826,8 @@ fn boundary<'t>(to: &'t Type, named: &'t HashMap<String, Type>, visiting: &mut H
 // to check. A function is checked for callability and wrapped in the site's
 // contract; a union with a function alternative picks the first alternative
 // whose shape holds, and its check is the failure when none does.
-pub(crate) fn lower_conform(ty: &Type, named: &Rc<HashMap<String, Type>>, span: Option<Span>) -> Option<Rc<Lowered>> {
+pub(crate) fn lower_conform(lazy: &Lazy, named: &Rc<HashMap<String, Type>>, span: Option<Span>) -> Option<Rc<Lowered>> {
+    let ty = &*lazy.ty;
     let infer = InferCtx::new(named.clone());
     let env = CheckEnv { defer: false, span, ..CheckEnv::new(&infer) };
     let mut visiting = HashSet::new();
@@ -1833,8 +1835,8 @@ pub(crate) fn lower_conform(ty: &Type, named: &Rc<HashMap<String, Type>>, span: 
     let (test, to, then) = match boundary(ty, named, &mut visiting) {
         Boundary::None => return None,
         Boundary::Shape(to) => (shape_test(to, &env, &mut defs, &HashSet::new()), to, Then::Done),
-        Boundary::Fun(fun_ty, param, ret) => (Test::Fun, fun_ty, Then::Wrap(Lazy::new(param.clone()), Lazy::new(ret.clone()))),
-        Boundary::Union(to) => (Test::Never, to, pick(to, &env, &mut defs, &visiting)),
+        Boundary::Fun(fun_ty, param, ret) => (Test::Fun, fun_ty, Then::Wrap(lazy.child(param.clone()), lazy.child(ret.clone()))),
+        Boundary::Union(to) => (Test::Never, to, pick(lazy, to, &env, &mut defs, &visiting)),
     };
     let bodies = defs.bodies.into_iter().map(|body| body.expect("every alias body is built before shape_test returns")).collect();
     let check = CheckSpec { test, defs: bodies, lens: Vec::new(), to: to.to_string(), span };
@@ -1845,7 +1847,7 @@ pub(crate) fn lower_conform(ty: &Type, named: &Rc<HashMap<String, Type>>, span: 
 // (one already being unfolded above never holds) and what a value passing it
 // still needs. Every
 // alternative shares one alias table and one set of length slots.
-fn pick(to: &Type, env: &CheckEnv, defs: &mut Defs, visiting: &HashSet<String>) -> Then {
+fn pick(lazy: &Lazy, to: &Type, env: &CheckEnv, defs: &mut Defs, visiting: &HashSet<String>) -> Then {
     let Type::Union(alts) = to else { unreachable!("pick is only ever called with a Union target") };
     let pick_one = |alt: &Type, defs: &mut Defs| {
         let test = match alt {
@@ -1854,8 +1856,8 @@ fn pick(to: &Type, env: &CheckEnv, defs: &mut Defs, visiting: &HashSet<String>) 
         };
         let mut visiting = visiting.clone();
         let then = match boundary(alt, &env.infer.named_types, &mut visiting) {
-            Boundary::Fun(_, param, ret) => Then::Wrap(Lazy::new(param.clone()), Lazy::new(ret.clone())),
-            Boundary::Union(nested) => pick(nested, env, defs, &visiting),
+            Boundary::Fun(_, param, ret) => Then::Wrap(lazy.child(param.clone()), lazy.child(ret.clone())),
+            Boundary::Union(nested) => pick(lazy, nested, env, defs, &visiting),
             Boundary::None | Boundary::Shape(_) => Then::Done,
         };
         (test, then)

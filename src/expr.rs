@@ -243,15 +243,38 @@ pub struct ConformSpec {
 // of an Unknown site holds the Lazy of the type it last saw (holding the Rc
 // keeps the type's address from being reused by another type), and a Lowered's
 // function contract holds one for its parameter and one for its result.
+// Those are drawn from the root's `family`: a type already in it is reused,
+// so a recursive type (`type F = Dyn -> F`) lowers to a finite cyclic graph
+// once, not a fresh chain per call. The family lists its members weakly, so
+// only the graph itself keeps them alive.
 #[derive(Debug)]
 pub struct Lazy {
     pub ty: Rc<Type>,
     pub lowered: std::cell::OnceCell<Option<Rc<Lowered>>>,
+    family: Rc<std::cell::RefCell<Vec<std::rc::Weak<Lazy>>>>,
 }
 
 impl Lazy {
     pub fn new(ty: Rc<Type>) -> Rc<Lazy> {
-        Rc::new(Lazy { ty, lowered: std::cell::OnceCell::new() })
+        let family = Rc::new(std::cell::RefCell::new(Vec::new()));
+        Lazy::join(&family, ty)
+    }
+
+    // The Lazy for `ty` in this one's family: the member holding an equal
+    // type, else a new member.
+    pub fn child(&self, ty: Rc<Type>) -> Rc<Lazy> {
+        Lazy::join(&self.family, ty)
+    }
+
+    fn join(family: &Rc<std::cell::RefCell<Vec<std::rc::Weak<Lazy>>>>, ty: Rc<Type>) -> Rc<Lazy> {
+        let mut members = family.borrow_mut();
+        members.retain(|member| member.strong_count() > 0);
+        if let Some(found) = members.iter().filter_map(|member| member.upgrade()).find(|member| *member.ty == *ty) {
+            return found;
+        }
+        let lazy = Rc::new(Lazy { ty, lowered: std::cell::OnceCell::new(), family: family.clone() });
+        members.push(Rc::downgrade(&lazy));
+        lazy
     }
 }
 
