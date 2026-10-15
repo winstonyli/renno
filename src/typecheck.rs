@@ -2475,7 +2475,7 @@ fn len_slot(index: &IndexExpr, env: &CheckEnv, defs: &mut Defs) -> usize {
 // Does checking `ty` do more than its shape test -- is a Fun reachable, so a
 // matching value must also get its per-call contract? Decides whether a
 // union check picks its alternative (Boundary::Union).
-fn needs_contract(ty: &Type, visiting: &Visiting) -> bool {
+pub(crate) fn needs_contract(ty: &Type, visiting: &Visiting) -> bool {
     fn go(ty: &Type, visiting: &Visiting, memo: &mut StackMemo) -> bool {
         let key = memo.key(ty, 0, visiting);
         if let Some(done) = key.as_ref().and_then(|k| memo.map.get(k)) {
@@ -2748,7 +2748,7 @@ fn record_field_type(ty: &Type, name: &str) -> Option<Type> {
 // The recursive types being unfolded somewhere above a point in a walk (an ancestor chain, not
 // a global memo), by group pointer and member (the Rc is kept so the pointer stays unique).
 #[derive(Clone, Default)]
-struct Visiting {
+pub(crate) struct Visiting {
     rec: Vec<(RecRef, usize)>,
 }
 
@@ -2787,7 +2787,7 @@ impl Visiting {
 // alternative (including that same A again) -- without this,
 // that's genuine infinite recursion in this function's own call stack,
 // not just a runtime concern.
-fn pattern_could_match(pat: &Pattern, ty: &Type, visiting: &Visiting) -> bool {
+pub(crate) fn pattern_could_match(pat: &Pattern, ty: &Type, visiting: &Visiting) -> bool {
     could_match(pat, ty, visiting, &mut StackMemo::default())
 }
 

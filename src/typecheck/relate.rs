@@ -599,6 +599,39 @@ mod tests {
         assert!(!matches!(got, Rel::Unknown(Residual::UNDECIDED, _)), "{got:?}");
     }
 
+    // An answer computed while a recursive type is being unfolded may rest on the revisit guard
+    // (a cyclic unfolding is Refuted), so it must not be reused outside that unfolding: the
+    // context number keeps the two apart.
+    #[test]
+    fn a_pair_decided_inside_an_unfolding_is_not_reused_outside_it() {
+        let infer = ctx();
+        let f = tup(&vec![Type::Int; 30]);
+        // R1 = R2 | F, R2 = Str | R1: F fits R2 only through R1, which is mid-unfolding when the
+        // first element reaches (F, R2) from inside R1, and where the guard refutes it.
+        let bound = |member| Type::RecVar(crate::types::RecVar::Bound { depth: 0, member });
+        let group = RecRef(Rc::new(crate::types::RecGroup::new(vec![Rc::from("R1"), Rc::from("R2")], vec![uni(&[bound(1), f.clone()]), uni(&[Type::Str, bound(0)])])));
+        let (r1, r2) = (Type::Rec(group.clone(), 0), Type::Rec(group, 1));
+        assert_eq!(relate(&f, &r1, &infer), Rel::Proven);
+        assert_eq!(relate(&f, &r2, &infer), Rel::Proven);
+        assert_eq!(relate(&tup(&[f.clone(), f.clone()]), &tup(&[r1, r2]), &infer), Rel::Proven);
+    }
+
+    // A pair whose computation hit the depth cap is Unknown only because of where it sat: it is
+    // never stored, so the same pair met near the root is decided in full.
+    #[test]
+    fn a_pair_decided_past_a_cap_is_not_stored() {
+        let infer = ctx();
+        let chain = |n: usize, leaf: Type| (0..n).fold(leaf, |acc, _| fun(Type::Int, acc));
+        // The (Int, Str) chains of 100 levels hit the cap partway down; their 37-level tails
+        // (big nodes, the last pair computed before the cap) are first met there, then again,
+        // refuted, as the second element.
+        let (deep_from, deep_to) = (chain(100, Type::Int), chain(100, Type::Str));
+        let (tail_from, tail_to) = (chain(37, Type::Int), chain(37, Type::Str));
+        assert!(is_big(&tail_from) && is_big(&tail_to));
+        let got = relate(&tup(&[deep_from, tail_from]), &tup(&[deep_to, tail_to]), &infer);
+        assert!(matches!(got, Rel::Refuted(_)), "{got:?}");
+    }
+
     // The pair memo makes a pair decided at a shallow position hold at a shared position deeper
     // than MAX_DEPTH: Proven where the depth cap alone gave a run-time test. Sound (the memoized
     // answer was computed in full), and pinned here as the accepted behaviour change.

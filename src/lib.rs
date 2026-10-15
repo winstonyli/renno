@@ -3644,38 +3644,71 @@ g(len)").unwrap_err();
     // unify and consistent over two 2^60-leaf DAGs decide each distinct pair once.
     #[test]
     fn unify_and_consistent_decide_shared_pairs_once() {
-        use crate::span::Span;
-        use crate::typecheck::{unify_trial, InferCtx};
-        use types::Type;
-        let dag = |leaf: Type| (0..60).fold(leaf, |t, _| rec_tup(vec![t.clone(), t]));
-        let span = Span { start: 0, end: 0 };
-        let mut infer = InferCtx::new();
-        assert!(unify_trial(&dag(Type::Var("a".into())), &dag(Type::Int), &mut infer, span).is_ok());
-        assert_eq!(infer.resolve_deep(&Type::Var("a".into())), Type::Int);
-        assert!(unify_trial(&dag(Type::Int), &dag(Type::Str), &mut infer, span).is_err(), "a mismatch at the far end is still found");
-        assert!(types::consistent(&dag(Type::Int), &dag(Type::Dyn)));
-        assert!(!types::consistent(&dag(Type::Int), &dag(Type::Str)));
+        bounded(20, || {
+            use crate::span::Span;
+            use crate::typecheck::{unify_trial, InferCtx};
+            use types::Type;
+            let dag = |leaf: Type| (0..60).fold(leaf, |t, _| rec_tup(vec![t.clone(), t]));
+            let span = Span { start: 0, end: 0 };
+            let mut infer = InferCtx::new();
+            assert!(unify_trial(&dag(Type::Var("a".into())), &dag(Type::Int), &mut infer, span).is_ok());
+            assert_eq!(infer.resolve_deep(&Type::Var("a".into())), Type::Int);
+            assert!(unify_trial(&dag(Type::Int), &dag(Type::Str), &mut infer, span).is_err(), "a mismatch at the far end is still found");
+            assert!(types::consistent(&dag(Type::Int), &dag(Type::Dyn)));
+            assert!(!types::consistent(&dag(Type::Int), &dag(Type::Str)));
+        });
+    }
+
+    // Runs `f` on its own thread (types are not Send, so it builds its own) and fails, rather
+    // than hangs, when it has not finished in `secs`.
+    fn bounded<F: FnOnce() + Send + 'static>(secs: u64, f: F) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("did not finish within {secs}s"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => std::panic::resume_unwind(handle.join().unwrap_err()),
+        }
     }
 
     // A query over a 2^60-leaf DAG costs its distinct nodes, and one over a subtree its summary
     // rules out costs nothing.
     #[test]
     fn query_walkers_visit_shared_nodes_once() {
-        use types::Type;
-        let dag = |leaf: Type| {
-            let mut t = leaf;
-            for _ in 0..60 {
-                t = rec_tup(vec![t.clone(), t]);
-            }
-            t
-        };
-        assert_eq!(typecheck::vars_in(&dag(Type::Var("a".into()))).len(), 1);
-        assert!(typecheck::vars_in(&dag(Type::Int)).is_empty());
-        assert_eq!(types::first_free(&dag(rec_free(7, "X"))).as_deref(), Some("X"));
-        assert!(types::first_free(&dag(Type::Int)).is_none());
-        // The same shape, but with the placeholder only at the far end of a path no walk can skip.
-        let mixed = rec_tup(vec![dag(Type::Int), dag(Type::Var("b".into()))]);
-        assert_eq!(typecheck::vars_in(&mixed).len(), 1);
+        bounded(20, || {
+            use types::Type;
+            let dag = |leaf: Type| {
+                let mut t = leaf;
+                for _ in 0..60 {
+                    t = rec_tup(vec![t.clone(), t]);
+                }
+                t
+            };
+            assert_eq!(typecheck::vars_in(&dag(Type::Var("a".into()))).len(), 1);
+            assert!(typecheck::vars_in(&dag(Type::Int)).is_empty());
+            assert_eq!(types::first_free(&dag(rec_free(7, "X"))).as_deref(), Some("X"));
+            assert!(types::first_free(&dag(Type::Int)).is_none());
+            // The same shape, but with the placeholder only at the far end of a path no walk can skip.
+            let mixed = rec_tup(vec![dag(Type::Int), dag(Type::Var("b".into()))]);
+            assert_eq!(typecheck::vars_in(&mixed).len(), 1);
+        });
+    }
+
+    // The walks memoized per (node, recursive types above it) answer a 2^60-leaf union DAG in
+    // its distinct nodes. Every alternative fails, so nothing short-circuits.
+    #[test]
+    fn stack_memo_walks_decide_shared_unions_once() {
+        bounded(20, || {
+            use crate::expr::Pattern;
+            use crate::typecheck::{needs_contract, pattern_could_match, Visiting};
+            use types::Type;
+            let dag = (0..60).fold(Type::Int, |t, _| Type::Union(Hc::new(vec![t.clone(), t])));
+            assert!(!needs_contract(&dag, &Visiting::default()));
+            assert!(!pattern_could_match(&Pattern::List(vec![Pattern::Var("x".into())]), &dag, &Visiting::default()));
+        });
     }
 
     // Building the same structure twice gives one node; anything that prints or compares
@@ -5389,7 +5422,9 @@ g(len)").unwrap_err();
         }
         let last = n - 1;
         src.push_str(&format!("let x: L{last} = (true, true) in let d: Dyn = (true, (true, true)) in let y: L{last} = d in 0"));
-        assert_eq!(run_source(&src).unwrap().as_int(), 0);
+        // Bounded: a walk that no longer skips subtrees it cannot change (Rebuild::skip) is
+        // quadratic here, minutes rather than a second.
+        assert_eq!(finishes_within(20, &src).unwrap().as_int(), 0);
     }
 
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain
