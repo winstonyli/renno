@@ -33,6 +33,8 @@ pub enum VarRef {
 // later one, and its body needs an entry whichever run resolved it. A node
 // must be resolved under one layout only: every evaluation walks a copy of
 // its own, so no two evaluations resolve the same node.
+// `Clone` is for eval_pure_in's debug cross-check only (a derived impl costs
+// nothing when unused, so release builds are unaffected).
 #[derive(Default, Clone)]
 pub struct Resolved {
     base: usize,
