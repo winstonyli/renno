@@ -2991,8 +2991,9 @@ g(len)").unwrap_err();
     // A `let` nested in another definition's right-hand side is a definition of
     // its own whose nodes also sit inside the enclosing one: each evaluation
     // runs a copy of its own root, in which a nested definition that already has
-    // a value is read from the frame instead (the last six cases are reused
-    // groups). Every result is what the checker gave before definitions were
+    // a value is read from the frame instead (the last five cases put a `let rec`
+    // group directly in a `let`'s right-hand side: its members' values are reused,
+    // the last two with a member other than the first). Every result is what the checker gave before definitions were
     // evaluated once (bbdc1cf).
     #[test]
     fn definitions_nested_in_definitions_evaluate_as_before() {
@@ -3015,6 +3016,8 @@ g(len)").unwrap_err();
             ("let A = Int in let F = (let rec g = fun n -> A in let y: g(0) = 1 in g) in let x: F(0) = 1 in x", "1"),
             ("let A = Int in let F = (let rec L = Union(Tuple(A, L), Bool) in let y: L = true in L) in let x: F = (1, true) in x", "[1, true]"),
             ("let A = Int in let F = (let rec T = (fun u -> u)(A) and k = 5 in let y: T = 1 in T) in let x: F = 1 in x", "1"),
+            ("let F = (let rec T = (fun u -> u)(Int) and k = Bool in let y: k = true in k) in let x: F = true in x", "true"),
+            ("let A = Int in let F = (let rec A = Bool and k = A in let y: k = 1 in k) in let x: F = 1 in x", "1"),
         ];
         for (src, want) in cases {
             assert_eq!(run_source(src).unwrap().to_string(), *want, "{src}");
@@ -3149,7 +3152,7 @@ g(len)").unwrap_err();
     // value, so A's budget only pays for its own loop.
     #[test]
     fn a_nested_definition_reuses_its_value_within_the_budget() {
-        let loop_ = "let rec loop = fun n -> if n == 0 then Int else loop(n - 1) in let K = fun a -> fun b -> a in";
+        let loop_ = "let rec loop = fun n -> if n == 0 then Int else loop(n - 1) in";
         let src = format!("{loop_} let A = (let B = loop(60000) in let y: B = 1 in loop(60000)) in let x: A = true in x");
         let (mut arena, spans, root) = parser::parse(&src).expect("parse");
         let err = typecheck::check(&mut arena, root, &spans).expect_err("A is Int, x is Bool");
@@ -3160,6 +3163,22 @@ g(len)").unwrap_err();
     #[test]
     fn a_nested_definition_nothing_reads_is_not_evaluated() {
         assert_eq!(definitions_evaluated("let A = (let C = Int in C) in let x: A = 1 in x"), 1);
+    }
+
+    // B runs out of fuel (an annotation in an untaken branch makes it a Failed
+    // definition) and A returns it: A's evaluation must fail too, not reuse
+    // anything for B, so `x: A` is reported as not terminating.
+    #[test]
+    fn a_failed_nested_definition_still_fails_the_enclosing_evaluation() {
+        let loop_ = "let rec loop = fun n -> if n == 0 then Int else loop(n - 1) in";
+        for src in [
+            format!("{loop_} let A = (let B = loop(200000) in let w = (if false then (let y: B = 1 in 0) else 0) in B) in let x: A = true in x"),
+            format!("{loop_} let A = (let B = loop(200000) in let y: B = 1 in B) in let x: A = true in x"),
+            "let rec spin = fun n -> if n == 0 then 0 else spin(n - 1) in let A = (let B = spin(150000) in let w = (if false then (let y: Int = B in 0) else 0) in Int) in let x: A = true in x".to_string(),
+        ] {
+            let err = run_source(&src).unwrap_err();
+            assert!(err.contains("did not terminate"), "{src}: {err}");
+        }
     }
 
     // D fails (fuel) but sits in an untaken branch: A's evaluation never reaches it.

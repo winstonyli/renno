@@ -519,7 +519,7 @@ pub(crate) struct InferCtx {
     // group member's value), and which member; None when two definitions claim
     // one node, which is never reused. Elaborated once, so two claims only come
     // from a node elaborated twice.
-    value_of: HashMap<ExprRef, Option<(usize, usize)>>,
+    value_of: FxMap<ExprRef, Option<(usize, usize)>>,
     // An annotation is being elaborated (annotation_type): a name it reads
     // is not a value-position read, so `lookup` leaves CheckDef::used alone.
     in_annotation: bool,
@@ -549,7 +549,7 @@ impl InferCtx {
             bound_names: HashSet::new(),
             defs: Vec::new(),
             resolved: Resolved::default(),
-            value_of: HashMap::new(),
+            value_of: FxMap::default(),
             in_annotation: false,
             direct_value: None,
             proofs: Vec::new(),
@@ -579,7 +579,8 @@ impl InferCtx {
     }
 
     // Records that parsed node `node` is member `member` of definition `def`'s
-    // value; a second claim on the node withdraws it (never reused).
+    // value; a second claim on the node withdraws it (never reused). Defensive:
+    // no program is known to elaborate one parsed value node twice.
     fn note_value_of(&mut self, node: ExprRef, def: usize, member: usize) {
         self.value_of.entry(node).and_modify(|e| *e = None).or_insert(Some((def, member)));
     }
@@ -3999,7 +4000,7 @@ fn member_value(def: &CheckDef, value: &Value, member: usize) -> Value {
 // in it means the same binder here as in the checker's scope: the values agree
 // (eval_pure_in's debug build checks it). Nothing is evaluated for this; a
 // definition that failed or has no value yet is run inline, as before.
-fn reusable(defs: &[Rc<CheckDef>], value_of: &HashMap<ExprRef, Option<(usize, usize)>>, n: ExprRef) -> Option<Value> {
+fn reusable(defs: &[Rc<CheckDef>], value_of: &FxMap<ExprRef, Option<(usize, usize)>>, n: ExprRef) -> Option<Value> {
     let (d, member) = (*value_of.get(&n)?)?;
     match defs[d].value.get() {
         Some(DefValue::Done(value)) => Some(member_value(&defs[d], value, member)),
