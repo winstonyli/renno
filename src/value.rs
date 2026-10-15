@@ -63,7 +63,7 @@ pub enum Builtin {
     // Dyn-sourced shape mismatch already panics at the point of use.
     GetField,
     // (Type, Dyn) -> Bool: does the value satisfy the type, for user
-    // programs. A Dyn boundary check is a native Expr::Check instead; both
+    // programs. A Dyn boundary check is a native Expr::Conform instead; both
     // share machine::test_holds, and the type is lowered by
     // typecheck::lower_test. A List type is tested element by element, Dyn
     // always holds, and a Fun type is callability only (Closure, RecClosure,

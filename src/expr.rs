@@ -29,7 +29,7 @@ pub type Arena = PrimaryMap<ExprRef, Expr>;
 // The byte-span of each Arena node's ORIGINAL source text, indexed by the
 // same ExprRef -- built by the parser in lockstep with Arena (see
 // parser::Parser::push_spanned) so the two never desync. A node typecheck
-// synthesizes (a Check, a Conform, a re-emitted Let with a
+// synthesizes (a Conform, a re-emitted Let with a
 // resolved type) gets no entry here; typecheck never needs one, since every
 // error it reports uses the span of an ORIGINAL (pre-elaboration) ExprRef
 // that was already in scope before any such node was built -- see
@@ -103,11 +103,11 @@ pub enum BinOp {
     Cons,
 }
 
-// The runtime test an `Expr::Check` applies to a value (machine::test_holds),
+// The runtime test a boundary applies to a value (machine::test_holds),
 // derived from the target type. It follows the VALUE (finite, immutable,
 // acyclic), so a deep test of a function-free type always terminates. A
 // function position is only a callability tag (the per-call contract is
-// an Expr::Conform's job, and only for a Fun target or a union alternative).
+// the Conform's `Then`, and only for a Fun target or a union alternative).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Test {
     // Dyn/Var: everything passes. Never: nothing does (a failing branch, or a
@@ -128,8 +128,9 @@ pub enum Test {
     ListOf(Box<Test>),
     // A list of exactly this many elements, each passing (a Vec(k) with a literal k).
     ListLen(Box<Test>, usize),
-    // A list as long as `CheckSpec::lens[slot]` says, each element passing (a
-    // Vec(n) with a non-literal n; the slot is read when the check is entered).
+    // A list as long as `lens[slot]` says (the values of the owning Lowered's
+    // `slots`, read when the check is entered), each element passing (a Vec(n)
+    // with a non-literal n).
     ListLenArg(Box<Test>, usize),
     // A list of exactly this many elements, position i passing tests[i].
     TupleOf(Vec<Test>),
@@ -149,10 +150,6 @@ pub struct CheckSpec {
     // The bodies `Test::Ref(i)` indexes; empty unless the target reaches a
     // recursive type.
     pub defs: Vec<Test>,
-    // The length slots `Test::ListLenArg` reads, each an `Expr::Len` node. A
-    // node rather than a field here, so resolve_obligations patches it in
-    // place and every copy of this Check (Pending, a finished cast) sees it.
-    pub lens: Vec<ExprRef>,
     // The target type, written (capped, Type::brief) only if a check fails, for the failure
     // message `type error: expected {to}, found {type}`.
     pub to: Type,
@@ -162,7 +159,7 @@ pub struct CheckSpec {
 }
 
 // A length slot's term: an index expression as the run-time check reads it.
-// Evaluating one is total (machine::eval_len), so a Check evaluates its slots
+// Evaluating one is total (machine::eval_len), so a Conform evaluates its slots
 // on entry whatever the value turns out to be.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LenExpr {
@@ -193,7 +190,7 @@ impl LenExpr {
     }
 }
 
-// A length slot's value, read when its Check is entered.
+// A length slot's value, read when its Conform is entered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Len {
     Exact(usize),
@@ -218,16 +215,33 @@ pub enum AnnotKind {
     Unknown,
 }
 
-// An Unknown site's check (spec 11.2): Expr::Conform tests its operand
-// against the type its `ty` variable holds, lowered at run time
-// (typecheck::lower_conform) with today's run-time check messages.
+// Where a boundary's type comes from (P3).
+#[derive(Debug)]
+pub enum TypeSource {
+    // Known at check time: lowered then (the Lazy's `lowered` cell is already
+    // filled). The root Lazy is held, not just its Lowered, so a recursive
+    // type's family stays alive and `F = Fun(Dyn, F)` lowers once.
+    Static(Rc<Lazy>),
+    // An Unknown site (spec 11.2): the type is the value the Var node `ty`
+    // names (the site's annotation binder), lowered when reached
+    // (typecheck::lower_conform); the cell memoizes the Lazy of the type it
+    // last saw.
+    Site(ExprRef, std::cell::RefCell<Option<Rc<Lazy>>>),
+}
+
+// A boundary's check (spec 11.2, 11.6; P3): Expr::Conform tests its operand
+// against the type its `source` gives, with today's run-time check messages.
+// One node for every boundary: a function-free shape (a native test, a
+// `Then::Done`), a function or a union with a function alternative (a
+// contract), and an Unknown site's run-time type.
 #[derive(Debug)]
 pub struct ConformSpec {
-    // The index variable names the annotation's text writes, and for each
-    // the Expr::Len slot holding its run-time value (spec 11.4).
+    pub source: TypeSource,
+    // The index variable names the type's text writes (a static boundary: the
+    // ones its lowered slots read), and for each the Expr::Len slot holding
+    // its run-time value (spec 11.4).
     pub index_names: Vec<String>,
     pub lens: Vec<ExprRef>,
-    pub memo: std::cell::RefCell<Option<Rc<Lazy>>>,
     // The source span a failure blames (None keeps whatever span ran last).
     pub span: Option<Span>,
     // The site's own binder is typed to the checker (a static boundary), so
@@ -276,7 +290,7 @@ impl Lazy {
     }
 }
 
-// A run-time type as checks: a native Check spec (its `lens` unused), for
+// A type as checks: a native Check spec, for
 // each length slot its tests read the index whose value fills it, and what a
 // value passing `check` still needs.
 #[derive(Debug)]
@@ -330,20 +344,18 @@ impl AnnotSpec {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    // `e` tested natively against `spec` -- evaluates `e` once, no effects,
-    // no env frame. Typecheck-synthesized only (a Dyn-boundary check);
-    // never written by the parser.
-    Check(ExprRef, Rc<CheckSpec>),
     // A kept annotation's value (spec 11.2): the elaborated annotation,
     // evaluated in check mode to a Value::Type. Typecheck binds it to an
     // unlexable name just before the annotated binder.
     Annot(ExprRef, Rc<AnnotSpec>),
-    // A site's check (spec 11.2): the operand conformed to the type value the
-    // second node holds -- a variable bound to an Unknown site's Annot, or a
-    // type literal at a static function boundary. Typecheck-synthesized only.
-    Conform(ExprRef, ExprRef, Rc<ConformSpec>),
-    // A Check's length slot (CheckSpec::lens). Typecheck-synthesized only and
-    // never evaluated on its own: the owning Check reads it on entry.
+    // A boundary (spec 11.2, 11.6; P3): the operand conformed to a type,
+    // natively. The type is known at check time (a static boundary, lowered
+    // then) or is the value an Unknown site's annotation variable holds
+    // (lowered when reached). Evaluates the operand once, no effects, no env
+    // frame. Typecheck-synthesized only; never written by the parser.
+    Conform(ExprRef, Rc<ConformSpec>),
+    // A Conform's length slot (ConformSpec::lens). Typecheck-synthesized only
+    // and never evaluated on its own: the owning Conform reads it on entry.
     Len(LenExpr),
     Int(i64),
     // A second numeric literal kind, distinct from Int -- see types::
@@ -473,13 +485,12 @@ impl Expr {
     pub(crate) fn children_with(&self, out: &mut Vec<ExprRef>, annotations: bool) {
         match self {
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::TypeLit(_) => {}
-            Expr::Check(e, spec) => {
-                out.push(*e);
-                out.extend(&spec.lens);
-            }
             Expr::Len(term) => term.witnesses(out),
-            Expr::Conform(e, ty, spec) => {
-                out.extend([*e, *ty]);
+            Expr::Conform(e, spec) => {
+                out.push(*e);
+                if let TypeSource::Site(ty, _) = &spec.source {
+                    out.push(*ty);
+                }
                 out.extend(&spec.lens);
             }
             Expr::FieldAccess(e, _) | Expr::Perform(_, e) | Expr::Annot(e, _) => out.push(*e),
@@ -546,7 +557,7 @@ pub fn copy_tree(arena: &mut Arena, root: ExprRef, mut replace: impl FnMut(&mut 
         }
         let at = |k: &ExprRef| copies[k];
         let node = match &arena[n] {
-            Expr::Check(..) | Expr::Annot(..) | Expr::Conform(..) | Expr::Len(_) => unreachable!("a check-time evaluation runs a parsed tree"),
+            Expr::Annot(..) | Expr::Conform(..) | Expr::Len(_) => unreachable!("a check-time evaluation runs a parsed tree"),
             Expr::Int(i) => Expr::Int(*i),
             Expr::Float(f) => Expr::Float(*f),
             Expr::Bool(b) => Expr::Bool(*b),

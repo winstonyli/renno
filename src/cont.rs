@@ -70,8 +70,9 @@ pub enum Frame {
     // comment for why records need a
     // name-keyed runtime shape ListElems has no way to produce.
     RecordElems { names: Rc<Vec<String>>, remaining: Vec<ExprRef>, done: Vec<Value>, env: Env },
-    // The operand of an Expr::Check has just evaluated -- test it against
-    // the spec, with the length slots read when the Check was entered.
+    // The operand of an Expr::Conform whose type needs nothing beyond its
+    // native test (`Then::Done`) has just evaluated -- test it against the
+    // spec, with the length slots read when the Conform was entered.
     Check { spec: Rc<CheckSpec>, lens: Vec<Len> },
     // A value that must conform to a type needing a contract (a function, or a
     // union with a function alternative) has just evaluated, at a site, or as

@@ -19,7 +19,7 @@ pub static PRELUDE: &[(&str, Builtin)] = &[
     ("get", Builtin::Get),
     // `is(T, v)`: v satisfies the type value T. An ordinary prelude builtin,
     // not hidden, the same way `fail` isn't; Dyn-boundary checks do not call
-    // it (typecheck emits a native Expr::Check; machine::test_holds is the
+    // it (typecheck emits a native Expr::Conform; machine::test_holds is the
     // shared definition). List(T) is deep, Dyn always holds, and a Fun type is
     // callability only (its parameter and result types are ignored).
     ("is", Builtin::Is),

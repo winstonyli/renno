@@ -4,14 +4,14 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, ContNode, Frame};
 use crate::env::{Env, PRELUDE};
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::resolve::{group_kind, resolve, GroupKind, Resolved, VarRef};
 use crate::span::Span;
 use crate::types::{close_group, first_free, fresh_rec_id, EffectRow, Hc, RecVar, Type};
 use crate::util::find_field;
-use crate::value::{table_lookup, Builtin, Contract, HandlerData, SiteCtx, TypeCtor, Value};
+use crate::value::{Builtin, Contract, HandlerData, SiteCtx, TypeCtor, Value};
 
 enum Control {
     Eval(ExprRef, Env),
@@ -312,13 +312,6 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                     CURRENT_SPAN.with(|c| c.set(Some(*span)));
                 }
                 match &arena[expr] {
-                Expr::Check(operand, spec) => {
-                    // The slots read the env the operand is evaluated in (no
-                    // allocation when there are none).
-                    let lens = spec.lens.iter().map(|slot| eval_slot(arena, *slot, &env, resolved)).collect();
-                    cont = Cont::cons(Frame::Check { spec: spec.clone(), lens }, cont);
-                    control = Control::Eval(*operand, env);
-                }
                 Expr::Annot(ann, spec) => match &spec.kind {
                     AnnotKind::Confirm(t) if spec.done.get() => control = Control::Apply(Value::Type(t.clone())),
                     // The check-time evaluation ran out of fuel, and the run
@@ -342,29 +335,35 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                         }
                     }
                 },
-                Expr::Conform(operand, ty, spec) => {
-                    // A static site's type is a literal; an Unknown site's is the value of its annotation's binder.
-                    let t = match &arena[*ty] {
-                        Expr::TypeLit(t) => t.clone(),
-                        _ => match local(&env, resolved, *ty) {
-                            Value::Type(t) => t,
-                            _ => panic!("internal: a conform node's type variable holds no type"),
-                        },
+                Expr::Conform(operand, spec) => {
+                    // A static boundary's type was lowered at check time; an Unknown site's is the value of its
+                    // annotation's binder. Borrowed, so a boundary that needs nothing more than its native test
+                    // adds no reference-count traffic to the hot path.
+                    let site;
+                    let lazy: &Rc<Lazy> = match &spec.source {
+                        TypeSource::Static(lazy) => lazy,
+                        TypeSource::Site(ty, memo) => {
+                            let Value::Type(t) = local(&env, resolved, *ty) else { panic!("internal: a conform node's type variable holds no type") };
+                            site = conform_lazy(memo, t);
+                            &site
+                        }
                     };
-                    let lazy = conform_lazy(spec, t);
-                    if let Some(lowered) = lazy_lowered(&lazy, spec) {
-                        let table = site_table(arena, spec, &lowered, &env, resolved);
+                    if let Some(lowered) = lazy_lowered(lazy, spec) {
                         cont = match lowered.then {
                             Then::Done => {
-                                let lens = lowered.slots.iter().map(|index| to_len(index_len(index, &|name| table_lookup(&spec.index_names, &table, name)))).collect();
+                                let lens = done_lens(arena, spec, lowered, &env, resolved);
                                 Cont::cons(Frame::Check { spec: lowered.check.clone(), lens }, cont)
                             }
-                            _ => Cont::cons(Frame::Conform { lazy, ctx: Rc::new(SiteCtx { spec: spec.clone(), table, witness: None }) }, cont),
+                            _ => {
+                                // The slots read the env the operand is evaluated in.
+                                let table = spec.lens.iter().map(|slot| eval_slot(arena, *slot, &env, resolved)).collect();
+                                Cont::cons(Frame::Conform { lazy: lazy.clone(), ctx: Rc::new(SiteCtx { spec: spec.clone(), table, witness: None }) }, cont)
+                            }
                         };
                     }
                     control = Control::Eval(*operand, env);
                 }
-                Expr::Len(_) => unreachable!("an Expr::Len slot is read by its Check, never evaluated"),
+                Expr::Len(_) => unreachable!("an Expr::Len slot is read by its Conform, never evaluated"),
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
                 Expr::Float(x) => control = Control::Apply(Value::Float(*x)),
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
@@ -858,7 +857,7 @@ fn advance_elems(arena: &Arena, spans: &SpanMap, frame: Frame, rest: Cont, value
 
 // ---- The deep check: ONE iterative walker ----
 //
-// `test_holds` (every Dyn-boundary Expr::Check, and the `is` builtin) and `explain` (the failure message's "at element 1")
+// `test_holds` (every Dyn-boundary Expr::Conform, and the `is` builtin) and `explain` (the failure message's "at element 1")
 // are two runs of `walk`, so there is a single definition of the test and the
 // native stack use is O(1) in the value's nesting depth (a recursive check
 // overflowed the worker stack at about 150,000 levels in debug builds). The
@@ -890,9 +889,9 @@ fn leaf(t: &Test, v: &Value) -> Option<bool> {
     })
 }
 
-// A Check's length slot under `env`: the Expr::Len node's term, evaluated.
+// A Conform's length slot under `env`: the Expr::Len node's term, evaluated.
 fn eval_slot(arena: &Arena, slot: ExprRef, env: &Env, resolved: &Resolved) -> Len {
-    let Expr::Len(term) = &arena[slot] else { panic!("internal: a Check's length slot is not an Expr::Len") };
+    let Expr::Len(term) = &arena[slot] else { panic!("internal: a Conform's length slot is not an Expr::Len") };
     to_len(eval_len(term, env, resolved))
 }
 
@@ -961,14 +960,21 @@ fn local(env: &Env, resolved: &Resolved, var: ExprRef) -> Value {
     }
 }
 
-// The values of an Unknown site's length table, read on entry in `env` as a
-// Check's are. Empty when nothing the lowered type reads needs it: a plain
-// check with no length slots.
-fn site_table(arena: &Arena, spec: &ConformSpec, lowered: &Lowered, env: &Env, resolved: &Resolved) -> Vec<Len> {
-    if matches!(lowered.then, Then::Done) && lowered.slots.is_empty() {
-        return Vec::new();
-    }
-    spec.lens.iter().map(|slot| eval_slot(arena, *slot, env, resolved)).collect()
+// The length-slot values of a boundary that needs nothing beyond its native
+// test, read on entry in `env`: each of the lowered type's slots over the
+// values of the names it reads (the Conform's own slots, evaluated on demand,
+// so a check with no length slots allocates nothing).
+fn done_lens(arena: &Arena, spec: &ConformSpec, lowered: &Lowered, env: &Env, resolved: &Resolved) -> Vec<Len> {
+    lowered
+        .slots
+        .iter()
+        .map(|index| {
+            to_len(index_len(index, &|name| {
+                let i = spec.index_names.iter().position(|n| n == name)?;
+                Some(eval_slot(arena, spec.lens[i], env, resolved))
+            }))
+        })
+        .collect()
 }
 
 // A contract call's parameter type and argument: when the type is Vec(n),
@@ -992,8 +998,8 @@ thread_local! {
 
 // An Unknown site's checks against type value `t`, lowered once while the same
 // value keeps coming back (spec 11.5).
-fn conform_lazy(spec: &ConformSpec, t: Rc<Type>) -> Rc<Lazy> {
-    let mut memo = spec.memo.borrow_mut();
+fn conform_lazy(memo: &std::cell::RefCell<Option<Rc<Lazy>>>, t: Rc<Type>) -> Rc<Lazy> {
+    let mut memo = memo.borrow_mut();
     if let Some(seen) = memo.as_ref()
         && (Rc::ptr_eq(&seen.ty, &t) || *seen.ty == *t)
     {
@@ -1009,9 +1015,10 @@ fn conform_lazy(spec: &ConformSpec, t: Rc<Type>) -> Rc<Lazy> {
 }
 
 // The checks for a type (None: nothing to check), lowered the first time they
-// are asked for: the blame span is the site's.
-fn lazy_lowered(lazy: &Lazy, spec: &ConformSpec) -> Option<Rc<Lowered>> {
-    lazy.lowered.get_or_init(|| crate::typecheck::lower_conform(lazy, spec.span)).clone()
+// are asked for (a static boundary's already is): the blame span is the site's.
+// Borrowed from the Lazy.
+fn lazy_lowered<'a>(lazy: &'a Lazy, spec: &ConformSpec) -> Option<&'a Lowered> {
+    lazy.lowered.get_or_init(|| crate::typecheck::lower_conform(lazy, spec.span)).as_deref()
 }
 
 // `value` conformed to the type `lazy` holds, at the site `ctx` (spec 11.6): a

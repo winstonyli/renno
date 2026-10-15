@@ -126,12 +126,12 @@ mod tests {
     }
 
     // Walks the elaborated tree looking for a runtime boundary check: a
-    // native Expr::Check, or an Expr::Conform (a function or a union with a
+    // native Expr::Conform (a function or a union with a
     // function alternative). Needed because arena-indexed Expr's derived
     // Debug only prints the immediate node (children are plain ExprRef
     // indices, so Debug does not recurse through them).
     fn contains_check(arena: &expr::Arena, root: expr::ExprRef) -> bool {
-        tree_any(arena, root, &|n| matches!(n, expr::Expr::Check(..) | expr::Expr::Conform(..)))
+        tree_any(arena, root, &|n| matches!(n, expr::Expr::Conform(..)))
     }
 
     // Does any node of the (elaborated) tree under `root` satisfy `pred`?
@@ -2269,7 +2269,7 @@ mod tests {
         // get_field with no shape check first, so a non-record value hit
         // get_field's own internal-assertion panic instead of the file's
         // ordinary type-error message every other Dyn-boundary
-        // Record check produces. Now goes through build_shape_check
+        // Record check produces. Now goes through build_boundary_check
         // first, same as any other Dyn-to-Record boundary.
         let src = r#"
             handle
@@ -2472,9 +2472,8 @@ g(len)").unwrap_err();
         spans.push(Span { start: 8, end: 9 });
         let five = arena.push(Expr::Int(5));
         spans.push(Span { start: 10, end: 11 });
-        // Synthesized after parsing: a Check around `f`, a spanless leaf, and the App over both.
-        let spec = std::rc::Rc::new(crate::expr::CheckSpec { test: crate::expr::Test::Fun, defs: vec![], lens: vec![], to: crate::types::Type::Dyn, span: None });
-        let check = arena.push(Expr::Check(f, spec));
+        // Synthesized after parsing: a node around `f`, a spanless leaf, and the App over both.
+        let check = arena.push(Expr::Perform("e".into(), f));
         let leaf = arena.push(Expr::Bool(true));
         let pair = arena.push(Expr::Tuple(vec![check, five]));
         let both = arena.push(Expr::If(leaf, pair, pair));
@@ -2988,6 +2987,27 @@ g(len)").unwrap_err();
         assert_eq!(run_source("let d: Dyn = fun x -> x in let f: (Dyn -> Dyn) = d in f(1)").unwrap().as_int(), 1);
         rejects("let d: Dyn = 3 in d(1)", "type error: expected (Dyn -> Dyn), found Int");
         assert_eq!(run_source("let d: Dyn = fun x -> x + 1 in d(1)").unwrap().as_int(), 2);
+    }
+
+    // A function boundary whose parameter and result need nothing is a plain callability test
+    // (no contract wraps the value); one that needs a check on either side gets a contract.
+    #[test]
+    fn p3_a_function_boundary_needs_a_contract_only_when_a_side_needs_a_check() {
+        let then_of = |src: &str, want: &dyn Fn(&expr::Then) -> bool| {
+            let (arena, root) = elaborated_tree(src);
+            tree_any(&arena, root, &|n| match n {
+                expr::Expr::Conform(_, spec) => match &spec.source {
+                    expr::TypeSource::Static(lazy) => lazy.lowered.get().and_then(|l| l.as_ref()).is_some_and(|l| want(&l.then)),
+                    expr::TypeSource::Site(..) => false,
+                },
+                _ => false,
+            })
+        };
+        let plain = "let d: Dyn = fun z -> z in let f: (Dyn -> Dyn) = d in f(1)";
+        assert!(then_of(plain, &|t| matches!(t, expr::Then::Done)));
+        assert!(!then_of(plain, &|t| matches!(t, expr::Then::Wrap(..))));
+        let checked = "let d: Dyn = fun z -> z in let f: (Int -> Dyn) = d in f(1)";
+        assert!(then_of(checked, &|t| matches!(t, expr::Then::Wrap(..))));
     }
 
     // A closed function passed through a static function boundary inside a Confirm site's
@@ -5249,7 +5269,7 @@ g(len)").unwrap_err();
             // annotation's site holds its type in a variable.
             let site = |e: &expr::Expr| match e {
                 expr::Expr::Annot(..) => true,
-                expr::Expr::Conform(_, ty, _) => matches!(arena[*ty], expr::Expr::Var(_)),
+                expr::Expr::Conform(_, spec) => matches!(spec.source, expr::TypeSource::Site(..)),
                 _ => false,
             };
             assert!(!tree_any(&arena, elaborated, &site), "{name}");
@@ -6632,7 +6652,7 @@ g(len)").unwrap_err();
         let err = run_source(src).unwrap_err();
         // Type::Indexed's own Display renders as "[Dyn](3)", not "Vec(3)"
         // (see types.rs's own Display impl) -- this is the same runtime
-        // message format every failing Expr::Check produces.
+        // message format every failing Expr::Conform produces.
         assert!(err.contains("expected [Dyn](3)"), "expected a genuine Vec(3) length mismatch at runtime, got: {err}");
     }
 
@@ -8868,7 +8888,7 @@ g(len)").unwrap_err();
         }
     }
 
-    // --- Native Expr::Check (spec 2026-10-08-cast-cost-design, phase 1) ---
+    // --- Native Expr::Conform (spec 2026-10-08-cast-cost-design, phase 1) ---
 
     fn elaborated_tree(src: &str) -> (expr::Arena, expr::ExprRef) {
         let (mut arena, spans, root) = parser::parse(src).unwrap();
@@ -8876,10 +8896,16 @@ g(len)").unwrap_err();
         (arena, out)
     }
 
-    // A Check with exactly this test is somewhere in the tree.
+    // A static Conform whose lowered native test is exactly this one is somewhere in the tree.
     fn has_assert_check(src: &str, test: expr::Test) -> bool {
         let (arena, root) = elaborated_tree(src);
-        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(_, s) if s.test == test))
+        tree_any(&arena, root, &|n| match n {
+            expr::Expr::Conform(_, spec) => match &spec.source {
+                expr::TypeSource::Static(lazy) => lazy.lowered.get().and_then(|l| l.as_ref()).is_some_and(|l| l.check.test == test),
+                expr::TypeSource::Site(..) => false,
+            },
+            _ => false,
+        })
     }
 
     // A synthesized call to the `is` builtin, which a check used to
@@ -8931,7 +8957,7 @@ g(len)").unwrap_err();
     // Some native check (a Check or a Conform, whatever its test) is somewhere in the tree.
     fn has_native_assert_check(src: &str) -> bool {
         let (arena, root) = elaborated_tree(src);
-        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(..) | expr::Expr::Conform(..)))
+        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Conform(..)))
     }
 
     // A bare Fun crossing is a per-call contract: it is only exercised by calling.
@@ -8972,7 +8998,7 @@ g(len)").unwrap_err();
     fn dyn_and_unannotated_targets_emit_no_check() {
         for src in ["let d: Dyn = 3 in let y: Dyn = d in y", "let f = fun x -> x in f(3)"] {
             let (arena, root) = elaborated_tree(src);
-            assert!(!tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(..))), "{src}");
+            assert!(!tree_any(&arena, root, &|n| matches!(n, expr::Expr::Conform(..))), "{src}");
         }
     }
 
@@ -9085,8 +9111,11 @@ g(len)").unwrap_err();
         let witness = arena.push(Expr::Var("h".into()));
         let slot = arena.push(Expr::Len(LenExpr::Witness(witness, "n".into())));
         let test = Test::ListLenArg(Box::new(Test::Any), 0);
-        let spec = CheckSpec { test, defs: vec![], lens: vec![slot], to: crate::types::Type::Dyn, span: None };
-        let check = arena.push(Expr::Check(body, std::rc::Rc::new(spec)));
+        let check_spec = std::rc::Rc::new(CheckSpec { test, defs: vec![], to: crate::types::Type::Dyn, span: None });
+        let lazy = crate::expr::Lazy::new(std::rc::Rc::new(crate::types::Type::Dyn));
+        lazy.lowered.set(Some(std::rc::Rc::new(crate::expr::Lowered { check: check_spec, slots: vec![crate::index_expr::IndexExpr::Var("n".into())], then: crate::expr::Then::Done }))).ok();
+        let spec = crate::expr::ConformSpec { source: crate::expr::TypeSource::Static(lazy), index_names: vec!["n".into()], lens: vec![slot], span: None, trusted: true };
+        let check = arena.push(Expr::Conform(body, std::rc::Rc::new(spec)));
         let top = arena.push(Expr::Let(name, ann, val, check));
         expr::fill_synthesized_spans(&arena, top, &mut spans);
         expect_run_error("type error: index variable n has no runtime value to check a length against", || {
@@ -9102,8 +9131,7 @@ g(len)").unwrap_err();
         // top node, never a Check: every slot has exactly one reachable owner.
         fn owners(arena: &expr::Arena, r: expr::ExprRef, out: &mut std::collections::HashMap<expr::ExprRef, usize>) {
             let lens = match &arena[r] {
-                expr::Expr::Check(_, spec) => &spec.lens[..],
-                expr::Expr::Conform(_, _, spec) => &spec.lens[..],
+                expr::Expr::Conform(_, spec) => &spec.lens[..],
                 _ => &[],
             };
             for slot in lens {

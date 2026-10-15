@@ -271,15 +271,9 @@ fn visit(
         }
         // A kept annotation runs in the scope of the binder it annotates.
         Expr::FieldAccess(target, _) | Expr::Annot(target, _) => work.push(Work::Visit(*target)),
-        // A Check's length slots are evaluated in the Check's own scope,
-        // on entry, before the target value exists.
-        Expr::Check(target, spec) => {
-            work.push(Work::Visit(*target));
-            for slot in spec.lens.iter().rev() {
-                work.push(Work::Visit(*slot));
-            }
-        }
-        // So are a Conform's, and the variable holding its type.
+        // A Conform's length slots are evaluated in its own scope, on entry,
+        // before the operand value exists; so is the variable holding an
+        // Unknown site's type.
         Expr::Conform(..) => {
             let mut kids = Vec::new();
             arena[id].children(&mut kids);
