@@ -2901,19 +2901,6 @@ g(len)").unwrap_err();
         typecheck::DEF_EVALS.with(|c| c.get())
     }
 
-    // The sharing pre-pass runs on a check-time evaluation's first use only: a
-    // program with none (no annotation to evaluate) never runs it.
-    #[test]
-    fn the_sharing_pass_runs_only_when_something_is_evaluated() {
-        let runs = |src: &str| {
-            typecheck::SHARING_RUNS.with(|c| c.set(0));
-            let value = run_source_on_this_thread(src).expect("runs").to_string();
-            (typecheck::SHARING_RUNS.with(|c| c.get()), value)
-        };
-        assert_eq!(runs("let f = fun x -> x + 1 in let g = fun y -> f(y) in g(2)"), (0, "3".to_string()));
-        assert_eq!(runs("let A = Int in let x: A = 1 in let y: A = 2 in x + y"), (1, "3".to_string()));
-    }
-
     // A recursive type function applied afresh on every call rebuilds an equal but
     // not pointer-equal type each time; the site's memo must still hit (the `==` half
     // of conform_lazy), or every call mints a fresh Lazy family.
@@ -3003,9 +2990,10 @@ g(len)").unwrap_err();
 
     // A `let` nested in another definition's right-hand side is a definition of
     // its own whose nodes also sit inside the enclosing one: each evaluation
-    // gets its own copy of the parts that read outside themselves and shares
-    // the closed parts (resolve::sharing). Every result is what the checker gave before
-    // definitions were evaluated once (bbdc1cf).
+    // runs a copy of its own root, in which a nested definition that already has
+    // a value is read from the frame instead (the last six cases are reused
+    // groups). Every result is what the checker gave before definitions were
+    // evaluated once (bbdc1cf).
     #[test]
     fn definitions_nested_in_definitions_evaluate_as_before() {
         let cases: &[(&str, &str)] = &[
@@ -3041,21 +3029,18 @@ g(len)").unwrap_err();
         }
     }
 
-    // Pins shadowing of a prelude name under sharing: `Int` here is the user's
-    // `Bool`, so `Z`, `q` and `B` must not resolve it as the prelude's. Clause (c)
-    // of `resolve::sharing` (a name no binder binds) is defensive: a shadowed
-    // name is Local in the program walk anyway, and no program is known that
-    // reaches (c) with a name that is Local in some other walk.
+    // Pins shadowing of a prelude name inside nested definitions: `Int` here is
+    // the user's `Bool`, so `Z`, `q` and `B` must not resolve it as the prelude's.
     #[test]
-    fn shadowed_prelude_names_are_not_shared() {
+    fn shadowed_prelude_names_in_nested_definitions() {
         let src = "let Int = Bool in let Z = Int in let A = (let q = Z in let B = Int in B) in let x: A = true in x";
         assert_eq!(run_source(src).unwrap().to_string(), "true");
     }
 
-    // A closed lambda is shared by every evaluation that reads it, under
-    // different frames: it has one layout everywhere.
+    // A lambda that two evaluations read (`F`, through `G`) is evaluated under
+    // different frames: its closure keeps one layout.
     #[test]
-    fn a_shared_closed_lambda_keeps_one_layout() {
+    fn a_lambda_two_evaluations_read_keeps_one_layout() {
         let src = "let F = fun a -> Tuple(a, a) in let G = F in let x: G(Int) = (1, 2) in x";
         assert_eq!(run_source(src).unwrap().to_string(), "[1, 2]");
     }
@@ -3212,8 +3197,8 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn copy_open_makes_new_nodes_that_evaluate_the_same() {
-        use crate::expr::{copy_open, Expr};
+    fn copy_tree_makes_new_nodes_that_evaluate_the_same() {
+        use crate::expr::{copy_tree, Expr};
         use cranelift_entity::EntityRef;
         use std::collections::HashSet;
         let src = "let o = opaque in let rec go = fun n -> if n == 0 then [] else n :: go(n - 1) in \
@@ -3225,7 +3210,7 @@ g(len)").unwrap_err();
         let mut arena = arena;
         let before = arena.len();
         let want = machine::run(&arena, root, Env::prelude(), &spans).to_string();
-        let copy = copy_open(&mut arena, root, |_| false);
+        let copy = copy_tree(&mut arena, root, |_, _| None);
         assert_ne!(copy, root);
         let mut seen = HashSet::new();
         let mut stack = vec![copy];
@@ -3267,60 +3252,57 @@ g(len)").unwrap_err();
 
     // The copy walks and rebuilds iteratively: 50k nested lets on the default stack.
     #[test]
-    fn copy_open_is_iterative() {
-        use crate::expr::{copy_open, Arena, Expr};
+    fn copy_tree_is_iterative() {
+        use crate::expr::{copy_tree, Arena, Expr};
         let mut arena = Arena::new();
         let mut body = arena.push(Expr::Int(0));
         for _ in 0..50_000 {
             let val = arena.push(Expr::Int(1));
             body = arena.push(Expr::Let("x".into(), None, val, body));
         }
-        let copy = copy_open(&mut arena, body, |_| false);
+        let copy = copy_tree(&mut arena, body, |_, _| None);
         let _resolved = resolve::resolve(&arena, copy);
     }
 
-    // A kept subtree comes back as the original, everything else is new, and an
-    // annotation slot still names the original annotation.
+    // A replaced subtree comes back as the replacement (its original children are
+    // never visited), everything else is new, and an annotation slot still names
+    // the original annotation.
     #[test]
-    fn copy_open_shares_closed_subtrees() {
-        use crate::expr::{copy_open, Expr};
+    fn copy_tree_replaces_reused_subtrees() {
+        use crate::expr::{copy_tree, Expr};
         use cranelift_entity::EntityRef;
         use std::collections::HashSet;
         let src = "let t: Int = 3 in let u = (4, 5) in (t, u)";
         let (mut arena, spans, root) = parser::parse(src).expect("parse");
         let before = arena.len();
         let want = machine::run(&arena, root, Env::prelude(), &spans).to_string();
-        let kept: HashSet<_> = arena
+        let pair = arena
             .iter()
             .filter(|(_, e)| matches!(e, Expr::Tuple(items) if items.len() == 2 && items.iter().all(|i| matches!(arena[*i], Expr::Int(_)))))
             .map(|(id, _)| id)
-            .collect();
-        assert_eq!(kept.len(), 1);
+            .collect::<Vec<_>>();
+        assert_eq!(pair.len(), 1);
+        let pair = pair[0];
+        let Expr::Tuple(originals) = arena[pair].clone() else { panic!("a tuple") };
         let Expr::Let(_, Some(ann), ..) = arena[root].clone() else { panic!("an annotated let") };
-        let copy = copy_open(&mut arena, root, |n| kept.contains(&n));
+        let (mut asked, mut replacement) = (HashSet::new(), None);
+        let copy = copy_tree(&mut arena, root, |arena, n| {
+            asked.insert(n);
+            (n == pair).then(|| {
+                let (a, b) = (arena.push(Expr::Int(4)), arena.push(Expr::Int(5)));
+                *replacement.insert(arena.push(Expr::Tuple(vec![a, b])))
+            })
+        });
+        let replacement = replacement.expect("the pair was replaced");
         assert_ne!(copy, root);
+        assert!(originals.iter().all(|o| !asked.contains(o)), "the replaced subtree's children were visited");
         let Expr::Let(_, copy_ann, ..) = arena[copy].clone() else { panic!("a let") };
         assert_eq!(copy_ann, Some(ann));
-        let (mut stack, mut seen, mut shared, mut kids) = (vec![copy], HashSet::new(), 0, Vec::new());
-        while let Some(n) = stack.pop() {
-            if !seen.insert(n) {
-                continue;
-            }
-            if kept.contains(&n) {
-                shared += 1;
-                continue;
-            }
-            assert!(n.index() >= before, "node {n:?} of the copy is an original");
-            kids.clear();
-            arena[n].children_with(&mut kids, false);
-            stack.extend(kids.iter().copied());
-        }
-        assert_eq!(shared, 1);
+        let Expr::Let(_, _, _, rest) = arena[copy].clone() else { panic!("a let") };
+        let Expr::Let(_, _, u_val, _) = arena[rest].clone() else { panic!("the second let") };
+        assert_eq!(u_val, replacement);
+        assert!(copy.index() >= before && rest.index() >= before, "the copy's own nodes are new");
         assert_eq!(machine::run(&arena, copy, Env::prelude(), &spans).to_string(), want);
-        // A kept root is not copied at all.
-        let len = arena.len();
-        assert_eq!(copy_open(&mut arena, root, |_| true), root);
-        assert_eq!(arena.len(), len);
     }
 
     #[test]

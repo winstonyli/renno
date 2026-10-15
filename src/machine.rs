@@ -118,24 +118,77 @@ pub fn eval_pure(arena: &Arena, expr: ExprRef, spans: &SpanMap, fuel: u64) -> Pu
 }
 
 // `eval_pure` inside one enclosing frame: `names` are bound to `values`. A
-// copy of `expr`'s open part is resolved into `resolved`, which the caller keeps
-// so that a closure this evaluation returns (or stores in a value) can be called
-// by a later one that shares the table. The copy is what keeps that table
-// sound: a variable's slot is only valid for the layout its node was resolved
-// under, and the same tree can be evaluated under several (a `let` nested in
-// another definition's right-hand side is reached by both), so every
-// evaluation gets its own nodes wherever the layout could differ. The closed
-// subtrees (`resolved.shares`) resolve alike under every layout: they are not
-// copied, the copy points at the originals, and a whole closed `expr` is run
-// as it is.
-pub fn eval_pure_in(arena: &mut Arena, expr: ExprRef, names: &[String], values: Vec<Value>, resolved: &mut Resolved, spans: &SpanMap, fuel: u64) -> Pure {
+// copy of `expr` is resolved into `resolved`, which the caller keeps so that a
+// closure this evaluation returns (or stores in a value) can be called by a
+// later one that shares the table. The copy is what keeps that table sound: a
+// variable's slot is only valid for the layout its node was resolved under,
+// and the same tree can be evaluated under several (a `let` nested in another
+// definition's right-hand side is reached by both), so every evaluation gets
+// one copy of its own, and every walk resolves only nodes its own copy made.
+// A subtree `reuse` has a value for (a nested definition already evaluated) is
+// not copied or run: a fresh variable stands for it, and the frame binds that
+// variable to the value, after `names`.
+//
+// A debug build runs the same `expr` once more with nothing reused (own copy,
+// own table, a clone of the arena, so nothing it makes lingers) and asserts
+// that the two results print alike: reusing a value must equal running the
+// subtree again. It compares at the root: a nested subtree may read binders
+// between it and the root, so it cannot run alone. A run that does not finish
+// (stuck, error, out of fuel) in the inline version is not compared; reuse may
+// finish where it runs out of fuel, since the reused steps are not recounted.
+#[allow(clippy::too_many_arguments)]
+pub fn eval_pure_in(
+    arena: &mut Arena,
+    expr: ExprRef,
+    names: &[String],
+    values: Vec<Value>,
+    reuse: impl Fn(ExprRef) -> Option<Value>,
+    resolved: &mut Resolved,
+    spans: &SpanMap,
+    fuel: u64,
+) -> Pure {
     debug_assert_eq!(names.len(), values.len(), "eval_pure_in: one value per name");
-    let expr = crate::expr::copy_open(arena, expr, |n| resolved.shares(n));
-    crate::resolve::resolve_into(arena, expr, names, resolved);
+    let (mut bound, mut frame_values) = (names.to_vec(), values);
+    let original = expr;
+    let expr = crate::expr::copy_tree(arena, expr, |arena, n| {
+        let v = reuse(n)?;
+        bound.push(format!("{}#reused", bound.len()));
+        frame_values.push(v);
+        Some(arena.push(Expr::Var(bound.last().expect("just pushed").clone())))
+    });
+    crate::resolve::resolve_into(arena, expr, &bound, resolved);
+    let mut frame = Bindings::default();
+    #[cfg(debug_assertions)]
+    let kept = (names.len() < bound.len()).then(|| frame_values[..names.len()].to_vec());
+    frame_values.into_iter().for_each(|v| frame.push(v));
+    let env = frame.extend(&Env::prelude());
+    let out = run_pure(arena, expr, env, spans, resolved, fuel);
+    #[cfg(debug_assertions)]
+    if let Some(kept) = kept {
+        assert_reuse_matches_inline(arena, original, names, kept, resolved, spans, fuel, &out);
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = original;
+    out
+}
+
+// The debug cross-check of `eval_pure_in`: `expr` run with nothing reused.
+#[cfg(debug_assertions)]
+#[allow(clippy::too_many_arguments)]
+fn assert_reuse_matches_inline(arena: &Arena, expr: ExprRef, names: &[String], values: Vec<Value>, resolved: &Resolved, spans: &SpanMap, fuel: u64, reused: &Pure) {
+    let mut scratch = arena.clone();
+    let copy = crate::expr::copy_tree(&mut scratch, expr, |_, _| None);
+    // A clone: the closures in `values` run their bodies, which only the real
+    // table has entries for, and the scratch nodes must not enter it.
+    let mut table = resolved.clone();
+    crate::resolve::resolve_into(&scratch, copy, names, &mut table);
     let mut frame = Bindings::default();
     values.into_iter().for_each(|v| frame.push(v));
     let env = frame.extend(&Env::prelude());
-    run_pure(arena, expr, env, spans, resolved, fuel)
+    if let Pure::Done(inline) = run_pure(&scratch, copy, env, spans, &table, fuel) {
+        let Pure::Done(got) = reused else { panic!("reuse failed where running the subtrees again finished with {inline}") };
+        assert_eq!(got.to_string(), inline.to_string(), "a reused value differs from running its subtree again");
+    }
 }
 
 // Runs `expr` (resolved in `resolved`) in check mode; see eval_pure.
@@ -1934,14 +1987,14 @@ mod tests {
         let (f, five) = (arena.push(Expr::Var("f".into())), arena.push(Expr::Int(5)));
         let call = arena.push(Expr::App(f, five));
         let mut table = Resolved::default();
-        let Pure::Done(closure) = eval_pure_in(&mut arena, lam, &["a".to_string()], vec![Value::Int(10)], &mut table, &spans, 100) else {
+        let Pure::Done(closure) = eval_pure_in(&mut arena, lam, &["a".to_string()], vec![Value::Int(10)], |_| None, &mut table, &spans, 100) else {
             panic!("the lambda must evaluate")
         };
-        let Pure::Done(sum) = eval_pure_in(&mut arena, call, &["f".to_string()], vec![closure], &mut table, &spans, 100) else {
+        let Pure::Done(sum) = eval_pure_in(&mut arena, call, &["f".to_string()], vec![closure], |_| None, &mut table, &spans, 100) else {
             panic!("the call must evaluate")
         };
         assert_eq!(sum.as_int(), 15);
-        let Pure::Done(pair) = eval_pure_in(&mut arena, five, &[], Vec::new(), &mut table, &spans, 100) else { panic!("a literal") };
+        let Pure::Done(pair) = eval_pure_in(&mut arena, five, &[], Vec::new(), |_| None, &mut table, &spans, 100) else { panic!("a literal") };
         assert_eq!(pair.as_int(), 5);
     }
 
@@ -1960,43 +2013,53 @@ mod tests {
         let mut table = Resolved::default();
         let build = |arena: &mut Arena, names: &[&str], values: Vec<Value>, table: &mut Resolved| {
             let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-            let Pure::Done(closure) = eval_pure_in(arena, lam, &names, values, table, &spans, 100) else { panic!("the lambda must evaluate") };
+            let Pure::Done(closure) = eval_pure_in(arena, lam, &names, values, |_| None, table, &spans, 100) else { panic!("the lambda must evaluate") };
             closure
         };
         let c1 = build(&mut arena, &["a"], vec![Value::Int(10)], &mut table);
         let c2 = build(&mut arena, &["z", "a"], vec![Value::Int(0), Value::Int(20)], &mut table);
         for (closure, want) in [(c1, 15), (c2, 25)] {
-            let Pure::Done(sum) = eval_pure_in(&mut arena, call, &["f".to_string()], vec![closure], &mut table, &spans, 100) else { panic!("the call must evaluate") };
+            let Pure::Done(sum) = eval_pure_in(&mut arena, call, &["f".to_string()], vec![closure], |_| None, &mut table, &spans, 100) else { panic!("the call must evaluate") };
             assert_eq!(sum.as_int(), want);
         }
         build(&mut arena, &["a"], vec![Value::Int(30)], &mut table);
     }
 
-    // A closed root (`fun a -> (a, a)` reads only its own parameter) is run as
-    // it is under any frame: no copy, so the arena does not grow, and the
-    // closures it builds under two frames behave alike.
+    // A subtree `reuse` has a value for is read from the frame, not copied or
+    // run: `zzz` is unbound, so running it would fail, and the copy is the
+    // Let, one variable for the reused value, the Tuple and its two Vars.
     #[test]
-    fn eval_pure_in_shares_a_closed_root_under_two_frames() {
+    fn eval_pure_in_runs_a_reused_subtree_as_its_value() {
         let mut arena = Arena::new();
         let spans = SpanMap::new();
-        let (a1, a2) = (arena.push(Expr::Var("a".into())), arena.push(Expr::Var("a".into())));
-        let body = arena.push(Expr::Tuple(vec![a1, a2]));
-        let lam = arena.push(Expr::Lambda("a".into(), None, body));
-        let (f, five) = (arena.push(Expr::Var("f".into())), arena.push(Expr::Int(5)));
-        let call = arena.push(Expr::App(f, five));
-        let mut table = crate::resolve::sharing(&arena, lam, &std::collections::HashSet::new());
-        assert!(table.shares(lam));
+        let zzz = arena.push(Expr::Var("zzz".into()));
+        let (b1, b2) = (arena.push(Expr::Var("b".into())), arena.push(Expr::Var("b".into())));
+        let pair = arena.push(Expr::Tuple(vec![b1, b2]));
+        let root = arena.push(Expr::Let("b".into(), None, zzz, pair));
         let len = arena.len();
-        let mut closures = Vec::new();
-        for (names, values) in [(vec!["a".to_string()], vec![Value::Int(10)]), (vec!["z".to_string(), "a".to_string()], vec![Value::Int(0), Value::Int(20)])] {
-            let Pure::Done(closure) = eval_pure_in(&mut arena, lam, &names, values, &mut table, &spans, 100) else { panic!("the lambda must evaluate") };
-            closures.push(closure);
-            assert_eq!(arena.len(), len, "a closed root is not copied");
-        }
-        for closure in closures {
-            let Pure::Done(pair) = eval_pure_in(&mut arena, call, &["f".to_string()], vec![closure], &mut table, &spans, 100) else { panic!("the call must evaluate") };
-            assert_eq!(pair.to_string(), "[5, 5]");
-        }
+        let mut table = Resolved::default();
+        let reuse = |n: ExprRef| (n == zzz).then_some(Value::Int(7));
+        let Pure::Done(v) = eval_pure_in(&mut arena, root, &[], Vec::new(), reuse, &mut table, &spans, 100) else { panic!("the reused subtree must not run") };
+        assert_eq!(v.to_string(), "[7, 7]");
+        assert_eq!(arena.len() - len, 5);
+    }
+
+    // The debug cross-check: a reused value that differs from what running the
+    // subtree gives (here 4 for `1 + 2`) is caught.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a reused value differs from running its subtree again")]
+    fn eval_pure_in_debug_catches_a_reused_value_that_differs_from_running_it() {
+        let mut arena = Arena::new();
+        let spans = SpanMap::new();
+        let (one, two) = (arena.push(Expr::Int(1)), arena.push(Expr::Int(2)));
+        let sum = arena.push(Expr::BinOp(BinOp::Add, one, two));
+        let (b1, b2) = (arena.push(Expr::Var("b".into())), arena.push(Expr::Var("b".into())));
+        let pair = arena.push(Expr::Tuple(vec![b1, b2]));
+        let root = arena.push(Expr::Let("b".into(), None, sum, pair));
+        let mut table = Resolved::default();
+        let reuse = |n: ExprRef| (n == sum).then_some(Value::Int(4));
+        eval_pure_in(&mut arena, root, &[], Vec::new(), reuse, &mut table, &spans, 100);
     }
 
     #[test]

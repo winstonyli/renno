@@ -512,15 +512,14 @@ pub(crate) struct InferCtx {
     defs: Vec<Rc<CheckDef>>,
     // Where the variables of every check-time evaluation live. One table for
     // them all: a closure one evaluation builds is called by a later one. Each
-    // evaluation resolves a copy of the open part of its root (eval_pure_in),
-    // so a node is never resolved under two layouts; the closed parsed nodes
-    // resolve alike under any, so they are shared (`ensure_sharing` finds them on first use).
+    // evaluation resolves a copy of its root (eval_pure_in), so a node is never
+    // resolved under two layouts.
     resolved: Resolved,
-    // The parsed root `resolved`'s sharing pass has yet to walk; taken by the
-    // first check-time evaluation, so a program with none never pays for it.
-    // Elaboration only adds nodes until the in-place writes after it, so the
-    // walk sees the parsed tree whenever it runs before them.
-    sharing_root: Option<ExprRef>,
+    // The definition whose value each parsed node is (a let's right-hand side, a
+    // group member's value), and which member; None when two definitions claim
+    // one node, which is never reused. Elaborated once, so two claims only come
+    // from a node elaborated twice.
+    value_of: HashMap<ExprRef, Option<(usize, usize)>>,
     // An annotation is being elaborated (annotation_type): a name it reads
     // is not a value-position read, so `lookup` leaves CheckDef::used alone.
     in_annotation: bool,
@@ -550,7 +549,7 @@ impl InferCtx {
             bound_names: HashSet::new(),
             defs: Vec::new(),
             resolved: Resolved::default(),
-            sharing_root: None,
+            value_of: HashMap::new(),
             in_annotation: false,
             direct_value: None,
             proofs: Vec::new(),
@@ -577,6 +576,12 @@ impl InferCtx {
         });
         self.defs.push(def.clone());
         def
+    }
+
+    // Records that parsed node `node` is member `member` of definition `def`'s
+    // value; a second claim on the node withdraws it (never reused).
+    fn note_value_of(&mut self, node: ExprRef, def: usize, member: usize) {
+        self.value_of.entry(node).and_modify(|e| *e = None).or_insert(Some((def, member)));
     }
 
     // Flags `ty` as reaching a Dyn sink if it is (still) a bare type variable.
@@ -1551,7 +1556,6 @@ fn resolve_pendings(arena: &mut Arena, infer: &InferCtx) {
         let (from, to) = (snapshot_type(&p.from, infer, &vars), snapshot_type(&p.to, infer, &vars));
         let result = cast_now(arena, p.e, &from, &to, &env);
         let node = arena[result].clone();
-        debug_assert!(!infer.resolved.shares(p.slot), "an in-place write to a shared node");
         arena[p.slot] = node;
     }
 }
@@ -2241,7 +2245,6 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
                 && !ob.witness_vars().contains(&name.as_str())
                 && mentions.get(name) == Some(&1)
                 && !infer.index_subst.values().any(|v| free_index_vars(v).contains(name)));
-        debug_assert!(!infer.resolved.shares(ob.slot), "an in-place write to a shared node");
         if unconstrained {
             arena[ob.slot] = Expr::Len(LenExpr::Any);
             continue;
@@ -3763,7 +3766,6 @@ fn settle_erasure(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx) {
     });
     splices.sort_by_key(|s| cranelift_entity::EntityRef::index(s.outer));
     for s in splices {
-        debug_assert!(!infer.resolved.shares(s.outer), "an in-place write to a shared node");
         arena[s.outer] = arena[s.inner].clone();
     }
 }
@@ -3981,6 +3983,30 @@ fn ensure_values(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx, roots
     }
 }
 
+// Member `member` of definition `def`'s value: a group's value is the list of
+// its members', a let's is the value itself.
+fn member_value(def: &CheckDef, value: &Value, member: usize) -> Value {
+    match (&def.node, value) {
+        (DefNode::Group(_), Value::List(members)) => members[member].clone(),
+        _ => value.clone(),
+    }
+}
+
+// The value running parsed node `n` would give, if some finished definition
+// holds it: `n` is that definition's right-hand side (or a group member's
+// value) and the definition is Done. Running `n` inline is deterministic and
+// a Done definition is not stuck, so it reads only definitions, and every name
+// in it means the same binder here as in the checker's scope: the values agree
+// (eval_pure_in's debug build checks it). Nothing is evaluated for this; a
+// definition that failed or has no value yet is run inline, as before.
+fn reusable(defs: &[Rc<CheckDef>], value_of: &HashMap<ExprRef, Option<(usize, usize)>>, n: ExprRef) -> Option<Value> {
+    let (d, member) = (*value_of.get(&n)?)?;
+    match defs[d].value.get() {
+        Some(DefValue::Done(value)) => Some(member_value(&defs[d], value, member)),
+        _ => None,
+    }
+}
+
 // The names `reads` stand for, with the values the definitions they read have,
 // as the frame an evaluation runs in; or, if any of those definitions failed,
 // the failure of the earliest one.
@@ -3992,10 +4018,7 @@ fn read_frame(infer: &InferCtx, reads: &[Read]) -> Result<(Vec<String>, Vec<Valu
         match infer.defs[read.def].value.get().expect("a dependency is evaluated first") {
             DefValue::Done(value) => {
                 names.push(read.name.clone());
-                values.push(match (&infer.defs[read.def].node, value) {
-                    (DefNode::Group(_), Value::List(members)) => members[read.member].clone(),
-                    _ => value.clone(),
-                });
+                values.push(member_value(&infer.defs[read.def], value, read.member));
             }
             DefValue::Failed { origin, why } if failed.as_ref().is_none_or(|(o, _)| origin < o) => failed = Some((*origin, why.clone())),
             DefValue::Failed { .. } => {}
@@ -4025,8 +4048,7 @@ fn def_value(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx, i: usize)
             arena.push(Expr::LetRec(bindings.clone(), tuple))
         }
     };
-    infer.ensure_sharing(arena);
-    match eval_pure_in(arena, root, &names, values, &mut infer.resolved, spans, ANNOTATION_FUEL) {
+    match eval_pure_in(arena, root, &names, values, |n| reusable(&infer.defs, &infer.value_of, n), &mut infer.resolved, spans, ANNOTATION_FUEL) {
         Pure::Done(value) => DefValue::Done(value),
         Pure::Stuck(why) => DefValue::Failed { origin: i, why: Failure::Stuck(why) },
         Pure::Error(msg) => DefValue::Failed { origin: i, why: Failure::Error(msg) },
@@ -4037,20 +4059,6 @@ fn def_value(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx, i: usize)
 thread_local! {
     // How many definitions def_value has evaluated on this thread.
     pub(crate) static DEF_EVALS: Cell<usize> = const { Cell::new(0) };
-    // How many times the sharing pass has run on this thread.
-    pub(crate) static SHARING_RUNS: Cell<usize> = const { Cell::new(0) };
-}
-
-impl InferCtx {
-    // Runs the sharing pass if no check-time evaluation has needed it yet;
-    // every evaluation calls it before it uses `resolved`.
-    fn ensure_sharing(&mut self, arena: &Arena) {
-        if let Some(root) = self.sharing_root.take() {
-            #[cfg(test)]
-            SHARING_RUNS.with(|c| c.set(c.get() + 1));
-            self.resolved = crate::resolve::sharing(arena, root, &self.bound_names);
-        }
-    }
 }
 
 // What `ann`, which reads `reads` directly, evaluates to at check time: the
@@ -4060,10 +4068,7 @@ fn eval_annotation(arena: &mut Arena, ann: ExprRef, reads: &[Read], spans: &Span
     let roots: Vec<usize> = reads.iter().map(|r| r.def).collect();
     ensure_values(arena, spans, infer, &roots);
     match read_frame(infer, reads) {
-        Ok((names, values)) => {
-            infer.ensure_sharing(arena);
-            eval_pure_in(arena, ann, &names, values, &mut infer.resolved, spans, ANNOTATION_FUEL)
-        }
+        Ok((names, values)) => eval_pure_in(arena, ann, &names, values, |n| reusable(&infer.defs, &infer.value_of, n), &mut infer.resolved, spans, ANNOTATION_FUEL),
         Err((_, why)) => why.into_pure(),
     }
 }
@@ -4135,6 +4140,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     }
                 };
                 let def = infer.new_def(DefNode::Let(val), vec![val3], &cur_ctx);
+                infer.note_value_of(val, def.idx, 0);
                 cur_ctx = extend_generalized(&cur_ctx.with_annot(&existentials), &var, bound_ty.clone(), infer, Some(def.clone()));
                 pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3, def });
                 cur_expr = body;
@@ -4248,6 +4254,11 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 }
                 let values = elaborated.iter().map(|(_, _, _, v)| *v).collect();
                 let def = infer.new_def(DefNode::Group(bindings.clone()), values, &cur_ctx);
+                // Not the early definition of a direct-`fun` group: it is made
+                // before its values exist, and is the group as they see it.
+                for (m, (_, _, val)) in bindings.iter().enumerate() {
+                    infer.note_value_of(*val, def.idx, m);
+                }
                 // The group's existential variables stay in scope, and open, after it.
                 introduced.retain(|(_, entry)| !entry.universal);
                 cur_ctx = cur_ctx.with_annot(&introduced);
@@ -5609,7 +5620,6 @@ fn binder_names(arena: &Arena) -> HashSet<String> {
 pub fn check(arena: &mut Arena, root: ExprRef, spans: &SpanMap) -> Result<ExprRef, TypeError> {
     let mut infer = InferCtx::new();
     infer.bound_names = binder_names(arena);
-    infer.sharing_root = Some(root);
     let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), spans, &mut infer)?;
     resolve_pendings(arena, &infer);
     resolve_obligations(arena, &infer);

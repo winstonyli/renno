@@ -515,17 +515,17 @@ impl Expr {
     }
 }
 
-// A copy of the parsed tree rooted at `root`, except for the subtrees `keep`
-// names: those are not copied, the copy points at the originals. Every other
-// reachable node is pushed again, children mapped to their copies (a node
-// reached twice is copied once, so the copy shares as the original does).
-// Annotation slots are not copied either: neither the resolver nor the
-// check-mode machine enters them, so the copy's point at the originals.
-// Iterative, so a deep chain costs no native stack. Check-time evaluation runs
-// the copy (machine::eval_pure_in); `keep` names the closed subtrees
-// (resolve::Resolved::shares), so each evaluation has nodes of its own only
-// for the part that reads outside itself. If `keep(root)`, nothing is copied.
-pub fn copy_open(arena: &mut Arena, root: ExprRef, keep: impl Fn(ExprRef) -> bool) -> ExprRef {
+// A copy of the parsed tree rooted at `root`. Every reachable node is pushed
+// again, children mapped to their copies (a node reached twice is copied once,
+// so the copy shares as the original does), except a node `replace` answers
+// for: it returns the node to put in its place (it may push one), and the
+// subtree under the original is neither visited nor copied. Annotation slots
+// are not copied either: neither the resolver nor the check-mode machine
+// enters them, so the copy's point at the originals. Iterative, so a deep chain
+// costs no native stack. Check-time evaluation runs the copy
+// (machine::eval_pure_in), so each evaluation has nodes of its own; `replace`
+// is where it reads an already-evaluated nested definition's value instead.
+pub fn copy_tree(arena: &mut Arena, root: ExprRef, mut replace: impl FnMut(&mut Arena, ExprRef) -> Option<ExprRef>) -> ExprRef {
     let mut copies: HashMap<ExprRef, ExprRef> = HashMap::new();
     let mut stack = vec![(root, false)];
     let mut kids = Vec::new();
@@ -533,8 +533,8 @@ pub fn copy_open(arena: &mut Arena, root: ExprRef, keep: impl Fn(ExprRef) -> boo
         if copies.contains_key(&n) {
             continue;
         }
-        if keep(n) {
-            copies.insert(n, n);
+        if !expanded && let Some(r) = replace(arena, n) {
+            copies.insert(n, r);
             continue;
         }
         if !expanded {

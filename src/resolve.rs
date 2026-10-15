@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use cranelift_entity::EntityRef;
@@ -31,30 +31,17 @@ pub enum VarRef {
 // evaluation's copy of its root, and the checker keeps one table for all
 // its check-time evaluations, since a closure built in one run is called in a
 // later one, and its body needs an entry whichever run resolved it. A node
-// must be resolved under one layout only. Open nodes (ones that read a binder
-// outside themselves) are copied for each evaluation, so no two evaluations
-// resolve the same one. Closed nodes resolve the same under every layout, so
-// `sharing` finds them once, before the first evaluation, and evaluations
-// share them (`shares`).
-#[derive(Default)]
+// must be resolved under one layout only: every evaluation walks a copy of
+// its own, so no two evaluations resolve the same node.
+#[derive(Default, Clone)]
 pub struct Resolved {
     base: usize,
     vars: Vec<Option<VarRef>>,
-    // Indexed by ExprRef: the node is closed and its entries are already in
-    // `vars`. Covers the nodes that existed when `sharing` ran; later nodes
-    // are not shared. Empty (nothing shared) for `Resolved::default()`.
-    shared: Vec<bool>,
 }
 
 impl Resolved {
     pub fn get(&self, expr: ExprRef) -> Option<VarRef> {
         self.vars.get(expr.index().wrapping_sub(self.base)).copied().flatten()
-    }
-
-    // True if `expr` is closed: an evaluation may run the original node instead
-    // of a copy, and its entries need no resolving.
-    pub fn shares(&self, expr: ExprRef) -> bool {
-        self.shared.get(expr.index()).copied().unwrap_or(false)
     }
 
     // Records where `id` lives, growing the range to cover it. Growing at the
@@ -109,8 +96,6 @@ enum Work {
     // Enter / leave one runtime frame with these binder names.
     Push(Vec<String>),
     Pop,
-    // The node's subtree is done (`sharing` only).
-    Leave(ExprRef),
 }
 
 // Iterative on purpose: parser and typecheck flatten Let/Fun chains to keep
@@ -126,70 +111,12 @@ pub fn resolve(arena: &Arena, root: ExprRef) -> Resolved {
 
 // `resolve`, adding to `resolved` and with `outer` as one enclosing frame
 // (none if empty) around `root`: the layout of a runtime env that holds those
-// names' values. A node `resolved` already holds must come out the same.
-//
-// A shared (closed) node is not entered: `sharing` already put its entries in.
-// A debug build enters it anyway, so every debug run re-checks, through
-// `insert`'s conflict panic, that a closed node resolves alike everywhere.
+// names' values. A node `resolved` already holds must come out the same: it
+// does, because `eval_pure_in` walks only nodes its own copy made.
 pub fn resolve_into(arena: &Arena, root: ExprRef, outer: &[String], resolved: &mut Resolved) {
-    let skip = |id: ExprRef| !cfg!(debug_assertions) && resolved.shares(id);
-    for (id, r) in walk(arena, root, outer, skip) {
+    for (id, r) in walk(arena, root, outer) {
         resolved.insert(id, r);
     }
-}
-
-// The table of the whole program `root` (what `resolve` returns) that also
-// finds its closed nodes: ones whose Vars all resolve the same under any
-// layout around them, so an evaluation can share them instead of copying them.
-// A node is closed when every Var in it is
-//   (a) bound by a binder inside the node, or
-//   (b) a synthesized `#name` (always the prelude), or
-//   (c) neither Local here nor a name any binder of the program binds (`bound`),
-//       so no check-time scope can make it Local.
-// For (a), hops and slot come only from frames the node itself pushes, and a
-// frame's shape is syntactic. Nodes the walk does not visit (annotation
-// subtrees, the Lambda node of a function group, nodes added later) are not
-// closed. The entries this writes for open nodes are never read: an open
-// original is always copied before it is evaluated.
-pub fn sharing(arena: &Arena, root: ExprRef, bound: &HashSet<String>) -> Resolved {
-    let mut resolved = Resolved { shared: vec![false; arena.len()], ..Resolved::default() };
-    let mut scopes = Scopes::default();
-    let mut found = Vec::new();
-    let mut work = vec![Work::Visit(root)];
-    // Per node entered and not yet left: the depth of its scope, and the lowest
-    // frame (index into `scopes.frames`) any Var in it binds in. A frame
-    // numbered below the node's own depth lies outside it.
-    let mut lows: Vec<(isize, isize)> = Vec::new();
-    while let Some(item) = work.pop() {
-        match item {
-            Work::Push(names) => scopes.push(names),
-            Work::Pop => scopes.pop(),
-            Work::Visit(id) => {
-                lows.push((scopes.frames.len() as isize, isize::MAX));
-                work.push(Work::Leave(id));
-                visit(arena, id, &scopes, &mut found, &mut work);
-                for (var, r) in found.drain(..) {
-                    resolved.insert(var, r);
-                    let Expr::Var(name) = &arena[var] else { unreachable!("only Var nodes are resolved") };
-                    let low = match r {
-                        VarRef::Local { hops, .. } => scopes.frames.len() as isize - 1 - hops as isize,
-                        _ if name.starts_with('#') => isize::MAX,
-                        _ if bound.contains(name) => -1,
-                        _ => isize::MAX,
-                    };
-                    lows.last_mut().expect("the Var's own entry").1 = low;
-                }
-            }
-            Work::Leave(id) => {
-                let (depth, low) = lows.pop().expect("a node entered");
-                resolved.shared[id.index()] = low >= depth;
-                if let Some(parent) = lows.last_mut() {
-                    parent.1 = parent.1.min(low);
-                }
-            }
-        }
-    }
-    resolved
 }
 
 // The names `root` uses but does not bind (a prelude name counts as free; a
@@ -197,7 +124,7 @@ pub fn sharing(arena: &Arena, root: ExprRef, bound: &HashSet<String>) -> Resolve
 // looks these up to find the `let`s an annotation depends on.
 pub fn free_vars(arena: &Arena, root: ExprRef) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for (id, r) in walk(arena, root, &[], |_| false) {
+    for (id, r) in walk(arena, root, &[]) {
         let Expr::Var(name) = &arena[id] else { unreachable!("only Var nodes are resolved") };
         if !matches!(r, VarRef::Local { .. }) && !name.starts_with('#') && !out.contains(name) {
             out.push(name.clone());
@@ -206,9 +133,8 @@ pub fn free_vars(arena: &Arena, root: ExprRef) -> Vec<String> {
     out
 }
 
-// Every Var node under `root` with where it lives, in visit order, without
-// entering a node `skip` names.
-fn walk(arena: &Arena, root: ExprRef, outer: &[String], skip: impl Fn(ExprRef) -> bool) -> Vec<(ExprRef, VarRef)> {
+// Every Var node under `root` with where it lives, in visit order.
+fn walk(arena: &Arena, root: ExprRef, outer: &[String]) -> Vec<(ExprRef, VarRef)> {
     let mut found: Vec<(ExprRef, VarRef)> = Vec::new();
     let mut scopes = Scopes::default();
     if !outer.is_empty() {
@@ -219,9 +145,7 @@ fn walk(arena: &Arena, root: ExprRef, outer: &[String], skip: impl Fn(ExprRef) -
         match item {
             Work::Push(names) => scopes.push(names),
             Work::Pop => scopes.pop(),
-            Work::Visit(id) if skip(id) => {}
             Work::Visit(id) => visit(arena, id, &scopes, &mut found, &mut work),
-            Work::Leave(_) => unreachable!("only `sharing` leaves nodes"),
         }
     }
     found
@@ -774,85 +698,5 @@ mod tests {
         assert_eq!(resolved.get(f), Some(VarRef::Prelude(list)));
         assert_eq!(resolved.get(ExprRef::new(0)), None);
         assert_eq!(resolved.get(app), None);
-    }
-
-    // Nodes of `src` (in arena order) that satisfy `pick`, and whether
-    // `sharing` found each closed. `bound` stands for the names a binder of
-    // the program binds.
-    fn closed_of(src: &str, bound: &[&str], pick: impl Fn(&Arena, ExprRef) -> bool) -> Vec<bool> {
-        let (arena, _spans, root) = crate::parser::parse(src).expect("parse failed");
-        let bound: HashSet<String> = bound.iter().map(|s| s.to_string()).collect();
-        let table = sharing(&arena, root, &bound);
-        let picked: Vec<bool> = arena.iter().filter(|(id, _)| pick(&arena, *id)).map(|(id, _)| table.shares(id)).collect();
-        assert!(!picked.is_empty(), "{src}: nothing picked");
-        picked
-    }
-
-    fn var_named(name: &'static str) -> impl Fn(&Arena, ExprRef) -> bool {
-        move |arena, id| matches!(&arena[id], Expr::Var(n) if n == name)
-    }
-
-    fn the_node(arena: &Arena, id: ExprRef) -> bool {
-        // The root is the last node the parser pushes.
-        id.index() + 1 == arena.len()
-    }
-
-    // `Resolved::sharing` finds the nodes that resolve the same under every walk.
-    #[test]
-    fn closed_nodes_are_the_ones_every_walk_resolves_alike() {
-        // A lambda reads only its own parameter: closed; the Var itself is not.
-        assert_eq!(closed_of("fun x -> x", &[], the_node), [true]);
-        assert_eq!(closed_of("fun x -> x", &[], var_named("x")), [false]);
-        // `Int` is closed while nothing binds it, and open once some binder does
-        // (a walk might then see it as that binder's Local).
-        assert_eq!(closed_of("let f = fun x -> Int in f", &[], var_named("Int")), [true]);
-        assert_eq!(closed_of("let f = fun x -> Int in f", &["Int"], var_named("Int")), [false]);
-        assert_eq!(closed_of("let Int = Bool in let f = fun x -> Int in f", &["Int"], var_named("Int")), [false]);
-        // A synthesized `#Int` is the prelude's whatever binds `Int`.
-        let mut arena = Arena::new();
-        let hash_int = arena.push(Expr::Var("#Int".into()));
-        let bound: HashSet<String> = ["Int".to_string()].into();
-        assert!(sharing(&arena, hash_int, &bound).shares(hash_int));
-        // A type group is closed when its values read only its own names, and
-        // each value, which reads them from outside itself, is not.
-        let src = "let rec T = Union(Int, T) in T";
-        assert_eq!(closed_of(src, &["T"], the_node), [true]);
-        assert_eq!(closed_of(src, &["T"], |a, id| matches!(a[id], Expr::App(..))), [false]);
-        assert_eq!(closed_of("fun u -> (let rec T = Union(Int, T) in T)", &["T", "u"], the_node), [true]);
-        assert_eq!(closed_of("let rec T = Union(Int, U) in T", &["T"], the_node), [true]);
-        assert_eq!(closed_of("fun u -> (let rec T = Union(u, T) in T)", &["T", "u"], |a, id| matches!(a[id], Expr::LetRec(..))), [false]);
-        // Match arms: one with no variable pushes no frame, one with a variable does.
-        let src = "fun a -> match a | 0 -> a | y -> y";
-        assert_eq!(closed_of(src, &["a", "y"], |a, id| matches!(a[id], Expr::Match(..))), [false]);
-        assert_eq!(closed_of(src, &["a", "y"], the_node), [true]);
-        assert_eq!(closed_of("match 1 | 2 -> 3 | y -> y", &["y"], |a, id| matches!(a[id], Expr::Match(..))), [true]);
-        assert_eq!(closed_of("match 1 | 2 -> 3 | y -> y", &["y"], var_named("y")), [false]);
-        // A handler clause binds its payload and resume variables.
-        let src = "handle perform ping(3) with handler ping(x, k) -> k(x + 1)";
-        assert_eq!(closed_of(src, &["x", "k"], |a, id| matches!(a[id], Expr::MakeHandler { .. })), [true]);
-        assert_eq!(closed_of(src, &["x", "k"], |a, id| matches!(a[id], Expr::App(..))), [false]);
-        // An annotation subtree is never visited: not closed.
-        let src = "let t: Int = 3 in t";
-        let (arena, _spans, root) = crate::parser::parse(src).expect("parse failed");
-        let table = sharing(&arena, root, &HashSet::new());
-        let Expr::Let(_, Some(ann), ..) = arena[root] else { panic!("an annotated let") };
-        assert!(!table.shares(ann));
-        assert!(table.shares(root));
-        // A node added after the pass is not.
-        let mut arena = arena;
-        let added = arena.push(Expr::Int(1));
-        assert!(!table.shares(added));
-    }
-
-    // 50k nested lets on the default stack: the pass is iterative.
-    #[test]
-    fn sharing_pass_is_iterative() {
-        let mut arena = Arena::new();
-        let mut body = arena.push(Expr::Int(0));
-        for _ in 0..50_000 {
-            let val = arena.push(Expr::Int(1));
-            body = arena.push(Expr::Let("x".into(), None, val, body));
-        }
-        assert!(sharing(&arena, body, &HashSet::new()).shares(body));
     }
 }
