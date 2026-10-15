@@ -5360,9 +5360,15 @@ g(len)").unwrap_err();
     // placeholder inside its values (main read the outer binding). The failure names that.
     #[test]
     fn a_shadowed_name_in_an_all_calls_let_rec_says_it_is_a_placeholder() {
-        let placeholder = "recursive type placeholder n (inside its own `let rec` group)";
+        let placeholder = "recursive type placeholder n (`n` inside its own `let rec` of calls is the group's own binding, not an outer `n`, and is not a value yet)";
         rejects("let n = 1 in let rec n = (fun x -> x + 1)(n) in n", &format!("expected Int | Float, found {placeholder}"));
-        rejects("let f = fun x -> x in let rec f = (fun g -> g(1))(f) in f", "recursive type placeholder f");
+        rejects("let rec n = (fun x -> x + 1)(n) in 7", &format!("expected Int | Float, found {placeholder}"));
+        rejects("let f = fun x -> x in let rec f = (fun g -> g(1))(f) in f", "recursive type placeholder f (`f` inside its own `let rec` of calls");
+        // Neighbours, text unchanged: a forward reference, a value-level group, an unrelated outer name.
+        rejects("let rec n = (fun x -> x)(n) in n", "recursive type n is not built by a type constructor");
+        rejects("let rec a = (fun x -> x)(b) and b = (fun x -> x)(1) in a", "recursive type a is not built by a type constructor");
+        assert_eq!(run_source("let n = 1 in let rec m = (fun x -> x + 1)(n) in m").unwrap().to_string(), "2");
+        assert_eq!(run_source("let rec n = (fun x -> x + 1)(5) in n").unwrap().to_string(), "6");
         // A finished type is still just a Type.
         rejects("let rec T = Union(Int, T) in T + 1", "expected Int | Float, found Type");
     }

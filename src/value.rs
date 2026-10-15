@@ -361,7 +361,7 @@ impl Value {
             // A group name read inside its own all-calls `let rec` (rule P) is still the
             // group's placeholder; name it, so a failed check says why it is not a value.
             Value::Type(t) => match first_free(t) {
-                Some(name) => return std::borrow::Cow::Owned(format!("recursive type placeholder {name} (inside its own `let rec` group)")),
+                Some(name) => return std::borrow::Cow::Owned(format!("recursive type placeholder {name} (`{name}` inside its own `let rec` of calls is the group's own binding, not an outer `{name}`, and is not a value yet)")),
                 None => "Type",
             },
         })
