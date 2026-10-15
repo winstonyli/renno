@@ -5572,7 +5572,7 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::typecheck::InferCtx;
         let mut infer = InferCtx::new();
-        infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
+        infer.index_subst.insert_mut("n".to_string(), IndexExpr::Lit(3));
         let resolved = infer.resolve_index(&IndexExpr::Var("n".to_string()));
         assert_eq!(resolved, IndexExpr::Lit(3));
     }
@@ -5592,7 +5592,7 @@ g(len)").unwrap_err();
         use crate::typecheck::InferCtx;
         use std::rc::Rc;
         let mut infer = InferCtx::new();
-        infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
+        infer.index_subst.insert_mut("n".to_string(), IndexExpr::Lit(3));
         let expr = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)));
         let resolved = infer.resolve_index_deep(&expr);
         assert_eq!(resolved, IndexExpr::Add(Rc::new(IndexExpr::Lit(3)), Rc::new(IndexExpr::Lit(1))));
@@ -5605,7 +5605,7 @@ g(len)").unwrap_err();
         use std::rc::Rc;
         use types::Type;
         let mut infer = InferCtx::new();
-        infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
+        infer.index_subst.insert_mut("n".to_string(), IndexExpr::Lit(3));
         let ty = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".to_string())));
         let resolved = infer.resolve_deep(&ty);
         assert_eq!(resolved, Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Lit(3))));
@@ -5749,7 +5749,7 @@ g(len)").unwrap_err();
         use crate::typecheck::{unify_index, InferCtx};
         use std::rc::Rc;
         let mut infer = InferCtx::new();
-        infer.index_subst.insert("n".to_string(), IndexExpr::Lit(3));
+        infer.index_subst.insert_mut("n".to_string(), IndexExpr::Lit(3));
         let span = Span { start: 0, end: 0 };
         let lhs = IndexExpr::Add(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)));
         unify_index(&lhs, &IndexExpr::Lit(4), &mut infer, span).unwrap();
@@ -6828,7 +6828,7 @@ g(len)").unwrap_err();
     // rescue itself by just binding whichever fresh var is still free at
     // that point to whatever's needed, REGARDLESS of whether the
     // intended hypothesis ever fired. Confirmed empirically: surgically
-    // disabling ONLY `infer.index_subst.insert(n_name.clone(),
+    // disabling ONLY `infer.index_subst.insert_mut(n_name.clone(),
     // hypothesis)` in the step-case arm (src/typecheck.rs, leaving the
     // tail's own `arm_ctx = extend(..., Vec(m))` retyping intact) does
     // NOT make `recursive_vec_function_typechecks_via_pattern_refinement`

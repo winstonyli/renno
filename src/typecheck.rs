@@ -457,7 +457,7 @@ pub(crate) struct InferCtx {
     // Grows monotonically as unify() binds variables; never shrinks --
     // no backtracking, matching this checker's existing single-pass
     // character everywhere else.
-    subst: HashMap<String, Type>,
+    subst: HashTrieMap<String, Type>,
     // Grows monotonically exactly like `subst`, for the same reason --
     // no backtracking anywhere in this checker. A SEPARATE map from
     // `subst`: an index variable (IndexExpr::Var) and a type variable
@@ -465,7 +465,7 @@ pub(crate) struct InferCtx {
     // plain Strings -- conflating them would let an ordinary generic
     // function's own type-var name collide with an unrelated Vec's
     // own index-var name.
-    pub(crate) index_subst: HashMap<String, IndexExpr>,
+    pub(crate) index_subst: HashTrieMap<String, IndexExpr>,
     // Index variables that unify_index_expr must NOT bind: the free index
     // variables of an annotated binding's signature (the fresh ones its
     // binder introduced, not the user's spelling) while its value is
@@ -502,7 +502,7 @@ pub(crate) struct InferCtx {
     // variable. Grows like `subst` and is snapshotted/restored with it by
     // unify_trial (a failed trial must not leak flags); propagated by
     // `lookup` and `unify`.
-    dyn_sunk: HashSet<String>,
+    dyn_sunk: HashTrieSet<String>,
     // Every name some binder in the arena binds (check). A
     // name in an annotation that no binder has can only be a prelude name or
     // unbound, so annotation_type skips the scope walk for it: without this,
@@ -537,15 +537,15 @@ pub(crate) struct InferCtx {
 impl InferCtx {
     pub(crate) fn new() -> InferCtx {
         InferCtx {
-            subst: HashMap::new(),
-            index_subst: HashMap::new(),
+            subst: HashTrieMap::new(),
+            index_subst: HashTrieMap::new(),
             rigid_index: HashSet::new(),
             index_witness: Vec::new(),
             obligations: RefCell::new(Vec::new()),
             pendings: RefCell::new(Vec::new()),
             resume_row: None,
             repeatable_depth: 0,
-            dyn_sunk: HashSet::new(),
+            dyn_sunk: HashTrieSet::new(),
             bound_names: HashSet::new(),
             defs: Vec::new(),
             resolved: Resolved::default(),
@@ -588,7 +588,7 @@ impl InferCtx {
     // Flags `ty` as reaching a Dyn sink if it is (still) a bare type variable.
     fn note_dyn_sink(&mut self, ty: &Type) {
         if let Type::Var(v) = self.resolve(ty) {
-            self.dyn_sunk.insert(v);
+            self.dyn_sunk.insert_mut(v);
         }
     }
 
@@ -784,7 +784,7 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
         _ if a == b => Rel::Proven,
         // A flexible variable yields to a rigid one: bind the flexible side, never the rigid one.
         (IndexExpr::Var(rigid), IndexExpr::Var(flex)) if infer.rigid_index.contains(rigid) && !infer.rigid_index.contains(flex) => {
-            infer.index_subst.insert(flex.clone(), IndexExpr::Var(rigid.clone()));
+            infer.index_subst.insert_mut(flex.clone(), IndexExpr::Var(rigid.clone()));
             Rel::Proven
         }
         (IndexExpr::Var(name), other) | (other, IndexExpr::Var(name)) => {
@@ -804,7 +804,7 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
                     Some(_) => refuted(format!("infinite index expression: {} occurs in {other}", IndexExpr::Var(name.clone()))),
                 };
             }
-            infer.index_subst.insert(name.clone(), other.clone());
+            infer.index_subst.insert_mut(name.clone(), other.clone());
             Rel::Proven
         }
         _ => {
@@ -889,10 +889,10 @@ fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: 
             if let Type::Var(o) = other
                 && (infer.dyn_sunk.contains(name) || infer.dyn_sunk.contains(o))
             {
-                infer.dyn_sunk.insert(name.clone());
-                infer.dyn_sunk.insert(o.clone());
+                infer.dyn_sunk.insert_mut(name.clone());
+                infer.dyn_sunk.insert_mut(o.clone());
             }
-            infer.subst.insert(name.clone(), other.clone());
+            infer.subst.insert_mut(name.clone(), other.clone());
             Ok(())
         }
         (Type::Dyn, _) | (_, Type::Dyn) => Ok(()),
@@ -1087,6 +1087,7 @@ fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Spa
 // src/lib.rs -- a different module -- rather than because anything
 // outside typecheck.rs is meant to call this directly.
 pub(crate) fn unify_trial(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
+    // The three maps are persistent (rpds), so each snapshot is an O(1) share, not a copy.
     let snapshot = infer.subst.clone();
     // unify() (Task 3) now writes to index_subst too, via
     // unify_index_expr's own bare-variable-bind arm -- a failed trial
@@ -5359,10 +5360,10 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 if let (Some(k), Some(prior)) = (index_key, prior_index_value) {
                     match prior {
                         Some(v) => {
-                            infer.index_subst.insert(k.clone(), v.clone());
+                            infer.index_subst.insert_mut(k.clone(), v.clone());
                         }
                         None => {
-                            infer.index_subst.remove(k);
+                            infer.index_subst.remove_mut(k);
                         }
                     }
                 }
@@ -5443,13 +5444,13 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     match target {
                         IndexedRefinementTarget::List { index_var: n_name, elem_ty } => match pat {
                             Pattern::List(items) if items.is_empty() => {
-                                infer.index_subst.insert(n_name.clone(), IndexExpr::Lit(0));
+                                infer.index_subst.insert_mut(n_name.clone(), IndexExpr::Lit(0));
                             }
                             Pattern::Cons(_, tail) => {
                                 if let Pattern::Var(tail_name) = &**tail {
                                     let m = fresh_index_name("m");
                                     let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
-                                    infer.index_subst.insert(n_name.clone(), hypothesis);
+                                    infer.index_subst.insert_mut(n_name.clone(), hypothesis);
                                     infer.rigid_index.insert(m.clone());
                                     let refined_tail_ty = Type::Indexed(Hc::new(Type::List(elem_ty.clone())), Rc::new(IndexExpr::Var(m)));
                                     arm_ctx = extend(&arm_ctx, tail_name, refined_tail_ty);
@@ -5480,12 +5481,12 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                             let matches_base = pattern_could_match(pat, base_alt, &visiting_id);
                             let matches_step = pattern_could_match(pat, step_alt, &visiting_id);
                             if matches_base && !matches_step {
-                                infer.index_subst.insert(n_name.clone(), IndexExpr::Lit(0));
+                                infer.index_subst.insert_mut(n_name.clone(), IndexExpr::Lit(0));
                             } else if matches_step && !matches_base {
                                 if let Some(Pattern::Var(self_ref_name)) = self_ref_pattern(pat, step_alt, *self_ref) {
                                     let m = fresh_index_name("m");
                                     let hypothesis = IndexExpr::Add(Rc::new(IndexExpr::Var(m.clone())), Rc::new(IndexExpr::Lit(1)));
-                                    infer.index_subst.insert(n_name.clone(), hypothesis);
+                                    infer.index_subst.insert_mut(n_name.clone(), hypothesis);
                                     infer.rigid_index.insert(m.clone());
                                     let refined_ty = Type::Indexed(Hc::new(rec.clone()), Rc::new(IndexExpr::Var(m)));
                                     arm_ctx = extend(&arm_ctx, self_ref_name, refined_ty);

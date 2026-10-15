@@ -385,10 +385,10 @@ mod tests {
     // a := Int, s := Str, u unbound; index n rigid, z := 0.
     fn ctx() -> InferCtx {
         let mut i = InferCtx::new();
-        i.subst.insert("a".to_string(), Type::Int);
-        i.subst.insert("s".to_string(), Type::Str);
+        i.subst.insert_mut("a".to_string(), Type::Int);
+        i.subst.insert_mut("s".to_string(), Type::Str);
         i.rigid_index.insert("n".to_string());
-        i.index_subst.insert("z".to_string(), lit(0));
+        i.index_subst.insert_mut("z".to_string(), lit(0));
         i
     }
     enum Exp {
