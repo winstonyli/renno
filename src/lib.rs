@@ -10138,6 +10138,23 @@ g(len)").unwrap_err();
         assert!(err.contains("type error: expected ([Dyn](n) -> ([Dyn](n), ") && err.contains("found List"), "{err}");
     }
 
+    // Behaviour change, accepted: main's relate ran out of fuel on the 2^13-leaf pair below, so it
+    // answered Unknown and left a run-time test; with each shared pair decided once the checker
+    // sees the pair refuted (`(Dyn.., Bool)` never fits `(.., Int) | Str`) and rejects it statically.
+    #[test]
+    fn a_pair_main_ran_out_of_fuel_on_is_now_decided_statically() {
+        let chain = |prefix: &str, leaf: &str| {
+            let mut s = format!("let {prefix}0 = {leaf} in ");
+            for i in 1..=13 {
+                s.push_str(&format!("let {prefix}{i} = Tuple(({prefix}{}, {prefix}{})) in ", i - 1, i - 1));
+            }
+            s
+        };
+        let src = format!("{}{}let f = fun x: (T13, Int) | Str -> 0 in let g = fun y: (D13, Bool) -> f(y) in 0", chain("T", "Int"), chain("D", "Dyn"));
+        let err = finishes_within(20, &src).expect_err("rejected at check time");
+        assert!(err.contains("type mismatch: expected"), "{}", &err[..err.len().min(300)]);
+    }
+
     // A message names at most BRIEF_NODES type nodes, then `...`; a small type prints in full.
     #[test]
     fn type_text_in_messages_is_capped() {

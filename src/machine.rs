@@ -197,7 +197,7 @@ fn annotation_value(spec: &AnnotSpec, outcome: Result<Value, Stuck>) -> Rc<Type>
     if let AnnotKind::Confirm(expected) = &spec.kind {
         if *t != **expected {
             set_current_span(Some(spec.span));
-            crate::run_error!("annotation evaluated to {t} at run time but {expected} at check time")
+            crate::run_error!("annotation evaluated to {} at run time but {} at check time", t.brief(), expected.brief())
         }
         spec.done.set(true);
     }
