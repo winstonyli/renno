@@ -119,7 +119,7 @@ pub enum Test {
     Bool,
     Str,
     // A list of anything (`ListOf(Any)`, kept as its own fast variant: the
-    // is_list prelude predicate and the Vec(n) length checks use it).
+    // `is(List, v)` and the Vec(n) length checks use it).
     List,
     Fun,
     // The exact Value::Token with this id.

@@ -17,15 +17,12 @@ pub static PRELUDE: &[(&str, Builtin)] = &[
     ("fold", Builtin::Fold),
     ("fail", Builtin::Fail),
     ("get", Builtin::Get),
-    // Ordinary prelude predicates, not hidden, the same way `fail` isn't.
-    // Dyn-boundary checks no longer call them (typecheck emits a native
-    // Expr::Check; machine::test_holds is the shared definition).
-    ("is_int", Builtin::IsInt),
-    ("is_float", Builtin::IsFloat),
-    ("is_bool", Builtin::IsBool),
-    ("is_str", Builtin::IsStr),
-    ("is_list", Builtin::IsList),
-    ("is_fun", Builtin::IsFun),
+    // `is(T, v)`: v satisfies the type value T. An ordinary prelude builtin,
+    // not hidden, the same way `fail` isn't; Dyn-boundary checks do not call
+    // it (typecheck emits a native Expr::Check; machine::test_holds is the
+    // shared definition). List(T) is deep, Dyn always holds, and a Fun type is
+    // callability only (its parameter and result types are ignored).
+    ("is", Builtin::Is),
     // Runtime half of `.field` access's own desugaring
     // (typecheck::elaborate_node's Expr::FieldAccess arm) --
     // same "ordinary prelude builtin, not hidden" treatment.

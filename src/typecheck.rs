@@ -2378,6 +2378,18 @@ fn shape_of(ty: &Type, env: &CheckEnv) -> Shape {
     Shape { test, defs: bodies, lens: defs.lens }
 }
 
+// The native test for a run-time type value (the `is` builtin): the test and
+// its alias table, shape_of under an empty environment. A Vec whose length is
+// a variable has no value to compare against, so it is an Err.
+pub(crate) fn lower_test(ty: &Type) -> Result<(Test, Vec<Test>), String> {
+    let infer = InferCtx::new();
+    let shape = shape_of(ty, &CheckEnv::new(&infer));
+    match shape.lens.is_empty() {
+        true => Ok((shape.test, shape.defs)),
+        false => Err("is: type has a free length variable".to_string()),
+    }
+}
+
 // The deep test for `ty`: what the value must be, element by element
 // (function-free types; a Fun position is only a callability tag). A Vec(n)
 // whose index is not a literal reads its length from a slot (len_slot).

@@ -345,8 +345,75 @@ mod tests {
     }
 
     #[test]
-    fn is_int_and_is_float_are_mutually_exclusive() {
-        assert_eq!(run_untyped("(is_int(1.5), is_float(1.5), is_int(1), is_float(1))").to_string(), "[false, true, true, false]");
+    fn is_int_and_float_are_mutually_exclusive() {
+        assert_eq!(run_untyped("(is(Int)(1.5), is(Float)(1.5), is(Int)(1), is(Float)(1))").to_string(), "[false, true, true, false]");
+    }
+
+    // `is(T)(v)`: v satisfies T under the shared native test (machine::test_holds).
+    // List(Int) is deep, Dyn always holds, a Fun type is callability only (it
+    // ignores the parameter and result types, like the old is_fun), a Record
+    // tolerates extra fields, a Tuple has exact arity.
+    #[test]
+    fn is_tests_a_value_against_a_type() {
+        for (src, want) in [
+            ("is(Int)(3)", true),
+            ("is(Int)(true)", false),
+            ("is(Float)(1.5)", true),
+            ("is(Float)(1)", false),
+            ("is(Bool)(false)", true),
+            ("is(Bool)(0)", false),
+            ("is(Str)(\"a\")", true),
+            ("is(Str)(1)", false),
+            ("is(List(Int))([1, 2])", true),
+            ("is(List(Int))([])", true),
+            ("is(List(Int))([1, true])", false),
+            ("is(List(Int))(1)", false),
+            ("is(List(Dyn))([1, true])", true),
+            ("is(Tuple(Int, Str))((1, \"a\"))", true),
+            ("is(Tuple(Int, Str))((1, 2))", false),
+            ("is(Tuple(Int, Str))((1, \"a\", 2))", false),
+            ("is(Record({a: Int}))({a: 1, b: true})", true),
+            ("is(Record({a: Int}))({a: true})", false),
+            ("is(Record({a: Int}))({b: 1})", false),
+            ("is(Union(Int, Str))(1)", true),
+            ("is(Union(Int, Str))(\"a\")", true),
+            ("is(Union(Int, Str))(true)", false),
+            ("is(Dyn)(1)", true),
+            ("is(Dyn)(fun x -> x)", true),
+            ("is(Fun(Int, Int))(fun x -> x)", true),
+            ("is(Fun(Int, Int))(fun x -> true)", true),
+            ("is(Fun(Int, Int))(len)", true),
+            ("is(Fun(Int, Int))(1)", false),
+            ("is(Vec(2))([1, 2])", true),
+            ("is(Vec(2))([1])", false),
+            ("is(Indexed(List(Int), 2))([1, true])", false),
+            ("is(Indexed(List(Int), 2))([1, 2])", true),
+        ] {
+            assert_eq!(run_untyped(src).as_bool(), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn is_rejects_bad_calls() {
+        for (src, msg) in [
+            ("is(1)(2)", "is expects a type"),
+        ] {
+            let err = run_source(src).expect_err(src);
+            assert!(err.contains(msg), "{src}: {err}");
+        }
+        assert!(run_source("is(Int)").is_ok(), "partial application is an ordinary builtin partial");
+        assert!(run_source("is(Int)(1)(2)").is_err());
+    }
+
+    // The checker has no special case for `is`: a prelude builtin typed like
+    // print, so type values and any value pass in and a Bool comes out.
+    #[test]
+    fn is_is_typed_as_dyn_dyn_to_bool_and_can_be_shadowed() {
+        assert!(run_source("is(Union(Int, Str))(1)").unwrap().as_bool());
+        assert_eq!(run_source("let b: Bool = is(Int)(1) in if b then 1 else 0").unwrap().as_int(), 1);
+        assert!(run_source("let x: Dyn = 1 in is(Int)(x)").unwrap().as_bool());
+        assert_eq!(run_source("let is = fun a -> fun b -> 7 in is(Int)(1)").unwrap().as_int(), 7);
+        assert_eq!(run_source("let f = fun is: Int -> is + 1 in f(2)").unwrap().as_int(), 3);
     }
 
     #[test]
@@ -8551,17 +8618,17 @@ g(len)").unwrap_err();
         assert_eq!(run_source(&format!("{d}d(1)(2)")).unwrap().as_int(), 3);
     }
 
-    // The DOWN check calls builtins (is_int, fail); a parameter
+    // The DOWN check calls builtins (fail); a parameter
     // named like one must not capture them.
     #[test]
     fn a_literal_parameter_named_like_a_builtin_does_not_capture_the_check() {
-        assert_eq!(run_source("let d: Dyn = fun is_int: Int -> is_int + 1 in d(2)").unwrap().as_int(), 3);
-        for name in ["fail", "is_int", "is_list"] {
+        assert_eq!(run_source("let d: Dyn = fun is: Int -> is + 1 in d(2)").unwrap().as_int(), 3);
+        for name in ["fail", "is", "len"] {
             let src = format!("let d: Dyn = fun {name}: Int -> {name} + 1 in d(true)");
             let err = run_source(&src).expect_err(&src);
             assert!(err.contains("type error: expected Int, found Bool"), "{src}: {err}");
         }
-        let rec = "let rec is_int: Dyn = fun is_int: Int -> if is_int < 1 then 0 else 1 in is_int(3)";
+        let rec = "let rec is: Dyn = fun is: Int -> if is < 1 then 0 else 1 in is(3)";
         assert_eq!(elaborated_let_rec_groups(rec), vec![resolve::GroupKind::Functions]);
     }
 
@@ -8680,21 +8747,21 @@ g(len)").unwrap_err();
     #[test]
     fn synthesized_builtin_calls_are_not_captured_by_user_bindings() {
         for (src, want) in [
-            ("let is_int = 0 in len(map(fun x: Int -> x + 1)([1, 2]))", 2),
-            ("let g = fun is_int: Bool -> len(map(fun x: Int -> x + 1)([1, 2])) in g(true)", 2),
-            ("let is_list = 0 in len(map(fun v: [Int] -> len(v))([[1], [2]]))", 2),
+            ("let is = 0 in len(map(fun x: Int -> x + 1)([1, 2]))", 2),
+            ("let g = fun is: Bool -> len(map(fun x: Int -> x + 1)([1, 2])) in g(true)", 2),
+            ("let is = 0 in len(map(fun v: [Int] -> len(v))([[1], [2]]))", 2),
             ("let len = 0 in let f = fun a: Vec(n) -> fun b: Vec(n) -> 7 in let d: Dyn = f in d([1])([2])", 7),
-            ("let is_fun = 0 in let d: Dyn = fun x: Int -> x in d(1)", 1),
-            ("let is_bool = 0 in let d: Dyn = fun x: Bool -> 1 in d(true)", 1),
-            ("let is_float = 0 in let d: Dyn = fun x: Float -> 1 in d(1.5)", 1),
+            ("let is = 0 in let d: Dyn = fun x: Int -> x in d(1)", 1),
+            ("let is = 0 in let d: Dyn = fun x: Bool -> 1 in d(true)", 1),
+            ("let is = 0 in let d: Dyn = fun x: Float -> 1 in d(1.5)", 1),
         ] {
             assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
         }
-        let s = "let is_str = 0 in let d: Dyn = fun s: Str -> s in d(\"a\")";
+        let s = "let is = 0 in let d: Dyn = fun s: Str -> s in d(\"a\")";
         assert_eq!(run_source(s).unwrap(), Outcome::Str("a".to_string()));
         for src in [
             "let fail = fun x -> 0 in let f = fun a: Int -> a + 1 in let d: Dyn = f in d(true)",
-            "let is_int = fun x -> true in let x: Dyn = true in let y: Int = x in y",
+            "let is = fun x -> true in let x: Dyn = true in let y: Int = x in y",
             "let fail = 0 in let x: Dyn = true in let y: Int = x in y",
         ] {
             let err = run_source(src).unwrap_err();
@@ -8791,11 +8858,11 @@ g(len)").unwrap_err();
         tree_any(&arena, root, &|n| matches!(n, expr::Expr::Check(_, s) if s.test == test))
     }
 
-    // A synthesized call to one of the prelude predicates a check used to
-    // desugar into (`#is_int`, `#is_list`, ...).
+    // A synthesized call to the `is` builtin, which a check used to
+    // desugar into (as `#is_int`, ...).
     fn calls_a_check_predicate(src: &str) -> bool {
         let (arena, root) = elaborated_tree(src);
-        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Var(v) if v.starts_with("#is_")))
+        tree_any(&arena, root, &|n| matches!(n, expr::Expr::Var(v) if v == "#is"))
     }
 
     type ShapeCase = (&'static str, Vec<&'static str>, Vec<(&'static str, &'static str)>, bool);

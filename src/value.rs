@@ -62,17 +62,14 @@ pub enum Builtin {
     // Option: renno has no Option/Result in the prelude, and every other
     // Dyn-sourced shape mismatch already panics at the point of use.
     GetField,
-    // Dyn -> Bool, one per primitive tag, for user programs. A Dyn-to-
-    // primitive boundary check is a native Expr::Check instead; both share
-    // machine::test_holds. IsFun covers every callable representation
-    // (Closure/RecClosure/Continuation/Builtin/PartialBuiltin).
-    IsInt,
-    // Dyn -> Bool. Float's own tag test, same story as IsInt.
-    IsFloat,
-    IsBool,
-    IsStr,
-    IsList,
-    IsFun,
+    // (Type, Dyn) -> Bool: does the value satisfy the type, for user
+    // programs. A Dyn boundary check is a native Expr::Check instead; both
+    // share machine::test_holds, and the type is lowered by
+    // typecheck::lower_test. A List type is tested element by element, Dyn
+    // always holds, and a Fun type is callability only (Closure, RecClosure,
+    // Continuation, Builtin, PartialBuiltin or Contract), ignoring the
+    // parameter and result types.
+    Is,
     // Dyn -> Dyn: writes the argument's own Display impl to stdout (same
     // rendering the REPL/CLI already gives a program's final result --
     // see main.rs's run_and_print) followed by a newline, then returns
@@ -176,17 +173,12 @@ impl Builtin {
             | Builtin::Shallow
             | Builtin::Len
             | Builtin::Fail
-            | Builtin::IsInt
-            | Builtin::IsFloat
-            | Builtin::IsBool
-            | Builtin::IsStr
-            | Builtin::IsList
-            | Builtin::IsFun
             | Builtin::Print
             | Builtin::ToStr
             | Builtin::Reverse
             | Builtin::Ty(_) => 1,
             Builtin::Map
+            | Builtin::Is
             | Builtin::Get
             | Builtin::GetField
             | Builtin::Filter
@@ -223,8 +215,8 @@ pub enum Value {
     // What an `opaque` expression evaluates to -- a DISTINCT kind from
     // Int specifically so it can never be confused with (or forged as) a
     // real Int value: Pattern::Int can never match it. Never a legal type
-    // annotation target (none of is_int/is_bool/is_str/is_list/is_fun
-    // ever recognizes one -- see typecheck::build_boundary_check;
+    // annotation target (no check ever recognizes one -- see
+    // typecheck::build_boundary_check;
     // Type::Token itself has no surface spelling either).
     Token(u64),
     // Rc<Vec<Value>>, not a persistent cons-list: most list use in a

@@ -858,8 +858,7 @@ fn advance_elems(arena: &Arena, spans: &SpanMap, frame: Frame, rest: Cont, value
 
 // ---- The deep check: ONE iterative walker ----
 //
-// `test_holds` (every Dyn-boundary Expr::Check, and the is_int/is_float/...
-// prelude predicates) and `explain` (the failure message's "at element 1")
+// `test_holds` (every Dyn-boundary Expr::Check, and the `is` builtin) and `explain` (the failure message's "at element 1")
 // are two runs of `walk`, so there is a single definition of the test and the
 // native stack use is O(1) in the value's nesting depth (a recursive check
 // overflowed the worker stack at about 150,000 levels in debug builds). The
@@ -867,8 +866,8 @@ fn advance_elems(arena: &Arena, spans: &SpanMap, frame: Frame, rest: Cont, value
 // choice points: a failing alternative rewinds the work list to the height
 // the `Or` started at and tries the next one. `defs` is the owning
 // CheckSpec's alias table (what Test::Ref indexes) and `lens` the values of
-// its length slots (what Test::ListLenArg reads); the prelude predicates pass
-// `&[]` for both. The value is finite and acyclic, and every step consumes
+// its length slots (what Test::ListLenArg reads); `is` passes `&[]` for the
+// slots (lower_test rejects a type that needs one). The value is finite and acyclic, and every step consumes
 // structure, so the walk ends.
 
 // A scalar test decided by the value's own tag; None for a compound test.
@@ -1583,11 +1582,14 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 _ => crate::run_error!("get expects a list and an int"),
             }
         }
-        Builtin::IsInt => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Int, &[], &[], &v))),
-        Builtin::IsFloat => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Float, &[], &[], &v))),
-        Builtin::IsBool => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Bool, &[], &[], &v))),
-        Builtin::IsStr => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Str, &[], &[], &v))),
-        Builtin::IsList => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::List, &[], &[], &v))),
+        // (type, value) -- args.pop() order matches Get's own convention.
+        Builtin::Is => match (args.pop(), args.pop()) {
+            (Some(v), Some(Value::Type(t))) => match crate::typecheck::lower_test(&t) {
+                Ok((test, defs)) => Value::Bool(test_holds(&test, &defs, &[], &v)),
+                Err(msg) => crate::run_error!("{msg}"),
+            },
+            _ => crate::run_error!("is expects a type and a value"),
+        },
         // (record, name) -- args.pop() order matches Get's own (list, i)
         // convention: last-pushed arg (name) pops first.
         // Panics on a missing field the same way Get panics on an
@@ -1608,7 +1610,6 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
                 _ => crate::run_error!("get_field expects a record and a string"),
             }
         }
-        Builtin::IsFun => Value::Bool(args.pop().is_some_and(|v| test_holds(&Test::Fun, &[], &[], &v))),
         // Echoes its argument back unchanged after printing it -- see
         // Builtin::Print's own doc comment.
         Builtin::Print => match args.pop() {
@@ -2111,6 +2112,17 @@ mod tests {
         let int_or_token = Test::Or(vec![Test::Int, Test::Token(7)]);
         assert!(holds(&int_or_token, &Value::Token(7)) && holds(&int_or_token, &Value::Int(1)) && !holds(&int_or_token, &Value::Bool(true)));
         assert!(!holds(&Test::Or(vec![]), &Value::Int(1)));
+    }
+
+    // `is` on a type whose Vec length is a variable has no length to compare
+    // against: a run-time error, not a silent shape-only test.
+    #[test]
+    fn is_rejects_a_type_with_a_free_length_variable() {
+        let list = Type::List(Hc::new(Type::Int));
+        let open = Type::Indexed(Hc::new(list), Rc::new(IndexExpr::Var("n".to_string())));
+        let err = std::panic::catch_unwind(|| crate::typecheck::lower_test(&open)).expect("lower_test must not panic");
+        assert_eq!(err.unwrap_err(), "is: type has a free length variable");
+        assert!(crate::typecheck::lower_test(&Type::List(Hc::new(Type::Int))).is_ok());
     }
 
     #[test]
