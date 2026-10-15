@@ -10091,6 +10091,18 @@ g(len)").unwrap_err();
         assert!(err.contains("found Bool"), "{}", &err[..err.len().min(300)]);
     }
 
+    // A shared big node first reached under `Vec(n) -> X` (which drops its own `n`) is reached
+    // again as a union alternative, where `n` must still be read: the visit may not be skipped.
+    #[test]
+    fn a_shared_big_node_adds_its_index_variables_at_every_visit() {
+        let src = "let T0 = Int in let T1 = Tuple((T0, T0)) in let T2 = Tuple((T1, T1)) in let T3 = Tuple((T2, T2)) in let T4 = Tuple((T3, T3)) in \
+                   let t0 = 1 in let t1 = (t0, t0) in let t2 = (t1, t1) in let t3 = (t2, t2) in let t4 = (t3, t3) in \
+                   let f = fun v: Vec(n) -> let d: Dyn = fun i -> ([1, 2, 3], t4) in \
+                   let g: (Int -> ((Vec(n) -> (Vec(n), T4)) | (Vec(n), T4))) = d in g(1) in f([1])";
+        let err = finishes_within(20, src).expect_err("a run-time type error, as on main");
+        assert!(err.contains("type error: expected ([Dyn](n) -> ([Dyn](n), ") && err.contains("found List"), "{err}");
+    }
+
     // A message names at most BRIEF_NODES type nodes, then `...`; a small type prints in full.
     #[test]
     fn type_text_in_messages_is_capped() {

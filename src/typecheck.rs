@@ -1939,15 +1939,36 @@ fn static_contract(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> 
 struct Seen {
     rec: HashSet<(*const RecGroup, usize)>,
     keep: Vec<RecRef>,
-    // The big nodes already walked in this mode: a second walk would add the same names.
-    nodes: HashSet<(ById, bool, bool)>,
+    // What each big node added in this mode. A revisit adds the same names to *its* `out`: that
+    // map may differ from the first visit's (a Fun's own variable is dropped from its inner one),
+    // so skipping the revisit would lose names.
+    nodes: HashMap<(ById, bool, bool), BTreeMap<String, bool>>,
 }
 
 fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool, in_contract: bool, out: &mut BTreeMap<String, bool>) {
     // Only an Indexed names a variable.
-    if !ty.summary().any(Summary::INDEXED) || (is_big(ty) && !seen.nodes.insert((ById(ty.clone()), spine, in_contract))) {
+    if !ty.summary().any(Summary::INDEXED) {
         return;
     }
+    if !is_big(ty) {
+        return checked_index_vars_node(ty, infer, seen, spine, in_contract, out);
+    }
+    let key = (ById(ty.clone()), spine, in_contract);
+    let mine = match seen.nodes.get(&key) {
+        Some(done) => done.clone(),
+        None => {
+            let mut mine = BTreeMap::new();
+            checked_index_vars_node(ty, infer, seen, spine, in_contract, &mut mine);
+            seen.nodes.insert(key, mine.clone());
+            mine
+        }
+    };
+    for (name, repeatable) in mine {
+        *out.entry(name).or_insert(false) |= repeatable;
+    }
+}
+
+fn checked_index_vars_node(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool, in_contract: bool, out: &mut BTreeMap<String, bool>) {
     match ty {
         Type::Fun(param, _, ret) if spine => {
             let mut inner = BTreeMap::new();
