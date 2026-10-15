@@ -1,25 +1,12 @@
-// "Gradual verification": a `where` refinement predicate is PROVEN
-// outright when it cheaply can be, skipping the runtime check entirely --
-// zero overhead, the actual payoff of doing this gradually instead of as
-// a bare assert -- and falls back to an ordinary runtime check otherwise.
-// Same three-way shape as gradual TYPING's own Dyn-boundary Check nodes:
-// proven statically (nothing inserted), refuted statically (a real error,
-// here at parse time since the value's already known), or deferred to
-// runtime (an unannotated/Dyn-sourced value's real type/shape).
-//
-// `>`/`<=`/`>=`/`!=` are sugar over `<`/`==` (see `cmp()` in parser.rs),
-// so a predicate can use them directly -- and compound predicates built
-// from `&&`/`||`/`!` are just as provable: try_eval_bool recognizes the
-// `if` shape everything here desugars into and evaluates through it.
+// Verification by explicit guard: a predicate is just an `if` whose
+// failing branch calls `fail`, so a value outside its range stops the
+// program with a message of your choosing. Any predicate works --
+// comparisons, `&&`/`||`/`!`, arithmetic -- since it is ordinary code.
 
-// Proven at parse time: 50 is a known literal, `50 >= 0 && 50 < 100` is
-// decidable right here, so this `let` compiles to EXACTLY `let n = 50 in
-// n + 1` -- no wrapping `if`/`fail` at all.
-let proven = let n: Int where n >= 0 && n < 100 = 50 in n + 1 in
+let checked = let n: Int = 50 in if n >= 0 && n < 100 then n + 1 else fail("n out of range") in
 
-// Not provable (the parameter's actual value is unknown until a caller
-// supplies one) -- becomes a real runtime check: `if n >= 0 && n < 100
-// then n * 2 else fail(...)`.
-let double_in_range = fun n: Int where n >= 0 && n < 100 -> n * 2 in
+// The parameter's actual value is unknown until a caller supplies one, so
+// the guard runs each time the function is called.
+let double_in_range = fun n: Int -> if n >= 0 && n < 100 then n * 2 else fail("n out of range") in
 
-proven + double_in_range(3)
+checked + double_in_range(3)

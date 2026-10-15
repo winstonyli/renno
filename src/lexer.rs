@@ -14,8 +14,6 @@ pub enum Token {
     Rec,
     #[token("and")]
     And,
-    #[token("where")]
-    Where,
     // A literal, evaluating to a token unique to its own source position
     // (see Expr::Token's own doc comment) -- combined with tuples, this
     // builds a hand-rolled nominal type: two tuples carrying the SAME

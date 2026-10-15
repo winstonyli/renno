@@ -44,109 +44,12 @@ struct Parser<'a> {
 // `atom`) -- deferred until the terminal body is parsed, then folded back
 // into nested Let/Lambda nodes in reverse.
 enum PendingBinder {
-    // `where_pred`, if present, is a gradual-verification refinement on
-    // this binding (`let n: Int where n > 0 = ...`) -- see
-    // desugar_refinement for how it's resolved at fold-back time (proven
-    // outright when `val` is a literal, else an ordinary runtime check).
-    // Not supported on `let rec` (see the `rec` check where `where` is
-    // parsed) -- proving would need to reason about a recursive value,
-    // which is well past what desugar_refinement's tiny evaluator attempts.
-    Let { var: String, ann: Option<ExprRef>, val: ExprRef, where_pred: Option<ExprRef> },
+    Let { var: String, ann: Option<ExprRef>, val: ExprRef },
     // `let rec f = val_f [and g = val_g ...] in ...` -- one or more
     // simultaneously-recursive bindings folding back into a single
     // Expr::LetRec (never Expr::Let, which is never recursive).
     LetRec { bindings: Vec<(String, Option<ExprRef>, ExprRef)> },
-    // `where_pred` here is NEVER proven statically, even when `val` looks
-    // like a literal at some call site -- a Lambda parameter's value is
-    // whatever the CALLER passes, unknown at definition time, so this
-    // always becomes a real runtime check.
-    Fun { param: String, ann: Option<ExprRef>, where_pred: Option<ExprRef> },
-}
-
-// A tiny, deliberately narrow compile-time evaluator for `where` refinement
-// predicates (desugar_refinement): substitutes `subst` for every Var named
-// `var_name` (the only variable a refinement can meaningfully reference --
-// the value being refined) and tries to reduce to a literal Int, handling
-// only Int literals, that one Var, and +, -, *, /, % over two such. None
-// the moment anything else appears -- the caller falls back to a real
-// runtime check rather than reject the predicate as unsupported syntax,
-// the same "prove what's cheap, defer to runtime otherwise" stance as this
-// checker's other analyses (typecheck's missing_case, dominates). A
-// predicate can use any comparison (`<`/`<=`/`>`/`>=`/`==`/`!=`) and
-// `&&`/`||`/`!` freely -- see try_eval_bool, which recognizes the `If`
-// shape all of those desugar into.
-fn try_eval_int(arena: &Arena, expr: ExprRef, var_name: &str, subst: i64) -> Option<i64> {
-    match &arena[expr] {
-        Expr::Int(n) => Some(*n),
-        Expr::Var(name) if name == var_name => Some(subst),
-        Expr::BinOp(op, l, r) => {
-            let l = try_eval_int(arena, *l, var_name, subst)?;
-            let r = try_eval_int(arena, *r, var_name, subst)?;
-            match op {
-                BinOp::Add => Some(l + r),
-                BinOp::Sub => Some(l - r),
-                BinOp::Mul => Some(l * r),
-                BinOp::Div if r != 0 => Some(l / r),
-                BinOp::Mod if r != 0 => Some(l % r),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-// Same idea, for evaluating a `let`'s OWN bound value expression -- no
-// substitution, since nothing is in scope yet at that point (Int literals
-// and +/-/*// over them only). Unary minus (`-n`, desugared to `0 - n` --
-// see `unary`) falls out of this for free, so `-1` counts as a literal
-// for proving purposes just like `1` does -- without this, "n = -1
-// violates n > 0" would only be caught by a runtime check, not proven at
-// parse time, since `-1` is never actually an Expr::Int node.
-fn try_eval_closed_int(arena: &Arena, expr: ExprRef) -> Option<i64> {
-    match &arena[expr] {
-        Expr::Int(n) => Some(*n),
-        Expr::BinOp(op, l, r) => {
-            let l = try_eval_closed_int(arena, *l)?;
-            let r = try_eval_closed_int(arena, *r)?;
-            match op {
-                BinOp::Add => Some(l + r),
-                BinOp::Sub => Some(l - r),
-                BinOp::Mul => Some(l * r),
-                BinOp::Div if r != 0 => Some(l / r),
-                BinOp::Mod if r != 0 => Some(l % r),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-// Same idea, for the predicate's own top-level Bool result: an Int
-// comparison (`<`/`==`, via try_eval_int on both sides) or a bare Bool
-// literal.
-fn try_eval_bool(arena: &Arena, expr: ExprRef, var_name: &str, subst: i64) -> Option<bool> {
-    match &arena[expr] {
-        Expr::Bool(b) => Some(*b),
-        Expr::BinOp(BinOp::Lt, l, r) => {
-            Some(try_eval_int(arena, *l, var_name, subst)? < try_eval_int(arena, *r, var_name, subst)?)
-        }
-        Expr::BinOp(BinOp::Eq, l, r) => {
-            Some(try_eval_int(arena, *l, var_name, subst)? == try_eval_int(arena, *r, var_name, subst)?)
-        }
-        // `&&`/`||`/`!` all desugar into exactly this If shape
-        // (and_expr/or_expr/unary), so evaluating an If by trying its
-        // condition first, then whichever branch that picks, handles all
-        // three uniformly -- a refinement predicate like `0 < n && n <
-        // 100` can still be proven, not just a bare single comparison.
-        Expr::If(c, t, e) => {
-            if try_eval_bool(arena, *c, var_name, subst)? {
-                try_eval_bool(arena, *t, var_name, subst)
-            } else {
-                try_eval_bool(arena, *e, var_name, subst)
-            }
-        }
-        _ => None,
-    }
+    Fun { param: String, ann: Option<ExprRef> },
 }
 
 impl<'a> Parser<'a> {
@@ -1013,21 +916,9 @@ impl<'a> Parser<'a> {
                     // `and` only continues a `rec` group -- a plain `let`
                     // is always exactly one binding.
                     let mut bindings = Vec::new();
-                    let mut where_pred = None;
                     loop {
                         let var = self.ident()?;
                         let ann = self.opt_annotation()?;
-                        if matches!(self.peek(), Some(Token::Where)) {
-                            if rec {
-                                let span = self.span_at();
-                                return Err(self.err_at(
-                                    span,
-                                    "`where` refinements aren't supported on `let rec` bindings".to_string(),
-                                ));
-                            }
-                            self.bump();
-                            where_pred = Some(self.expr()?);
-                        }
                         self.expect(&Token::Equals)?;
                         let val = self.expr()?;
                         bindings.push((var, ann, val));
@@ -1042,7 +933,7 @@ impl<'a> Parser<'a> {
                         pending.push((start, PendingBinder::LetRec { bindings }));
                     } else {
                         let (var, ann, val) = bindings.into_iter().next().unwrap();
-                        pending.push((start, PendingBinder::Let { var, ann, val, where_pred }));
+                        pending.push((start, PendingBinder::Let { var, ann, val }));
                     }
                 }
                 Some(Token::Fun) => {
@@ -1050,14 +941,8 @@ impl<'a> Parser<'a> {
                     self.bump();
                     let param = self.ident()?;
                     let ann = self.opt_annotation()?;
-                    let where_pred = if matches!(self.peek(), Some(Token::Where)) {
-                        self.bump();
-                        Some(self.expr()?)
-                    } else {
-                        None
-                    };
                     self.expect(&Token::Arrow)?;
-                    pending.push((start, PendingBinder::Fun { param, ann, where_pred }));
+                    pending.push((start, PendingBinder::Fun { param, ann }));
                 }
                 _ => break,
             }
@@ -1073,72 +958,18 @@ impl<'a> Parser<'a> {
         for (start, binder) in pending.into_iter().rev() {
             let span = Span { start, end };
             result = match binder {
-                PendingBinder::Let { var, ann, val, where_pred } => {
-                    let body = match where_pred {
-                        None => result,
-                        Some(pred) => self.desugar_refinement(&var, pred, val, result, span)?,
-                    };
-                    self.push_spanned(Expr::Let(var, ann, val, body), span)
+                PendingBinder::Let { var, ann, val } => {
+                    self.push_spanned(Expr::Let(var, ann, val, result), span)
                 }
                 PendingBinder::LetRec { bindings } => {
                     self.push_spanned(Expr::LetRec(Rc::new(bindings), result), span)
                 }
-                PendingBinder::Fun { param, ann, where_pred } => {
-                    // Never proven statically here -- see PendingBinder::Fun's
-                    // own doc comment on why a parameter's value can't be.
-                    let body = match where_pred {
-                        None => result,
-                        Some(pred) => self.wrap_runtime_check(pred, result, span),
-                    };
-                    self.push_spanned(Expr::Lambda(param, ann, body), span)
+                PendingBinder::Fun { param, ann } => {
+                    self.push_spanned(Expr::Lambda(param, ann, result), span)
                 }
             };
         }
         Ok(result)
-    }
-
-    // `let name: T where pred = val in body` -- "gradual verification":
-    // a refinement predicate that's PROVEN outright when it cheaply can
-    // be (skipping the runtime check entirely -- zero overhead, the
-    // actual payoff of doing this gradually rather than as a bare
-    // assert), and falls back to an ordinary runtime check otherwise.
-    // Proving is only ever attempted when `val` reduces to a closed Int
-    // constant (try_eval_closed_int -- a Lambda parameter's ACTUAL value,
-    // or any expression that isn't just literals and arithmetic, isn't
-    // known until runtime; see PendingBinder::Fun's own doc comment for
-    // the parameter case), and only for the narrow predicate shapes
-    // try_eval_bool understands.
-    // A predicate that evaluates to PROVABLY FALSE is a parse-time error:
-    // the program could never have satisfied it, so there is no runtime
-    // to defer to.
-    fn desugar_refinement(
-        &mut self,
-        name: &str,
-        pred: ExprRef,
-        val: ExprRef,
-        body: ExprRef,
-        span: Span,
-    ) -> Result<ExprRef, String> {
-        if let Some(n) = try_eval_closed_int(&self.arena, val) {
-            if let Some(proven) = try_eval_bool(&self.arena, pred, name, n) {
-                return if proven {
-                    Ok(body)
-                } else {
-                    Err(self.err_at(span, format!("refinement violated: `{name}` = {n} does not satisfy the `where` clause")))
-                };
-            }
-        }
-        Ok(self.wrap_runtime_check(pred, body, span))
-    }
-
-    // `if pred then body else fail("...")`, built entirely from existing
-    // Expr nodes -- no new Value representation or machine.rs opcode
-    // needed for a refinement that can't be proven at parse time.
-    fn wrap_runtime_check(&mut self, pred: ExprRef, body: ExprRef, span: Span) -> ExprRef {
-        let msg = self.push_spanned(Expr::Str("refinement violated".to_string()), span);
-        let fail_var = self.push_spanned(Expr::Var("#fail".to_string()), span);
-        let fail_call = self.push_spanned(Expr::App(fail_var, msg), span);
-        self.push_spanned(Expr::If(pred, body, fail_call), span)
     }
 
     // Every atom form except `let`/`fun`/`type`, which `atom` handles

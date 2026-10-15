@@ -515,12 +515,6 @@ mod tests {
         assert!(err.contains("expected Int | Float, found Bool"), "unexpected message: {err}");
     }
 
-    #[test]
-    fn modulo_is_provable_in_refinements() {
-        let err = parser::parse("let n: Int where n % 2 == 0 = 5 in n").unwrap_err();
-        assert!(err.contains("refinement violated"), "unexpected message: {err}");
-    }
-
     // --- juxtaposition application (f a b, alongside f(a)(b)) ---
 
     #[test]
@@ -862,57 +856,48 @@ mod tests {
         assert!(typecheck::check(&mut arena, root, &spans).is_ok(), "genuinely mismatched Match arms must still widen to Dyn, not newly reject");
     }
 
-    // --- gradual verification (`where` refinements) ---
+    // --- explicit guards (`if p then v else fail(..)`; there is no `where`) ---
 
     #[test]
-    fn refinement_proven_at_parse_time_has_no_runtime_check() {
-        // If desugar_refinement's proof succeeds, `body` is used
-        // COMPLETELY UNCHANGED -- confirmed here by matching the bound
-        // value with a pattern that would fail if any wrapping `if`/`fail`
-        // node were still present around it.
-        let src = r#"let n: Int where 0 < n = 5 in match n | 5 -> "unwrapped" | _ -> "bug""#;
-        assert_eq!(run_untyped(src).as_str(), "unwrapped");
+    fn where_is_an_ordinary_identifier() {
+        assert_eq!(run_untyped("let where = 5 in where + 1").as_int(), 6);
+        assert_eq!(run_untyped("let f = fun where -> where * 2 in f(4)").as_int(), 8);
     }
 
     #[test]
-    fn refinement_proven_false_is_a_parse_time_error() {
-        // -1 is `0 - 1` (unary minus desugars, see parser::unary), not a
-        // literal Expr::Int -- try_eval_closed_int has to see through that
-        // for this to be proven at parse time rather than falling back to
-        // a runtime check.
-        let err = parser::parse("let n: Int where 0 < n = -1 in n").unwrap_err();
-        assert!(err.contains("refinement violated"), "unexpected message: {err}");
-        assert!(err.contains("= -1"), "unexpected message: {err}");
+    fn a_failed_literal_guard_is_a_run_time_error() {
+        // -1 is `0 - 1` (unary minus desugars, see parser::unary).
+        expect_run_error("refinement violated", || {
+            run_untyped("let n = -1 in if 0 < n then n else fail(\"refinement violated\")");
+        });
     }
 
     #[test]
-    fn refinement_on_dyn_sourced_value_falls_back_to_a_runtime_check_that_passes() {
-        let src = "handle (let n: Int where 0 < n = perform choose(0) in n + 1) \
+    fn guard_on_dyn_sourced_value_passes() {
+        let src = "handle (let n: Int = perform choose(0) in if 0 < n then n + 1 else fail(\"refinement violated\")) \
                     with handler choose(p, resume) -> resume(5)";
         assert_eq!(run_untyped(src).as_int(), 6);
     }
 
     #[test]
-    fn refinement_on_dyn_sourced_value_runtime_check_fails() {
+    fn guard_on_dyn_sourced_value_fails() {
         expect_run_error("refinement violated", || {
-        let src = "handle (let n: Int where 0 < n = perform choose(0) in n + 1) \
+        let src = "handle (let n: Int = perform choose(0) in if 0 < n then n + 1 else fail(\"refinement violated\")) \
                     with handler choose(p, resume) -> resume(-5)";
         run_untyped(src);
         });
     }
 
     #[test]
-    fn refinement_on_lambda_parameter_passes_at_runtime() {
-        // Never proven statically -- a parameter's value is whatever the
-        // caller passes, unknown at definition time.
-        let src = "let f = fun n: Int where 0 < n -> n * 2 in f(3)";
+    fn guard_on_lambda_parameter_passes_at_runtime() {
+        let src = "let f = fun n: Int -> if 0 < n then n * 2 else fail(\"refinement violated\") in f(3)";
         assert_eq!(run_untyped(src).as_int(), 6);
     }
 
     #[test]
-    fn refinement_on_lambda_parameter_fails_at_runtime() {
+    fn guard_on_lambda_parameter_fails_at_runtime() {
         expect_run_error("refinement violated", || {
-        let src = "let f = fun n: Int where 0 < n -> n * 2 in f(-3)";
+        let src = "let f = fun n: Int -> if 0 < n then n * 2 else fail(\"refinement violated\") in f(-3)";
         run_untyped(src);
         });
     }
@@ -976,13 +961,10 @@ mod tests {
     }
 
     #[test]
-    fn comparison_operators_are_provable_in_refinements() {
-        // `>=` desugars into the same If shape `&&`/`||`/`!` do
-        // (negate(Lt(...))), so try_eval_bool's existing If arm proves it
-        // for free -- no extra work needed for these four operators to
-        // compose with gradual verification's prover.
-        let err = parser::parse("let n: Int where n >= 100 = 5 in n").unwrap_err();
-        assert!(err.contains("refinement violated"), "unexpected message: {err}");
+    fn a_failed_ge_guard_is_a_run_time_error() {
+        expect_run_error("refinement violated", || {
+            run_untyped("let n = 5 in if n >= 100 then n else fail(\"refinement violated\")");
+        });
     }
 
     #[test]
@@ -1015,21 +997,16 @@ mod tests {
     }
 
     #[test]
-    fn boolean_operators_compose_with_refinement_predicates() {
-        // The `&&` addition directly closes gradual verification's own
-        // documented limitation (only `<`/`==` alone before this).
-        let src = "let n: Int where 0 < n && n < 100 = 50 in n";
+    fn boolean_operators_compose_in_a_guard_that_fails_with_its_message() {
+        let src = "let n = 50 in if 0 < n && n < 100 then n else fail(\"refinement violated\")";
         assert_eq!(run_untyped(src).as_int(), 50);
     }
 
     #[test]
-    fn compound_refinement_predicate_is_provable_at_parse_time() {
-        // try_eval_bool's If arm (added specifically because `&&` desugars
-        // into one) is what makes this provable at all -- without it,
-        // this would only be caught by a runtime check, not a parse error.
-        let err = parser::parse("let n: Int where 0 < n && n < 100 = 200 in n").unwrap_err();
-        assert!(err.contains("refinement violated"), "unexpected message: {err}");
-        assert!(err.contains("= 200"), "unexpected message: {err}");
+    fn compound_guard_fails_at_run_time() {
+        expect_run_error("refinement violated", || {
+            run_untyped("let n = 200 in if 0 < n && n < 100 then n else fail(\"refinement violated\")");
+        });
     }
 
     // --- map/fold: structural recursion over List without let rec ---
@@ -4713,7 +4690,7 @@ g(len)").unwrap_err();
         assert_eq!(ok("let T = Int in (fun x: T -> x)(3)"), "3");
         assert_eq!(ok("let T = Int in let x: [T] = [3] in x"), "[3]");
         assert_eq!(ok("let T = Int in let x: T | Bool = 3 in x"), "3");
-        assert_eq!(ok("let T = Int in let n: T where n > 0 = 5 in n"), "5");
+        assert_eq!(ok("let T = Int in let n: T = 5 in if n > 0 then n else fail(\"m\")"), "5");
         assert_eq!(ok("let T = Int in let rec f: (T -> T) = fun n -> n in f(3)"), "3");
         assert_eq!(ok("let rec f = fun n -> let T = Int in let x: T = n in x in f(3)"), "3");
         assert_eq!(ok("handle (let T = Int in let x: T = perform ask(1) in x) with handler ask(p, k) -> k(5)"), "5");
@@ -5537,9 +5514,9 @@ g(len)").unwrap_err();
 
     // NOTE: uses run_source, not run_untyped -- run_untyped is plain
     // parser::parse + machine::run with NO typecheck::check pass at all,
-    // so a plain `: T` annotation (unlike a `where` refinement, which the
-    // PARSER itself desugars into an embedded runtime check regardless of
-    // whether typecheck ever runs -- see desugar_refinement) is completely
+    // so a plain `: T` annotation (unlike an explicit `if p then v else
+    // fail(..)`, which is ordinary code and runs regardless of whether
+    // typecheck ever does) is completely
     // inert under it: machine.rs's own Expr::Let arm ignores its `_ann`
     // field outright. Confirmed empirically before this fix: under
     // run_untyped, the "matching length" case passed VACUOUSLY (no check
@@ -8797,18 +8774,6 @@ g(len)").unwrap_err();
         assert_eq!(run_source(src).unwrap().as_int(), 1);
         let direct = "let x: Dyn = [1, 2] in let y: Vec(n) = x in let f = fun w: Vec(n) -> len(w) in f([1])";
         assert_eq!(run_source(direct).unwrap().as_int(), 1);
-    }
-
-    #[test]
-    fn refinement_runtime_check_is_not_captured_by_a_user_fail() {
-        for src in [
-            "let fail = fun x -> 0 in handle (let n: Int where 0 < n = perform choose(0) in n + 1) with handler choose(p, resume) -> resume(-5)",
-            "let g = fun fail: Int -> handle (let n: Int where 0 < n = perform choose(0) in n + 1) with handler choose(p, resume) -> resume(-5) in g(1)",
-            "let fail = fun x -> 0 in let f = fun n: Int where 0 < n -> n * 2 in f(-3)",
-        ] {
-            let err = run_source(src).unwrap_err();
-            assert!(err.contains("refinement violated"), "{src}: {err}");
-        }
     }
 
     #[test]
