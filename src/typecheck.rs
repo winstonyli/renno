@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, LenExpr, LenSlot, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::machine::{eval_pure_in, pure_type, Pure, Stuck, ANNOTATION_FUEL};
 use crate::resolve::{group_kind, GroupKind, Resolved};
@@ -1932,9 +1932,9 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
     for (name, (repeatable, bare)) in read {
         let index = IndexExpr::Var(name.clone());
         let term = index_len_term(arena, &index, env);
-        let slot = arena.push(Expr::Len(term));
+        let slot = LenSlot::new(RefCell::new(term));
         if env.defer {
-            record_obligation(slot, &index, &CheckEnv { infer: env.infer, local: env.local.clone(), defer: env.defer, repeatable: env.repeatable || repeatable, span: env.span }, bare);
+            record_obligation(slot.clone(), &index, &CheckEnv { infer: env.infer, local: env.local.clone(), defer: env.defer, repeatable: env.repeatable || repeatable, span: env.span }, bare);
         }
         index_names.push(name);
         lens.push(slot);
@@ -2184,12 +2184,12 @@ impl IndexWitness {
 // index with every binding known at the crossing substituted (runtime_index),
 // so a Match arm's hypothesis, restored after the arm, stays in force.
 // `witnesses` are the (variable, hidden alias) pairs in scope at the
-// crossing, outermost first. `slot` is the Conform's `Expr::Len` length slot
-// for the variable, which resolve_obligations patches in place (every copy of
-// the Conform shares it).
+// crossing, outermost first. `slot` is the Conform's length slot for the
+// variable, which resolve_obligations patches in place (every copy of the
+// Conform shares it).
 #[derive(Clone)]
 struct Obligation {
-    slot: ExprRef,
+    slot: LenSlot,
     index: IndexExpr,
     witnesses: Vec<(String, String)>,
     // The crossing sits inside a function body, so one site can produce many
@@ -2255,13 +2255,13 @@ fn runtime_index(e: &IndexExpr, infer: &InferCtx, witness_vars: &[&str], by_alia
 // holds that clean `NoValue` failure until resolved). Every witness in scope
 // is marked used: the resolved slot may read any of them, and their alias
 // binders are emitted (or not) before typechecking finishes.
-fn record_obligation(slot: ExprRef, index: &IndexExpr, env: &CheckEnv, bare: bool) {
+fn record_obligation(slot: LenSlot, index: &IndexExpr, env: &CheckEnv, bare: bool) {
     if let Some(ob) = make_obligation(slot, index, env, bare) {
         env.infer.obligations.borrow_mut().push(ob);
     }
 }
 
-fn make_obligation(slot: ExprRef, index: &IndexExpr, env: &CheckEnv, bare: bool) -> Option<Obligation> {
+fn make_obligation(slot: LenSlot, index: &IndexExpr, env: &CheckEnv, bare: bool) -> Option<Obligation> {
     let in_scope: Vec<&IndexWitness> = env.infer.index_witness.iter().chain(env.local.iter().copied()).collect();
     let vars: Vec<&str> = in_scope.iter().map(|w| w.var.as_str()).collect();
     let index = runtime_index(index, env.infer, &vars, false);
@@ -2308,7 +2308,7 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
                 && mentions.get(name) == Some(&1)
                 && !infer.index_subst.values().any(|v| free_index_vars(v).contains(name)));
         if unconstrained {
-            arena[ob.slot] = Expr::Len(LenExpr::Any);
+            *ob.slot.borrow_mut() = LenExpr::Any;
             continue;
         }
         let witnesses: Vec<IndexWitness> = ob
@@ -2318,7 +2318,7 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
             .collect();
         let env = CheckEnv { infer, local: witnesses.iter().collect(), defer: false, repeatable: false, span: None };
         let term = index_len_term(arena, &index, &env);
-        arena[ob.slot] = Expr::Len(term);
+        *ob.slot.borrow_mut() = term;
     }
 }
 
@@ -3740,9 +3740,9 @@ fn conform_spec(arena: &mut Arena, site: &str, names: &BTreeSet<String>, blame: 
             Some(index) => index_len_term(arena, index, &env),
             None => LenExpr::Any,
         };
-        let slot = arena.push(Expr::Len(term));
+        let slot = LenSlot::new(RefCell::new(term));
         if let Some(index) = &bound {
-            record_obligation(slot, index, &env, true);
+            record_obligation(slot.clone(), index, &env, true);
         }
         lens.push(slot);
     }
@@ -4719,8 +4719,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     let node = arena[expr].clone();
     match node {
         // Emitted by elaboration itself (Dyn-boundary checks), never parsed.
-        Expr::Len(_) | Expr::Annot(..) | Expr::Conform(..) => {
-            unreachable!("Expr::Len, Expr::Annot and Expr::Conform are typecheck output, never elaboration input")
+        Expr::Annot(..) | Expr::Conform(..) => {
+            unreachable!("Expr::Annot and Expr::Conform are typecheck output, never elaboration input")
         }
         Expr::Int(_) => Ok((Type::Int, EffectRow::pure(), expr)),
         Expr::Float(_) => Ok((Type::Float, EffectRow::pure(), expr)),

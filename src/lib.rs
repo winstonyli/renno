@@ -9034,7 +9034,7 @@ g(len)").unwrap_err();
         let src = "let f = fun v: Vec(n) -> let d: Dyn = [1, 2] in let y: Vec(n) = d in 1 in f([1, 2])";
         assert!(has_assert_check(src, expr::Test::ListLenArg(Box::new(expr::Test::Any), 0)));
         let (arena, root) = elaborated_tree(src);
-        assert!(tree_any(&arena, root, &|n| matches!(n, expr::Expr::Len(expr::LenExpr::Witness(..)))));
+        assert!(tree_any(&arena, root, &|n| matches!(n, expr::Expr::Conform(_, s) if s.lens.iter().any(|l| matches!(*l.borrow(), expr::LenExpr::Witness(..))))));
         assert!(!tree_any(&arena, root, &|n| matches!(n, expr::Expr::Var(v) if v == "#len" || v == "#fail")));
         assert!(!calls_a_check_predicate(src));
         assert_eq!(run_source(src).unwrap().as_int(), 1);
@@ -9109,7 +9109,7 @@ g(len)").unwrap_err();
         let (mut arena, mut spans, root) = parser::parse("let h = 5 in [1, 2]").unwrap();
         let Expr::Let(name, ann, val, body) = arena[root].clone() else { panic!("not a let") };
         let witness = arena.push(Expr::Var("h".into()));
-        let slot = arena.push(Expr::Len(LenExpr::Witness(witness, "n".into())));
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(LenExpr::Witness(witness, "n".into())));
         let test = Test::ListLenArg(Box::new(Test::Any), 0);
         let check_spec = std::rc::Rc::new(CheckSpec { test, defs: vec![], to: crate::types::Type::Dyn, span: None });
         let lazy = crate::expr::Lazy::new(std::rc::Rc::new(crate::types::Type::Dyn));
@@ -9129,13 +9129,13 @@ g(len)").unwrap_err();
         // owns it, so a copied Check reachable from a second place would share
         // its slots across scopes. Casts and pending casts copy only a cast's
         // top node, never a Check: every slot has exactly one reachable owner.
-        fn owners(arena: &expr::Arena, r: expr::ExprRef, out: &mut std::collections::HashMap<expr::ExprRef, usize>) {
+        fn owners(arena: &expr::Arena, r: expr::ExprRef, out: &mut std::collections::HashMap<*const std::cell::RefCell<expr::LenExpr>, usize>) {
             let lens = match &arena[r] {
                 expr::Expr::Conform(_, spec) => &spec.lens[..],
                 _ => &[],
             };
             for slot in lens {
-                *out.entry(*slot).or_insert(0) += 1;
+                *out.entry(std::rc::Rc::as_ptr(slot)).or_insert(0) += 1;
             }
             let mut kids = Vec::new();
             arena[r].children(&mut kids);

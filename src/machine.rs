@@ -351,19 +351,18 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                     if let Some(lowered) = lazy_lowered(lazy, spec) {
                         cont = match lowered.then {
                             Then::Done => {
-                                let lens = done_lens(arena, spec, lowered, &env, resolved);
+                                let lens = done_lens(spec, lowered, &env, resolved);
                                 Cont::cons(Frame::Check { spec: lowered.check.clone(), lens }, cont)
                             }
                             _ => {
                                 // The slots read the env the operand is evaluated in.
-                                let table = spec.lens.iter().map(|slot| eval_slot(arena, *slot, &env, resolved)).collect();
+                                let table = spec.lens.iter().map(|slot| eval_slot(slot, &env, resolved)).collect();
                                 Cont::cons(Frame::Conform { lazy: lazy.clone(), ctx: Rc::new(SiteCtx { spec: spec.clone(), table, witness: None }) }, cont)
                             }
                         };
                     }
                     control = Control::Eval(*operand, env);
                 }
-                Expr::Len(_) => unreachable!("an Expr::Len slot is read by its Conform, never evaluated"),
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
                 Expr::Float(x) => control = Control::Apply(Value::Float(*x)),
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
@@ -889,10 +888,9 @@ fn leaf(t: &Test, v: &Value) -> Option<bool> {
     })
 }
 
-// A Conform's length slot under `env`: the Expr::Len node's term, evaluated.
-fn eval_slot(arena: &Arena, slot: ExprRef, env: &Env, resolved: &Resolved) -> Len {
-    let Expr::Len(term) = &arena[slot] else { panic!("internal: a Conform's length slot is not an Expr::Len") };
-    to_len(eval_len(term, env, resolved))
+// A Conform's length slot under `env`: its term, evaluated.
+fn eval_slot(slot: &std::cell::RefCell<LenExpr>, env: &Env, resolved: &Resolved) -> Len {
+    to_len(eval_len(&slot.borrow(), env, resolved))
 }
 
 // A length term's value as a slot holds it.
@@ -964,14 +962,14 @@ fn local(env: &Env, resolved: &Resolved, var: ExprRef) -> Value {
 // test, read on entry in `env`: each of the lowered type's slots over the
 // values of the names it reads (the Conform's own slots, evaluated on demand,
 // so a check with no length slots allocates nothing).
-fn done_lens(arena: &Arena, spec: &ConformSpec, lowered: &Lowered, env: &Env, resolved: &Resolved) -> Vec<Len> {
+fn done_lens(spec: &ConformSpec, lowered: &Lowered, env: &Env, resolved: &Resolved) -> Vec<Len> {
     lowered
         .slots
         .iter()
         .map(|index| {
             to_len(index_len(index, &|name| {
                 let i = spec.index_names.iter().position(|n| n == name)?;
-                Some(eval_slot(arena, spec.lens[i], env, resolved))
+                Some(eval_slot(&spec.lens[i], env, resolved))
             }))
         })
         .collect()

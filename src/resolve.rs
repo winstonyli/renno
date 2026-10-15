@@ -281,13 +281,6 @@ fn visit(
                 work.push(Work::Visit(kid));
             }
         }
-        Expr::Len(term) => {
-            let mut witnesses = Vec::new();
-            term.witnesses(&mut witnesses);
-            for w in witnesses.into_iter().rev() {
-                work.push(Work::Visit(w));
-            }
-        }
         Expr::Lambda(param, _, body) => scoped(work, vec![param.clone()], *body),
         Expr::App(f, a) => {
             work.push(Work::Visit(*a));

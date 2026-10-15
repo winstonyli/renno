@@ -176,6 +176,9 @@ pub enum LenExpr {
     NoValue(Rc<str>),
 }
 
+// A Conform's length slot: shared with the obligation that patches it.
+pub type LenSlot = Rc<std::cell::RefCell<LenExpr>>;
+
 impl LenExpr {
     // Appends the witness Var nodes this term reads to `out`.
     pub fn witnesses(&self, out: &mut Vec<ExprRef>) {
@@ -238,10 +241,12 @@ pub enum TypeSource {
 pub struct ConformSpec {
     pub source: TypeSource,
     // The index variable names the type's text writes (a static boundary: the
-    // ones its lowered slots read), and for each the Expr::Len slot holding
-    // its run-time value (spec 11.4).
+    // ones its lowered slots read), and for each the length slot holding its
+    // run-time value (spec 11.4). A slot is patched in place once inference has
+    // finished (typecheck::resolve_obligations), so it is shared and mutable;
+    // the witness Var nodes it reads are children of the node.
     pub index_names: Vec<String>,
-    pub lens: Vec<ExprRef>,
+    pub lens: Vec<LenSlot>,
     // The source span a failure blames (None keeps whatever span ran last).
     pub span: Option<Span>,
     // The site's own binder is typed to the checker (a static boundary), so
@@ -354,9 +359,6 @@ pub enum Expr {
     // (lowered when reached). Evaluates the operand once, no effects, no env
     // frame. Typecheck-synthesized only; never written by the parser.
     Conform(ExprRef, Rc<ConformSpec>),
-    // A Conform's length slot (ConformSpec::lens). Typecheck-synthesized only
-    // and never evaluated on its own: the owning Conform reads it on entry.
-    Len(LenExpr),
     Int(i64),
     // A second numeric literal kind, distinct from Int -- see types::
     // Type::Float's own doc comment for how far the Int/Float interop
@@ -485,13 +487,14 @@ impl Expr {
     pub(crate) fn children_with(&self, out: &mut Vec<ExprRef>, annotations: bool) {
         match self {
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Token(_) | Expr::Var(_) | Expr::TypeLit(_) => {}
-            Expr::Len(term) => term.witnesses(out),
             Expr::Conform(e, spec) => {
                 out.push(*e);
                 if let TypeSource::Site(ty, _) = &spec.source {
                     out.push(*ty);
                 }
-                out.extend(&spec.lens);
+                for slot in &spec.lens {
+                    slot.borrow().witnesses(out);
+                }
             }
             Expr::FieldAccess(e, _) | Expr::Perform(_, e) | Expr::Annot(e, _) => out.push(*e),
             Expr::Lambda(_, ann, body) => {
@@ -557,7 +560,7 @@ pub fn copy_tree(arena: &mut Arena, root: ExprRef, mut replace: impl FnMut(&mut 
         }
         let at = |k: &ExprRef| copies[k];
         let node = match &arena[n] {
-            Expr::Annot(..) | Expr::Conform(..) | Expr::Len(_) => unreachable!("a check-time evaluation runs a parsed tree"),
+            Expr::Annot(..) | Expr::Conform(..) => unreachable!("a check-time evaluation runs a parsed tree"),
             Expr::Int(i) => Expr::Int(*i),
             Expr::Float(f) => Expr::Float(*f),
             Expr::Bool(b) => Expr::Bool(*b),
