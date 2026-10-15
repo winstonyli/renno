@@ -2966,6 +2966,65 @@ g(len)").unwrap_err();
         assert_eq!(few, many, "minting must not grow with the number of calls");
     }
 
+    // ---- P3 pins (docs/superpowers/plans/2026-10-16-p3-contract-node.md): boundary behavior the
+    // one-node merge must keep exactly ----
+
+    // A single crossing whose index has no run-time value fails at the crossing for a
+    // compound index (`n + 1`), and passes for a bare one (`n`: the length IS the value).
+    #[test]
+    fn p3_a_single_unbound_index_crossing_is_no_value_for_a_compound_index_and_passes_when_bare() {
+        rejects("let d: Dyn = [] in let y: Vec(n + 1) = d in 1", "type error: index variable n has no runtime value to check a length against");
+        assert_eq!(run_source("let d: Dyn = [] in let y: Vec(n) = d in 1").unwrap().as_int(), 1);
+        rejects("let d: Dyn = 5 in let y: Vec(n) = d in 1", "type error: expected [Dyn](n), found Int");
+        // Two crossings sharing n: the first has no value to compare against.
+        rejects("let x: Dyn = [1, 2] in let y: Vec(n) = x in let z: Vec(n) = x in 0", "index variable n has no runtime value to check a length against");
+    }
+
+    // A function boundary on a Dyn: a non-function fails at the boundary, a function passes
+    // through (the callee site and an annotated let both).
+    #[test]
+    fn p3_a_dyn_to_function_boundary_fails_on_a_non_function_and_passes_a_function() {
+        rejects("let d: Dyn = 3 in let f: (Dyn -> Dyn) = d in f(1)", "type error: expected (Dyn -> Dyn), found Int");
+        assert_eq!(run_source("let d: Dyn = fun x -> x in let f: (Dyn -> Dyn) = d in f(1)").unwrap().as_int(), 1);
+        rejects("let d: Dyn = 3 in d(1)", "type error: expected (Dyn -> Dyn), found Int");
+        assert_eq!(run_source("let d: Dyn = fun x -> x + 1 in d(1)").unwrap().as_int(), 2);
+    }
+
+    // A closed function passed through a static function boundary inside a Confirm site's
+    // annotation: pins which annotation nodes stay in the tree and how often each is evaluated.
+    #[test]
+    fn p3_a_function_boundary_in_a_confirmed_annotation_keeps_its_site() {
+        let g = "let G = fun u -> (let d: Dyn = fun z -> z in let i: (Dyn -> Dyn) = d in Fun((Int, Int))) in ";
+        assert_eq!(annotation_evals(&format!("{g}let h: G(0) = fun x -> x + 1 in h(1)")), ("2".to_string(), vec![1]));
+        rejects(&format!("{g}let h: G(0) = fun x -> true in h(1)"), "type mismatch: expected Int, found Bool");
+    }
+
+    // A resumed continuation replays a boundary check on each resume.
+    #[test]
+    fn p3_a_boundary_check_is_replayed_by_every_resume() {
+        let ok = "handle (let y: Int = perform choose(0) in y + 100) with handler choose(p, resume) -> resume(1) + resume(2)";
+        assert_eq!(run_source(ok).unwrap().as_int(), 203);
+        rejects(
+            "handle (let y: Int = perform choose(0) in y + 100) with handler choose(p, resume) -> resume(true) + resume(2)",
+            "type error: expected Int, found Bool",
+        );
+    }
+
+    // A recursive function type at a static boundary mints one Lazy family however deep
+    // the calls go.
+    #[test]
+    fn p3_a_recursive_function_boundary_mints_one_family_however_deep_the_calls_go() {
+        let src = |depth: usize| format!("let rec F = Fun((Dyn, F)) in let rec k = fun x -> k in let d: Dyn = k in let g: F = d in g{}", "(1)".repeat(depth));
+        let mints = |depth: usize| {
+            machine::LAZY_MINTS.with(|c| c.set(0));
+            assert_eq!(run_source_on_this_thread(&src(depth)).expect("runs").to_string(), "<function>");
+            machine::LAZY_MINTS.with(|c| c.get())
+        };
+        let (few, many) = (mints(3), mints(30));
+        assert_eq!(few, many, "minting must not grow with the call depth");
+        rejects("let rec F = Fun((Dyn, F)) in let d: Dyn = fun x -> fun y -> 4 in let g: F = d in g(1)(2)", "type error: expected (Dyn -> F), found Int");
+    }
+
     // Each definition an annotation reaches is evaluated once, however many
     // annotations read it and however deep the chain.
     #[test]
