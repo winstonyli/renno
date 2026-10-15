@@ -153,9 +153,9 @@ pub struct CheckSpec {
     // node rather than a field here, so resolve_obligations patches it in
     // place and every copy of this Check (Pending, a finished cast) sees it.
     pub lens: Vec<ExprRef>,
-    // The type's display text, for the failure message `type error: expected
-    // {to}, found {type}`.
-    pub to: String,
+    // The target type, written (capped, Type::brief) only if a check fails, for the failure
+    // message `type error: expected {to}, found {type}`.
+    pub to: Type,
     // The cast site a failure blames (the node itself has no span in the
     // parser's SpanMap); None keeps whatever span ran last.
     pub span: Option<Span>,

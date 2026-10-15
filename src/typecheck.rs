@@ -26,6 +26,34 @@ pub(crate) use self::relate::{Cause, Rel, Residual, Why};
 #[derive(Debug)]
 pub struct TypeError(pub String, pub Span);
 
+// Why a unification failed, with its text not yet written: most failures are tried and dropped
+// (unify_trial, a rescue), and writing the text of a big type costs far more than the
+// unification did. `?` into a TypeError writes it (capped, Type::brief).
+#[derive(Debug)]
+pub(crate) enum Mismatch {
+    Expected { expected: Type, found: Type, span: Span },
+    Infinite { name: String, ty: Type, span: Span },
+    CannotTell { from: Type, to: Type, span: Span },
+    Text(TypeError),
+}
+
+impl From<TypeError> for Mismatch {
+    fn from(e: TypeError) -> Mismatch {
+        Mismatch::Text(e)
+    }
+}
+
+impl From<Mismatch> for TypeError {
+    fn from(m: Mismatch) -> TypeError {
+        match m {
+            Mismatch::Expected { expected, found, span } => TypeError(format!("type mismatch: expected {}, found {}", expected.brief(), found.brief()), span),
+            Mismatch::Infinite { name, ty, span } => TypeError(format!("infinite type: {name} occurs in {}", ty.brief()), span),
+            Mismatch::CannotTell { from, to, span } => cannot_tell(&from, &to, span),
+            Mismatch::Text(e) => e,
+        }
+    }
+}
+
 // A binding's type, plus the variables generalized over it -- quantified
 // fresh at every use, the way ML/Haskell generalize a `let`-bound type.
 // Three sorts of variable can be quantified. Row variables come from a
@@ -823,14 +851,14 @@ pub(crate) fn unify_index(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, sp
 // Called unconditionally from Expr::App/BinOp::Cons/If/Match/ListLit
 // (Tasks 4-6) -- a real decision point on every elaboration, not a
 // not-yet-wired-in mechanism.
-fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
+fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
     unify_in(t1, t2, infer, span, &mut HashSet::new())
 }
 
 // `done` holds the big pairs this call has already unified (after resolution). Within one call
 // the substitution only grows, so a pair unified once stays unified; a failure ends the call,
 // so no failed pair is ever recorded. Each call (and each unify_trial) has its own set.
-fn unify_in(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), TypeError> {
+fn unify_in(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), Mismatch> {
     let t1 = infer.resolve(t1);
     let t2 = infer.resolve(t2);
     let key = (is_big(&t1) || is_big(&t2)).then(|| (ById(t1.clone()), ById(t2.clone())));
@@ -842,12 +870,13 @@ fn unify_in(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut H
     Ok(())
 }
 
-fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), TypeError> {
+fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), Mismatch> {
+    let mismatch = || Mismatch::Expected { expected: t2.clone(), found: t1.clone(), span };
     match (t1, t2) {
         (Type::Var(n1), Type::Var(n2)) if n1 == n2 => Ok(()),
         (Type::Var(name), other) | (other, Type::Var(name)) => {
             if occurs_in(name, other, infer) {
-                return Err(TypeError(format!("infinite type: {name} occurs in {other}"), span));
+                return Err(Mismatch::Infinite { name: name.clone(), ty: other.clone(), span });
             }
             // Two variables being equated share one flag (a hop's instance
             // aliasing the caller's variable carries the sink back to it).
@@ -877,7 +906,7 @@ fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: 
         // real index-variable inference in.
         (Type::Indexed(wa, ia), Type::Indexed(wb, ib)) => {
             unify_in(wa, wb, infer, span, done)?;
-            unify_index(ia, ib, infer, span)
+            Ok(unify_index(ia, ib, infer, span)?)
         }
         (Type::Fun(p1, _r1, ret1), Type::Fun(p2, _r2, ret2)) => {
             unify_in(p1, p2, infer, span, done)?;
@@ -894,12 +923,12 @@ fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: 
             for (name, ty_a) in a.iter() {
                 match find_field(b, name) {
                     Some(ty_b) => unify_in(ty_a, ty_b, infer, span, done)?,
-                    None => return Err(TypeError(format!("type mismatch: expected {t2}, found {t1}"), span)),
+                    None => return Err(mismatch()),
                 }
             }
             Ok(())
         }
-        _ => Err(TypeError(format!("type mismatch: expected {t2}, found {t1}"), span)),
+        _ => Err(mismatch()),
     }
 }
 
@@ -913,7 +942,7 @@ fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: 
 // relate() refutes it -- unify_fits must never be stricter than
 // coerce_check, since it runs right after coerce() as a pure add-on
 // (binding Vars), not a second gate. See the catch-all below.
-fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
+fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
     fits_in(required, actual, infer, span, &mut HashSet::new())
 }
 
@@ -921,7 +950,7 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
 // safe under the contract above (never stricter than coerce_check): a remembered acceptance
 // cannot add strictness, and every caller propagates an error with `?`, so a failure ends the
 // call.
-fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), TypeError> {
+fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), Mismatch> {
     let required = infer.resolve(required);
     let actual = infer.resolve(actual);
     let key = (is_big(&required) || is_big(&actual)).then(|| (ById(required.clone()), ById(actual.clone())));
@@ -933,13 +962,14 @@ fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, don
     Ok(())
 }
 
-fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), TypeError> {
+fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), Mismatch> {
+    let mismatch = || Mismatch::Expected { expected: required.clone(), found: actual.clone(), span };
     match (required, actual) {
         (Type::Fun(req_param, req_row, req_ret), Type::Fun(act_param, act_row, act_ret)) => {
             fits_in(act_param, req_param, infer, span, done)?;
             fits_in(req_ret, act_ret, infer, span, done)?;
             if !row_consistent(req_row, act_row) {
-                return Err(TypeError(format!("type mismatch: expected {required}, found {actual}"), span));
+                return Err(mismatch());
             }
             Ok(())
         }
@@ -947,7 +977,7 @@ fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Spa
             for (name, req_ty) in req_fields.iter() {
                 match find_field(act_fields, name) {
                     Some(act_ty) => fits_in(req_ty, act_ty, infer, span, done)?,
-                    None => return Err(TypeError(format!("type mismatch: expected {required}, found {actual}"), span)),
+                    None => return Err(mismatch()),
                 }
             }
             Ok(())
@@ -1020,7 +1050,7 @@ fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Spa
                 // Never stricter than coerce_check, which rejects exactly the Refuted and Undecided pairs.
                 match relate(actual, required, infer) {
                     Rel::Refuted(_) => Err(e),
-                    Rel::Unknown(res, _) if res.undecided() => Err(cannot_tell(actual, required, span)),
+                    Rel::Unknown(res, _) if res.undecided() => Err(Mismatch::CannotTell { from: actual.clone(), to: required.clone(), span }),
                     _ => Ok(()),
                 }
             }
@@ -1050,7 +1080,7 @@ fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Spa
 // convention (see unify_index_expr's neighbors) keeps tests in
 // src/lib.rs -- a different module -- rather than because anything
 // outside typecheck.rs is meant to call this directly.
-pub(crate) fn unify_trial(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), TypeError> {
+pub(crate) fn unify_trial(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
     let snapshot = infer.subst.clone();
     // unify() (Task 3) now writes to index_subst too, via
     // unify_index_expr's own bare-variable-bind arm -- a failed trial
@@ -1426,7 +1456,7 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
                 // value. (Returning `Ok(e)` for every other target was a soundness hole found in round
                 // 1: `let s: L = []` with `let rec L = Union(Tuple(Int, L), Bool)` ran unchecked.)
                 match strip_indexed(&env.infer.resolve_deep(to)) {
-                    Type::Tuple(ts) if !ts.is_empty() => return Err(TypeError(format!("type mismatch: expected {to}, found {from}"), span)),
+                    Type::Tuple(ts) if !ts.is_empty() => return Err(TypeError(format!("type mismatch: expected {}, found {}", to.brief(), from.brief()), span)),
                     Type::List(_) => return Ok(e),
                     _ => {}
                 }
@@ -1529,7 +1559,7 @@ fn resolve_pendings(arena: &mut Arena, infer: &InferCtx) {
 // The one message for a non-dischargeable Unknown (Residual::UNDECIDED).
 fn cannot_tell(from: &Type, to: &Type, span: Span) -> TypeError {
     TypeError(
-        format!("cannot tell statically or at run time whether {from} fits {to}: an alternative differs only in a function type, a nominal type or a length"),
+        format!("cannot tell statically or at run time whether {} fits {}: an alternative differs only in a function type, a nominal type or a length", from.brief(), to.brief()),
         span,
     )
 }
@@ -1547,10 +1577,10 @@ fn refuted_error(from: &Type, to: &Type, why: &Why, span: Span) -> TypeError {
             _ => false,
         };
         if !indexable {
-            return TypeError(format!("{wrapped} is not an indexable type"), span);
+            return TypeError(format!("{} is not an indexable type", wrapped.brief()), span);
         }
     }
-    TypeError(format!("type mismatch: expected {to}, found {from}"), span)
+    TypeError(format!("type mismatch: expected {}, found {}", to.brief(), from.brief()), span)
 }
 // `t` without any Vec(n) index, at every depth.
 fn strip_indexed(t: &Type) -> Type {
@@ -1822,7 +1852,7 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
             let numeric = Type::Union(Hc::new(vec![Type::Int, Type::Float]));
             Ok(build_check_node(arena, e, Shape::plain(Test::Or(vec![Test::Int, Test::Float])), &numeric, &env.with_span(span)))
         }
-        other => Err(TypeError(format!("type mismatch: expected Int or Float, found {other}"), span)),
+        other => Err(TypeError(format!("type mismatch: expected Int or Float, found {}", other.brief()), span)),
     }
 }
 
@@ -2023,7 +2053,7 @@ pub(crate) fn lower_conform(lazy: &Lazy, span: Option<Span>) -> Option<Rc<Lowere
         }
     };
     let bodies = defs.bodies.into_iter().map(|body| body.expect("every alias body is built before shape_test returns")).collect();
-    let check = CheckSpec { test, defs: bodies, lens: Vec::new(), to: to.to_string(), span };
+    let check = CheckSpec { test, defs: bodies, lens: Vec::new(), to: to.clone(), span };
     Some(Rc::new(Lowered { check: Rc::new(check), slots: defs.lens, then }))
 }
 
@@ -2303,9 +2333,13 @@ impl Shape {
 // built) and the length slots.
 #[derive(Default)]
 struct Defs {
-    // A Rec's body, by group pointer and member (a global memo: each pointer is unfolded once);
-    // `keep` holds the groups so the pointers stay unique.
-    rec_ids: HashMap<(*const RecGroup, usize), usize>,
+    // A Rec's body, by exact identity (a global memo: each Rec is unfolded once).
+    rec_ids: HashMap<ById, usize>,
+    // A big compound node's alias: None after its first visit, Some(i) once a second visit gave
+    // it a body (so a shared node is tested once per value, not once per path to it). Keyed like
+    // StackMemo, since an unguarded Union alternative depends on the recursive types above it;
+    // `keep` holds those groups so their pointers stay unique.
+    shared: HashMap<StackKey, Option<usize>>,
     keep: Vec<RecRef>,
     bodies: Vec<Option<Test>>,
     lens: Vec<IndexExpr>,
@@ -2330,6 +2364,30 @@ fn shape_of(ty: &Type, env: &CheckEnv) -> Shape {
 // terminates because the value does. A placeholder is `Any` ("no information
 // here"; machine::pure_type keeps it out of every check).
 fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &Visiting) -> Test {
+    // A big node reached again becomes one alias (Test::Ref), so a type that is a DAG yields a
+    // test of the DAG's size, and the machine's (alias, value) memo keeps the walk linear.
+    let compound = matches!(ty, Type::List(_) | Type::Tuple(_) | Type::Record(_) | Type::Union(_) | Type::Indexed(..));
+    let key = if compound { StackMemo::default().key(ty, 0, unguarded) } else { None };
+    let Some(key) = key else { return shape_node(ty, env, defs, unguarded) };
+    match defs.shared.get(&key).copied() {
+        Some(Some(i)) => Test::Ref(i),
+        Some(None) => {
+            let i = defs.bodies.len();
+            defs.bodies.push(None);
+            defs.shared.insert(key, Some(i));
+            let body = shape_node(ty, env, defs, unguarded);
+            defs.bodies[i] = Some(body);
+            Test::Ref(i)
+        }
+        None => {
+            defs.keep.extend(unguarded.rec.iter().map(|(g, _)| g.clone()));
+            defs.shared.insert(key, None);
+            shape_node(ty, env, defs, unguarded)
+        }
+    }
+}
+
+fn shape_node(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &Visiting) -> Test {
     let element = |t: &Type, defs: &mut Defs| shape_test(t, env, defs, &Visiting::default());
     match ty {
         Type::Dyn | Type::Var(_) | Type::RecVar(_) => Test::Any,
@@ -2352,13 +2410,12 @@ fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &Visiting) 
         Type::Union(alts) => Test::Or(alts.iter().map(|alt| shape_test(alt, env, defs, unguarded)).collect()),
         Type::Rec(g, k) if unguarded.has_rec(g, *k) => Test::Never,
         Type::Rec(g, k) if !unguarded.is_empty() => shape_test(&unfold(g, *k), env, defs, &unguarded.with_rec(g, *k)),
-        Type::Rec(g, k) => match defs.rec_ids.get(&(Rc::as_ptr(&g.0), *k)) {
+        Type::Rec(g, k) => match defs.rec_ids.get(&ById(ty.clone())) {
             Some(&i) => Test::Ref(i),
             None => {
                 let i = defs.bodies.len();
                 defs.bodies.push(None);
-                defs.rec_ids.insert((Rc::as_ptr(&g.0), *k), i);
-                defs.keep.push(g.clone());
+                defs.rec_ids.insert(ById(ty.clone()), i);
                 let body = shape_test(&unfold(g, *k), env, defs, &unguarded.with_rec(g, *k));
                 defs.bodies[i] = Some(body);
                 Test::Ref(i)
@@ -2456,7 +2513,7 @@ fn build_check_node(arena: &mut Arena, value_ref: ExprRef, shape: Shape, to: &Ty
         }
         lens.push(slot);
     }
-    let spec = CheckSpec { test: shape.test, defs: shape.defs, lens, to: to.to_string(), span: env.span };
+    let spec = CheckSpec { test: shape.test, defs: shape.defs, lens, to: to.clone(), span: env.span };
     arena.push(Expr::Check(value_ref, Rc::new(spec)))
 }
 
@@ -4721,7 +4778,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 Type::Dyn | Type::Var(_) => Type::Dyn,
                 ty if record_shaped(ty) => record_field_type(ty, &name)
                     .ok_or_else(|| TypeError(format!("no field named `{name}`"), spans[expr]))?,
-                other => return Err(TypeError(format!("expected a record, found {other}"), spans[target])),
+                other => return Err(TypeError(format!("expected a record, found {}", other.brief()), spans[target])),
             };
             let checked_target = if matches!(target_ty, Type::Dyn | Type::Var(_)) {
                 let required = Type::Record(Hc::new(vec![(name.clone(), Type::Dyn)]));
@@ -4932,7 +4989,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     let a3 = coerce_cast(arena, a2, &a_ty, &Type::Dyn, &CheckEnv::at(infer, spans[a]));
                     (EffectRow::Dyn, Type::Dyn, arena.push(Expr::App(f3, a3)))
                 }
-                other => return Err(TypeError(format!("cannot call a value of type {other}"), spans[f])),
+                other => return Err(TypeError(format!("cannot call a value of type {}", other.brief()), spans[f])),
             };
             let row = EffectRow::union(&EffectRow::union(&f_row, &a_row), &call_row);
             Ok((ret_ty, row, app2))
@@ -5003,7 +5060,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     let numeric_pair = matches!(l_ty, Type::Int | Type::Float) && matches!(r_ty, Type::Int | Type::Float);
                     if !numeric_pair && !consistent(&l_ty, &r_ty) {
                         return Err(TypeError(
-                            format!("type mismatch: cannot compare {l_ty} with {r_ty}"),
+                            format!("type mismatch: cannot compare {} with {}", l_ty.brief(), r_ty.brief()),
                             spans[expr],
                         ));
                     }
@@ -5038,7 +5095,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     let r_ty = forget_index(&r_ty);
                     if !consistent(&l_ty, &r_ty) {
                         return Err(TypeError(
-                            format!("type mismatch: cannot concat {l_ty} with {r_ty}"),
+                            format!("type mismatch: cannot concat {} with {}", l_ty.brief(), r_ty.brief()),
                             spans[expr],
                         ));
                     }
@@ -5050,7 +5107,9 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         _ => {
                             return Err(TypeError(
                                 format!(
-                                    "type mismatch: cannot concat {l_ty} with {r_ty} (expected two strings or two lists)"
+                                    "type mismatch: cannot concat {} with {} (expected two strings or two lists)",
+                                    l_ty.brief(),
+                                    r_ty.brief()
                                 ),
                                 spans[expr],
                             ))
@@ -5177,7 +5236,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let handler_ty = infer.resolve_deep(&handler_ty);
             if !matches!(handler_ty, Type::Dyn | Type::Var(_)) {
                 return Err(TypeError(
-                    format!("handle: expected a handler value, found expression of type {handler_ty}"),
+                    format!("handle: expected a handler value, found expression of type {}", handler_ty.brief()),
                     spans[handler],
                 ));
             }
@@ -5274,8 +5333,9 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 if !pattern_could_match(pat, &scrut_ty, &Visiting::default()) {
                     return Err(TypeError(
                         format!(
-                            "match: pattern of type {} can never match scrutinee of type {scrut_ty}",
-                            pattern_type(pat)
+                            "match: pattern of type {} can never match scrutinee of type {}",
+                            pattern_type(pat).brief(),
+                            scrut_ty.brief()
                         ),
                         spans[expr],
                     ));

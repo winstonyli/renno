@@ -2429,7 +2429,7 @@ g(len)").unwrap_err();
         let five = arena.push(Expr::Int(5));
         spans.push(Span { start: 10, end: 11 });
         // Synthesized after parsing: a Check around `f`, a spanless leaf, and the App over both.
-        let spec = std::rc::Rc::new(crate::expr::CheckSpec { test: crate::expr::Test::Fun, defs: vec![], lens: vec![], to: String::new(), span: None });
+        let spec = std::rc::Rc::new(crate::expr::CheckSpec { test: crate::expr::Test::Fun, defs: vec![], lens: vec![], to: crate::types::Type::Dyn, span: None });
         let check = arena.push(Expr::Check(f, spec));
         let leaf = arena.push(Expr::Bool(true));
         let pair = arena.push(Expr::Tuple(vec![check, five]));
@@ -8918,7 +8918,7 @@ g(len)").unwrap_err();
         let witness = arena.push(Expr::Var("h".into()));
         let slot = arena.push(Expr::Len(LenExpr::Witness(witness, "n".into())));
         let test = Test::ListLenArg(Box::new(Test::Any), 0);
-        let spec = CheckSpec { test, defs: vec![], lens: vec![slot], to: "[Dyn](n)".into(), span: None };
+        let spec = CheckSpec { test, defs: vec![], lens: vec![slot], to: crate::types::Type::Dyn, span: None };
         let check = arena.push(Expr::Check(body, std::rc::Rc::new(spec)));
         let top = arena.push(Expr::Let(name, ann, val, check));
         expr::fill_synthesized_spans(&arena, top, &mut spans);
@@ -10089,5 +10089,20 @@ g(len)").unwrap_err();
         assert!(err.contains("found Bool"), "{err}");
         let err = finishes_within(20, &program(24, "true")).expect_err("wrong leaf");
         assert!(err.contains("found Bool"), "{}", &err[..err.len().min(300)]);
+    }
+
+    // A message names at most BRIEF_NODES type nodes, then `...`; a small type prints in full.
+    #[test]
+    fn type_text_in_messages_is_capped() {
+        let mut src = dag_chain("Tuple((P, P))", 24);
+        src.push_str("let v0 = true in ");
+        for i in 1..=24 {
+            src.push_str(&format!("let v{i} = (v{}, v{}) in ", i - 1, i - 1));
+        }
+        src.push_str("let d: Dyn = v24 in let t: T24 = d in 0");
+        let err = finishes_within(20, &src).expect_err("wrong leaf");
+        assert!(err.contains("...") && err.len() < 200_000, "{} bytes", err.len());
+        let small = finishes_within(20, "let f = fun x: Tuple((Int, Bool)) -> 0 in f(1)").expect_err("mismatch");
+        assert!(small.contains("(Int, Bool)") && !small.contains("..."), "{small}");
     }
 }

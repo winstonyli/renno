@@ -1023,7 +1023,7 @@ fn check_failed(spec: &CheckSpec, lens: &[Len], value: &Value) -> ! {
     let mut path = Vec::new();
     let found = explain(&spec.test, &spec.defs, lens, value, &mut path);
     let at = if path.is_empty() { String::new() } else { format!(" at {}", path_text(&path)) };
-    crate::run_error!("type error: expected {}, found {}{at}", spec.to, found.type_name())
+    crate::run_error!("type error: expected {}, found {}{at}", spec.to.brief(), found.type_name())
 }
 
 enum Step<'t, 'a> {

@@ -599,4 +599,21 @@ mod tests {
         let got = relate(&u1, &u2, &infer);
         assert!(!matches!(got, Rel::Unknown(Residual::UNDECIDED, _)), "{got:?}");
     }
+
+    // The pair memo makes a pair decided at a shallow position hold at a shared position deeper
+    // than MAX_DEPTH: Proven where the depth cap alone gave a run-time test. Sound (the memoized
+    // answer was computed in full), and pinned here as the accepted behaviour change.
+    #[test]
+    fn a_shared_pair_decided_shallow_is_decided_past_the_depth_cap() {
+        let infer = ctx();
+        let chain = |leaf: Type| (0..40).fold(leaf, |acc, _| fun(Type::Int, acc));
+        let (a, b) = (chain(Type::Int), chain(Type::Dyn));
+        assert_eq!(relate(&a, &b, &infer), Rel::Proven);
+        let nest = |leaf: &Type| (0..30).fold(leaf.clone(), |acc, _| tup(&[acc]));
+        let (from, to) = (tup(&[a.clone(), nest(&a)]), tup(&[b.clone(), nest(&b)]));
+        assert_eq!(relate(&from, &to, &infer), Rel::Proven);
+        // Alone, at the same depth, the pair is past the cap and not proven.
+        let (deep_from, deep_to) = (nest(&a), nest(&b));
+        assert_ne!(relate(&deep_from, &deep_to, &infer), Rel::Proven);
+    }
 }

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -1250,61 +1250,107 @@ pub fn row_consistent(a: &EffectRow, b: &EffectRow) -> bool {
 
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Type::Dyn => write!(f, "Dyn"),
-            Type::Int => write!(f, "Int"),
-            Type::Float => write!(f, "Float"),
-            // The name is internal bookkeeping (see Type::Var's own doc
-            // comment) that a user has no way to interpret -- render
-            // identically to Type::Dyn, which is what a Type::Var
-            // actually behaves like everywhere it's observable.
-            Type::Var(_) => write!(f, "Dyn"),
-            // The member's own name, never its body.
-            Type::Rec(g, i) => write!(f, "{}", g.0.names[*i]),
-            Type::RecVar(RecVar::Free { name, .. }) => write!(f, "{name}"),
-            // Unreachable by construction (a Bound only lives inside a group's bodies).
-            Type::RecVar(RecVar::Bound { depth, member }) => write!(f, "?{depth}.{member}"),
-            Type::Bool => write!(f, "Bool"),
-            Type::Str => write!(f, "Str"),
-            Type::List(elem) => write!(f, "[{elem}]"),
-            // Dyn row prints as a plain arrow -- matches every existing
-            // (unannotated-row) Fun type exactly as before this existed.
-            Type::Fun(a, EffectRow::Dyn, b) => write!(f, "({a} -> {b})"),
-            Type::Fun(a, row, b) => write!(f, "({a} ->{row} {b})"),
-            // The brand (the `opaque`'s source offset), so two token types
-            // read differently in a message (spec 12.6); Value::type_name
-            // names a token value the same way.
-            Type::Token(id) => write!(f, "Token#{id}"),
-            Type::Tuple(items) => {
-                write!(f, "(")?;
-                for (i, t) in items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{t}")?;
-                }
-                write!(f, ")")
+        write_type(self, f, &Cell::new(usize::MAX))
+    }
+}
+
+// The most type nodes a message prints (`Type::brief`); a bigger type ends in `...`. A type value
+// is a DAG, so its text can be exponentially larger than the type itself.
+const BRIEF_NODES: usize = 10_000;
+
+// A type for a message: the same text as its Display, cut off after BRIEF_NODES nodes.
+pub struct Brief<'a>(&'a Type);
+
+impl fmt::Display for Brief<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write_type(self.0, f, &Cell::new(BRIEF_NODES))
+    }
+}
+
+impl Type {
+    pub fn brief(&self) -> Brief<'_> {
+        Brief(self)
+    }
+}
+
+// The one rendering of a type: each node printed spends one unit of `budget`, and a node met with
+// none left prints `...` (so printing stops growing once it runs out).
+fn write_type(t: &Type, f: &mut fmt::Formatter, budget: &Cell<usize>) -> fmt::Result {
+    let left = budget.get();
+    if left == 0 {
+        return write!(f, "...");
+    }
+    budget.set(left - 1);
+    match t {
+        Type::Dyn => write!(f, "Dyn"),
+        Type::Int => write!(f, "Int"),
+        Type::Float => write!(f, "Float"),
+        // The name is internal bookkeeping (see Type::Var's own doc
+        // comment) that a user has no way to interpret -- render
+        // identically to Type::Dyn, which is what a Type::Var
+        // actually behaves like everywhere it's observable.
+        Type::Var(_) => write!(f, "Dyn"),
+        // The member's own name, never its body.
+        Type::Rec(g, i) => write!(f, "{}", g.0.names[*i]),
+        Type::RecVar(RecVar::Free { name, .. }) => write!(f, "{name}"),
+        // Unreachable by construction (a Bound only lives inside a group's bodies).
+        Type::RecVar(RecVar::Bound { depth, member }) => write!(f, "?{depth}.{member}"),
+        Type::Bool => write!(f, "Bool"),
+        Type::Str => write!(f, "Str"),
+        Type::List(elem) => {
+            write!(f, "[")?;
+            write_type(elem, f, budget)?;
+            write!(f, "]")
+        }
+        // Dyn row prints as a plain arrow -- matches every existing
+        // (unannotated-row) Fun type exactly as before this existed.
+        Type::Fun(a, row, b) => {
+            write!(f, "(")?;
+            write_type(a, f, budget)?;
+            match row {
+                EffectRow::Dyn => write!(f, " -> ")?,
+                row => write!(f, " ->{row} ")?,
             }
-            Type::Record(fields) => {
-                write!(f, "{{")?;
-                for (i, (name, t)) in fields.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{name}: {t}")?;
+            write_type(b, f, budget)?;
+            write!(f, ")")
+        }
+        // The brand (the `opaque`'s source offset), so two token types
+        // read differently in a message (spec 12.6); Value::type_name
+        // names a token value the same way.
+        Type::Token(id) => write!(f, "Token#{id}"),
+        Type::Tuple(items) => {
+            write!(f, "(")?;
+            for (i, t) in items.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
                 }
-                write!(f, "}}")
+                write_type(t, f, budget)?;
             }
-            Type::Union(alts) => {
-                for (i, t) in alts.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " | ")?;
-                    }
-                    write!(f, "{t}")?;
+            write!(f, ")")
+        }
+        Type::Record(fields) => {
+            write!(f, "{{")?;
+            for (i, (name, t)) in fields.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
                 }
-                Ok(())
+                write!(f, "{name}: ")?;
+                write_type(t, f, budget)?;
             }
-            Type::Indexed(wrapped, index) => write!(f, "{wrapped}({index})"),
+            write!(f, "}}")
+        }
+        Type::Union(alts) => {
+            for (i, t) in alts.iter().enumerate() {
+                if i > 0 {
+                    write!(f, " | ")?;
+                }
+                write_type(t, f, budget)?;
+            }
+            Ok(())
+        }
+        Type::Indexed(wrapped, index) => {
+            write_type(wrapped, f, budget)?;
+            write!(f, "({index})")
         }
     }
 }
