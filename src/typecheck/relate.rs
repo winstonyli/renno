@@ -2,11 +2,10 @@
 //! S2 T1 added `Why`/`Undecided`/`relate_cast`; consumers: coerce_check and the unify_fits rescue (T3), coerce_cast (T4).
 use super::{free_index_vars, unify_index_expr, InferCtx};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
-use crate::types::{is_big, row_consistent, unfold, ById, RecRef, Type};
+use crate::types::{is_big, row_consistent, unfold, ById, FxMap, RecRef, Type};
 use crate::util::find_field;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
 /// Native-stack guard (a source type that is itself very deep). Degenerate aliases are cut earlier
@@ -145,7 +144,7 @@ struct Budget {
     // the revisit guard makes an answer depend on that stack. A pair whose computation hit a cap
     // (`caps` counts them) is never stored, so a stored answer never depends on how much budget
     // was left.
-    pairs: RefCell<HashMap<(ById, ById, u32), Rel>>,
+    pairs: RefCell<FxMap<(ById, ById, u32), Rel>>,
     context: Cell<u32>,
     contexts: Cell<u32>,
     caps: Cell<u32>,
@@ -156,7 +155,7 @@ impl Default for Budget {
             left: Cell::new(FUEL),
             unfolding_rec: RefCell::new(Vec::new()),
             ignore_rows: false,
-            pairs: RefCell::new(HashMap::new()),
+            pairs: RefCell::new(FxMap::default()),
             context: Cell::new(0),
             contexts: Cell::new(0),
             caps: Cell::new(0),

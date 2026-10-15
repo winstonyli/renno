@@ -665,7 +665,10 @@ impl Hash for ById {
 // What a walk remembers: its result per node (and per context, for a walk whose answer depends
 // on where the node sits). One memo lives for one walk; the substitution a walk reads may
 // change between walks, so nothing is kept across them.
-pub type NodeMemo<V> = HashMap<(ById, u32), V>;
+pub type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+pub type FxSet<K> = HashSet<K, BuildHasherDefault<FxHasher>>;
+
+pub type NodeMemo<V> = FxMap<(ById, u32), V>;
 
 // A node smaller than this is walked again rather than looked up.
 const MEMO_MIN: u16 = 24;
@@ -673,7 +676,7 @@ const MEMO_MIN: u16 = 24;
 // The nodes a query walk has been through, so a shared node is walked once. Like a memo it
 // lives for one call, and a node smaller than MEMO_MIN is never recorded.
 #[derive(Default)]
-pub struct Visited(HashSet<ById>);
+pub struct Visited(FxSet<ById>);
 
 impl Visited {
     pub fn new() -> Visited {
@@ -768,7 +771,7 @@ impl Rebuild for SubstBound<'_> {
 // itself. Only closed terms are unfolded, so nothing needs shifting. Subtrees that mention no
 // reference are returned as the same nodes.
 pub fn unfold(g: &RecRef, i: usize) -> Type {
-    let mut walk = SubstBound { g, depth: 0, memo: NodeMemo::new() };
+    let mut walk = SubstBound { g, depth: 0, memo: NodeMemo::default() };
     walk.walk(&g.0.bodies[i]).unwrap_or_else(|| g.0.bodies[i].clone())
 }
 
@@ -805,7 +808,7 @@ impl Rebuild for ReplaceFree<'_> {
 
 // `t` with each Free placeholder `f(id, depth)` answers for replaced. None when nothing changed.
 fn replace_free(t: &Type, depth: u32, f: &dyn Fn(u64, u32) -> Option<Type>) -> Option<Type> {
-    ReplaceFree { f, depth, memo: NodeMemo::new() }.walk(t)
+    ReplaceFree { f, depth, memo: NodeMemo::default() }.walk(t)
 }
 
 // The name of the first placeholder `t` still contains (a type the machine built while a
@@ -1029,7 +1032,7 @@ fn strongly_connected(succ: &[Vec<usize>]) -> Vec<Vec<usize>> {
 fn canonical_order(comp: &mut [usize], bodies: &HashMap<usize, Type>, index: &HashMap<u64, usize>, scc_of: &[usize], c: usize) {
     use std::hash::{Hash, Hasher};
     // A node's hash is built from its children's, each hashed once per walk (`memo`).
-    fn skeleton(t: &Type, colour: &dyn Fn(u64) -> Option<u64>, memo: &mut HashMap<ById, u64>) -> u64 {
+    fn skeleton(t: &Type, colour: &dyn Fn(u64) -> Option<u64>, memo: &mut FxMap<ById, u64>) -> u64 {
         let big = t.summary().size >= MEMO_MIN;
         if big && let Some(done) = memo.get(&ById(t.clone())) {
             return *done;
@@ -1069,7 +1072,7 @@ fn canonical_order(comp: &mut [usize], bodies: &HashMap<usize, Type>, index: &Ha
             .iter()
             .map(|&m| {
                 let of = |id: u64| index.get(&id).filter(|&&j| scc_of[j] == c).map(|j| colours[j]);
-                (m, skeleton(&bodies[&m], &of, &mut HashMap::new()))
+                (m, skeleton(&bodies[&m], &of, &mut FxMap::default()))
             })
             .collect();
         let count = next.values().collect::<HashSet<_>>().len();
@@ -1110,11 +1113,11 @@ impl fmt::Display for EffectRow {
 // back-references are Bound indices, never pointers), so a plain structural recursion always
 // terminates.
 pub fn consistent(a: &Type, b: &Type) -> bool {
-    consistent_in(a, b, &mut HashMap::new())
+    consistent_in(a, b, &mut FxMap::default())
 }
 
 // `memo` holds the answers for big pairs (the relation is pure), so a shared pair is decided once.
-fn consistent_in(a: &Type, b: &Type, memo: &mut HashMap<(ById, ById), bool>) -> bool {
+fn consistent_in(a: &Type, b: &Type, memo: &mut FxMap<(ById, ById), bool>) -> bool {
     let key = (is_big(a) || is_big(b)).then(|| (ById(a.clone()), ById(b.clone())));
     if let Some(done) = key.as_ref().and_then(|k| memo.get(k)) {
         return *done;
@@ -1126,7 +1129,7 @@ fn consistent_in(a: &Type, b: &Type, memo: &mut HashMap<(ById, ById), bool>) -> 
     result
 }
 
-fn consistent_pair(a: &Type, b: &Type, memo: &mut HashMap<(ById, ById), bool>) -> bool {
+fn consistent_pair(a: &Type, b: &Type, memo: &mut FxMap<(ById, ById), bool>) -> bool {
     match (a, b) {
         (Type::Dyn, _) | (_, Type::Dyn) => true,
         // Treated exactly like Dyn here -- the one place it behaves
@@ -1233,10 +1236,10 @@ fn consistent_pair(a: &Type, b: &Type, memo: &mut HashMap<(ById, ById), bool>) -
 // by relate (typecheck/relate.rs), which has its own Record arm; this
 // helper survives for consistent()'s width-aware callers.
 pub fn record_satisfies(required: &[(String, Type)], actual: &[(String, Type)]) -> bool {
-    record_satisfies_in(required, actual, &mut HashMap::new())
+    record_satisfies_in(required, actual, &mut FxMap::default())
 }
 
-fn record_satisfies_in(required: &[(String, Type)], actual: &[(String, Type)], memo: &mut HashMap<(ById, ById), bool>) -> bool {
+fn record_satisfies_in(required: &[(String, Type)], actual: &[(String, Type)], memo: &mut FxMap<(ById, ById), bool>) -> bool {
     required.iter().all(|(name, ty)| find_field(actual, name).is_some_and(|aty| consistent_in(ty, aty, memo)))
 }
 

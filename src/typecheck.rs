@@ -10,7 +10,7 @@ use crate::resolve::{group_kind, GroupKind, Resolved};
 use crate::span::Span;
 use crate::value::Value;
 use rpds::{HashTrieMap, HashTrieSet};
-use crate::types::{consistent, each_child, is_big, row_consistent, unfold, ById, EffectRow, Hc, Interned, NodeMemo, RecGroup, RecRef, RecVar, Rebuild, Summary, Type, Visited};
+use crate::types::{consistent, each_child, is_big, row_consistent, unfold, ById, EffectRow, Hc, Interned, NodeMemo, RecGroup, RecRef, RecVar, Rebuild, Summary, Type, Visited, FxMap, FxSet};
 use crate::util::find_field;
 mod relate;
 use self::relate::{relate, relate_cast};
@@ -639,7 +639,7 @@ impl InferCtx {
     pub(crate) fn resolve_deep(&self, ty: &Type) -> Type {
         // Only a bound variable or a bound index can change anything.
         let relevant = (if self.subst.is_empty() { 0 } else { Summary::VAR }) | (if self.index_subst.is_empty() { 0 } else { Summary::INDEXED });
-        ResolveDeep { infer: self, relevant, memo: NodeMemo::new() }.walk(ty).unwrap_or_else(|| ty.clone())
+        ResolveDeep { infer: self, relevant, memo: NodeMemo::default() }.walk(ty).unwrap_or_else(|| ty.clone())
     }
 
     // IndexExpr's own analog of resolve() -- follows a bound index
@@ -852,13 +852,13 @@ pub(crate) fn unify_index(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, sp
 // (Tasks 4-6) -- a real decision point on every elaboration, not a
 // not-yet-wired-in mechanism.
 fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
-    unify_in(t1, t2, infer, span, &mut HashSet::new())
+    unify_in(t1, t2, infer, span, &mut FxSet::default())
 }
 
 // `done` holds the big pairs this call has already unified (after resolution). Within one call
 // the substitution only grows, so a pair unified once stays unified; a failure ends the call,
 // so no failed pair is ever recorded. Each call (and each unify_trial) has its own set.
-fn unify_in(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), Mismatch> {
+fn unify_in(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
     let t1 = infer.resolve(t1);
     let t2 = infer.resolve(t2);
     let key = (is_big(&t1) || is_big(&t2)).then(|| (ById(t1.clone()), ById(t2.clone())));
@@ -870,7 +870,7 @@ fn unify_in(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut H
     Ok(())
 }
 
-fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), Mismatch> {
+fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
     let mismatch = || Mismatch::Expected { expected: t2.clone(), found: t1.clone(), span };
     match (t1, t2) {
         (Type::Var(n1), Type::Var(n2)) if n1 == n2 => Ok(()),
@@ -943,14 +943,14 @@ fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: 
 // coerce_check, since it runs right after coerce() as a pure add-on
 // (binding Vars), not a second gate. See the catch-all below.
 fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
-    fits_in(required, actual, infer, span, &mut HashSet::new())
+    fits_in(required, actual, infer, span, &mut FxSet::default())
 }
 
 // `done` holds the big pairs this call has already accepted, relate rescue included. That is
 // safe under the contract above (never stricter than coerce_check): a remembered acceptance
 // cannot add strictness, and every caller propagates an error with `?`, so a failure ends the
 // call.
-fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), Mismatch> {
+fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
     let required = infer.resolve(required);
     let actual = infer.resolve(actual);
     let key = (is_big(&required) || is_big(&actual)).then(|| (ById(required.clone()), ById(actual.clone())));
@@ -962,7 +962,7 @@ fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, don
     Ok(())
 }
 
-fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut HashSet<(ById, ById)>) -> Result<(), Mismatch> {
+fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
     let mismatch = || Mismatch::Expected { expected: required.clone(), found: actual.clone(), span };
     match (required, actual) {
         (Type::Fun(req_param, req_row, req_ret), Type::Fun(act_param, act_row, act_ret)) => {
@@ -1328,7 +1328,7 @@ pub(crate) fn subst_type(ty: &Type, row_subst: &HashMap<String, EffectRow>, type
     let relevant = (if type_subst.is_empty() { 0 } else { Summary::VAR })
         | (if row_subst.is_empty() { 0 } else { Summary::ROWVAR })
         | (if index_subst.is_empty() { 0 } else { Summary::INDEXED });
-    SubstType { row_subst, type_subst, index_subst, relevant, memo: NodeMemo::new() }.walk(ty).unwrap_or_else(|| ty.clone())
+    SubstType { row_subst, type_subst, index_subst, relevant, memo: NodeMemo::default() }.walk(ty).unwrap_or_else(|| ty.clone())
 }
 
 struct SubstType<'a> {
@@ -1378,7 +1378,7 @@ impl Rebuild for SubstType<'_> {
 // variable's meaning flows out of this one application.
 fn bind_row_vars(param: &Type, arg: &Type, subst: &mut HashMap<String, EffectRow>) {
     // Binding is first-wins, so a pair already walked adds nothing.
-    fn go(param: &Type, arg: &Type, subst: &mut HashMap<String, EffectRow>, seen: &mut HashSet<(ById, ById)>) {
+    fn go(param: &Type, arg: &Type, subst: &mut HashMap<String, EffectRow>, seen: &mut FxSet<(ById, ById)>) {
         if !param.summary().any(Summary::ROWVAR) || (is_big(param) && !seen.insert((ById(param.clone()), ById(arg.clone())))) {
             return;
         }
@@ -1392,7 +1392,7 @@ fn bind_row_vars(param: &Type, arg: &Type, subst: &mut HashMap<String, EffectRow
             go(p2, a2, subst, seen);
         }
     }
-    go(param, arg, subst, &mut HashSet::new());
+    go(param, arg, subst, &mut FxSet::default());
 }
 
 // "must be callable" -- the shape used wherever we need to check a value is
@@ -1474,7 +1474,7 @@ fn coerce_check(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, span: Spa
 // through runtime_index (a witnessed variable stays, so a Match hypothesis restored later
 // cannot change what it means).
 fn snapshot_type(t: &Type, infer: &InferCtx, witness_vars: &[&str]) -> Type {
-    Snapshot { infer, witness_vars, memo: NodeMemo::new() }.walk(t).unwrap_or_else(|| t.clone())
+    Snapshot { infer, witness_vars, memo: NodeMemo::default() }.walk(t).unwrap_or_else(|| t.clone())
 }
 
 struct Snapshot<'a> {
@@ -1584,7 +1584,7 @@ fn refuted_error(from: &Type, to: &Type, why: &Why, span: Span) -> TypeError {
 }
 // `t` without any Vec(n) index, at every depth.
 fn strip_indexed(t: &Type) -> Type {
-    StripIndexed { memo: NodeMemo::new() }.walk(t).unwrap_or_else(|| t.clone())
+    StripIndexed { memo: NodeMemo::default() }.walk(t).unwrap_or_else(|| t.clone())
 }
 
 struct StripIndexed {
@@ -1612,7 +1612,7 @@ impl Rebuild for StripIndexed {
 // compare when every variable in it has a value; otherwise the check degrades
 // to is_list only (see build_cast).
 fn erase_open_indexed(t: &Type, env: &CheckEnv) -> Type {
-    EraseOpen { env, memo: NodeMemo::new() }.walk(t).unwrap_or_else(|| t.clone())
+    EraseOpen { env, memo: NodeMemo::default() }.walk(t).unwrap_or_else(|| t.clone())
 }
 
 struct EraseOpen<'a, 'b> {
@@ -1942,7 +1942,7 @@ struct Seen {
     // What each big node added in this mode. A revisit adds the same names to *its* `out`: that
     // map may differ from the first visit's (a Fun's own variable is dropped from its inner one),
     // so skipping the revisit would lose names.
-    nodes: HashMap<(ById, bool, bool), BTreeMap<String, bool>>,
+    nodes: FxMap<(ById, bool, bool), BTreeMap<String, bool>>,
 }
 
 fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool, in_contract: bool, out: &mut BTreeMap<String, bool>) {
@@ -2355,12 +2355,12 @@ impl Shape {
 #[derive(Default)]
 struct Defs {
     // A Rec's body, by exact identity (a global memo: each Rec is unfolded once).
-    rec_ids: HashMap<ById, usize>,
+    rec_ids: FxMap<ById, usize>,
     // A big compound node's alias: None after its first visit, Some(i) once a second visit gave
     // it a body (so a shared node is tested once per value, not once per path to it). Keyed like
     // StackMemo, since an unguarded Union alternative depends on the recursive types above it;
     // `keep` holds those groups so their pointers stay unique.
-    shared: HashMap<StackKey, Option<usize>>,
+    shared: FxMap<StackKey, Option<usize>>,
     keep: Vec<RecRef>,
     bodies: Vec<Option<Test>>,
     lens: Vec<IndexExpr>,
@@ -2498,7 +2498,7 @@ fn needs_contract(ty: &Type, visiting: &Visiting) -> bool {
 // (`Visiting`), since the answer may depend on any of them.
 #[derive(Default)]
 struct StackMemo {
-    map: HashMap<(ById, usize, Vec<(*const RecGroup, usize)>), bool>,
+    map: FxMap<StackKey, bool>,
     // The groups the keys point at, kept so an address is never reused within the call.
     keep: Vec<RecRef>,
 }
@@ -2695,7 +2695,7 @@ fn record_shaped(ty: &Type) -> bool {
 // shaped like a record" separately, so this only ever needs to answer
 // the narrower "does it have GOT this one" question.
 fn record_field_type(ty: &Type, name: &str) -> Option<Type> {
-    fn go(ty: &Type, name: &str, memo: &mut HashMap<ById, Option<Type>>) -> Option<Type> {
+    fn go(ty: &Type, name: &str, memo: &mut FxMap<ById, Option<Type>>) -> Option<Type> {
         match ty {
             Type::Record(fields) => find_field(fields, name).cloned(),
             Type::Union(alts) => {
@@ -2726,7 +2726,7 @@ fn record_field_type(ty: &Type, name: &str) -> Option<Type> {
             _ => None,
         }
     }
-    go(ty, name, &mut HashMap::new())
+    go(ty, name, &mut FxMap::default())
 }
 
 // Does `pat` have ANY chance of matching a value of type `ty`? For every
@@ -2952,7 +2952,7 @@ fn count_bound(t: &Type, nest: u32, member: usize) -> usize {
         }
         result
     }
-    go(t, nest, member, &mut NodeMemo::new())
+    go(t, nest, member, &mut NodeMemo::default())
 }
 
 // Case B's own analog of Case A's `Pattern::Cons(_, tail)` tail-position
