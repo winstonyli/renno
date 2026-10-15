@@ -3024,6 +3024,9 @@ g(len)").unwrap_err();
             ("let Base = Int in let MkPair = fun a -> (let P = Tuple(Base, Base) in let p: P = (1, 2) in P) in 0", "0"),
             ("let A = Int in let F = (let B = A in let y: B = 1 in B) in let x: F = 1 in x", "1"),
             ("let A = Int in let MkL = fun u -> (let C = A in let rec L = Union(Tuple(C, L), Bool) in L) in let x: MkL(0) = true in x", "true"),
+            ("let A = Int in let F = (let rec g = fun n -> A in let y: g(0) = 1 in g) in let x: F(0) = 1 in x", "1"),
+            ("let A = Int in let F = (let rec L = Union(Tuple(A, L), Bool) in let y: L = true in L) in let x: F = (1, true) in x", "[1, true]"),
+            ("let A = Int in let F = (let rec T = (fun u -> u)(A) and k = 5 in let y: T = 1 in T) in let x: F = 1 in x", "1"),
         ];
         for (src, want) in cases {
             assert_eq!(run_source(src).unwrap().to_string(), *want, "{src}");
@@ -3135,20 +3138,51 @@ g(len)").unwrap_err();
         assert_linear_growth(function_nested);
     }
 
-    // Open nesting (the innermost definition reads an outer one) is still copied
-    // once per enclosing evaluation: a documented residual, so its growth is
-    // printed (`--nocapture`), not asserted.
+    // Open nesting (the innermost definition reads an outer one): an enclosing
+    // evaluation reads a nested definition's value instead of re-copying it.
     #[test]
-    fn nested_open_definitions_evaluate_as_before() {
-        let grown: Vec<usize> = [50, 100, 200]
-            .iter()
-            .map(|&d| {
-                let (grown, result) = arena_growth(open_nested(d));
-                assert_eq!(result, 1);
-                grown
-            })
-            .collect();
-        eprintln!("open nesting arena growth at depth 50/100/200: {grown:?}");
+    fn nested_open_definitions_grow_the_arena_linearly() {
+        assert_linear_growth(open_nested);
+    }
+
+    // `d` recursive function groups nested in each other's bodies, the innermost
+    // reading an outer definition; each is annotated by a `let` of its own.
+    fn grpnest_nested(d: usize) -> String {
+        let mut s = format!("let rec g{d} = fun n -> B in let y{d}: g{d}(0) = 1 in g{d}(0)");
+        for k in (2..d).rev() {
+            s = format!("let rec g{k} = fun n -> ({s}) in let y{k}: g{k}(0) = 1 in g{k}(0)");
+        }
+        format!("let B = Int in let rec g1 = fun n -> ({s}) in let x: g1(0) = 1 in x")
+    }
+
+    #[test]
+    fn nested_group_definitions_grow_the_arena_linearly() {
+        assert_linear_growth(grpnest_nested);
+    }
+
+    // B's 60000-step loop is spent once, in B's own evaluation; A reuses B's
+    // value, so A's budget only pays for its own loop.
+    #[test]
+    fn a_nested_definition_reuses_its_value_within_the_budget() {
+        let loop_ = "let rec loop = fun n -> if n == 0 then Int else loop(n - 1) in let K = fun a -> fun b -> a in";
+        let src = format!("{loop_} let A = (let B = loop(60000) in let y: B = 1 in loop(60000)) in let x: A = true in x");
+        let (mut arena, spans, root) = parser::parse(&src).expect("parse");
+        let err = typecheck::check(&mut arena, root, &spans).expect_err("A is Int, x is Bool");
+        assert!(err.0.contains("expected Int, found Bool"), "{}", err.0);
+    }
+
+    // Reuse never triggers an evaluation: C is read by nothing.
+    #[test]
+    fn a_nested_definition_nothing_reads_is_not_evaluated() {
+        assert_eq!(definitions_evaluated("let A = (let C = Int in C) in let x: A = 1 in x"), 1);
+    }
+
+    // D fails (fuel) but sits in an untaken branch: A's evaluation never reaches it.
+    #[test]
+    fn a_failed_nested_definition_does_not_fail_an_untaken_branch() {
+        let src = "let rec loop = fun n -> loop(n) in let A = if true then Int else (let D = loop(1) in let y: D = 1 in D) in let x: A = true in x";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("expected Int, found Bool"), "{err}");
     }
 
     // Two definitions per group (an early one for the group's own values, a final
