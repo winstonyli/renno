@@ -663,7 +663,13 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                                 }
                                 // Never Ty: every type constructor takes one argument.
                                 Value::PartialBuiltin(b, prev_args) => {
-                                    let args = (*prev_args).clone();
+                                    // Take the collected args when this call is their only
+                                    // holder; clone (and count it) when the partial is shared.
+                                    let args = Rc::try_unwrap(prev_args).unwrap_or_else(|shared| {
+                                        #[cfg(test)]
+                                        PARTIAL_SHARED.with(|c| c.set(c.get() + 1));
+                                        (*shared).clone()
+                                    });
                                     set_current_span(callee_span);
                                     control = enter(collect_builtin_arg(b, args, value), &mut cont);
                                 }
@@ -894,6 +900,12 @@ fn param_witness(param: &Type, arg: &Value) -> Option<(String, Len)> {
         _ => Len::NoValue(n.as_str().into()),
     };
     Some((n.clone(), len))
+}
+
+#[cfg(test)]
+thread_local! {
+    // How many times a PartialBuiltin call found its collected args shared (and cloned them).
+    pub(crate) static PARTIAL_SHARED: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]

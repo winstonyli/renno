@@ -3118,6 +3118,19 @@ g(len)").unwrap_err();
         assert_eq!(few, many, "minting must not grow with the number of calls");
     }
 
+    #[test]
+    fn a_partial_builtin_called_once_hands_over_its_args_without_cloning() {
+        let shared = |src: &str, want: i64| {
+            machine::PARTIAL_SHARED.with(|c| c.set(0));
+            assert_eq!(run_source_on_this_thread(src).expect("runs").as_int(), want);
+            machine::PARTIAL_SHARED.with(|c| c.get())
+        };
+        let once = "fold(fun a -> fun x -> a + x)(0)([1, 2, 3])";
+        assert_eq!(shared(once, 6), 0, "a one-shot curried call owns its collected args");
+        let twice = "let g = fold(fun a -> fun x -> a + x)(0) in g([1, 2]) + g([3])";
+        assert!(shared(twice, 6) >= 1, "a partial used twice is shared, so its args are cloned");
+    }
+
     // ---- P3 pins (docs/superpowers/plans/2026-10-16-p3-contract-node.md): boundary behavior the
     // one-node merge must keep exactly ----
 
