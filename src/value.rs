@@ -1,7 +1,7 @@
 use std::fmt;
 use std::rc::Rc;
 
-use crate::cont::Cont;
+use crate::cont::Captured;
 use crate::env::Env;
 use crate::expr::{ExprRef, Lazy, Len, ConformSpec};
 use crate::list::List;
@@ -246,7 +246,7 @@ pub enum Value {
     // (including itself) with no mutation and no Rc cycle: each call
     // re-derives its own siblings.
     RecClosure(Rc<[ExprRef]>, usize, Env),
-    Continuation(Cont),
+    Continuation(Rc<Captured>),
     Handler(Rc<HandlerData>),
     Builtin(Builtin),
     // A multi-arg Builtin (Map, Fold) with some but not all of its

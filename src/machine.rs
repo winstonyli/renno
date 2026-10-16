@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::cont::{Cont, Frame, Node};
+use crate::cont::{Cont, Frame, Meta, Node};
 use crate::env::{Env, PRELUDE};
 use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
 use crate::frame::Bindings;
@@ -260,8 +260,8 @@ fn annotation_value(spec: &AnnotSpec, outcome: Result<Value, Stuck>) -> Rc<Type>
 }
 
 // Feeds `value`, a callback's (or an element's) result, to the Iterate frame on top of `cont`.
-// Its node is copied first (`Cont::unshared_top`) if anything else holds it, which only
-// happens transiently (a captured continuation holds clones of frames, never the live nodes).
+// Its node is copied first (`Cont::unshared_top`) if anything else holds it: after a resume
+// while the captured continuation is alive, the live top node IS the captured segment's.
 fn iterate(cont: &mut Cont, value: Value, spans: &SpanMap) -> Control {
     let Frame::Iterate { state, pending } = &mut cont.unshared_top().frame else {
         unreachable!("internal: iterate is called on an Iterate frame")
@@ -331,6 +331,9 @@ fn enter(dispatch: Dispatch, cont: &mut Cont) -> Control {
 // type-constructor builtins. Every PURE test is a constant, so the ordinary
 // instance (`run_loop::<false>`) compiles without them: no cost on the hot path.
 fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap, resolved: &Resolved, mut fuel: u64) -> Result<Value, Stuck> {
+    // The handlers (and joins) below the segment `cont` is running; each run starts with none.
+    // PURE never installs one.
+    let mut meta = Meta::default();
     loop {
         // Native code between sub-evaluations (a higher-order builtin's callbacks, a
         // literal's elements, a `let rec` group's values) takes the result first. Its state is
@@ -583,7 +586,16 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
             // eagerly cloning the whole frame (most fields on most arms
             // would otherwise be cloned and immediately discarded).
             Control::Apply(value) => match cont.node() {
-                None => return Ok(value),
+                // The segment returned: continue after the nearest mark (a handler's identity
+                // return clause, or a join), going round the loop again so the Iterate check
+                // sees the new top.
+                None => match meta.underflow() {
+                    None => return Ok(value),
+                    Some(rest) => {
+                        cont = rest;
+                        control = Control::Apply(value);
+                    }
+                },
                 Some(Node { frame, rest }) => {
                     let rest = rest.clone();
                     // Each arm clones the specific fields it needs into
@@ -632,13 +644,14 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                                     control = Control::Eval(group[index], frame.extend(&closure_env));
                                 }
                                 Value::Continuation(k) => {
-                                    // resume(value): splice the captured
+                                    // resume(value): push the captured
                                     // continuation back in front of whatever
-                                    // comes after this call. Cloning k here
-                                    // (each time resume is invoked) is just
-                                    // an Rc clone -- multi-shot is calling
-                                    // this arm more than once with the same k.
-                                    cont = Cont::append(&k, &cont);
+                                    // comes after this call: its segment by
+                                    // pointer, plus its marks. Nothing is
+                                    // copied per frame -- multi-shot is
+                                    // calling this arm more than once with
+                                    // the same k.
+                                    meta.resume(&k, &mut cont);
                                     control = Control::Apply(value);
                                 }
                                 Value::Builtin(b) => {
@@ -665,7 +678,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                             cont = rest;
                             match value {
                                 Value::Handler(data) => {
-                                    cont = Cont::cons(Frame::HandlerMark(data), cont);
+                                    meta.install(data, &mut cont);
                                     control = Control::Eval(body, env);
                                 }
                                 _ => crate::run_error!("handle: expected a handler value"),
@@ -738,21 +751,12 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                             cont = rest;
                             control = Control::Perform(effect, value);
                         }
-                        Frame::HandlerMark(_) => {
-                            // Handled body finished normally (no pending
-                            // effect reached this mark) -- identity return
-                            // clause: just pass the value through. Nothing
-                            // in the HandlerData is needed here, so nothing
-                            // gets cloned.
-                            cont = rest;
-                            control = Control::Apply(value);
-                        }
                     }
                 }
             },
 
             Control::Perform(effect, payload) => {
-                control = perform(&mut cont, &effect, payload);
+                control = perform(&mut cont, &mut meta, &effect, payload);
             }
         }
     }
@@ -1812,41 +1816,16 @@ fn value_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-// Search outward through `cont` for a matching HandlerMark, capturing every
-// frame passed along the way into `k`. `k` becomes the first-class
-// `resume` value bound in the handler body -- a persistent Cont, so the
-// handler can apply it zero, one, or many times. No arena needed here --
-// HandlerData.body is an ExprRef, just handed to Control::Eval as-is; the
-// next loop iteration in `run` is what looks it up.
-fn perform(cont: &mut Cont, effect: &str, payload: Value) -> Control {
-    let mut captured = Vec::new();
-    let mut node = cont.clone();
-
-    loop {
-        match node.node() {
-            None => crate::run_error!("unhandled effect: {effect}"),
-            Some(Node { frame, rest }) => {
-                crate::cont::count_walked();
-                if let Frame::HandlerMark(data) = frame {
-                    if data.effect == effect {
-                        // deep: reinstall this same HandlerMark at the far
-                        // end of k, exactly where it originally sat, so an
-                        // effect performed while running the resumed
-                        // continuation is caught by this handler again.
-                        // shallow: k ends bare -- a repeat occurrence
-                        // escapes to whatever handler sits further out.
-                        let base = if data.deep { Cont::cons(frame.clone(), Cont::nil()) } else { Cont::nil() };
-                        let k = Cont::from_frames(captured, base);
-                        let handler_env = data.env.push2(payload, Value::Continuation(k));
-                        *cont = rest.clone();
-                        return Control::Eval(data.body, handler_env);
-                    }
-                }
-                captured.push(frame.clone());
-                node = rest.clone();
-            }
-        }
-    }
+// Search outward through the marks for the nearest handler of `effect`
+// (Meta::capture). The current segment and the marks passed become `k`, the
+// first-class `resume` value bound in the handler body -- immutable, so the
+// handler can apply it zero, one, or many times; the handler's own clause runs
+// outside it (deep: `resume` reinstalls it; shallow: it does not). No arena
+// needed here -- HandlerData.body is an ExprRef, just handed to Control::Eval
+// as-is; the next loop iteration in `run` is what looks it up.
+fn perform(cont: &mut Cont, meta: &mut Meta, effect: &str, payload: Value) -> Control {
+    let Some((data, k)) = meta.capture(effect, cont) else { crate::run_error!("unhandled effect: {effect}") };
+    Control::Eval(data.body, data.env.push2(payload, Value::Continuation(k)))
 }
 
 #[cfg(test)]

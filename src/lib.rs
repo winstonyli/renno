@@ -10756,31 +10756,33 @@ g(len)").unwrap_err();
         )
     }
 
-    // Walked linearly (at most two marks per perform: the capture's and the resume's), and
-    // frame nodes allocated linearly: doubling n doubles the allocations.
-    fn assert_linear(program: fn(usize) -> String, walked_bound: impl Fn(usize) -> usize, alloc_per_level: usize) {
+    // Walked linearly (two marks per perform: the capture's and the resume's), and frame nodes
+    // allocated linearly: doubling n doubles the allocations, at most `alloc_per_level` per
+    // level (measured on the green run: 12, 14 and 12 plus a constant; the old code's counts
+    // were quadratic, 4,030,009 at n = 2000).
+    fn assert_linear(program: fn(usize) -> String, alloc_per_level: usize) {
         let (out, cons, walked) = cont_cost(&program(2000));
         assert_eq!(out, Outcome::Int(2000));
-        assert!(walked <= walked_bound(2000), "walked {walked} > {}", walked_bound(2000));
+        assert!(walked <= 2 * 2000 + 10, "walked {walked}");
         let (_, cons_half, _) = cont_cost(&program(1000));
         let ratio = cons as f64 / cons_half as f64;
         assert!((1.9..=2.1).contains(&ratio), "cons {cons_half} -> {cons}: ratio {ratio}");
-        assert!(cons <= alloc_per_level * 2000, "cons {cons} > {alloc_per_level} per level");
+        assert!(cons <= alloc_per_level * 2000 + 16, "cons {cons} > {alloc_per_level} per level");
     }
 
     #[test]
     fn perform_in_non_tail_recursion_walks_and_allocates_linearly() {
-        assert_linear(perform_many, |n| 2 * n + 10, 20);
+        assert_linear(perform_many, 12);
     }
 
     #[test]
     fn perform_with_non_tail_resume_walks_and_allocates_linearly() {
-        assert_linear(perform_many_non_tail_resume, |n| 2 * n + 10, 20);
+        assert_linear(perform_many_non_tail_resume, 14);
     }
 
     #[test]
     fn perform_in_a_natural_map_walks_and_allocates_linearly() {
-        assert_linear(perform_in_rmap, |n| 2 * n + 10, 20);
+        assert_linear(perform_in_rmap, 12);
     }
 
     // The captured continuation is the pending 1000-deep recursion, resumed twice: neither the
