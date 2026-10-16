@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::cont::{Cont, ContNode, Frame};
+use crate::cont::{Cont, Frame, Node};
 use crate::env::{Env, PRELUDE};
 use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
 use crate::frame::Bindings;
@@ -259,20 +259,11 @@ fn annotation_value(spec: &AnnotSpec, outcome: Result<Value, Stuck>) -> Rc<Type>
     t
 }
 
-// The top node of `cont`, uniquely owned: copied (one frame clone, which for an Iterate
-// frame bumps its state's count) if anything else holds it, which only happens
-// transiently (a captured continuation holds clones of frames, never the live nodes).
-fn unshared_top(cont: &mut Cont) -> &mut ContNode {
-    if Rc::get_mut(&mut cont.0).is_none() {
-        let ContNode::Frame(frame, rest) = &*cont.0 else { unreachable!("internal: the top of an Iterate chain is a frame") };
-        *cont = Cont::cons(frame.clone(), rest.clone());
-    }
-    Rc::get_mut(&mut cont.0).expect("internal: just unshared")
-}
-
 // Feeds `value`, a callback's (or an element's) result, to the Iterate frame on top of `cont`.
+// Its node is copied first (`Cont::unshared_top`) if anything else holds it, which only
+// happens transiently (a captured continuation holds clones of frames, never the live nodes).
 fn iterate(cont: &mut Cont, value: Value, spans: &SpanMap) -> Control {
-    let ContNode::Frame(Frame::Iterate { state, pending }, _) = unshared_top(cont) else {
+    let Frame::Iterate { state, pending } = &mut cont.unshared_top().frame else {
         unreachable!("internal: iterate is called on an Iterate frame")
     };
     if let Some(b) = pending.take() {
@@ -290,7 +281,7 @@ fn follow(cont: &mut Cont, next: Next) -> Control {
     match next {
         Next::Call { f, a, b } => {
             if b.is_some() {
-                let ContNode::Frame(Frame::Iterate { pending, .. }, _) = unshared_top(cont) else {
+                let Frame::Iterate { pending, .. } = &mut cont.unshared_top().frame else {
                     unreachable!("internal: follow is called on an Iterate frame")
                 };
                 *pending = b;
@@ -314,7 +305,7 @@ fn follow(cont: &mut Cont, next: Next) -> Control {
 
 // Drops the Iterate frame on top of `cont`.
 fn pop(cont: &mut Cont) {
-    let ContNode::Frame(_, rest) = &*cont.0 else { unreachable!("internal: follow is called on an Iterate frame") };
+    let Some(Node { rest, .. }) = cont.node() else { unreachable!("internal: follow is called on an Iterate frame") };
     *cont = rest.clone();
 }
 
@@ -345,7 +336,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
         // literal's elements, a `let rec` group's values) takes the result first. Its state is
         // changed in place when only this evaluation holds it, so building n elements is
         // O(n); one a captured continuation shares is copied first.
-        if matches!(control, Control::Apply(_)) && matches!(&*cont.0, ContNode::Frame(Frame::Iterate { .. }, _)) {
+        if matches!(control, Control::Apply(_)) && matches!(cont.top(), Some(Frame::Iterate { .. })) {
             let Control::Apply(value) = control else { unreachable!() };
             control = iterate(&mut cont, value, spans);
             continue;
@@ -591,9 +582,9 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
             // specific fields it actually moves elsewhere, instead of
             // eagerly cloning the whole frame (most fields on most arms
             // would otherwise be cloned and immediately discarded).
-            Control::Apply(value) => match &*cont.0 {
-                ContNode::Nil => return Ok(value),
-                ContNode::Frame(frame, rest) => {
+            Control::Apply(value) => match cont.node() {
+                None => return Ok(value),
+                Some(Node { frame, rest }) => {
                     let rest = rest.clone();
                     // Each arm clones the specific fields it needs into
                     // owned locals FIRST (ending frame's borrow there),
@@ -1832,9 +1823,9 @@ fn perform(cont: &mut Cont, effect: &str, payload: Value) -> Control {
     let mut node = cont.clone();
 
     loop {
-        match &*node.0 {
-            ContNode::Nil => crate::run_error!("unhandled effect: {effect}"),
-            ContNode::Frame(frame, rest) => {
+        match node.node() {
+            None => crate::run_error!("unhandled effect: {effect}"),
+            Some(Node { frame, rest }) => {
                 crate::cont::count_walked();
                 if let Frame::HandlerMark(data) = frame {
                     if data.effect == effect {

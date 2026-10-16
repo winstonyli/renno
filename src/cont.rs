@@ -107,15 +107,16 @@ pub(crate) fn count_walked() {
     WALKED.with(|c| c.set(c.get() + 1));
 }
 
-// Persistent, Nil-terminated linked stack of frames. Cloning a Cont is an
-// Rc clone -- O(1) -- which is what lets a captured continuation be resumed
-// more than once without the calls interfering with each other.
-#[derive(Clone)]
-pub struct Cont(pub Rc<ContNode>);
+// Persistent linked stack of frames; `None` is the empty stack, which costs no allocation
+// (the same shape as `Env`). Cloning a Cont is an Rc clone -- O(1) -- which is what lets a
+// captured continuation be resumed more than once without the calls interfering with each
+// other.
+#[derive(Clone, Default)]
+pub struct Cont(Option<Rc<Node>>);
 
-pub enum ContNode {
-    Nil,
-    Frame(Frame, Cont),
+pub struct Node {
+    pub frame: Frame,
+    pub rest: Cont,
 }
 
 impl Frame {
@@ -127,13 +128,38 @@ impl Frame {
 
 impl Cont {
     pub fn nil() -> Cont {
-        Cont(Rc::new(ContNode::Nil))
+        Cont(None)
+    }
+
+    // The one place a frame node is allocated.
+    fn new_node(frame: Frame, rest: Cont) -> Rc<Node> {
+        #[cfg(test)]
+        CONS.with(|c| c.set(c.get() + 1));
+        Rc::new(Node { frame, rest })
     }
 
     pub fn cons(frame: Frame, rest: Cont) -> Cont {
-        #[cfg(test)]
-        CONS.with(|c| c.set(c.get() + 1));
-        Cont(Rc::new(ContNode::Frame(frame, rest)))
+        Cont(Some(Cont::new_node(frame, rest)))
+    }
+
+    // The top node, or None for the empty stack.
+    pub fn node(&self) -> Option<&Node> {
+        self.0.as_deref()
+    }
+
+    // The top frame, or None for the empty stack.
+    pub fn top(&self) -> Option<&Frame> {
+        self.node().map(|n| &n.frame)
+    }
+
+    // The top node, uniquely owned: copied (one frame clone, which for an Iterate frame bumps
+    // its state's count) if anything else holds it. Panics on the empty stack.
+    pub fn unshared_top(&mut self) -> &mut Node {
+        let rc = self.0.as_mut().expect("internal: the top of an Iterate chain is a frame");
+        if Rc::get_mut(rc).is_none() {
+            *rc = Cont::new_node(rc.frame.clone(), rc.rest.clone());
+        }
+        Rc::get_mut(rc).expect("internal: just unshared")
     }
 
     // Fold `frames` onto `tail`, frames[0] ending up closest to the top
@@ -155,34 +181,30 @@ impl Cont {
     pub fn append(k: &Cont, tail: &Cont) -> Cont {
         let mut frames = Vec::new();
         let mut node = k.clone();
-        loop {
-            match &*node.0 {
-                ContNode::Nil => break,
-                ContNode::Frame(f, rest) => {
-                    count_walked();
-                    frames.push(f.clone());
-                    node = rest.clone();
-                }
-            }
+        while let Some(Node { frame, rest }) = node.node() {
+            count_walked();
+            frames.push(frame.clone());
+            node = rest.clone();
         }
         Cont::from_frames(frames, tail.clone())
     }
 }
 
-// Rust's default Drop for a struct wrapping Rc<ContNode> recurses through `rest` one field-drop at a
+// Rust's default Drop for a struct wrapping Rc<Node> recurses through `rest` one field-drop at a
 // time, which is O(depth) native stack for a long continuation chain (many
 // nested lets/binops evaluated in sequence build exactly this shape).
 // Unwind iteratively instead via Rc::try_unwrap, stopping the moment some
 // other clone of a node is still held elsewhere (a captured/resumable
 // continuation, e.g.) -- that node and everything under it stays alive and
-// gets cleaned up normally by whoever else holds it.
+// gets cleaned up normally by whoever else holds it. Allocates nothing: the
+// emptied `rest` is `None`, so each node's own Drop finds nothing to unwind.
 impl Drop for Cont {
     fn drop(&mut self) {
-        let mut node = std::mem::replace(&mut self.0, Rc::new(ContNode::Nil));
-        loop {
-            match Rc::try_unwrap(node) {
-                Ok(ContNode::Frame(_, mut rest)) => node = std::mem::replace(&mut rest.0, Rc::new(ContNode::Nil)),
-                _ => break,
+        let mut cur = self.0.take();
+        while let Some(rc) = cur {
+            match Rc::try_unwrap(rc) {
+                Ok(mut node) => cur = node.rest.0.take(),
+                Err(_) => break,
             }
         }
     }

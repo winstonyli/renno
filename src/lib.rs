@@ -3602,8 +3602,8 @@ g(len)").unwrap_err();
 
     #[test]
     fn deep_cont_chain_drops_without_overflowing_the_stack() {
-        // Cont(Rc<ContNode>) is a struct wrapping an Rc pointing at
-        // "cargo + rest", so it has a recursive-Drop risk: a long enough
+        // Cont(Option<Rc<Node>>) is a struct wrapping an Rc pointing at
+        // "frame + rest", so it has a recursive-Drop risk: a long enough
         // chain's default field-by-field Drop recurses through `rest` and
         // can overflow the stack, independent of how the chain was built.
         // Built directly here (bypassing the parser/machine entirely) to
