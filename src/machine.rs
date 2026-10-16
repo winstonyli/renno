@@ -991,6 +991,20 @@ fn check_failed(spec: &CheckSpec, lens: &[Len], value: &Value) -> ! {
     crate::run_error!("type error: expected {}, found {}{at}", spec.to.brief(), found.type_name())
 }
 
+#[cfg(test)]
+thread_local! {
+    // Elements tested by the non-tracking walk: one per element of a scalar scan and one per
+    // `Step::Test` popped. The complexity tests bound it instead of timing (read on the thread
+    // that ran the program, the same pattern as LAZY_MINTS).
+    pub(crate) static CHECK_STEPS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[allow(unused_variables)]
+fn count_check_steps(n: usize) {
+    #[cfg(test)]
+    CHECK_STEPS.with(|c| c.set(c.get() + n));
+}
+
 enum Step<'t, 'a> {
     // Check this value against this test; the u32 is its path node.
     Test(&'t Test, &'a Value, u32),
@@ -1108,7 +1122,12 @@ fn walk<'t, 'a, const TRACK: bool>(
                     continue 'main;
                 }
                 Step::FailAt(v, node) => break 'step Fail { node, depth: depth_of(nodes, node), found: v },
-                Step::Test(t, v, node) => (t, v, node),
+                Step::Test(t, v, node) => {
+                    if !TRACK {
+                        count_check_steps(1);
+                    }
+                    (t, v, node)
+                }
             };
             let here = Fail { node, depth: depth_of(nodes, node), found: v };
             if let Some(ok) = leaf(t, v) {
@@ -1133,7 +1152,11 @@ fn walk<'t, 'a, const TRACK: bool>(
                     if leaf(element, v).is_some() {
                         // A scalar element test (`leaf` answers Some for those
                         // whatever the value): scan inline, nothing pushed.
-                        match items.iter().enumerate().find(|(_, x)| leaf(element, x) == Some(false)) {
+                        let scanned = items.iter().enumerate().find(|(_, x)| leaf(element, x) == Some(false));
+                        if !TRACK {
+                            count_check_steps(scanned.map_or(items.len(), |(i, _)| i + 1));
+                        }
+                        match scanned {
                             None => continue 'main,
                             Some((i, found)) => {
                                 let n = child::<TRACK>(nodes, node, Label::Element(i));
@@ -2247,5 +2270,86 @@ mod tests {
             }
         }
         assert!(failing > total / 10 && failing < total, "the generator should produce both outcomes: {failing}/{total} failing");
+    }
+
+    // The soundness net for block seals: values that share blocks (made only by the real list
+    // operations), checked by random tests in random order with repeats, must get the
+    // oracle's verdict, and failures the oracle's path, whatever was checked before. The
+    // length slots change between rounds, so a test that reads one must never be sealed.
+    fn element(r: &mut Rng, pool: &[Value]) -> Value {
+        match r.below(8) {
+            0 => Value::Bool(true),
+            1 => Value::Str(Rc::from("s")),
+            2 if !pool.is_empty() => pool[r.below(pool.len())].clone(),
+            _ => Value::Int(r.below(3) as i64),
+        }
+    }
+
+    fn random_pool(r: &mut Rng, size: usize) -> Vec<Value> {
+        let mut pool = vec![Value::List(List::empty())];
+        while pool.len() < size {
+            let pick = |r: &mut Rng, pool: &[Value]| pool[r.below(pool.len())].clone();
+            let list = |v: Value| match v {
+                Value::List(l) => Some(l),
+                _ => None,
+            };
+            let next = match r.below(10) {
+                0 => Some(Value::List(List::from_vec((0..r.below(6)).map(|_| element(r, &pool)).collect()))),
+                1..=3 => list(pick(r, &pool)).map(|l| Value::List(l.cons(element(r, &pool)))),
+                4 => list(pick(r, &pool)).and_then(|l| l.split_first().map(|(_, t)| Value::List(t))),
+                5 => list(pick(r, &pool)).zip(list(pick(r, &pool))).map(|(a, b)| Value::List(a.append(&b))),
+                6 => Some(Value::List(List::from_vec(vec![pick(r, &pool), pick(r, &pool)]))),
+                7 => Some(Value::List(List::from_vec(vec![pick(r, &pool)]))),
+                8 => Some(Value::Record(Rc::new(vec![("a".to_string(), pick(r, &pool)), ("b".to_string(), element(r, &pool))]))),
+                _ => list(pick(r, &pool)).map(|l| Value::List(l.cons(Value::Int(1)).cons(Value::Int(2)))),
+            };
+            pool.extend(next);
+        }
+        pool
+    }
+
+    // What a test needs before it runs: its seal ids.
+    fn prepare(_test: &mut Test, _defs: &mut [Test; 2]) {}
+
+    #[test]
+    fn checks_agree_with_the_recursive_definition_on_values_that_share_blocks() {
+        let mut r = Rng(0x2545_F491_4F6C_DD1D);
+        let pool = random_pool(&mut r, 160);
+        let by_hand = [
+            Test::ListOf(Box::new(Test::Int)),
+            Test::ListOf(Box::new(Test::Or(vec![Test::Int, Test::Str]))),
+            Test::ListOf(Box::new(Test::ListOf(Box::new(Test::Int)))),
+            Test::ListLen(Box::new(Test::Int), 2),
+            Test::ListOf(Box::new(Test::TupleOf(vec![Test::Int, Test::Int]))),
+        ];
+        let mut tests: Vec<(Test, [Test; 2])> = Vec::new();
+        for i in 0..60 {
+            let mut defs = [random_test(&mut r, 3, false), random_test(&mut r, 3, false)];
+            let mut test = by_hand.get(i).cloned().unwrap_or_else(|| random_test(&mut r, 4, false));
+            prepare(&mut test, &mut defs);
+            tests.push((test, defs));
+        }
+        let (mut failing, mut total) = (0, 0);
+        for round in 0..4 {
+            let mut lens = test_lens();
+            lens.rotate_left(round);
+            for _ in 0..5_000 {
+                let (test, defs) = &tests[r.below(tests.len())];
+                let v = &pool[r.below(pool.len())];
+                let (want_test, want_defs) = (subst_lens(test, &lens), defs.each_ref().map(|d| subst_lens(d, &lens)));
+                let want = holds_recursive(&want_test, &want_defs, v);
+                assert_eq!(want, test_holds(test, defs, &lens, v), "holds differs: {test:?} {defs:?} {v}");
+                total += 1;
+                if !want {
+                    failing += 1;
+                    let (mut want_path, mut got_path) = (Vec::new(), Vec::new());
+                    let want_found = explain_recursive(&want_test, &want_defs, v, &mut want_path);
+                    let got_found = explain(test, defs, &lens, v, &mut got_path);
+                    assert_eq!(want_path, got_path, "path differs: {test:?} {defs:?} {v}");
+                    assert!(std::ptr::eq(want_found, got_found), "found differs: {test:?} {defs:?} {v}");
+                }
+            }
+        }
+        assert!(failing > total / 20 && failing < total * 19 / 20, "both outcomes expected: {failing}/{total} failing");
     }
 }

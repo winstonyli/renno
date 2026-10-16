@@ -10942,4 +10942,240 @@ g(len)").unwrap_err();
         src.push_str(&format!("handle nest({n}) with deep(handler a(p, r) -> r(5))"));
         assert_eq!(finishes_within(2, &src).unwrap(), Outcome::Int(6));
     }
+
+    // ---- Block seals (docs/superpowers/plans/2026-10-16-contract-recheck-witness.md) ----
+    // A list function reached through a boundary used to re-check the whole list at every
+    // call. The complexity tests count the elements the walk tests (machine::CHECK_STEPS), so
+    // they are deterministic; the pins are programs whose verdicts and messages must not
+    // change.
+
+    // The program's outcome and the elements the non-tracking walk tested.
+    fn check_cost(src: &str) -> (Outcome, usize) {
+        machine::CHECK_STEPS.with(|c| c.set(0));
+        let v = run_source_on_this_thread(src).expect("runs");
+        (Outcome::from(&v), machine::CHECK_STEPS.with(|c| c.get()))
+    }
+
+    // Linear: the first check scans the list (>= n, so a dead counter fails), and no later
+    // call re-scans it.
+    fn assert_checks_linear(src: &str, n: usize) {
+        let (out, steps) = check_cost(src);
+        assert_eq!(out, Outcome::Int(n as i64));
+        assert!(steps >= n, "the first check must scan the list: {steps} steps");
+        assert!(steps <= 3 * n + 16, "check steps {steps} for n = {n}");
+    }
+
+    // P1: a parameter of a direct `let rec` annotated with a run-time binder.
+    fn prog_site_param(n: usize) -> String {
+        format!("let count = fun T -> (let rec go = fun xs: List(T) -> match xs | [] -> 0 | h :: t -> 1 + go(t) in go) in count(Int)(range(0)({n}))")
+    }
+
+    // P1c: the same over a cons-built list (several doubling blocks), so tails cross block
+    // boundaries and the blocks below the top must be sealed too.
+    fn prog_site_param_cons_built(n: usize) -> String {
+        format!(
+            "let build = fun n -> (let rec b = fun i -> if i == 0 then [] else i :: b(i - 1) in b(n)) in \
+             let count = fun T -> (let rec go = fun xs: List(T) -> match xs | [] -> 0 | h :: t -> 1 + go(t) in go) in count(Int)(build({n}))"
+        )
+    }
+
+    // P2: a function value given a function type from Dyn, called on a growing accumulator.
+    fn prog_contract_result(n: usize) -> String {
+        format!(
+            "let d: Dyn = fun xs -> 0 :: xs in let step: (List(Int) -> List(Int)) = d in \
+             let rec loop = fun i -> fun acc -> if i == 0 then len(acc) else loop(i - 1)(step(acc)) in loop({n})([])"
+        )
+    }
+
+    // P3: a Dyn value crossing to a static List(Int) inside a loop. (The annotated `let` is
+    // the crossing: passed straight to the recursive call it is not checked at all, because
+    // the callee's type is still being inferred there.)
+    fn prog_dyn_crossing(n: usize) -> String {
+        format!(
+            "let push: Dyn = fun x -> fun xs -> x :: xs in \
+             let rec loop = fun i -> fun acc: List(Int) -> if i == 0 then len(acc) else (let a: List(Int) = push(i)(acc) in loop(i - 1)(a)) in loop({n})([])"
+        )
+    }
+
+    // P5: `is(T)` in a loop over the tails.
+    fn prog_is_loop(n: usize) -> String {
+        format!("let rec go = fun xs -> match xs | [] -> 0 | h :: t -> (if is(List(Int))(t) then 1 else 0) + go(t) in go(range(0)({n}))")
+    }
+
+    // P4: an untrusted contract (a run-time function type) called with every tail.
+    fn prog_untrusted_contract(n: usize) -> String {
+        format!(
+            "let app = fun T -> fun f: (List(T) -> Int) -> (let rec go = fun xs: Dyn -> match xs | [] -> 0 | h :: t -> f(t) + go(t) in go) in \
+             app(Int)(fun l -> 1)(range(0)({n}))"
+        )
+    }
+
+    #[test]
+    fn site_param_recursion_checks_linearly() {
+        assert_checks_linear(&prog_site_param(N), N);
+    }
+
+    #[test]
+    fn site_param_recursion_over_a_cons_built_list_checks_linearly() {
+        assert_checks_linear(&prog_site_param_cons_built(N), N);
+    }
+
+    #[test]
+    fn contract_result_on_a_growing_accumulator_checks_linearly() {
+        assert_checks_linear(&prog_contract_result(N), N);
+    }
+
+    #[test]
+    fn dyn_crossing_in_a_loop_checks_linearly() {
+        assert_checks_linear(&prog_dyn_crossing(N), N);
+    }
+
+    #[test]
+    fn is_in_a_loop_checks_linearly() {
+        assert_checks_linear(&prog_is_loop(N), N);
+    }
+
+    #[test]
+    fn an_untrusted_contract_on_every_tail_checks_linearly() {
+        let (out, steps) = check_cost(&prog_untrusted_contract(N));
+        assert_eq!(out, Outcome::Int(N as i64));
+        assert!((N..=4 * N + 16).contains(&steps), "check steps {steps} for n = {N}");
+    }
+
+    // The 20k counter runs: release, with the scale gates.
+    #[test]
+    #[ignore]
+    fn scale_check_steps_20k() {
+        let n = 20_000;
+        for src in [prog_site_param(n), prog_site_param_cons_built(n), prog_contract_result(n), prog_dyn_crossing(n), prog_is_loop(n)] {
+            assert_checks_linear(&src, n);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_site_param_recursion_100k() {
+        assert_eq!(finishes_within(2, &prog_site_param(100_000)).unwrap(), Outcome::Int(100_000));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_contract_result_acc_100k() {
+        assert_eq!(finishes_within(2, &prog_contract_result(100_000)).unwrap(), Outcome::Int(100_000));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_dyn_crossing_loop_100k() {
+        assert_eq!(finishes_within(2, &prog_dyn_crossing(100_000)).unwrap(), Outcome::Int(100_000));
+    }
+
+    // ---- Semantic pins: green before and after seals; the texts are the main-4c58a36 ones ----
+
+    fn run_err(src: &str) -> String {
+        run_source(src).expect_err("a run-time type error")
+    }
+
+    const BUILD: &str = "let build = fun n -> (let rec b = fun i -> if i == 0 then [] else i :: b(i - 1) in b(n)) in";
+
+    // A cons onto a view claims the free slot above a sealed view: the bad element must not be
+    // skipped (pin 1). With 7 elements the top block is full, so the cons opens a new block
+    // over the sealed view instead (pin 2).
+    #[test]
+    fn a_bad_cons_over_a_sealed_view_is_still_found() {
+        for n in [5, 7] {
+            let src = format!(
+                "{BUILD} let xs = build({n}) in let d: Dyn = xs in let ok: List(Int) = d in let ys: Dyn = \"bad\" :: d in let z: List(Int) = ys in len(z)"
+            );
+            let err = run_err(&src);
+            assert!(err.starts_with("line 1, column 205: type error: expected [Int], found Str at element 0"), "{err}");
+        }
+    }
+
+    // `explain` counts the failing element from the head across a sealed 1000-element list.
+    #[test]
+    fn a_bad_element_above_a_sealed_list_is_named_by_its_index() {
+        let src = "let d: Dyn = range(0)(1000) in let ok: List(Int) = d in let bad: Dyn = \"bad\" in \
+                   let a: Dyn = 1 :: 2 :: 3 :: bad :: 4 :: 5 :: 6 :: 7 :: 8 :: d in let z: List(Int) = a in len(z)";
+        let err = run_err(src);
+        assert!(err.starts_with("line 1, column 165: type error: expected [Int], found Str at element 3"), "{err}");
+    }
+
+    // One value, two element tests: a pass for the wider test says nothing about the narrower.
+    #[test]
+    fn one_list_checked_against_two_element_tests_gets_each_verdict() {
+        let err = run_err("let xs: Dyn = [1, \"a\"] in let a: List(Union(Int, Str)) = xs in let b: List(Int) = xs in 0");
+        assert!(err.starts_with("line 1, column 83: type error: expected [Int], found Str at element 1"), "{err}");
+        let alternating = "let xs: Dyn = [1, \"a\"] in let a: List(Union(Int, Str)) = xs in \
+                           (is(List(Int))(xs), is(List(Union(Int, Str)))(xs), is(List(Int))(xs), is(List(Union(Int, Str)))(xs))";
+        assert_eq!(run_source(alternating).unwrap().to_string(), "[false, true, false, true]");
+    }
+
+    // An element test that reads a run-time length is never sealed: the same value passes for
+    // n = 2 and must fail for n = 3.
+    #[test]
+    fn a_length_reading_element_test_is_rechecked_for_every_length() {
+        let head = "let d: Dyn = [[1, 2]] in let f = fun v: Vec(n) -> (let z: List(Vec(n)) = d in len(z)) in";
+        assert_eq!(run_source(&format!("{head} f([0, 0])")).unwrap(), Outcome::Int(1));
+        let err = run_err(&format!("{head} let a = f([0, 0]) in f([0, 0, 0])"));
+        assert!(err.starts_with("line 1, column 74: type error: expected [[Dyn](n)], found List at element 0"), "{err}");
+    }
+
+    // Structurally different tests that differ only in a leaf, a literal length or a recursive
+    // body each keep their own verdict on one value.
+    #[test]
+    fn different_tests_on_one_value_do_not_share_a_seal() {
+        let err = run_err("let d: Dyn = [[1, 2]] in let a: List(Vec(2)) = d in let b: List(Vec(3)) = d in 0");
+        assert!(err.starts_with("line 1, column 75: type error: expected [[Dyn](3)], found List at element 0"), "{err}");
+        let rec = "let rec R1 = Union(Tuple(Int, R1), Bool) in let rec R2 = Union(Tuple(Str, R2), Bool) in \
+                   let d: Dyn = [(1, true)] in let a: List(R1) = d in let b: List(R2) = d in 0";
+        let err = run_err(rec);
+        assert!(err.starts_with("line 1, column 158: type error: expected [R2], found Int at element 0, element 0"), "{err}");
+    }
+
+    // A sealed tuple view only passes at its own height: `(0, t)` where `t` is a shorter view
+    // of an already-checked inner tuple still fails on its arity.
+    #[test]
+    fn a_shorter_view_of_a_checked_recursive_tuple_still_fails() {
+        let src = "let rec L = Union(Tuple(Int, L), Bool) in let v: Dyn = (1, (2, (3, false))) in let a: L = v in \
+                   let inner: Dyn = (match v | (a1, b1) -> b1 | _ -> 0) in let t: Dyn = (match inner | h :: t -> t | _ -> []) in let c: L = (0, t) in 0";
+        let err = run_err(src);
+        assert!(err.starts_with("line 1, column 217: type error: expected (Int, L) | Bool, found List at element 1"), "{err}");
+        let again = "let rec L = Union(Tuple(Int, L), Bool) in let v: Dyn = (1, (2, (3, false))) in let a: L = v in let b: L = v in 0";
+        assert_eq!(run_source(again).unwrap(), Outcome::Int(0));
+    }
+
+    // A failed check leaves nothing behind.
+    #[test]
+    fn a_failed_check_seals_nothing() {
+        let src = "let xs: Dyn = [1, 2, [3, \"x\"]] in (is(List(Union(Int, List(Int))))(xs), is(List(Union(Int, List(Int))))(xs))";
+        assert_eq!(run_source(src).unwrap().to_string(), "[false, false]");
+        // The first alternative fails deep inside element 0 and element 1 passes it: a later
+        // check against the first alternative's element type alone must still fail on element 0.
+        let err = run_err("let xs: Dyn = [[1, \"x\"], [1, 2]] in let a: List(Union(List(Int), List(Union(Int, Str)))) = xs in let b: List(List(Int)) = xs in 0");
+        assert!(err.starts_with("line 1, column 123: type error: expected [[Int]], found Str at element 0, element 1"), "{err}");
+    }
+
+    // Multi-shot: the contract result is checked once per resume.
+    #[test]
+    fn a_multi_shot_resume_through_a_list_contract_is_unchanged() {
+        let src = "let d: Dyn = fun xs -> 0 :: xs in let step: (List(Int) -> List(Int)) = d in \
+                   handle (let r = perform pick(0) in len(step(step(r)))) with deep(handler pick(p, resume) -> resume([1, 2]) + resume([3]))";
+        assert_eq!(run_source(src).unwrap(), Outcome::Int(7));
+    }
+
+    // The failure blames the parameter annotation, however many calls passed before it.
+    #[test]
+    fn a_late_bad_element_blames_the_parameter_annotation() {
+        let src = "let bad: Dyn = \"x\" in let run = fun T -> (let rec go = fun i -> fun acc: List(T) -> if i == 0 then len(acc) else go(i - 1)((if i == 600 then bad else i) :: acc) in go) in run(Int)(1000)([])";
+        let err = run_err(src);
+        assert!(err.starts_with("line 1, column 74: type error: expected [Int], found Str at element 0"), "{err}");
+    }
+
+    // The length is checked every time, before any seal is consulted.
+    #[test]
+    fn a_sealed_list_still_has_its_length_checked() {
+        let err = run_err("let d: Dyn = [1, 2, 3] in let a: List(Int) = d in let b: Vec(2) = d in 0");
+        assert!(err.starts_with("line 1, column 67: type error: expected [Dyn](2), found List"), "{err}");
+    }
 }
