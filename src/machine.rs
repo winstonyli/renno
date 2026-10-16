@@ -7,6 +7,7 @@ use crate::env::{Env, PRELUDE};
 use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
+use crate::iterate::{Iter, Next};
 use crate::resolve::{group_kind, resolve, GroupKind, Resolved, VarRef};
 use crate::span::Span;
 use crate::types::{close_group, first_free, fresh_rec_id, EffectRow, Hc, RecVar, Type};
@@ -257,23 +258,71 @@ fn annotation_value(spec: &AnnotSpec, outcome: Result<Value, Stuck>) -> Rc<Type>
     t
 }
 
-// Calls a renno function VALUE from native Rust code (used by fold/map's
-// Builtin dispatch below to invoke the callback once per element) by
-// seeding the same trampoline the AppArg frame's own dispatch already
-// implements, rather than duplicating that Closure/Continuation/Builtin
-// matching logic a second time.
-//
-// The seeded continuation is fresh (Cont::nil()), not the caller's real
-// one -- so an effect performed inside `func` can NEVER reach a `handle`
-// that lexically wraps the outer fold/map call; it always panics
-// "unhandled effect", regardless of what the calling program looks like.
-// Threading the real outer continuation through a native re-entrant call
-// like this is a substantially harder problem (effect handlers crossing
-// an FFI-like boundary) that this feature doesn't attempt. In practice
-// this is the expected shape for a structural-recursion primitive anyway
-// -- fold/map are conventionally pure transformations.
-pub fn apply(arena: &Arena, func: Value, arg: Value, spans: &SpanMap, resolved: &Resolved) -> Value {
-    finished(run_loop::<false>(arena, Control::Apply(arg), Cont::cons(Frame::AppArg { func, callee_span: None }, Cont::nil()), spans, resolved, 0))
+// The top node of `cont`, uniquely owned: copied (one frame clone, which for an Iterate
+// frame bumps its state's count) if anything else holds it, which only happens
+// transiently (a captured continuation holds clones of frames, never the live nodes).
+fn unshared_top(cont: &mut Cont) -> &mut ContNode {
+    if Rc::get_mut(&mut cont.0).is_none() {
+        let ContNode::Frame(frame, rest) = &*cont.0 else { unreachable!("internal: the top of an Iterate chain is a frame") };
+        *cont = Cont::cons(frame.clone(), rest.clone());
+    }
+    Rc::get_mut(&mut cont.0).expect("internal: just unshared")
+}
+
+// Feeds `value`, a callback's result, to the Iterate frame on top of `cont`.
+fn iterate(cont: &mut Cont, value: Value) -> Control {
+    let ContNode::Frame(Frame::Iterate { state, pending }, _) = unshared_top(cont) else {
+        unreachable!("internal: iterate is called on an Iterate frame")
+    };
+    if let Some(b) = pending.take() {
+        // The first half of a two-argument call returned a function: apply it to `b`.
+        *cont = Cont::cons(Frame::AppArg { func: value, callee_span: None }, cont.clone());
+        return Control::Apply(b);
+    }
+    // Copy-on-write: copies the state only if a captured continuation still holds it.
+    let next = Rc::make_mut(state).step(value);
+    follow(cont, next)
+}
+
+// Does what the Iterate frame on top of `cont` asked for.
+fn follow(cont: &mut Cont, next: Next) -> Control {
+    match next {
+        Next::Call { f, a, b } => {
+            if b.is_some() {
+                let ContNode::Frame(Frame::Iterate { pending, .. }, _) = unshared_top(cont) else {
+                    unreachable!("internal: follow is called on an Iterate frame")
+                };
+                *pending = b;
+            }
+            // The same entry an ordinary call takes, so closures, continuations,
+            // builtins and contracts all behave as they do anywhere else.
+            *cont = Cont::cons(Frame::AppArg { func: f, callee_span: None }, cont.clone());
+            Control::Apply(a)
+        }
+        Next::Done(v) => {
+            let ContNode::Frame(_, rest) = &*cont.0 else { unreachable!("internal: follow is called on an Iterate frame") };
+            *cont = rest.clone();
+            Control::Apply(v)
+        }
+    }
+}
+
+// What a saturated builtin call does: yields a value, or starts a step-driven computation
+// whose first request is `Next` (already `Done` for an empty list: no frame).
+enum Dispatch {
+    Value(Value),
+    Iterate(Iter, Next),
+}
+
+// Continues `cont` with a builtin call's outcome, pushing the Iterate frame if one starts.
+fn enter(dispatch: Dispatch, cont: &mut Cont) -> Control {
+    match dispatch {
+        Dispatch::Value(v) | Dispatch::Iterate(_, Next::Done(v)) => Control::Apply(v),
+        Dispatch::Iterate(iter, next) => {
+            *cont = Cont::cons(Frame::Iterate { state: Rc::new(iter), pending: None }, cont.clone());
+            follow(cont, next)
+        }
+    }
 }
 
 // PURE is eval_pure's check mode: a step budget (`fuel`), no effects, only the
@@ -284,12 +333,20 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
         // A list, record or type-group accumulator frame that only this evaluation holds is
         // moved, not cloned, so building n elements is O(n). A frame a captured
         // continuation shares falls through to the cloning arms below.
-        if matches!(control, Control::Apply(_))
-            && let Some((frame, rest)) = cont.take_unshared_elems()
-        {
-            let Control::Apply(value) = control else { unreachable!() };
-            (control, cont) = advance_elems(arena, spans, frame, rest, value);
-            continue;
+        if matches!(control, Control::Apply(_)) {
+            if let Some((frame, rest)) = cont.take_unshared_elems() {
+                let Control::Apply(value) = control else { unreachable!() };
+                (control, cont) = advance_elems(arena, spans, frame, rest, value);
+                continue;
+            }
+            // A higher-order builtin between callbacks takes the result first. None can run
+            // in check mode (only type constructors dispatch there), so that instance
+            // compiles without the test.
+            if !PURE && matches!(&*cont.0, ContNode::Frame(Frame::Iterate { .. }, _)) {
+                let Control::Apply(value) = control else { unreachable!() };
+                control = iterate(&mut cont, value);
+                continue;
+            }
         }
         match control {
             Control::Eval(expr, env) => {
@@ -615,13 +672,13 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                                         return Err(if matches!(b, Builtin::GetField) { Stuck::Field } else { Stuck::Builtin });
                                     }
                                     set_current_span(callee_span);
-                                    control = Control::Apply(collect_builtin_arg(arena, b, Vec::new(), value, spans, resolved));
+                                    control = enter(collect_builtin_arg(b, Vec::new(), value), &mut cont);
                                 }
                                 // Never Ty: every type constructor takes one argument.
                                 Value::PartialBuiltin(b, prev_args) => {
                                     let args = (*prev_args).clone();
                                     set_current_span(callee_span);
-                                    control = Control::Apply(collect_builtin_arg(arena, b, args, value, spans, resolved));
+                                    control = enter(collect_builtin_arg(b, args, value), &mut cont);
                                 }
                                 _ => {
                                     set_current_span(callee_span);
@@ -672,6 +729,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                             (control, cont) =
                                 advance_type_group(arena, spans, *group, ids.clone(), done.clone(), env.clone(), vals_env.clone(), rest, value);
                         }
+                        Frame::Iterate { .. } => unreachable!("internal: an Iterate frame is fed at the top of the loop"),
                         Frame::MatchArms { arms, env } => {
                             let (arms, env) = (arms.clone(), env.clone());
                             let outcome = first_match(&arms, 0, &value, &env);
@@ -1546,16 +1604,55 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
 // Appends one argument to a builtin's collected-so-far list, dispatching
 // the real operation once `b`'s declared arity is reached, otherwise
 // handing back a PartialBuiltin waiting for the rest.
-fn collect_builtin_arg(arena: &Arena, b: Builtin, mut args: Vec<Value>, arg: Value, spans: &SpanMap, resolved: &Resolved) -> Value {
+fn collect_builtin_arg(b: Builtin, mut args: Vec<Value>, arg: Value) -> Dispatch {
     args.push(arg);
-    if args.len() == b.arity() {
-        dispatch_builtin(arena, b, args, spans, resolved)
-    } else {
-        Value::PartialBuiltin(b, Rc::new(args))
+    if args.len() != b.arity() {
+        return Dispatch::Value(Value::PartialBuiltin(b, Rc::new(args)));
+    }
+    match b {
+        Builtin::Map | Builtin::Filter | Builtin::Fold | Builtin::Sort => start_iteration(b, args),
+        _ => Dispatch::Value(dispatch_builtin(b, args)),
     }
 }
 
-fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &SpanMap, resolved: &Resolved) -> Value {
+// The higher-order builtins: argument shapes are checked here, before any callback runs
+// (the same messages and callee span as ever); the callbacks run as a Frame::Iterate.
+fn start_iteration(b: Builtin, mut args: Vec<Value>) -> Dispatch {
+    let (iter, next) = match b {
+        Builtin::Map => {
+            let (list, f) = (args.pop(), args.pop());
+            match (f, list) {
+                (Some(f), Some(Value::List(items))) => Iter::map(f, items),
+                _ => crate::run_error!("map expects a function and a list"),
+            }
+        }
+        Builtin::Fold => {
+            let (list, init, f) = (args.pop(), args.pop(), args.pop());
+            match (f, init, list) {
+                (Some(f), Some(init), Some(Value::List(items))) => Iter::fold(f, init, items),
+                _ => crate::run_error!("fold expects a function, an initial value, and a list"),
+            }
+        }
+        Builtin::Filter => {
+            let (list, pred) = (args.pop(), args.pop());
+            match (pred, list) {
+                (Some(pred), Some(Value::List(items))) => Iter::filter(pred, items),
+                _ => crate::run_error!("filter expects a function and a list"),
+            }
+        }
+        Builtin::Sort => {
+            let (list, cmp) = (args.pop(), args.pop());
+            match (cmp, list) {
+                (Some(cmp), Some(Value::List(items))) => Iter::sort(cmp, &items),
+                _ => crate::run_error!("sort expects a comparator and a list"),
+            }
+        }
+        _ => unreachable!("internal: not a higher-order builtin"),
+    };
+    Dispatch::Iterate(iter, next)
+}
+
+fn dispatch_builtin(b: Builtin, mut args: Vec<Value>) -> Value {
     match b {
         // deep/shallow: clone the handler data, flip the `deep` bit, hand
         // back a new handler value. No AST-level flag.
@@ -1628,47 +1725,8 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             Some(v) => Value::Str(Rc::from(v.to_string())),
             None => crate::run_error!("to_str expects one argument"),
         },
-        Builtin::Map => {
-            let (list, f) = (args.pop(), args.pop());
-            match (f, list) {
-                (Some(f), Some(Value::List(items))) => {
-                    let mapped: Vec<Value> =
-                        items.iter().map(|v| apply(arena, f.clone(), v.clone(), spans, resolved)).collect();
-                    Value::List(Rc::new(mapped))
-                }
-                _ => crate::run_error!("map expects a function and a list"),
-            }
-        }
-        Builtin::Fold => {
-            let (list, init, f) = (args.pop(), args.pop(), args.pop());
-            match (f, init, list) {
-                (Some(f), Some(init), Some(Value::List(items))) => {
-                    let mut acc = init;
-                    for item in items.iter() {
-                        // f is curried (one renno-level argument at a
-                        // time): f(acc) yields a closure, applied to item.
-                        let partial = apply(arena, f.clone(), acc, spans, resolved);
-                        acc = apply(arena, partial, item.clone(), spans, resolved);
-                    }
-                    acc
-                }
-                _ => crate::run_error!("fold expects a function, an initial value, and a list"),
-            }
-        }
-        Builtin::Filter => {
-            let (list, pred) = (args.pop(), args.pop());
-            match (pred, list) {
-                (Some(pred), Some(Value::List(items))) => {
-                    let filtered: Vec<Value> = items
-                        .iter()
-                        .filter(|v| apply(arena, pred.clone(), (*v).clone(), spans, resolved).as_bool())
-                        .cloned()
-                        .collect();
-                    Value::List(Rc::new(filtered))
-                }
-                _ => crate::run_error!("filter expects a function and a list"),
-            }
-        }
+        // Higher-order: collect_builtin_arg sends these to start_iteration.
+        Builtin::Map | Builtin::Fold | Builtin::Filter | Builtin::Sort => unreachable!("internal: a higher-order builtin is started, not dispatched"),
         Builtin::Reverse => match args.pop() {
             Some(Value::List(items)) => {
                 let mut items = (*items).clone();
@@ -1677,26 +1735,6 @@ fn dispatch_builtin(arena: &Arena, b: Builtin, mut args: Vec<Value>, spans: &Spa
             }
             _ => crate::run_error!("reverse expects a list"),
         },
-        Builtin::Sort => {
-            let (list, cmp) = (args.pop(), args.pop());
-            match (cmp, list) {
-                (Some(cmp), Some(Value::List(items))) => {
-                    let mut items = (*items).clone();
-                    items.sort_by(|a, b| {
-                        let a_first = apply(arena, apply(arena, cmp.clone(), a.clone(), spans, resolved), b.clone(), spans, resolved).as_bool();
-                        if a_first {
-                            std::cmp::Ordering::Less
-                        } else if apply(arena, apply(arena, cmp.clone(), b.clone(), spans, resolved), a.clone(), spans, resolved).as_bool() {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            std::cmp::Ordering::Equal
-                        }
-                    });
-                    Value::List(Rc::new(items))
-                }
-                _ => crate::run_error!("sort expects a comparator and a list"),
-            }
-        }
         Builtin::Range => {
             let (end, start) = (args.pop(), args.pop());
             match (start, end) {

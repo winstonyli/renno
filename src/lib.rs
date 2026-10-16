@@ -3,6 +3,7 @@ pub mod env;
 pub mod expr;
 pub mod frame;
 pub mod index_expr;
+pub mod iterate;
 pub mod lexer;
 pub mod machine;
 pub mod parser;
@@ -1024,7 +1025,7 @@ mod tests {
     #[test]
     fn fold_sums_left_to_right() {
         // f is curried (one renno arg at a time): fold applies f(acc)(item)
-        // via two native machine::apply calls per element.
+        // via two applications per element (Frame::Iterate's `pending`).
         assert_eq!(run_untyped("fold(fun acc -> fun x -> acc + x)(0)([1, 2, 3, 4])").as_int(), 10);
     }
 
@@ -1033,18 +1034,120 @@ mod tests {
         assert_eq!(run_untyped("fold(fun acc -> fun x -> acc + x)(42)([])").as_int(), 42);
     }
 
+    // --- effects through higher-order builtins ---
+
+    // map/filter/fold/sort run as a Frame::Iterate on the real continuation, so a
+    // callback's effect reaches the handler around the call, multi-shot included.
     #[test]
-    fn effect_inside_map_callback_cannot_reach_an_outer_handler() {
-        expect_run_error("unhandled effect: log", || {
-        // Documented limitation: map/fold call their callback via
-        // machine::apply, which seeds a FRESH continuation -- an effect
-        // performed inside the callback can never reach a `handle` that
-        // lexically wraps the map/fold call itself. Expected shape for a
-        // native structural-recursion primitive (conventionally pure),
-        // not something this feature attempts to fix.
-        let src = "handle map(fun x -> perform log(x))([1, 2, 3]) with handler log(p, resume) -> resume(p)";
-        run_untyped(src);
+    fn effect_inside_map_callback_reaches_an_outer_handler() {
+        let src = "handle map(fun x -> perform log(x))([1, 2, 3]) with deep(handler log(p, resume) -> resume(p))";
+        assert_eq!(run_untyped(src).to_string(), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn map_callback_effect_under_a_deep_handler() {
+        let src = "handle map(fun x -> perform choose(x))([1, 2]) with deep(handler choose(p, resume) -> resume(p + 100))";
+        assert_eq!(run_untyped(src).to_string(), "[101, 102]");
+        // The typed path (check, elaborate, run) agrees.
+        let typed = run_source(src).unwrap();
+        assert_eq!(typed, Outcome::List(vec![Outcome::Int(101), Outcome::Int(102)]));
+    }
+
+    #[test]
+    fn map_callback_effect_under_a_shallow_handler() {
+        let one = "handle map(fun x -> perform choose(x))([1]) with handler choose(p, resume) -> resume(p + 100)";
+        assert_eq!(run_untyped(one).to_string(), "[101]");
+        // The second perform runs inside the resumed continuation, past a shallow
+        // handler, exactly as for a renno-level map.
+        expect_run_error("unhandled effect: choose", || {
+            run_untyped("handle map(fun x -> perform choose(x))([1, 2]) with handler choose(p, resume) -> resume(p + 100)");
         });
+    }
+
+    #[test]
+    fn filter_callback_effect_reaches_the_handler() {
+        let src = "handle filter(fun x -> perform keep(x))([1, 2, 3, 4]) with deep(handler keep(p, resume) -> resume(p % 2 == 0))";
+        assert_eq!(run_untyped(src).to_string(), "[2, 4]");
+    }
+
+    #[test]
+    fn fold_callback_effect_reaches_the_handler() {
+        let src = "handle fold(fun a -> fun x -> a + perform ask(x))(0)([1, 2, 3]) with deep(handler ask(p, resume) -> resume(p * 10))";
+        assert_eq!(run_untyped(src).as_int(), 60);
+    }
+
+    #[test]
+    fn sort_comparator_effect_reaches_the_handler() {
+        let src = "handle sort(fun a -> fun b -> perform le((a, b)))([3, 1, 2]) \
+                   with deep(handler le(p, resume) -> match p | (a, b) -> resume(a <= b))";
+        assert_eq!(run_untyped(src).to_string(), "[1, 2, 3]");
+    }
+
+    // The builtin's multi-shot behavior is the renno-level map's.
+    #[test]
+    fn multi_shot_through_map_matches_a_renno_level_map() {
+        let handler = "deep(handler choose(p, resume) -> resume(p + 100) ++ resume(p + 200))";
+        let builtin = format!("handle map(fun x -> perform choose(x))([1, 2]) with {handler}");
+        let renno = format!(
+            "let rec rmap = fun f -> fun xs -> match xs | [] -> [] | h :: t -> f(h) :: rmap(f)(t) in \
+             handle rmap(fun x -> perform choose(x))([1, 2]) with {handler}"
+        );
+        let got = run_untyped(&builtin).to_string();
+        assert_eq!(got, run_untyped(&renno).to_string());
+        assert_eq!(got, "[101, 102, 101, 202, 201, 102, 201, 202]");
+    }
+
+    // The second branch must see the sort state as of its capture: a first branch that
+    // mutated the shared state in place would leave `[2, 1]` for the second.
+    #[test]
+    fn multi_shot_through_sort_copies_the_captured_state() {
+        let src = "handle sort(fun a -> fun b -> perform le(0))([2, 1]) \
+                   with deep(handler le(p, resume) -> resume(true) ++ resume(false))";
+        assert_eq!(run_untyped(src).to_string(), "[2, 1, 1, 2]");
+    }
+
+    // The capture happens between fold's two curried halves f(acc) and (x), so the
+    // pending second argument must be kept per branch.
+    #[test]
+    fn multi_shot_through_fold_keeps_the_pending_argument_per_branch() {
+        let src = "handle fold(fun a -> perform pick(a))(0)([5]) \
+                   with deep(handler pick(p, resume) -> resume(fun x -> x + 1) + resume(fun x -> x * 10))";
+        assert_eq!(run_untyped(src).as_int(), 56);
+    }
+
+    // The callbacks run on the heap, not the native stack: nested 100000 deep on a
+    // default 2 MiB test thread.
+    #[test]
+    fn nested_builtin_callbacks_use_no_native_stack() {
+        let src = "let rec f = fun n -> if n == 0 then 0 else get(map(fun x -> f(n - 1) + 1)([1]))(0) in f(100000)";
+        assert_eq!(run_untyped(src).as_int(), 100000);
+    }
+
+    // Pins that hold before and after (written first, run against 898df97).
+    #[test]
+    fn resume_as_a_map_callback_still_works() {
+        let src = "handle (perform choose(0)) + 1 with handler choose(p, resume) -> map(resume)([1, 2])";
+        assert_eq!(run_untyped(src).to_string(), "[2, 3]");
+    }
+
+    #[test]
+    fn builtin_callback_errors_keep_their_text_and_location() {
+        let err = run_source("map(fun x -> perform log(x))([1])").unwrap_err();
+        assert!(err.contains("unhandled effect: log") && err.contains("line 1, column 1"), "unexpected message: {err}");
+        let err = run_source("map(3)([1, 2])").unwrap_err();
+        assert!(err.contains("attempt to call a non-function value") && err.contains("line 1, column 1"), "unexpected message: {err}");
+        let err = run_source("filter(fun x -> 1)([1])").unwrap_err();
+        assert!(err.contains("expected bool") && err.contains("line 1, column 17"), "unexpected message: {err}");
+        let err = run_source("map(1)(2)").unwrap_err();
+        assert!(err.contains("map expects a function and a list") && err.contains("line 1, column 1"), "unexpected message: {err}");
+    }
+
+    // sort(cmp): `cmp(x, y)` means "x may stay before y"; a merge takes the left element
+    // when cmp(left, right) holds, so a `<=` comparator is stable.
+    #[test]
+    fn sort_with_a_less_equal_comparator_is_stable() {
+        let src = "sort(fun a -> fun b -> get(a)(0) <= get(b)(0))([(1, \"a\"), (0, \"b\"), (1, \"c\"), (0, \"d\")])";
+        assert_eq!(run_untyped(src).to_string(), "[[0, b], [0, d], [1, a], [1, c]]");
     }
 
     #[test]
@@ -1119,8 +1222,8 @@ mod tests {
     #[test]
     fn let_rec_composes_with_map() {
         // `map`'s callback itself uses `let rec` internally -- confirms
-        // RecClosure works fine as a value passed through machine::apply,
-        // not just when called directly from the trampoline loop.
+        // RecClosure works fine as a value passed through a higher-order
+        // builtin, not just when called directly from the trampoline loop.
         let src = "map(fun n -> let rec loop = fun i -> if i < n then i + loop(i + 1) else 0 in loop(1))([3, 6])";
         assert_eq!(run_untyped(src).to_string(), "[3, 15]");
     }

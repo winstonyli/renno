@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use crate::env::Env;
 use crate::expr::{AnnotSpec, BinOp, CheckSpec, ExprRef, Lazy, Len, Pattern};
+use crate::iterate::Iter;
 use crate::span::Span;
 use crate::value::{HandlerData, SiteCtx, Value};
 
@@ -12,9 +13,9 @@ use crate::value::{HandlerData, SiteCtx, Value};
 pub enum Frame {
     // `callee_span` is the CALLEE sub-expression's own span (`f` in `f(a)`),
     // not the whole App -- Some when it came from an ordinary Eval of an
-    // App expr; None for AppArg frames built directly by machine::apply's
-    // native re-entrant call, e.g. fold/map's callback -- there's no App
-    // expr behind that, so CURRENT_SPAN is just left alone, same fallback
+    // App expr; None for AppArg frames the Iterate driver builds for a
+    // higher-order builtin's callback (map, filter, fold, sort) -- there's no
+    // App expr behind that, so CURRENT_SPAN is just left alone, same fallback
     // as before this field existed. Carried from AppFunc into AppArg so a
     // "not a function" panic blames `f` itself, not whatever the
     // argument's own span happened to be (the last thing Eval'd before the
@@ -90,6 +91,15 @@ pub enum Frame {
     // (one pointer bump) instead of six separately-cloned fields, and one
     // definition instead of two structurally-identical ones to keep in sync.
     HandlerMark(Rc<HandlerData>),
+    // A higher-order builtin (map, filter, fold, sort) between callbacks: machine::iterate
+    // feeds each callback's result to `state` and applies the callback to the next
+    // element, so the builtin's progress lives on the continuation, where `perform` can
+    // capture it and `resume` can replay it (multi-shot). `state` is shared copy-on-write:
+    // cloning this frame (a capture, a splice) is an Rc bump, and the driver copies the
+    // state only when it is about to change one a captured continuation still holds.
+    // `pending` is the second argument of a curried two-argument call (fold's `x` in
+    // f(acc)(x), sort's `b`) whose first half is running.
+    Iterate { state: Rc<Iter>, pending: Option<Value> },
 }
 
 // Persistent, Nil-terminated linked stack of frames. Cloning a Cont is an

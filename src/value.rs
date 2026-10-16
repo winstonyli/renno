@@ -27,17 +27,15 @@ pub enum Builtin {
     Shallow,
     // Str -> Int (character count) or List -> Int (element count).
     Len,
-    // (a -> b, [a]) -> [b]. Applies its callback via machine::apply --
-    // see that function's doc comment for the effect-handling caveat
-    // (the callback runs in a fresh continuation, so an effect it
-    // performs can never reach a `handle` wrapping the outer map call).
+    // (a -> b, [a]) -> [b]. Runs as a Frame::Iterate (iterate.rs): the
+    // callback is applied on the real continuation, so an effect it
+    // performs reaches a `handle` around the map call, multi-shot included.
     Map,
     // (acc -> a -> acc, acc, [a]) -> acc, left to right. The structural
-    // eliminator for List: a native, Rust-loop-driven fold is how renno
+    // eliminator for List: a native, step-driven fold is how renno
     // gets real list-consuming recursion without a general `let rec` --
     // unconditionally terminating (bounded by the list's own length),
-    // no user-definable fixpoint needed. Same effect-handling caveat as
-    // Map.
+    // no user-definable fixpoint needed. Runs as a Frame::Iterate like Map.
     Fold,
     // Str -> Dyn (never actually returns -- always panics with its
     // argument as the message). What a `where` refinement clause
@@ -86,8 +84,8 @@ pub enum Builtin {
     // separate feature of its own.
     ToStr,
     // (a -> Bool, [a]) -> [a]. Map's own structural sibling -- same
-    // callback-driven shape, same effect-handling caveat (see Map's own
-    // doc comment).
+    // callback-driven shape, also a Frame::Iterate (see Map's own doc
+    // comment).
     Filter,
     // [a] -> [a]. Single-arg, unlike Filter/Map -- nothing to call back
     // into, just an ordinary structural rebuild.
@@ -95,12 +93,11 @@ pub enum Builtin {
     // ((a, a) -> Bool, [a]) -> [a]. `cmp(x, y)` means "x belongs at or
     // before y". Bool, not a three-way Ordering -- renno has no Ordering
     // type, and Bool is the same contract every other renno-level
-    // predicate (Filter's own, map's callback) already uses. ponytail:
-    // dispatch_builtin's own Sort arm calls `cmp` up to twice per
-    // comparison (translating this Bool predicate into Rust's own
-    // Ordering for sort_by) -- upgrade to a single 3-way callback only if
-    // sort ever shows up in a profile; not worth an Ordering type for one
-    // builtin otherwise.
+    // predicate (Filter's own, map's callback) already uses. Calls `cmp`
+    // once per comparison, as a step-driven natural merge sort
+    // (iterate.rs): a merge takes the left element iff cmp(left, right),
+    // so a `<=` comparator is stable and a strict `<` orders ties
+    // right-first. Sorted and strictly reversed input take n-1 calls.
     Sort,
     // (Int, Int) -> [Int], exclusive of the end (`range(0, 3)` is
     // `[0, 1, 2]`) -- same convention as Rust's own `0..3`, not `..=`.

@@ -100,11 +100,8 @@ fn list_cons_recursion_source(n: i64) -> String {
 }
 
 // `sort(fun a -> fun b -> a <= b)(reverse(range(0, n)))` -- worst-case
-// input (fully reverse-sorted) to maximize comparator calls. Exercises
-// dispatch_builtin's own Sort arm, which its doc comment (value.rs) says
-// calls the renno-level comparator up to twice per comparison, gated
-// behind "only if sort ever shows up in a profile" -- no benchmark
-// existed to produce that evidence before now.
+// input (fully reverse-sorted). Exercises iterate.rs's step-driven Sort,
+// which detects the one descending run and answers in n-1 comparator calls.
 fn sort_source(n: i64) -> String {
     format!("sort(fun a -> fun b -> a <= b)(reverse(range(0)({n})))")
 }
