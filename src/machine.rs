@@ -7,7 +7,7 @@ use crate::env::{Env, PRELUDE};
 use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
-use crate::iterate::{Iter, Next};
+use crate::iterate::{step_shared, Iter, Next};
 use crate::resolve::{group_kind, resolve, GroupKind, Resolved, VarRef};
 use crate::span::Span;
 use crate::types::{first_free, fresh_rec_id, EffectRow, Hc, RecVar, Type};
@@ -280,7 +280,7 @@ fn iterate(cont: &mut Cont, value: Value, spans: &SpanMap) -> Control {
         return Control::Apply(b);
     }
     // Copy-on-write: copies the state only if a captured continuation still holds it.
-    let next = Rc::make_mut(state).step(value, spans);
+    let next = step_shared(state, value, spans);
     follow(cont, next)
 }
 

@@ -60,6 +60,13 @@ pub enum Iter {
     TypeGroup { bindings: LetRecBindings, body: ExprRef, ids: Rc<[u64]>, done: Vec<Value>, env: Env, vals_env: Env },
 }
 
+// The driver's one way to advance a state a frame holds: copy-on-write, so a state a
+// captured continuation shares is copied first and each resumption continues from the
+// state as captured.
+pub fn step_shared(state: &mut Rc<Iter>, v: Value, spans: &SpanMap) -> Next {
+    Rc::make_mut(state).step(v, spans)
+}
+
 fn list(items: Vec<Value>) -> Value {
     Value::List(Rc::new(items))
 }
@@ -449,7 +456,8 @@ mod tests {
             let items = random_items(&mut r, n, 10);
             for prefix in [0usize, 1, 3, n, 2 * n] {
                 // Run `prefix` questions from a random stream, then clone mid-way.
-                let (mut iter, mut next) = Iter::sort(Value::Bool(true), &ints(&items));
+                let (iter, mut next) = Iter::sort(Value::Bool(true), &ints(&items));
+                let mut iter = Rc::new(iter);
                 let mut stream = Vec::new();
                 let mut coin = Rng(n as u64 + prefix as u64 + 9);
                 while stream.len() < prefix {
@@ -458,9 +466,11 @@ mod tests {
                     }
                     let ans = coin.next() & 1 == 0;
                     stream.push(ans);
-                    next = iter.step(Value::Bool(ans), &SpanMap::new());
+                    next = step_shared(&mut iter, Value::Bool(ans), &SpanMap::new());
                 }
-                let fork = (iter.clone(), next.clone());
+                // The fork shares the state, as a captured continuation does: the first step
+                // of each copy must go through the driver's copy-on-write.
+                let fork = (Rc::clone(&iter), next.clone());
                 // Each copy finishes with its own answer stream.
                 for ((mut it, mut nx), bias) in [((iter, next), 0u64), (fork, 1)] {
                     let mut full = stream.clone();
@@ -470,7 +480,7 @@ mod tests {
                             Next::Call { .. } => {
                                 let ans = c.next() % 3 != bias;
                                 full.push(ans);
-                                nx = it.step(Value::Bool(ans), &SpanMap::new());
+                                nx = step_shared(&mut it, Value::Bool(ans), &SpanMap::new());
                             }
                             Next::Done(Value::List(out)) => break out.iter().map(int).collect::<Vec<_>>(),
                             _ => unreachable!(),

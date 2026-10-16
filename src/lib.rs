@@ -1126,6 +1126,42 @@ mod tests {
         assert_eq!(run_untyped(&format!("handle let rec x = perform choose(1) and y = perform choose(2) in [x, y] with {h}")).to_string(), "[1, 2, 1, 20, 10, 2, 10, 20]");
         let record = "let r = handle {x: perform a(1), y: perform a(2)} with deep(handler a(p, resume) -> resume(p * 10)) in r.x + r.y";
         assert_eq!(run_source(record).unwrap().as_int(), 30);
+        // Resumed twice: x in {1, 10}, y in {2, 20}, so (102 + 120) + (1002 + 1020).
+        let twice = "handle (let r = {x: perform a(1), y: perform a(2)} in r.x * 100 + r.y) with deep(handler a(p, resume) -> resume(p) + resume(p * 10))";
+        assert_eq!(run_source(twice).unwrap().as_int(), 2244);
+    }
+
+    // A handler that never resumes drops the continuation, Iterate frame included.
+    #[test]
+    fn a_handler_that_aborts_through_map_drops_the_iteration() {
+        let src = "handle map(fun x -> perform stop(x))([1, 2, 3]) with handler stop(p, resume) -> 42";
+        assert_eq!(run_untyped(src).as_int(), 42);
+        let src = "handle fold(fun a -> fun x -> a + perform stop(x))(0)([1, 2, 3]) with deep(handler stop(p, resume) -> 7)";
+        assert_eq!(run_untyped(src).as_int(), 7);
+    }
+
+    // Two Iterate frames (outer and inner map) in one captured continuation, resumed twice
+    // at the inner perform: same answer as renno-level maps.
+    #[test]
+    fn two_nested_iterate_frames_resumed_twice_match_renno_level_maps() {
+        let handler = "deep(handler choose(p, resume) -> resume(p + 100) ++ resume(p + 200))";
+        let builtin = format!("handle map(fun x -> map(fun y -> perform choose(y))([x, x + 10]))([1, 2]) with {handler}");
+        let renno = format!(
+            "let rec rmap = fun f -> fun xs -> match xs | [] -> [] | h :: t -> f(h) :: rmap(f)(t) in \
+             handle rmap(fun x -> rmap(fun y -> perform choose(y))([x, x + 10]))([1, 2]) with {handler}"
+        );
+        let got = run_untyped(&builtin).to_string();
+        assert_eq!(got, run_untyped(&renno).to_string());
+        // 2^4 branches of two pairs each, plus the outer list.
+        assert_eq!(got.matches('[').count(), 33, "{got}");
+    }
+
+    // A callback behind a function contract still reaches the handler, once per resumption.
+    #[test]
+    fn a_contract_wrapped_callback_that_performs_reaches_the_handler() {
+        let src = "let f: (Int -> Int) = fun x -> perform choose(x) in \
+                   handle map(f)([1, 2]) with deep(handler choose(p, resume) -> resume(p + 100) ++ resume(p + 200))";
+        assert_eq!(run_source(src).unwrap().to_string(), "[101, 102, 101, 202, 201, 102, 201, 202]");
     }
 
     // The callbacks run on the heap, not the native stack: nested 100000 deep on a
