@@ -11063,6 +11063,24 @@ g(len)").unwrap_err();
         assert!((N..=10 * N + 16).contains(&steps), "check steps {steps} for n = {N}");
     }
 
+    // F3 (review): a list entered at a `Ref` whose def is a list type. Its whole seal (Mark) and
+    // its every-element seal (Seal) share one cell; the whole seal must not clobber the
+    // every-element one, or each call re-scans the list (n^2).
+    fn prog_list_def_recursion(n: usize) -> String {
+        format!(
+            "let mk = fun E -> (let rec T = Union(E, List(T)) in \
+             let rec go = fun p: Tuple(Int, T) -> match p | (n, h :: t) -> 1 + go((n, t)) | _ -> 0 in go) in \
+             mk(Int)((0, range(0)({n})))"
+        )
+    }
+
+    #[test]
+    fn recursion_over_a_list_def_at_a_ref_checks_linearly() {
+        let (out, steps) = check_cost(&prog_list_def_recursion(N));
+        assert_eq!(out, Outcome::Int(N as i64));
+        assert!((N..=10 * N + 16).contains(&steps), "check steps {steps} for n = {N}");
+    }
+
     // The 20k counter runs: release, with the scale gates.
     #[test]
     #[ignore]
@@ -11152,6 +11170,13 @@ g(len)").unwrap_err();
                    let d: Dyn = [(1, true)] in let a: List(R1) = d in let b: List(R2) = d in 0";
         let err = run_err(rec);
         assert!(err.starts_with("line 1, column 158: type error: expected [R2], found Int at element 0, element 0"), "{err}");
+        // Two opaque token types: the same list passes one and must fail the other (the token
+        // numbers in the message depend on the run, so only its shape is pinned).
+        let tok = "let a = opaque in let b = opaque in let d: Dyn = [a] in let x: List(TypeOf(a)) = d in let y: List(TypeOf(b)) = d in 0";
+        let err = run_err(tok);
+        assert!(err.starts_with("line 1, column 112: type error: expected [Token#") && err.contains("found Token#") && err.contains("at element 0"), "{err}");
+        let same = "let a = opaque in let d: Dyn = [a] in let x: List(TypeOf(a)) = d in let y: List(TypeOf(a)) = d in 0";
+        assert_eq!(run_source(same).unwrap(), Outcome::Int(0));
     }
 
     // A sealed tuple view only passes at its own height: `(0, t)` where `t` is a shorter view

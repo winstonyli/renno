@@ -157,8 +157,11 @@ pub enum Length {
 // never sealed. Derived data, a cache key and not meaning, so it is invisible to equality
 // (every two Seals are equal) and to Debug: structural assertions on tests and snapshots do
 // not depend on the interner's order.
+//
+// `!Send` and `!Sync` on purpose (the raw-pointer marker): the id is only meaningful in the
+// interner of the thread that assigned it, so a Test carrying one must stay on that thread.
 #[derive(Clone, Copy, Default)]
-pub struct Seal(pub Option<SealId>);
+pub struct Seal(pub Option<SealId>, pub(crate) std::marker::PhantomData<*const ()>);
 
 impl PartialEq for Seal {
     fn eq(&self, _: &Seal) -> bool {
@@ -199,11 +202,13 @@ impl Test {
 // a Test, CheckSpec or Lazy. Keys are built bottom-up, each node once over its children's
 // ids, so assigning ids to a test is linear in its size.
 //
-// Per thread is sound because every value a seal can sit on is not Send (list blocks hold
-// Rc, and so do the CheckSpecs and Lazys that carry ids): a sealed block and a test carrying
-// an id always live on the thread that made both, so both drew their ids from that thread's
-// interner (check-time evaluations and the run share one thread, lib.rs
-// run_source_on_this_thread). If Rc ever became Arc this interner would have to be global.
+// Per thread is sound because everything an id can sit in or on is not Send: list blocks hold
+// Rc, and a `Test` carries `Seal`, which is `!Send` by construction (a test moved to another
+// thread would meet that thread's different interner; the compiler now refuses the move, and
+// `tests_carrying_ids_are_not_send` below fails to build if that is ever undone). So a sealed
+// block and a test carrying an id always live on the thread that made both (check-time
+// evaluations and the run share one thread, lib.rs run_source_on_this_thread). If Rc ever
+// became Arc this interner would have to be global.
 //
 // Equal id means equal meaning:
 //   - the id of an every-element test is `Every(rel(element test))`;
@@ -1046,16 +1051,37 @@ mod seal_tests {
     // Past the cap a test gets no id (it behaves as before); under it ids are assigned.
     #[test]
     fn the_interner_stops_at_its_cap() {
-        set_seal_cap(0);
-        assert_eq!(root_id(list_of(Test::Int), vec![]), None);
-        set_seal_cap(2);
-        // Int is key 1 and Every(Int) key 2: the inner list is sealed, but its parent's key
-        // is the third and does not fit.
-        let mut test = list_of(list_of(Test::Int));
-        assign_seals(&mut test, &mut [], &mut Then::Done);
-        let mut out = Vec::new();
-        seals(&test, &mut out);
-        assert_eq!(out.len(), 2);
-        assert!(out[0].is_none() && out[1].is_some(), "{out:?}");
+        // A fresh thread: the interner is per thread and starts empty ("Int is key 1" below
+        // needs that), and the lowered cap never leaks into another test.
+        std::thread::spawn(|| {
+            set_seal_cap(0);
+            assert_eq!(root_id(list_of(Test::Int), vec![]), None);
+            set_seal_cap(2);
+            // Int is key 1 and Every(Int) key 2: the inner list is sealed, but its parent's
+            // key is the third and does not fit.
+            let mut test = list_of(list_of(Test::Int));
+            assign_seals(&mut test, &mut [], &mut Then::Done);
+            let mut out = Vec::new();
+            seals(&test, &mut out);
+            assert_eq!(out.len(), 2);
+            assert!(out[0].is_none() && out[1].is_some(), "{out:?}");
+            set_seal_cap(SEAL_CAP);
+        })
+        .join()
+        .expect("the cap test");
+    }
+
+    // Compile-time: `Test` (through `Seal`) must not be Send, so an id cannot leave the thread
+    // whose interner assigned it. If it became Send, `probe` would be ambiguous and this
+    // would not build.
+    #[test]
+    fn tests_carrying_ids_are_not_send() {
+        trait AmbiguousIfSend<A> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+        <Test as AmbiguousIfSend<_>>::probe();
+        <Seal as AmbiguousIfSend<_>>::probe();
     }
 }

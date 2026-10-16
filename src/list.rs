@@ -120,10 +120,21 @@ struct Mark {
     height: u32,
 }
 
-// A height as a seal stores it: saturated, which only weakens the fact (a lower height is
-// still true).
+// A height as an every-element seal stores it: saturated, which only weakens the fact (a
+// lower height is still true). A whole seal is exact-view only, so it never saturates
+// (`whole_mark`).
 fn saturate(top: usize) -> u32 {
     u32::try_from(top).unwrap_or(u32::MAX)
+}
+
+// The seal a whole seal of `id` at view height `top` writes over `old`, or None: write
+// nothing. Nothing when the height does not fit (a saturated whole seal would also match a
+// different, shorter view), and nothing when `old` already covers at least this view (an
+// every-element seal written by the same walk, which a whole seal would clobber: a tail of
+// the list is then checked at its own `Ref` against `old`, O(1), instead of re-scanned).
+fn whole_mark(old: Mark, id: SealId, top: usize) -> Option<Mark> {
+    let height = u32::try_from(top).ok()?;
+    (old.id == 0 || old.height < height).then_some(Mark { id: id.get(), height })
 }
 
 // Views are made three ways, each preserving "every view (b, top) has b.slots[..top] set":
@@ -367,9 +378,12 @@ impl List {
         })
     }
 
+    // Records the whole seal, unless that would lose a fact (`whole_mark`).
     pub fn seal_whole(&self, id: SealId) {
         if let Some(b) = &self.block {
-            b.seal.set(Mark { id: id.get(), height: saturate(self.top) });
+            if let Some(mark) = whole_mark(b.seal.get(), id, self.top) {
+                b.seal.set(mark);
+            }
         }
     }
 
@@ -943,7 +957,16 @@ mod tests {
         l.seal_whole(id(1));
         assert!(l.has_whole_seal(id(1)) && !short.has_whole_seal(id(1)) && !l.has_whole_seal(id(2)));
         short.seal_whole(id(1));
-        assert!(short.has_whole_seal(id(1)) && !l.has_whole_seal(id(1)), "the block's one seal is now the short view's");
+        // F3: a seal covering at least this view is never overwritten, so the short view's whole
+        // seal is not written (the block keeps the taller one).
+        assert!(!short.has_whole_seal(id(1)) && l.has_whole_seal(id(1)), "a covering seal is kept");
+        // A taller view does replace a shorter one's.
+        let tall = bulk(&[1, 2, 3, 4]);
+        let low = tall.split_first().map(|(_, t)| t).unwrap();
+        low.seal_whole(id(1));
+        assert!(low.has_whole_seal(id(1)));
+        tall.seal_whole(id(1));
+        assert!(tall.has_whole_seal(id(1)) && !low.has_whole_seal(id(1)));
         // A whole seal and an every-element seal never mix (different ids), but they share the cell.
         assert_eq!(unsealed(&l, 2), ints(&l));
     }
@@ -952,6 +975,26 @@ mod tests {
     fn a_seal_height_saturates() {
         assert_eq!(saturate(5), 5);
         assert_eq!(saturate(usize::MAX), u32::MAX);
+    }
+
+    // A whole seal is exact-view only: it writes nothing for a height that does not fit (a
+    // saturated one would match a shorter view), and never over a seal covering at least
+    // this view (the every-element seal the same walk just wrote).
+    #[test]
+    fn a_whole_seal_never_saturates_and_never_clobbers_a_covering_seal() {
+        let none = Mark::default();
+        let w = id(7);
+        assert_eq!(whole_mark(none, w, 5).map(|m| (m.id, m.height)), Some((7, 5)));
+        assert!(whole_mark(none, w, u32::MAX as usize + 5).is_none());
+        assert!(whole_mark(none, w, u32::MAX as usize).is_some());
+        let every = Mark { id: 3, height: 5 };
+        assert!(whole_mark(every, w, 5).is_none() && whole_mark(every, w, 4).is_none());
+        assert_eq!(whole_mark(every, w, 6).map(|m| m.id), Some(7));
+        // Through the list: the every-element seal survives a whole seal at the same view.
+        let l = bulk(&[1, 2, 3]);
+        l.seal_every(id(3));
+        l.seal_whole(id(7));
+        assert!(l.is_sealed_every(id(3)) && !l.has_whole_seal(id(7)));
     }
 
     // The model: the element addresses some earlier `seal_every(id)` call covered. `unsealed`
@@ -973,6 +1016,7 @@ mod tests {
         let mut pool: Vec<List> = vec![List::empty(), bulk(&[1, 2, 3]), linear(9)];
         let mut covered: [std::collections::HashSet<usize>; 4] = Default::default();
         let mut counter = 100;
+        let mut graveyard: Vec<List> = Vec::new();
         for _ in 0..3000 {
             let l = pool[r.next(pool.len())].clone();
             match r.next(7) {
@@ -993,7 +1037,9 @@ mod tests {
                 }
             }
             if pool.len() > 600 {
-                pool.swap_remove(r.next(pool.len()));
+                // Kept alive: a freed block's addresses could be reused and a stale address
+                // would then count as covered.
+                graveyard.push(pool.swap_remove(r.next(pool.len())));
             }
             let (probe, n) = (&pool[r.next(pool.len())], 1 + r.next(3) as u32);
             let got: Vec<usize> = probe.unsealed(id(n)).map(addr).collect();

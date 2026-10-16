@@ -1286,7 +1286,7 @@ fn test_holds(test: &Test, defs: &[Test], lens: &[Len], v: &Value) -> bool {
             Test::Or(alternatives) if alternatives.iter().all(|a| leaf(a, v).is_some()) => alternatives.iter().any(|a| leaf(a, v) == Some(true)),
             // The walk's O(1) sealed query, asked before it allocates a work list (the length
             // is still checked first, as the walk does).
-            Test::Elems { len, seal: Seal(Some(id)), .. }
+            Test::Elems { len, seal: Seal(Some(id), _), .. }
                 if matches!(v, Value::List(items) if items.is_sealed_every(*id) && match len {
                     Length::Any => true,
                     Length::Exact(n) => items.len() == *n,
