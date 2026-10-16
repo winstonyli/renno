@@ -90,11 +90,11 @@ fn record_construction_source(n: i64) -> String {
 
 // `let rec sum = fun l -> match l | [] -> 0 | h::t -> h + sum(t) in
 // sum(range(0, n))` -- isolates Pattern::Cons's own deconstruction cost
-// (machine.rs's `items[1..].to_vec()`, a full tail clone per step) from
-// everything else: the list itself is built once, natively, by `range`
-// (O(n)), so only the recursive traversal is on the clock. If Cons's
-// tail-clone is a real cost, time should grow roughly with n^2, not n --
-// no benchmark existed for pure list-pattern recursion before now.
+// from everything else: the list itself is built once, natively, by
+// `range` (O(n)), so only the recursive traversal is on the clock. The
+// pattern is O(1) per step (list.rs's split_first, a view of the tail),
+// so time grows linearly with n; before the claim-list it copied the
+// tail at every step and grew with n^2.
 fn list_cons_recursion_source(n: i64) -> String {
     format!("let rec sum = fun l -> match l | [] -> 0 | h :: t -> h + sum(t) in sum(range(0)({n}))")
 }

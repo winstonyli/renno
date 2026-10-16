@@ -4343,7 +4343,7 @@ g(len)").unwrap_err();
         // runtime (see value.rs's own doc comment: "a fixed-arity
         // List"). Match on Value::List directly instead.
         match &result {
-            Value::List(items) => assert_eq!(items[0].as_int(), 1),
+            Value::List(items) => assert_eq!(items.get(0).unwrap().as_int(), 1),
             other => panic!("expected a tuple (Value::List), got {other}"),
         }
     }
@@ -4369,7 +4369,7 @@ g(len)").unwrap_err();
         // runtime (see value.rs's own doc comment: "a fixed-arity
         // List"). Match on Value::List directly instead.
         match &result {
-            Value::List(items) => assert_eq!(items[0].as_int(), 1),
+            Value::List(items) => assert_eq!(items.get(0).unwrap().as_int(), 1),
             other => panic!("expected a tuple (Value::List), got {other}"),
         }
     }
@@ -7716,7 +7716,7 @@ g(len)").unwrap_err();
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         match machine::run(&arena, elaborated, Env::prelude(), &spans) {
-            Value::List(items) => assert_eq!((items[0].as_int(), items[1].as_int()), (3, 5)),
+            Value::List(items) => assert_eq!((items.get(0).unwrap().as_int(), items.get(1).unwrap().as_int()), (3, 5)),
             other => panic!("expected a tuple, got {other}"),
         }
     }
@@ -7880,7 +7880,7 @@ g(len)").unwrap_err();
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated = typecheck::check(&mut arena, root, &spans).unwrap();
         match machine::run(&arena, elaborated, Env::prelude(), &spans) {
-            Value::List(items) => assert_eq!((items[0].as_int(), items[1].as_int()), (1, 2)),
+            Value::List(items) => assert_eq!((items.get(0).unwrap().as_int(), items.get(1).unwrap().as_int()), (1, 2)),
             other => panic!("expected a tuple, got {other}"),
         }
     }

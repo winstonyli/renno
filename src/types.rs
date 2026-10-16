@@ -398,8 +398,8 @@ pub enum Type {
     Var(String),
     Bool,
     Str,
-    // Element type. renno's List is a native primitive (Value::List,
-    // Rc<Vec<Value>>).
+    // Element type. renno's List is a native primitive (Value::List, the
+    // claim-list of list.rs).
     List(Hc<Type>),
     // param, effect row (what calling this may perform), return type.
     Fun(Hc<Type>, EffectRow, Hc<Type>),

@@ -47,17 +47,17 @@ pub(crate) fn counters() -> (usize, usize, usize) {
 }
 
 #[allow(unused_variables)]
-pub(crate) fn count_writes(n: usize) {
+fn count_writes(n: usize) {
     #[cfg(test)]
     WRITES.with(|c| c.set(c.get() + n));
 }
 
-pub(crate) fn count_block() {
+fn count_block() {
     #[cfg(test)]
     BLOCKS.with(|c| c.set(c.get() + 1));
 }
 
-pub(crate) fn count_hop() {
+fn count_hop() {
     #[cfg(test)]
     HOPS.with(|c| c.set(c.get() + 1));
 }
@@ -173,10 +173,15 @@ impl List {
         b.push_all(self.to_vec().into_iter().rev())
     }
 
+    pub fn first(&self) -> Option<&Value> {
+        let b = self.block.as_ref()?;
+        Some(b.slots[self.top - 1].get().expect("a view's slots are set"))
+    }
+
     // The head and the rest, in O(1).
     pub fn split_first(&self) -> Option<(&Value, List)> {
+        let head = self.first()?;
         let b = self.block.as_ref()?;
-        let head = b.slots[self.top - 1].get().expect("a view's slots are set");
         let tail = if self.top == 1 { b.below.clone() } else { List { block: self.block.clone(), top: self.top - 1, len: self.len - 1 } };
         Some((head, tail))
     }
@@ -479,7 +484,7 @@ mod tests {
         for _ in 0..4000 {
             let (l, m) = pool[r.next(pool.len())].clone();
             let new = match r.next(6) {
-                0 | 1 | 2 => {
+                0..=2 => {
                     counter += 1;
                     let mut m = m;
                     m.insert(0, counter);

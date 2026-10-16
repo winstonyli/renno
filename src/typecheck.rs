@@ -4024,7 +4024,7 @@ fn ensure_values(arena: &mut Arena, spans: &SpanMap, infer: &mut InferCtx, roots
 // its members', a let's is the value itself.
 fn member_value(def: &CheckDef, value: &Value, member: usize) -> Value {
     match (&def.node, value) {
-        (DefNode::Group(_), Value::List(members)) => members[member].clone(),
+        (DefNode::Group(_), Value::List(members)) => members.get(member).cloned().expect("a group value has one member per definition"),
         _ => value.clone(),
     }
 }

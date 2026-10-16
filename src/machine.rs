@@ -8,6 +8,7 @@ use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, 
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::iterate::{step_shared, Iter, Next};
+use crate::list::List;
 use crate::resolve::{group_kind, resolve, GroupKind, Resolved, VarRef};
 use crate::span::Span;
 use crate::types::{first_free, fresh_rec_id, EffectRow, Hc, RecVar, Type};
@@ -472,7 +473,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                 }
                 Expr::ListLit(items) => {
                     if items.is_empty() {
-                        control = Control::Apply(Value::List(Rc::new(Vec::new())));
+                        control = Control::Apply(Value::List(List::empty()));
                     } else {
                         let (iter, first) = Iter::elems(None, items.clone(), env.clone());
                         cont = Cont::cons(Frame::iterate(iter), cont);
@@ -1004,15 +1005,19 @@ enum Step<'t, 'a> {
     // have passed: a present failing field is reported before the record).
     FailAt(&'a Value, u32),
     // Everything above this entered (alias, value) has passed: remember it.
-    Mark((usize, usize)),
+    Mark(MemoKey),
 }
 
-// A compound value's identity (its shared allocation), for the walk's memo of
+// An (alias, value identity) pair of the walk's memo.
+type MemoKey = (usize, (usize, usize));
+
+// A compound value's identity (its shared allocation; a list's includes the view's
+// height, as two views of one block are different lists), for the walk's memo of
 // decided (alias, value) pairs. Scalars are as cheap to re-test as to look up.
-fn identity(v: &Value) -> Option<usize> {
+fn identity(v: &Value) -> Option<(usize, usize)> {
     match v {
-        Value::List(items) => Some(Rc::as_ptr(items) as usize),
-        Value::Record(fields) => Some(Rc::as_ptr(fields) as usize),
+        Value::List(items) => Some(items.identity()),
+        Value::Record(fields) => Some((Rc::as_ptr(fields) as usize, 0)),
         _ => None,
     }
 }
@@ -1055,6 +1060,22 @@ fn child<'t, const TRACK: bool>(nodes: &mut Nodes<'t>, parent: u32, label: Label
     (nodes.len() - 1) as u32
 }
 
+// Pushes one test per element, reversed so the stack pops them in element order (a list
+// is walked forward, so the segment is reversed after the pushes).
+fn push_elements<'t, 'a, const TRACK: bool>(
+    work: &mut Vec<Step<'t, 'a>>,
+    nodes: &mut Nodes<'t>,
+    node: u32,
+    tests: impl Iterator<Item = (&'t Test, &'a Value)>,
+) {
+    let start = work.len();
+    for (i, (t, x)) in tests.enumerate() {
+        let n = child::<TRACK>(nodes, node, Label::Element(i));
+        work.push(Step::Test(t, x, n));
+    }
+    work[start..].reverse();
+}
+
 // None when `v` passes `test`, else the innermost failure (with TRACK, its
 // path node and depth; an `Or` reports its alternative that got furthest,
 // the first on ties). `no_value` gets the first NoValue slot reached on a list.
@@ -1078,7 +1099,7 @@ fn walk<'t, 'a, const TRACK: bool>(
     // not once per alternative (doubling per level). A skipped failure reports
     // at the alias position itself: the same furthest-failure ranking as the
     // first walk, which already holds the deeper report.
-    let mut memo: HashMap<(usize, usize), bool> = HashMap::new();
+    let mut memo: HashMap<MemoKey, bool> = HashMap::new();
     'main: loop {
         let mut fail: Fail<'a> = 'step: {
             let step = work.pop()?;
@@ -1117,29 +1138,22 @@ fn walk<'t, 'a, const TRACK: bool>(
                     if leaf(element, v).is_some() {
                         // A scalar element test (`leaf` answers Some for those
                         // whatever the value): scan inline, nothing pushed.
-                        match items.iter().position(|x| leaf(element, x) == Some(false)) {
+                        match items.iter().enumerate().find(|(_, x)| leaf(element, x) == Some(false)) {
                             None => continue 'main,
-                            Some(i) => {
+                            Some((i, found)) => {
                                 let n = child::<TRACK>(nodes, node, Label::Element(i));
-                                break 'step Fail { node: n, depth: depth_of(nodes, n), found: &items[i] };
+                                break 'step Fail { node: n, depth: depth_of(nodes, n), found };
                             }
                         }
                     }
-                    // Reversed, so the stack pops them in element order.
-                    for (i, x) in items.iter().enumerate().rev() {
-                        let n = child::<TRACK>(nodes, node, Label::Element(i));
-                        work.push(Step::Test(element, x, n));
-                    }
+                    push_elements::<TRACK>(&mut work, nodes, node, items.iter().map(|x| (&**element, x)));
                 }
                 Test::ListLen(element, len) => {
                     let Value::List(items) = v else { break 'step here };
                     if items.len() != *len {
                         break 'step here;
                     }
-                    for (i, x) in items.iter().enumerate().rev() {
-                        let n = child::<TRACK>(nodes, node, Label::Element(i));
-                        work.push(Step::Test(element, x, n));
-                    }
+                    push_elements::<TRACK>(&mut work, nodes, node, items.iter().map(|x| (&**element, x)));
                 }
                 Test::ListLenArg(element, slot) => {
                     let Value::List(items) = v else { break 'step here };
@@ -1152,20 +1166,14 @@ fn walk<'t, 'a, const TRACK: bool>(
                         }
                         Len::Exact(_) | Len::Never => break 'step here,
                     }
-                    for (i, x) in items.iter().enumerate().rev() {
-                        let n = child::<TRACK>(nodes, node, Label::Element(i));
-                        work.push(Step::Test(element, x, n));
-                    }
+                    push_elements::<TRACK>(&mut work, nodes, node, items.iter().map(|x| (&**element, x)));
                 }
                 Test::TupleOf(elements) => {
                     let Value::List(items) = v else { break 'step here };
                     if items.len() != elements.len() {
                         break 'step here;
                     }
-                    for (i, (x, element)) in items.iter().zip(elements).enumerate().rev() {
-                        let n = child::<TRACK>(nodes, node, Label::Element(i));
-                        work.push(Step::Test(element, x, n));
-                    }
+                    push_elements::<TRACK>(&mut work, nodes, node, elements.iter().zip(items.iter()));
                 }
                 Test::RecordOf(required) => {
                     let Value::Record(fields) = v else { break 'step here };
@@ -1420,14 +1428,7 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
         BinOp::Eq => Value::Bool(value_eq(&lhs, &rhs)),
         BinOp::Concat => match (&lhs, &rhs) {
             (Value::Str(a), Value::Str(b)) => Value::Str(Rc::from(format!("{a}{b}"))),
-            (Value::List(a), Value::List(b)) => {
-                crate::list::count_writes(a.len() + b.len());
-                crate::list::count_block();
-                let mut v = Vec::with_capacity(a.len() + b.len());
-                v.extend(a.iter().cloned());
-                v.extend(b.iter().cloned());
-                Value::List(Rc::new(v))
-            }
+            (Value::List(a), Value::List(b)) => Value::List(a.append(b)),
             _ => {
                 // Whichever operand isn't Str/List is the actual culprit;
                 // if both are (e.g. an Int and a Bool), neither operand
@@ -1443,14 +1444,7 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
             }
         },
         BinOp::Cons => match &rhs {
-            Value::List(items) => {
-                crate::list::count_writes(items.len() + 1);
-                crate::list::count_block();
-                let mut v = Vec::with_capacity(items.len() + 1);
-                v.push(lhs);
-                v.extend(items.iter().cloned());
-                Value::List(Rc::new(v))
-            }
+            Value::List(items) => Value::List(items.cons(lhs)),
             _ => {
                 set_current_span(r_span);
                 crate::run_error!(":: expects a list on the right")
@@ -1501,7 +1495,7 @@ fn start_iteration(b: Builtin, mut args: Vec<Value>) -> Dispatch {
         Builtin::Sort => {
             let (list, cmp) = (args.pop(), args.pop());
             match (cmp, list) {
-                (Some(cmp), Some(Value::List(items))) => Iter::sort(cmp, &items),
+                (Some(cmp), Some(Value::List(items))) => Iter::sort(cmp, items.to_vec()),
                 _ => crate::run_error!("sort expects a comparator and a list"),
             }
         }
@@ -1533,12 +1527,8 @@ fn dispatch_builtin(b: Builtin, mut args: Vec<Value>) -> Value {
             let (i, list) = (args.pop(), args.pop());
             match (list, i) {
                 (Some(Value::List(items)), Some(Value::Int(idx))) => {
-                    let idx = usize::try_from(idx).ok().filter(|&idx| idx < items.len());
-                    match idx {
-                        Some(idx) => {
-                            crate::list::count_hop();
-                            items[idx].clone()
-                        }
+                    match usize::try_from(idx).ok().and_then(|idx| items.get(idx)) {
+                        Some(v) => v.clone(),
                         None => crate::run_error!("get: index out of bounds"),
                     }
                 }
@@ -1590,22 +1580,16 @@ fn dispatch_builtin(b: Builtin, mut args: Vec<Value>) -> Value {
         Builtin::Map | Builtin::Fold | Builtin::Filter | Builtin::Sort => unreachable!("internal: a higher-order builtin is started, not dispatched"),
         Builtin::Reverse => match args.pop() {
             Some(Value::List(items)) => {
-                crate::list::count_writes(items.len());
-                crate::list::count_block();
-                let mut items = (*items).clone();
+                let mut items = items.to_vec();
                 items.reverse();
-                Value::List(Rc::new(items))
+                Value::List(List::from_vec(items))
             }
             _ => crate::run_error!("reverse expects a list"),
         },
         Builtin::Range => {
             let (end, start) = (args.pop(), args.pop());
             match (start, end) {
-                (Some(Value::Int(start)), Some(Value::Int(end))) => {
-                    crate::list::count_writes(usize::try_from(end.saturating_sub(start)).unwrap_or(0));
-                    crate::list::count_block();
-                    Value::List(Rc::new((start..end).map(Value::Int).collect()))
-                }
+                (Some(Value::Int(start)), Some(Value::Int(end))) => Value::List((start..end).map(Value::Int).collect()),
                 _ => crate::run_error!("range expects two ints"),
             }
         }
@@ -1652,7 +1636,7 @@ fn construct_type(ctor: TypeCtor, arg: Value) -> Type {
             Type::Record(Hc::new(fields))
         }
         // (A, B) is `A -> B`; (A, "e", B) is `A ->{e} B`.
-        (TypeCtor::Fun, Value::List(items)) => match &items[..] {
+        (TypeCtor::Fun, Value::List(items)) => match &items.to_vec()[..] {
             [Value::Type(a), Value::Type(b)] => Type::Fun(Hc::new((**a).clone()), EffectRow::Dyn, Hc::new((**b).clone())),
             [Value::Type(a), Value::Str(row), Value::Type(b)] => {
                 Type::Fun(Hc::new((**a).clone()), EffectRow::Var(row.to_string()), Hc::new((**b).clone()))
@@ -1671,7 +1655,7 @@ fn construct_type(ctor: TypeCtor, arg: Value) -> Type {
         },
         // (T, k) is T at index k; (T, Vec(n)) takes the index n, which is
         // how the parser passes a symbolic `Indexed(T, n)`.
-        (TypeCtor::Indexed, Value::List(items)) => match &items[..] {
+        (TypeCtor::Indexed, Value::List(items)) => match &items.to_vec()[..] {
             [Value::Type(t), Value::Int(k)] if *k >= 0 => Type::Indexed(Hc::new((**t).clone()), Rc::new(IndexExpr::Lit(*k))),
             [Value::Type(t), Value::Type(i)] => match &**i {
                 Type::Indexed(_, index) => Type::Indexed(Hc::new((**t).clone()), index.clone()),
@@ -1684,7 +1668,7 @@ fn construct_type(ctor: TypeCtor, arg: Value) -> Type {
     }
 }
 
-fn types_of(items: &[Value], ctor: &str) -> Vec<Type> {
+fn types_of(items: &List, ctor: &str) -> Vec<Type> {
     items
         .iter()
         .map(|v| match v {
@@ -1771,10 +1755,8 @@ fn match_pattern(pat: &Pattern, value: &Value, out: &mut Bindings) -> bool {
         },
         Pattern::Cons(head, tail) => match value {
             Value::List(items) if !items.is_empty() => {
-                crate::list::count_writes(items.len() - 1);
-                crate::list::count_block();
-                let tail_val = Value::List(Rc::new(items[1..].to_vec()));
-                match_pattern(head, &items[0], out) && match_pattern(tail, &tail_val, out)
+                let (first, rest) = items.split_first().expect("a non-empty list has a head");
+                match_pattern(head, first, out) && match_pattern(tail, &Value::List(rest), out)
             }
             _ => false,
         },
@@ -1884,7 +1866,7 @@ mod tests {
     use super::*;
 
     fn list(n: usize) -> Value {
-        Value::List(Rc::new(vec![Value::Int(0); n]))
+        Value::List(List::from_vec(vec![Value::Int(0); n]))
     }
 
     // Two evaluations share one table: the closure the first builds (over the
@@ -1987,7 +1969,7 @@ mod tests {
     // The scalar-`Or` fast path must agree with the walker for every value.
     #[test]
     fn a_scalar_or_agrees_with_the_walker() {
-        let list = Value::List(Rc::new(vec![Value::Int(1)]));
+        let list = Value::List(List::from_vec(vec![Value::Int(1)]));
         let values = [Value::Int(1), Value::Float(1.0), Value::Bool(true), list];
         let ors = [
             Test::Or(vec![]),
@@ -2039,10 +2021,10 @@ mod tests {
 
     #[test]
     fn deep_tests_follow_the_value_and_explain_names_the_failing_element() {
-        let ints = |xs: &[i64]| Value::List(Rc::new(xs.iter().map(|n| Value::Int(*n)).collect()));
+        let ints = |xs: &[i64]| Value::List(List::from_vec(xs.iter().map(|n| Value::Int(*n)).collect()));
         let list_of_int = Test::ListOf(Box::new(Test::Int));
         assert!(test_holds(&list_of_int, &[], &[], &ints(&[1, 2])) && test_holds(&list_of_int, &[], &[], &ints(&[])));
-        let mixed = Value::List(Rc::new(vec![Value::Int(1), Value::Bool(true)]));
+        let mixed = Value::List(List::from_vec(vec![Value::Int(1), Value::Bool(true)]));
         assert!(!test_holds(&list_of_int, &[], &[], &mixed));
         let mut path = Vec::new();
         assert_eq!(explain(&list_of_int, &[], &[], &mixed, &mut path).type_name(), "Bool");
@@ -2057,7 +2039,7 @@ mod tests {
 
         // let rec L = Union(Tuple(Int, L), Bool): the type body is defs[0], reached through Ref(0).
         let defs = [Test::Or(vec![Test::TupleOf(vec![Test::Int, Test::Ref(0)]), Test::Bool])];
-        let pair = |a: Value, b: Value| Value::List(Rc::new(vec![a, b]));
+        let pair = |a: Value, b: Value| Value::List(List::from_vec(vec![a, b]));
         let good = pair(Value::Int(1), pair(Value::Int(2), Value::Bool(true)));
         let bad = pair(Value::Int(1), pair(Value::Int(2), Value::Int(3)));
         assert!(test_holds(&Test::Ref(0), &defs, &[], &good) && !test_holds(&Test::Ref(0), &defs, &[], &bad));
@@ -2072,7 +2054,7 @@ mod tests {
     #[test]
     fn the_walker_handles_a_very_deep_spine_on_a_small_stack() {
         const DEPTH: usize = 100_000;
-        let pair = |a: Value, b: Value| Value::List(Rc::new(vec![a, b]));
+        let pair = |a: Value, b: Value| Value::List(List::from_vec(vec![a, b]));
         let defs = [Test::Or(vec![Test::TupleOf(vec![Test::Int, Test::Ref(0)]), Test::Bool])];
         let chain = |leaf: Value| (0..DEPTH).fold(leaf, |tail, i| pair(Value::Int(i as i64), tail));
         let good = chain(Value::Bool(true));
@@ -2084,7 +2066,7 @@ mod tests {
         assert_eq!(path.len(), DEPTH);
         // nested single-element lists: [[[...[Int]...]]] against ListOf(Ref) where the alias is [self] | Int
         let list_defs = [Test::Or(vec![Test::Int, Test::ListOf(Box::new(Test::Ref(0)))])];
-        let nest = (0..DEPTH).fold(Value::Int(1), |inner, _| Value::List(Rc::new(vec![inner])));
+        let nest = (0..DEPTH).fold(Value::Int(1), |inner, _| Value::List(List::from_vec(vec![inner])));
         assert!(test_holds(&Test::Ref(0), &list_defs, &[], &nest));
         // the nested chains cannot be dropped recursively on this stack
         std::mem::forget((good, bad, nest));
@@ -2111,7 +2093,7 @@ mod tests {
             (Test::ListOf(t), Value::List(items)) | (Test::ListLen(t, _), Value::List(items)) => match items.iter().position(|x| !holds_recursive(t, defs, x)) {
                 Some(i) => {
                     path.push(format!("element {i}"));
-                    explain_recursive(t, defs, &items[i], path)
+                    explain_recursive(t, defs, items.get(i).expect("a failing element exists"), path)
                 }
                 None => v,
             },
@@ -2119,7 +2101,7 @@ mod tests {
                 match items.iter().zip(ts).position(|(x, t)| !holds_recursive(t, defs, x)) {
                     Some(i) => {
                         path.push(format!("element {i}"));
-                        explain_recursive(&ts[i], defs, &items[i], path)
+                        explain_recursive(&ts[i], defs, items.get(i).expect("a failing element exists"), path)
                     }
                     None => v,
                 }
@@ -2186,7 +2168,7 @@ mod tests {
             1 => Value::Bool(true),
             2 => Value::Str(Rc::from("s")),
             3 => Value::Float(1.0),
-            4 | 5 => Value::List(Rc::new((0..r.below(4)).map(|_| random_value(r, depth - 1)).collect())),
+            4 | 5 => Value::List(List::from_vec((0..r.below(4)).map(|_| random_value(r, depth - 1)).collect())),
             _ => {
                 let mut fields = Vec::new();
                 for name in NAMES {
@@ -2227,13 +2209,13 @@ mod tests {
     #[test]
     fn a_length_slot_is_exact_any_or_no_value() {
         let lens = test_lens();
-        let list = |n: i64| Value::List(Rc::new((0..n).map(Value::Int).collect()));
+        let list = |n: i64| Value::List(List::from_vec((0..n).map(Value::Int).collect()));
         let arg = |slot| Test::ListLenArg(Box::new(Test::Int), slot);
         assert!(test_holds(&arg(0), &[], &lens, &list(2)));
         assert!(!test_holds(&arg(0), &[], &lens, &list(3)));
         assert!(test_holds(&arg(1), &[], &lens, &list(5)));
         // Any skips only the length: the elements are still tested.
-        assert!(!test_holds(&arg(1), &[], &lens, &Value::List(Rc::new(vec![Value::Bool(true)]))));
+        assert!(!test_holds(&arg(1), &[], &lens, &Value::List(List::from_vec(vec![Value::Bool(true)]))));
         assert!(!test_holds(&arg(2), &[], &lens, &list(2)));
         assert!(!test_holds(&arg(3), &[], &lens, &list(0)));
         // A NoValue slot is reported only when the walk reaches it on a list,
@@ -2246,12 +2228,33 @@ mod tests {
         assert!(test_holds(&or, &[], &lens, &Value::Bool(true)));
         // One slot shared by every element: [Vec(n)] with n = 2.
         let nested = Test::ListOf(Box::new(Test::ListLenArg(Box::new(Test::Any), 0)));
-        assert!(test_holds(&nested, &[], &lens, &Value::List(Rc::new(vec![list(2), list(2)]))));
-        let bad = Value::List(Rc::new(vec![list(2), list(1)]));
+        assert!(test_holds(&nested, &[], &lens, &Value::List(List::from_vec(vec![list(2), list(2)]))));
+        let bad = Value::List(List::from_vec(vec![list(2), list(1)]));
         assert!(!test_holds(&nested, &[], &lens, &bad));
         let mut path = Vec::new();
         explain(&nested, &[], &lens, &bad, &mut path);
         assert_eq!(path, ["element 1"]);
+    }
+
+    // Two views of one block are two lists: the walk's memo of decided (alias, value) pairs
+    // must not equate them (a pass for the short view says nothing about the longer one).
+    #[test]
+    fn the_walk_memo_tells_two_views_of_one_block_apart() {
+        let short = List::empty().cons(Value::Int(1)).cons(Value::Int(2));
+        let long = short.cons(Value::Str(Rc::from("x")));
+        assert_eq!(short.identity().0, long.identity().0, "the cons claimed a slot of the same block");
+        let defs = [Test::ListOf(Box::new(Test::Int))];
+        let pair = Test::TupleOf(vec![Test::Ref(0), Test::Ref(0)]);
+        let value = Value::List(List::from_vec(vec![Value::List(short.clone()), Value::List(long)]));
+        assert!(!test_holds(&pair, &defs, &[], &value));
+        assert!(test_holds(&pair, &defs, &[], &Value::List(List::from_vec(vec![Value::List(short.clone()), Value::List(short)]))));
+    }
+
+    // `[nan] == [nan]` is false, so equality may not shortcut on a shared list.
+    #[test]
+    fn a_list_holding_nan_is_not_equal_to_itself() {
+        let l = Value::List(List::from_vec(vec![Value::Float(f64::NAN)]));
+        assert!(!value_eq(&l, &l.clone()));
     }
 
     #[test]

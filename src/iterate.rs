@@ -11,6 +11,7 @@ use std::rc::Rc;
 use crate::env::Env;
 use crate::expr::{ExprRef, SpanMap};
 use crate::frame::Bindings;
+use crate::list::List;
 use crate::types::{close_group, Type};
 use crate::value::Value;
 
@@ -39,12 +40,13 @@ pub type LetRecBindings = Rc<Vec<(String, Option<ExprRef>, ExprRef)>>;
 // captured continuation still holds.
 #[derive(Clone)]
 pub enum Iter {
-    // `i` is the index of the element whose callback is in flight.
-    Map { f: Value, items: Rc<Vec<Value>>, i: usize, out: Vec<Value> },
-    Filter { p: Value, items: Rc<Vec<Value>>, i: usize, out: Vec<Value> },
+    // `items` is the list from the element whose callback is in flight: a view, so a step
+    // is O(1) whatever block structure the list has.
+    Map { f: Value, items: List, out: Vec<Value> },
+    Filter { p: Value, items: List, out: Vec<Value> },
     // The accumulator is not stored: it travels as the call's argument and comes back as
     // the step's input, so fold's state is O(1) and a multi-shot branch copies nothing.
-    Fold { f: Value, items: Rc<Vec<Value>>, i: usize },
+    Fold { f: Value, items: List },
     // Boxed: much larger than the others.
     Sort(Box<Sort>),
     // A list or tuple literal (`record` None) or a record literal's field values, evaluated
@@ -68,43 +70,45 @@ pub fn step_shared(state: &mut Rc<Iter>, v: Value, spans: &SpanMap) -> Next {
 }
 
 fn list(items: Vec<Value>) -> Value {
-    if !items.is_empty() {
-        crate::list::count_writes(items.len());
-        crate::list::count_block();
-    }
-    Value::List(Rc::new(items))
+    Value::List(List::from_vec(items))
+}
+
+// Moves `items` past the element in flight; the next element, if any.
+fn advance(items: &mut List) -> Option<Value> {
+    *items = items.split_first().map(|(_, rest)| rest).unwrap_or_default();
+    items.first().cloned()
 }
 
 impl Iter {
     // The constructors return the state and its first request (Done at once for an empty
     // list).
-    pub fn map(f: Value, items: Rc<Vec<Value>>) -> (Iter, Next) {
+    pub fn map(f: Value, items: List) -> (Iter, Next) {
         let out = Vec::with_capacity(items.len());
         let next = match items.first() {
             Some(x) => Next::Call { f: f.clone(), a: x.clone(), b: None },
             None => Next::Done(list(Vec::new())),
         };
-        (Iter::Map { f, items, i: 0, out }, next)
+        (Iter::Map { f, items, out }, next)
     }
 
-    pub fn filter(p: Value, items: Rc<Vec<Value>>) -> (Iter, Next) {
+    pub fn filter(p: Value, items: List) -> (Iter, Next) {
         let out = Vec::with_capacity(items.len());
         let next = match items.first() {
             Some(x) => Next::Call { f: p.clone(), a: x.clone(), b: None },
             None => Next::Done(list(Vec::new())),
         };
-        (Iter::Filter { p, items, i: 0, out }, next)
+        (Iter::Filter { p, items, out }, next)
     }
 
-    pub fn fold(f: Value, init: Value, items: Rc<Vec<Value>>) -> (Iter, Next) {
+    pub fn fold(f: Value, init: Value, items: List) -> (Iter, Next) {
         let next = match items.first() {
             Some(x) => Next::Call { f: f.clone(), a: init, b: Some(x.clone()) },
             None => Next::Done(init),
         };
-        (Iter::Fold { f, items, i: 0 }, next)
+        (Iter::Fold { f, items }, next)
     }
 
-    pub fn sort(cmp: Value, items: &[Value]) -> (Iter, Next) {
+    pub fn sort(cmp: Value, items: Vec<Value>) -> (Iter, Next) {
         let mut sort = Sort::new(cmp, items);
         let next = match sort.question() {
             Some((a, b)) => Next::Call { f: sort.cmp.clone(), a, b: Some(b) },
@@ -179,31 +183,26 @@ impl Iter {
                 }
                 Next::Tail(*body, frame.extend(env))
             }
-            Iter::Map { f, items, i, out } => {
+            Iter::Map { f, items, out } => {
                 out.push(v);
-                *i += 1;
-                match items.get(*i) {
-                    Some(x) => Next::Call { f: f.clone(), a: x.clone(), b: None },
+                match advance(items) {
+                    Some(x) => Next::Call { f: f.clone(), a: x, b: None },
                     None => Next::Done(list(std::mem::take(out))),
                 }
             }
-            Iter::Filter { p, items, i, out } => {
+            Iter::Filter { p, items, out } => {
                 if v.as_bool() {
-                    out.push(items[*i].clone());
+                    out.push(items.first().expect("a callback is in flight on an element").clone());
                 }
-                *i += 1;
-                match items.get(*i) {
-                    Some(x) => Next::Call { f: p.clone(), a: x.clone(), b: None },
+                match advance(items) {
+                    Some(x) => Next::Call { f: p.clone(), a: x, b: None },
                     None => Next::Done(list(std::mem::take(out))),
                 }
             }
-            Iter::Fold { f, items, i } => {
-                *i += 1;
-                match items.get(*i) {
-                    Some(x) => Next::Call { f: f.clone(), a: v, b: Some(x.clone()) },
-                    None => Next::Done(v),
-                }
-            }
+            Iter::Fold { f, items } => match advance(items) {
+                Some(x) => Next::Call { f: f.clone(), a: v, b: Some(x) },
+                None => Next::Done(v),
+            },
             Iter::Sort(s) => match s.answer(v.as_bool()) {
                 Some((a, b)) => Next::Call { f: s.cmp.clone(), a, b: Some(b) },
                 None => Next::Done(list(std::mem::take(&mut s.src))),
@@ -245,11 +244,11 @@ enum At {
 }
 
 impl Sort {
-    fn new(cmp: Value, items: &[Value]) -> Sort {
+    fn new(cmp: Value, items: Vec<Value>) -> Sort {
         Sort {
             cmp,
-            src: items.to_vec(),
             dst: Vec::with_capacity(items.len()),
+            src: items,
             runs: Vec::new(),
             next_runs: Vec::new(),
             at: At::Scan { start: 0, i: 1, desc: None },
@@ -375,7 +374,7 @@ mod tests {
     // Drives a sort to the end, answering each question with `answer`; returns the result
     // and the number of questions asked.
     fn drive(items: &[i64], mut answer: impl FnMut(i64, i64) -> bool) -> (Vec<i64>, usize) {
-        let (mut iter, mut next) = Iter::sort(Value::Bool(true), &ints(items));
+        let (mut iter, mut next) = Iter::sort(Value::Bool(true), ints(items));
         let mut asked = 0;
         loop {
             match next {
@@ -460,7 +459,7 @@ mod tests {
             let items = random_items(&mut r, n, 10);
             for prefix in [0usize, 1, 3, n, 2 * n] {
                 // Run `prefix` questions from a random stream, then clone mid-way.
-                let (iter, mut next) = Iter::sort(Value::Bool(true), &ints(&items));
+                let (iter, mut next) = Iter::sort(Value::Bool(true), ints(&items));
                 let mut iter = Rc::new(iter);
                 let mut stream = Vec::new();
                 let mut coin = Rng(n as u64 + prefix as u64 + 9);
@@ -500,7 +499,7 @@ mod tests {
 
     #[test]
     fn map_filter_fold_step_through_their_elements() {
-        let items = Rc::new(ints(&[1, 2, 3]));
+        let items = List::from_vec(ints(&[1, 2, 3]));
         let (mut it, mut next) = Iter::map(Value::Bool(true), items.clone());
         let mut seen = Vec::new();
         while let Next::Call { a, b: None, .. } = next {

@@ -4,6 +4,7 @@ use std::rc::Rc;
 use crate::cont::Cont;
 use crate::env::Env;
 use crate::expr::{ExprRef, Lazy, Len, ConformSpec};
+use crate::list::List;
 use crate::types::{first_free, Type};
 
 // A handler as data: which effect it handles, the clause body, the env it
@@ -216,12 +217,13 @@ pub enum Value {
     // typecheck::build_boundary_check;
     // Type::Token itself has no surface spelling either).
     Token(u64),
-    // Rc<Vec<Value>>, not a persistent cons-list: most list use in a
-    // scripting language is indexing/iteration, which arrays serve better
-    // than cons-lists. Pattern matching (Pattern::List/Cons) and tuples
-    // (a fixed-arity List, see types::Type::Tuple) both destructure this
-    // same representation.
-    List(Rc<Vec<Value>>),
+    // A claim-list (list.rs): contiguous blocks of write-once slots, so `::`, head
+    // and tail are O(1) (recursion over a list is linear), `get` is O(1) on a list
+    // built in bulk (a literal, `range`, a builtin's result) and O(blocks) on a
+    // cons-built one, and iteration stays mostly contiguous. Pattern matching
+    // (Pattern::List/Cons) and tuples (a fixed-arity List, see types::Type::Tuple)
+    // both destructure this same representation.
+    List(List),
     // A record: name-keyed, unlike Tuple's plain positional List (see
     // types::Type::Record's own doc comment for why records need this --
     // width subtyping needs a value whose fields can be looked up by
