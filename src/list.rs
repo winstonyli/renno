@@ -958,6 +958,20 @@ mod tests {
         assert_eq!(empties(), 0);
     }
 
+    // Equal lengths take the front path even when the left side has room to claim (a bulk left
+    // side is born grown, so the check above cannot tell `<` from `<=`; this one can).
+    #[test]
+    fn equal_lengths_do_not_claim() {
+        let base = roomy();
+        let r = base.append(&bulk(&[6, 7, 8, 9, 10]));
+        check(&r, &(1..=10).collect::<Vec<_>>());
+        assert_ne!(r.identity().0, base.identity().0, "equal lengths: the front path, not a claim of base's room");
+        check(&base, &[1, 2, 3, 4, 5]);
+        // One element shorter on the right does claim.
+        let s = base.append(&bulk(&[6, 7, 8, 9]));
+        assert_eq!(s.identity().0, base.identity().0);
+    }
+
     #[test]
     fn a_snoc_claimed_slot_below_a_seal_is_unsealed() {
         let l = roomy();
