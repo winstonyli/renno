@@ -78,6 +78,35 @@ pub enum Frame {
     Iterate { state: Rc<Iter>, pending: Option<Value> },
 }
 
+// Test-only operation counters (the same pattern as list.rs): the U11 complexity tests count
+// operations instead of timing them, so they are deterministic and fast in a debug build.
+// Thread-locals, read on the thread that ran the program.
+#[cfg(test)]
+thread_local! {
+    // Each `Cont::cons`: one frame node allocated.
+    pub(crate) static CONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // The cost of capture and resume: each frame `perform` visits while searching for its
+    // handler, plus each frame `Cont::append` copies.
+    pub(crate) static WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_counters() {
+    CONS.with(|c| c.set(0));
+    WALKED.with(|c| c.set(0));
+}
+
+// (cons, walked)
+#[cfg(test)]
+pub(crate) fn counters() -> (usize, usize) {
+    (CONS.with(|c| c.get()), WALKED.with(|c| c.get()))
+}
+
+pub(crate) fn count_walked() {
+    #[cfg(test)]
+    WALKED.with(|c| c.set(c.get() + 1));
+}
+
 // Persistent, Nil-terminated linked stack of frames. Cloning a Cont is an
 // Rc clone -- O(1) -- which is what lets a captured continuation be resumed
 // more than once without the calls interfering with each other.
@@ -102,6 +131,8 @@ impl Cont {
     }
 
     pub fn cons(frame: Frame, rest: Cont) -> Cont {
+        #[cfg(test)]
+        CONS.with(|c| c.set(c.get() + 1));
         Cont(Rc::new(ContNode::Frame(frame, rest)))
     }
 
@@ -128,6 +159,7 @@ impl Cont {
             match &*node.0 {
                 ContNode::Nil => break,
                 ContNode::Frame(f, rest) => {
+                    count_walked();
                     frames.push(f.clone());
                     node = rest.clone();
                 }
@@ -153,5 +185,20 @@ impl Drop for Cont {
                 _ => break,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The default test-thread stack (~2 MiB) would overflow on a recursive Drop at this depth.
+    #[test]
+    fn a_chain_of_a_million_frames_drops_on_a_small_stack() {
+        let mut chain = Cont::nil();
+        for _ in 0..1_000_000 {
+            chain = Cont::cons(Frame::PerformPayload { effect: "e".to_string() }, chain);
+        }
+        drop(chain);
     }
 }

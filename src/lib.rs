@@ -10725,4 +10725,170 @@ g(len)").unwrap_err();
                    let rec go = fun i -> fun s -> if i == 1000000 then s else go(i + 1)(s + get(xs)(i)) in go(0)(0)";
         assert_eq!(finishes_within(5, src).unwrap(), Outcome::Int(500_000_500_000));
     }
+
+    // --- U11 perform capture cost (docs/superpowers/plans/2026-10-16-u11-perform-capture-cost.md) ---
+    // The complexity pins count operations (cont.rs's counters) instead of timing them. The
+    // counters are thread-locals, so the program runs on this thread (`run_untyped`).
+
+    // The program's outcome, (frame nodes allocated, the capture/resume work).
+    fn cont_cost(src: &str) -> (Outcome, usize, usize) {
+        cont::reset_counters();
+        let v = run_untyped(src);
+        let (cons, walked) = cont::counters();
+        (Outcome::from(&v), cons, walked)
+    }
+
+    // A deep handler whose body performs once per level of a non-tail recursion, tail resume.
+    fn perform_many(n: usize) -> String {
+        format!("let rec go = fun i -> if i == 0 then 0 else (perform e(i)) + go(i - 1) in handle go({n}) with deep(handler e(p, resume) -> resume(1))")
+    }
+
+    // The same with a non-tail resume: every handler clause stays pending.
+    fn perform_many_non_tail_resume(n: usize) -> String {
+        format!("let rec go = fun i -> if i == 0 then 0 else (perform e(i)) + go(i - 1) in handle go({n}) with deep(handler e(p, resume) -> resume(1) + 0)")
+    }
+
+    // A natural (non-tail) map whose callback performs.
+    fn perform_in_rmap(n: usize) -> String {
+        format!(
+            "let rec rmap = fun f -> fun xs -> match xs | [] -> [] | h :: t -> f(h) :: rmap(f)(t) in \
+             len(handle rmap(fun x -> perform e(x))(range(0)({n})) with deep(handler e(p, resume) -> resume(1)))"
+        )
+    }
+
+    // Walked linearly (at most two marks per perform: the capture's and the resume's), and
+    // frame nodes allocated linearly: doubling n doubles the allocations.
+    fn assert_linear(program: fn(usize) -> String, walked_bound: impl Fn(usize) -> usize, alloc_per_level: usize) {
+        let (out, cons, walked) = cont_cost(&program(2000));
+        assert_eq!(out, Outcome::Int(2000));
+        assert!(walked <= walked_bound(2000), "walked {walked} > {}", walked_bound(2000));
+        let (_, cons_half, _) = cont_cost(&program(1000));
+        let ratio = cons as f64 / cons_half as f64;
+        assert!((1.9..=2.1).contains(&ratio), "cons {cons_half} -> {cons}: ratio {ratio}");
+        assert!(cons <= alloc_per_level * 2000, "cons {cons} > {alloc_per_level} per level");
+    }
+
+    #[test]
+    fn perform_in_non_tail_recursion_walks_and_allocates_linearly() {
+        assert_linear(perform_many, |n| 2 * n + 10, 20);
+    }
+
+    #[test]
+    fn perform_with_non_tail_resume_walks_and_allocates_linearly() {
+        assert_linear(perform_many_non_tail_resume, |n| 2 * n + 10, 20);
+    }
+
+    #[test]
+    fn perform_in_a_natural_map_walks_and_allocates_linearly() {
+        assert_linear(perform_in_rmap, |n| 2 * n + 10, 20);
+    }
+
+    // The captured continuation is the pending 1000-deep recursion, resumed twice: neither the
+    // capture nor either resume may cost anything in that depth.
+    #[test]
+    fn multi_shot_resume_does_not_copy_k() {
+        let src = "let rec deep = fun i -> if i == 0 then perform c(0) else 1 + deep(i - 1) in handle deep(1000) with handler c(p, r) -> r(1) + r(2)";
+        let (out, _, walked) = cont_cost(src);
+        assert_eq!(out, Outcome::Int(2003));
+        assert!(walked <= 10, "walked {walked}");
+    }
+
+    #[test]
+    fn forwarding_marks_are_replayed_per_resume() {
+        let src = "handle (handle (perform a(0)) + (perform b(0)) with deep(handler b(p, r) -> r(10))) with deep(handler a(p, r) -> r(1) + r(2))";
+        assert_eq!(run_untyped(src).as_int(), 23);
+    }
+
+    #[test]
+    fn shallow_matched_handler_is_not_reinstalled_but_an_inner_one_is() {
+        let both = "handle (handle (perform a(0)) + (perform b(0)) with deep(handler b(p, r) -> r(10))) with handler a(p, r) -> r(1) + r(2)";
+        assert_eq!(run_untyped(both).as_int(), 23);
+        let again = "handle (handle (perform a(0)) + (perform b(0)) + (perform a(1)) with deep(handler b(p, r) -> r(10))) with handler a(p, r) -> r(1) + r(2)";
+        expect_run_error("unhandled effect: a", || {
+            run_untyped(again);
+        });
+    }
+
+    #[test]
+    fn shallow_non_tail_resume_joins_back() {
+        assert_eq!(run_untyped("handle (perform a(0)) + 1 with handler a(p, r) -> r(5) * 2").as_int(), 12);
+    }
+
+    #[test]
+    fn an_empty_join_is_not_pushed_on_a_shallow_tail_resume() {
+        let (out, _, walked) = cont_cost("handle perform a(0) with handler a(p, r) -> r(1)");
+        assert_eq!(out, Outcome::Int(1));
+        // One mark visited by the capture, none pushed by the resume.
+        assert_eq!(walked, 1);
+    }
+
+    #[test]
+    fn an_escaped_continuation_resumes_outside_its_handle() {
+        assert_eq!(run_untyped("let k = handle perform e(0) with handler e(p, r) -> r in k(5)").as_int(), 5);
+        assert_eq!(run_untyped("let k = handle perform e(0) with deep(handler e(p, r) -> r) in k(5)").as_int(), 5);
+        // Deep: the continuation performs again after the escape, and the reinstalled handler catches it.
+        assert_eq!(run_untyped("let k = handle (perform e(0)) + (perform e(1)) with deep(handler e(p, r) -> r) in k(5)(7)").as_int(), 12);
+        // Shallow: nothing is reinstalled.
+        expect_run_error("unhandled effect: e", || {
+            run_untyped("let k = handle (perform e(0)) + (perform e(1)) with handler e(p, r) -> r in k(5)(7)");
+        });
+    }
+
+    #[test]
+    fn abort_from_deep_non_tail_recursion() {
+        let src = "let rec go = fun i -> if i == 0 then perform e(0) else 1 + go(i - 1) in handle go(100000) with deep(handler e(p, resume) -> 7)";
+        assert_eq!(run_untyped(src).as_int(), 7);
+    }
+
+    #[test]
+    fn handler_clause_effects_go_outward() {
+        // The clause's own effect is caught by the OUTER handler, not by the handler running it.
+        let outer = "handle (handle perform a(0) with deep(handler a(p, r) -> perform b(1) + r(0))) with deep(handler b(p, r) -> r(40))";
+        assert_eq!(run_untyped(outer).as_int(), 40);
+        expect_run_error("unhandled effect: a", || {
+            run_untyped("handle perform a(0) with deep(handler a(p, r) -> perform a(1))");
+        });
+    }
+
+    #[test]
+    fn deep_non_tail_resume_multi_shot_through_rmap() {
+        let handler = "with deep(handler c(p, resume) -> resume(p) ++ [])";
+        let rmap = format!(
+            "let rec rmap = fun f -> fun xs -> match xs | [] -> [] | h :: t -> f(h) :: rmap(f)(t) in handle rmap(fun x -> perform c(x))(range(0)(200)) {handler}"
+        );
+        let builtin = format!("handle map(fun x -> perform c(x))(range(0)(200)) {handler}");
+        let want = Outcome::List((0..200).map(Outcome::Int).collect());
+        assert_eq!(Outcome::from(&run_untyped(&rmap)), want);
+        assert_eq!(Outcome::from(&run_untyped(&builtin)), want);
+    }
+
+    // ---- U11 scale gates (release only; see the scale gates above) ----
+
+    #[test]
+    #[ignore]
+    fn scale_non_tail_perform_100k() {
+        assert_eq!(finishes_within(2, &perform_many(100_000)).unwrap(), Outcome::Int(100_000));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_non_tail_perform_non_tail_resume_100k() {
+        assert_eq!(finishes_within(2, &perform_many_non_tail_resume(100_000)).unwrap(), Outcome::Int(100_000));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_natural_map_performing_100k() {
+        assert_eq!(finishes_within(2, &perform_in_rmap(100_000)).unwrap(), Outcome::Int(100_000));
+    }
+
+    // One perform forwarded through 100,000 nested non-matching deep handlers, then resumed.
+    #[test]
+    #[ignore]
+    fn scale_forward_through_100k_handlers() {
+        let n = 100_000;
+        let mut src = String::from("let rec nest = fun i -> if i == 0 then perform a(0) + 1 else handle nest(i - 1) with deep(handler b(p, r) -> r(0)) in ");
+        src.push_str(&format!("handle nest({n}) with deep(handler a(p, r) -> r(5))"));
+        assert_eq!(finishes_within(2, &src).unwrap(), Outcome::Int(6));
+    }
 }

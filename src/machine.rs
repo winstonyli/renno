@@ -1835,6 +1835,7 @@ fn perform(cont: &mut Cont, effect: &str, payload: Value) -> Control {
         match &*node.0 {
             ContNode::Nil => crate::run_error!("unhandled effect: {effect}"),
             ContNode::Frame(frame, rest) => {
+                crate::cont::count_walked();
                 if let Frame::HandlerMark(data) = frame {
                     if data.effect == effect {
                         // deep: reinstall this same HandlerMark at the far
