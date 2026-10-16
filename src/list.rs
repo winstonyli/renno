@@ -11,10 +11,14 @@
 // tail. A slot is written at most once, so no view's contents ever change and the structure
 // is persistent in safe Rust.
 //
-// Cost: `::`, head and tail are O(1); `++` is O(|a|) whatever |b|; `get` is O(1) on a
-// bulk-built list (a literal, `range`, a builtin's result, a tuple) and O(blocks) on a
-// cons-built one (O(log n) when built linearly, up to O(n) for a list built by repeated
-// branching, as for a cons list).
+// Cost: `::` is amortized O(1) (one cons can open a block of twice the top block's capacity,
+// each block grows at most once), head and tail are O(1); `++` is O(|a|) whatever |b|; `get`
+// is O(1) on a bulk-built list (a literal, `range`, a builtin's result, a tuple) and
+// O(blocks) on a cons-built one (O(log n) when built linearly, up to O(n) for a list built
+// by repeated branching, as for a cons list).
+//
+// Memory: a view keeps alive every value consed into a free slot of its block, including by
+// a branch that was since dropped (see the spec, section 20, parked item M1).
 
 use std::cell::{Cell, OnceCell};
 use std::rc::Rc;
@@ -524,14 +528,17 @@ mod tests {
         check(&base, &[1]);
         check(&a, &[2, 1]);
         check(&b, &[3, 1]);
-        // A grown block: the first cons above a position claims it, the second branches.
-        let xs = linear(3); // [2, 1, 0], top block capacity 1 (blocks of 1, 2: top 2 of capacity 2)
+        // A block with a free slot (linear(2) is a 2-slot block holding one element): the
+        // first cons above that position claims the slot in place, the second branches.
+        let xs = linear(2);
+        assert_eq!((xs.capacity(), xs.len()), (2, 2));
         let first = xs.cons(val(10));
         let second = xs.cons(val(20));
-        check(&xs, &[2, 1, 0]);
-        check(&first, &[10, 2, 1, 0]);
-        check(&second, &[20, 2, 1, 0]);
-        assert_ne!(first.identity().0, second.identity().0, "the second cons got its own block");
+        check(&xs, &[1, 0]);
+        check(&first, &[10, 1, 0]);
+        check(&second, &[20, 1, 0]);
+        assert_eq!(first.identity().0, xs.identity().0, "the first cons claimed the free slot");
+        assert_ne!(second.identity().0, xs.identity().0, "the second cons got its own block");
     }
 
     #[test]

@@ -10527,6 +10527,10 @@ g(len)").unwrap_err();
         assert_eq!(out, Outcome::Int(N as i64));
         assert!(writes <= N + 8, "writes {writes}");
         assert!(blocks <= N.ilog2() as usize + 4, "blocks {blocks}");
+        // The counters are live: exact values for this deterministic build (blocks of 1, 2,
+        // 4, ... 1024 slots, each created with one slot set).
+        assert_eq!((writes, blocks), (N, 11));
+        assert_eq!(list::empties(), (1usize << 11) - 1 - 11, "padding of the 11 blocks");
     }
 
     #[test]
@@ -10577,15 +10581,16 @@ g(len)").unwrap_err();
 
     #[test]
     fn builtin_results_are_built_in_one_pass() {
-        for body in [
-            format!("len(range(0)({N}))"),
-            format!("len(reverse(range(0)({N})))"),
-            format!("len(map(fun x -> x + 1)(range(0)({N})))"),
-            format!("len(filter(fun x -> x > 3)(range(0)({N})))"),
-            format!("len(sort(fun a -> fun b -> a <= b)(reverse(range(0)({N}))))"),
-            format!("len(range(0)({N}) ++ range(0)({N}))"),
+        for (body, len) in [
+            (format!("len(range(0)({N}))"), N),
+            (format!("len(reverse(range(0)({N})))"), N),
+            (format!("len(map(fun x -> x + 1)(range(0)({N})))"), N),
+            (format!("len(filter(fun x -> x > 3)(range(0)({N})))"), N - 4),
+            (format!("len(sort(fun a -> fun b -> a <= b)(reverse(range(0)({N}))))"), N),
+            (format!("len(range(0)({N}) ++ range(0)({N}))"), 2 * N),
         ] {
-            list_cost(&body);
+            let (out, ..) = list_cost(&body);
+            assert_eq!(out, Outcome::Int(len as i64), "{body}");
             assert_eq!(list::empties(), 0, "{body}");
         }
     }
@@ -10610,6 +10615,9 @@ g(len)").unwrap_err();
         let (out, _, _, hops) = list_cost(&src);
         assert_eq!(out, Outcome::Int((n * (n - 1) / 2) as i64));
         assert!(hops <= n * (n.ilog2() as usize + 2), "hops {hops}");
+        // The counter is live: at least one block visit per get, and exactly this many here.
+        assert!(hops >= n);
+        assert_eq!(hops, 12274);
     }
 
     // ---- semantic pins: hold before and after the representation change ----
