@@ -10563,6 +10563,33 @@ g(len)").unwrap_err();
         assert!(writes <= N + 8, "writes {writes}");
     }
 
+    // A list built from a whole sequence of known length is one exactly-sized block built in
+    // one pass: no empty slot is created and then filled. (snoc re-copies the list each step,
+    // so the number of writes is quadratic; the cost per write is what is pinned.)
+    #[test]
+    fn snoc_builds_each_block_in_one_pass() {
+        let src = format!("let rec go = fun i -> fun acc -> if i == {N} then acc else go(i + 1)(acc ++ [i]) in len(go(0)([]))");
+        let (out, _, blocks, _) = list_cost(&src);
+        assert_eq!(out, Outcome::Int(N as i64));
+        assert_eq!(list::empties(), 0, "empties");
+        assert!(blocks <= 2 * N + 8, "blocks {blocks}");
+    }
+
+    #[test]
+    fn builtin_results_are_built_in_one_pass() {
+        for body in [
+            format!("len(range(0)({N}))"),
+            format!("len(reverse(range(0)({N})))"),
+            format!("len(map(fun x -> x + 1)(range(0)({N})))"),
+            format!("len(filter(fun x -> x > 3)(range(0)({N})))"),
+            format!("len(sort(fun a -> fun b -> a <= b)(reverse(range(0)({N}))))"),
+            format!("len(range(0)({N}) ++ range(0)({N}))"),
+        ] {
+            list_cost(&body);
+            assert_eq!(list::empties(), 0, "{body}");
+        }
+    }
+
     #[test]
     fn branch_cons_no_copy() {
         let src = format!("let base = range(0)({N}) in get(map(fun x -> len(x :: base))(range(0)(100)))(99)");

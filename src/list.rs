@@ -32,6 +32,9 @@ thread_local! {
     pub(crate) static BLOCKS: Cell<usize> = const { Cell::new(0) };
     // Each block visited by `get`.
     pub(crate) static HOPS: Cell<usize> = const { Cell::new(0) };
+    // Each empty slot created: room reserved for later conses, or a slot that is filled in a
+    // second pass. An exactly-sized block is built in one pass and creates none.
+    pub(crate) static EMPTIES: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -39,6 +42,12 @@ pub(crate) fn reset_counters() {
     WRITES.with(|c| c.set(0));
     BLOCKS.with(|c| c.set(0));
     HOPS.with(|c| c.set(0));
+    EMPTIES.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn empties() -> usize {
+    EMPTIES.with(|c| c.get())
 }
 
 #[cfg(test)]
@@ -55,6 +64,12 @@ fn count_writes(n: usize) {
 fn count_block() {
     #[cfg(test)]
     BLOCKS.with(|c| c.set(c.get() + 1));
+}
+
+#[allow(unused_variables)]
+fn count_empties(n: usize) {
+    #[cfg(test)]
+    EMPTIES.with(|c| c.set(c.get() + n));
 }
 
 fn count_hop() {
@@ -153,6 +168,7 @@ impl List {
         };
         count_writes(left);
         count_block();
+        count_empties(capacity);
         let slots: Box<[OnceCell<Value>]> = (0..capacity).map(|_| OnceCell::new()).collect();
         for (slot, x) in slots.iter().zip(refused.into_iter().chain(items)) {
             let _ = slot.set(x);
