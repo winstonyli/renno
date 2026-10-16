@@ -5,6 +5,7 @@ pub mod frame;
 pub mod index_expr;
 pub mod iterate;
 pub mod lexer;
+pub mod list;
 pub mod machine;
 pub mod parser;
 pub mod resolve;
@@ -10480,5 +10481,134 @@ g(len)").unwrap_err();
         assert!(err.contains("...") && err.len() < 200_000, "{} bytes", err.len());
         let small = finishes_within(20, "let f = fun x: Tuple((Int, Bool)) -> 0 in f(1)").expect_err("mismatch");
         assert!(small.contains("(Int, Bool)") && !small.contains("..."), "{small}");
+    }
+
+    // ---- P4b (docs/superpowers/plans/2026-10-15-p4b-cons-list-representation.md): list cost ----
+    // The complexity tests count operations (list.rs's counters) instead of timing them. The
+    // counters are thread-locals, so the program runs on this thread.
+
+    // The program's outcome and (values placed into list storage, storage allocations,
+    // blocks `get` visited).
+    fn list_cost(src: &str) -> (Outcome, usize, usize, usize) {
+        list::reset_counters();
+        let v = run_source_on_this_thread(src).expect("runs");
+        let (writes, blocks, hops) = list::counters();
+        (Outcome::from(&v), writes, blocks, hops)
+    }
+
+    fn ints(xs: &[i64]) -> Outcome {
+        Outcome::List(xs.iter().map(|n| Outcome::Int(*n)).collect())
+    }
+
+    const N: usize = 2000;
+
+    #[test]
+    fn cons_map_linear() {
+        let src = format!("let rec m = fun f -> fun xs -> match xs | [] -> [] | h :: t -> f(h) :: m(f)(t) in len(m(fun x -> x + 1)(range(0)({N})))");
+        let (out, writes, _, _) = list_cost(&src);
+        assert_eq!(out, Outcome::Int(N as i64));
+        assert!(writes <= 2 * N + 8, "writes {writes}");
+    }
+
+    #[test]
+    fn cons_filter_linear() {
+        let src = format!(
+            "let rec f = fun p -> fun xs -> match xs | [] -> [] | h :: t -> if p(h) then h :: f(p)(t) else f(p)(t) in len(f(fun x -> x % 2 == 0)(range(0)({N})))"
+        );
+        let (out, writes, _, _) = list_cost(&src);
+        assert_eq!(out, Outcome::Int(N as i64 / 2));
+        assert!(writes <= 2 * N + 8, "writes {writes}");
+    }
+
+    #[test]
+    fn cons_range_linear() {
+        let src = format!("let rec r = fun a -> fun b -> if a < b then a :: r(a + 1)(b) else [] in len(r(0)({N}))");
+        let (out, writes, blocks, _) = list_cost(&src);
+        assert_eq!(out, Outcome::Int(N as i64));
+        assert!(writes <= N + 8, "writes {writes}");
+        assert!(blocks <= N.ilog2() as usize + 4, "blocks {blocks}");
+    }
+
+    #[test]
+    fn rev_acc_linear() {
+        let src = format!(
+            "let rec ra = fun acc -> fun xs -> match xs | [] -> acc | h :: t -> ra(h :: acc)(t) in let r = ra([])(range(0)({N})) in (get(r)(0), len(r))"
+        );
+        let (out, writes, _, _) = list_cost(&src);
+        assert_eq!(out, ints(&[N as i64 - 1, N as i64]));
+        assert!(writes <= 2 * N + 8, "writes {writes}");
+    }
+
+    #[test]
+    fn pattern_sum_no_copies() {
+        let src = format!("let rec sum = fun l -> match l | [] -> 0 | h :: t -> h + sum(t) in sum(range(0)({N}))");
+        let (out, writes, _, _) = list_cost(&src);
+        assert_eq!(out, Outcome::Int((N * (N - 1) / 2) as i64));
+        assert!(writes <= N + 8, "writes {writes}");
+    }
+
+    #[test]
+    fn prepend_append_linear() {
+        let src = format!("let rec go = fun i -> fun acc -> if i == {N} then acc else go(i + 1)([i] ++ acc) in len(go(0)([]))");
+        let (out, writes, _, _) = list_cost(&src);
+        assert_eq!(out, Outcome::Int(N as i64));
+        assert!(writes <= 2 * N + 8, "writes {writes}");
+    }
+
+    #[test]
+    fn append_empty_free() {
+        let src = format!("let xs = range(0)({N}) in (len(xs ++ []), len([] ++ xs))");
+        let (out, writes, _, _) = list_cost(&src);
+        assert_eq!(out, ints(&[N as i64, N as i64]));
+        assert!(writes <= N + 8, "writes {writes}");
+    }
+
+    #[test]
+    fn branch_cons_no_copy() {
+        let src = format!("let base = range(0)({N}) in get(map(fun x -> len(x :: base))(range(0)(100)))(99)");
+        let (out, writes, _, _) = list_cost(&src);
+        assert_eq!(out, Outcome::Int(N as i64 + 1));
+        assert!(writes <= N + 300, "writes {writes}");
+    }
+
+    // A regression guard: a get loop over a cons-built list stays within n * (log2 n + 2)
+    // block visits.
+    #[test]
+    fn get_on_cons_list_log() {
+        let n = 4096usize;
+        let src = format!(
+            "let rec r = fun a -> fun b -> if a < b then a :: r(a + 1)(b) else [] in let xs = r(0)({n}) in \
+             let rec go = fun i -> fun acc -> if i == {n} then acc else go(i + 1)(acc + get(xs)(i)) in go(0)(0)"
+        );
+        let (out, _, _, hops) = list_cost(&src);
+        assert_eq!(out, Outcome::Int((n * (n - 1) / 2) as i64));
+        assert!(hops <= n * (n.ilog2() as usize + 2), "hops {hops}");
+    }
+
+    // ---- semantic pins: hold before and after the representation change ----
+
+    #[test]
+    fn claim_isolation() {
+        let src = "let xs = 1 :: [] in let a = 2 :: xs in let b = 3 :: xs in (a, b, xs)";
+        assert_eq!(run_source(src).unwrap(), Outcome::List(vec![ints(&[2, 1]), ints(&[3, 1]), ints(&[1])]));
+    }
+
+    #[test]
+    fn tail_view_cons() {
+        let src = "match [1, 2, 3] | h :: t -> (9 :: t, t, h :: t) | [] -> ([], [], [])";
+        assert_eq!(run_source(src).unwrap(), Outcome::List(vec![ints(&[9, 2, 3]), ints(&[2, 3]), ints(&[1, 2, 3])]));
+    }
+
+    #[test]
+    fn multi_shot_cons_shared_base() {
+        let src = "let base = [1, 2] in handle (perform c(0)) :: base with deep(handler c(p, resume) -> (resume(10), resume(20), base))";
+        assert_eq!(run_source(src).unwrap(), Outcome::List(vec![ints(&[10, 1, 2]), ints(&[20, 1, 2]), ints(&[1, 2])]));
+    }
+
+    // map iterates `xs` while its callback conses onto that same list.
+    #[test]
+    fn builtin_callback_conses_same_list() {
+        let src = "let xs = 1 :: [] in map(fun y -> len(y :: xs))(xs)";
+        assert_eq!(run_source(src).unwrap(), ints(&[2]));
     }
 }

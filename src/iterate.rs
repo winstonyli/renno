@@ -68,6 +68,10 @@ pub fn step_shared(state: &mut Rc<Iter>, v: Value, spans: &SpanMap) -> Next {
 }
 
 fn list(items: Vec<Value>) -> Value {
+    if !items.is_empty() {
+        crate::list::count_writes(items.len());
+        crate::list::count_block();
+    }
     Value::List(Rc::new(items))
 }
 

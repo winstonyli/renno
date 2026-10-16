@@ -1421,6 +1421,8 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
         BinOp::Concat => match (&lhs, &rhs) {
             (Value::Str(a), Value::Str(b)) => Value::Str(Rc::from(format!("{a}{b}"))),
             (Value::List(a), Value::List(b)) => {
+                crate::list::count_writes(a.len() + b.len());
+                crate::list::count_block();
                 let mut v = Vec::with_capacity(a.len() + b.len());
                 v.extend(a.iter().cloned());
                 v.extend(b.iter().cloned());
@@ -1442,6 +1444,8 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
         },
         BinOp::Cons => match &rhs {
             Value::List(items) => {
+                crate::list::count_writes(items.len() + 1);
+                crate::list::count_block();
                 let mut v = Vec::with_capacity(items.len() + 1);
                 v.push(lhs);
                 v.extend(items.iter().cloned());
@@ -1531,7 +1535,10 @@ fn dispatch_builtin(b: Builtin, mut args: Vec<Value>) -> Value {
                 (Some(Value::List(items)), Some(Value::Int(idx))) => {
                     let idx = usize::try_from(idx).ok().filter(|&idx| idx < items.len());
                     match idx {
-                        Some(idx) => items[idx].clone(),
+                        Some(idx) => {
+                            crate::list::count_hop();
+                            items[idx].clone()
+                        }
                         None => crate::run_error!("get: index out of bounds"),
                     }
                 }
@@ -1583,6 +1590,8 @@ fn dispatch_builtin(b: Builtin, mut args: Vec<Value>) -> Value {
         Builtin::Map | Builtin::Fold | Builtin::Filter | Builtin::Sort => unreachable!("internal: a higher-order builtin is started, not dispatched"),
         Builtin::Reverse => match args.pop() {
             Some(Value::List(items)) => {
+                crate::list::count_writes(items.len());
+                crate::list::count_block();
                 let mut items = (*items).clone();
                 items.reverse();
                 Value::List(Rc::new(items))
@@ -1592,7 +1601,11 @@ fn dispatch_builtin(b: Builtin, mut args: Vec<Value>) -> Value {
         Builtin::Range => {
             let (end, start) = (args.pop(), args.pop());
             match (start, end) {
-                (Some(Value::Int(start)), Some(Value::Int(end))) => Value::List(Rc::new((start..end).map(Value::Int).collect())),
+                (Some(Value::Int(start)), Some(Value::Int(end))) => {
+                    crate::list::count_writes(usize::try_from(end.saturating_sub(start)).unwrap_or(0));
+                    crate::list::count_block();
+                    Value::List(Rc::new((start..end).map(Value::Int).collect()))
+                }
                 _ => crate::run_error!("range expects two ints"),
             }
         }
@@ -1758,6 +1771,8 @@ fn match_pattern(pat: &Pattern, value: &Value, out: &mut Bindings) -> bool {
         },
         Pattern::Cons(head, tail) => match value {
             Value::List(items) if !items.is_empty() => {
+                crate::list::count_writes(items.len() - 1);
+                crate::list::count_block();
                 let tail_val = Value::List(Rc::new(items[1..].to_vec()));
                 match_pattern(head, &items[0], out) && match_pattern(tail, &tail_val, out)
             }
