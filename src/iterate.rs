@@ -75,7 +75,7 @@ fn list(items: Vec<Value>) -> Value {
 
 // Moves `items` past the element in flight; the next element, if any.
 fn advance(items: &mut List) -> Option<Value> {
-    *items = items.split_first().map(|(_, rest)| rest).unwrap_or_default();
+    items.pop_front();
     items.first().cloned()
 }
 

@@ -225,6 +225,18 @@ impl List {
         Some((head, tail))
     }
 
+    // Drops the head in place: the cursor step of an iteration (no reference-count traffic
+    // except when the view crosses into the block below).
+    pub fn pop_front(&mut self) {
+        let Some(b) = &self.block else { return };
+        self.len -= 1;
+        if self.top == 1 {
+            *self = b.below.clone();
+        } else {
+            self.top -= 1;
+        }
+    }
+
     // The i-th element: O(1) within the top block, one more step per block below it. There
     // is deliberately no `Index` impl, so the O(blocks) cost stays visible at call sites.
     pub fn get(&self, i: usize) -> Option<&Value> {
@@ -425,6 +437,16 @@ mod tests {
         }
         assert_eq!(seen, want);
         assert!(rest.is_empty());
+        // pop_front is the same step, in place.
+        let (mut cursor, mut seen) = (l.clone(), Vec::new());
+        while let Some(h) = cursor.first() {
+            seen.push(h.as_int());
+            cursor.pop_front();
+            assert_eq!(cursor.len(), want.len() - seen.len());
+        }
+        assert_eq!(seen, want);
+        cursor.pop_front();
+        assert!(cursor.is_empty());
     }
 
     // The bulk builds create every slot already set (no empty slot) and one block each.
