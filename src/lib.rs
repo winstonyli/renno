@@ -10611,4 +10611,83 @@ g(len)").unwrap_err();
         let src = "let xs = 1 :: [] in map(fun y -> len(y :: xs))(xs)";
         assert_eq!(run_source(src).unwrap(), ints(&[2]));
     }
+
+    // The three pins above on a list whose top block has free slots (built by four conses:
+    // blocks of 1, 2 and a 4-slot block holding one), where a cons really claims a slot in
+    // place and a later cons at the same position must not see it.
+    #[test]
+    fn claim_isolation_on_a_growing_block() {
+        let src = "let xs = 1 :: (2 :: (3 :: (4 :: []))) in let a = 10 :: xs in let b = 20 :: xs in (a, b, xs)";
+        assert_eq!(run_source(src).unwrap(), Outcome::List(vec![ints(&[10, 1, 2, 3, 4]), ints(&[20, 1, 2, 3, 4]), ints(&[1, 2, 3, 4])]));
+    }
+
+    #[test]
+    fn multi_shot_cons_on_a_growing_block() {
+        let src = "let base = 1 :: (2 :: (3 :: (4 :: []))) in \
+                   handle (perform c(0)) :: base with deep(handler c(p, resume) -> (resume(10), resume(20), base))";
+        assert_eq!(run_source(src).unwrap(), Outcome::List(vec![ints(&[10, 1, 2, 3, 4]), ints(&[20, 1, 2, 3, 4]), ints(&[1, 2, 3, 4])]));
+    }
+
+    #[test]
+    fn builtin_callback_conses_a_growing_list_it_iterates() {
+        let src = "let xs = 1 :: (2 :: (3 :: (4 :: []))) in map(fun y -> y :: xs)(xs)";
+        let want = [[1, 1, 2, 3, 4], [2, 1, 2, 3, 4], [3, 1, 2, 3, 4], [4, 1, 2, 3, 4]];
+        assert_eq!(run_source(src).unwrap(), Outcome::List(want.iter().map(|l| ints(l)).collect()));
+    }
+
+    // ---- scale gates (release only: `cargo test --release --lib -- --ignored scale_`). The bounds
+    // sit far from both the old quadratic times (tens of seconds at 100k) and the linear ones
+    // (well under a second), so CPU sharing cannot flip them. Non-tail shapes stay at 100k: 1M
+    // deep non-tail recursion costs about 250 MB of continuation. ----
+
+    #[test]
+    #[ignore]
+    fn scale_map_100k() {
+        let src = "let rec m = fun f -> fun xs -> match xs | [] -> [] | h :: t -> f(h) :: m(f)(t) in len(m(fun x -> x + 1)(range(0)(100000)))";
+        assert_eq!(finishes_within(2, src).unwrap(), Outcome::Int(100_000));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_filter_100k() {
+        let src = "let rec f = fun p -> fun xs -> match xs | [] -> [] | h :: t -> if p(h) then h :: f(p)(t) else f(p)(t) in len(f(fun x -> x % 2 == 0)(range(0)(100000)))";
+        assert_eq!(finishes_within(2, src).unwrap(), Outcome::Int(50_000));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_range_100k() {
+        let src = "let rec r = fun a -> fun b -> if a < b then a :: r(a + 1)(b) else [] in len(r(0)(100000))";
+        assert_eq!(finishes_within(2, src).unwrap(), Outcome::Int(100_000));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_rev_acc_1m() {
+        let src = "let rec ra = fun acc -> fun xs -> match xs | [] -> acc | h :: t -> ra(h :: acc)(t) in let r = ra([])(range(0)(1000000)) in (get(r)(0), len(r))";
+        assert_eq!(finishes_within(5, src).unwrap(), ints(&[999_999, 1_000_000]));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_prepend_append_1m() {
+        let src = "let rec go = fun i -> fun acc -> if i == 1000000 then acc else go(i + 1)([i] ++ acc) in len(go(0)([]))";
+        assert_eq!(finishes_within(5, src).unwrap(), Outcome::Int(1_000_000));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_pattern_sum_100k() {
+        let src = "let rec sum = fun l -> match l | [] -> 0 | h :: t -> h + sum(t) in sum(range(0)(100000))";
+        assert_eq!(finishes_within(2, src).unwrap(), Outcome::Int(4_999_950_000));
+    }
+
+    // A tail-recursive cons build (no deep continuation), then a get loop over all of it.
+    #[test]
+    #[ignore]
+    fn scale_get_loop_cons_built_1m() {
+        let src = "let rec build = fun i -> fun acc -> if i == 0 then acc else build(i - 1)(i :: acc) in let xs = build(1000000)([]) in \
+                   let rec go = fun i -> fun s -> if i == 1000000 then s else go(i + 1)(s + get(xs)(i)) in go(0)(0)";
+        assert_eq!(finishes_within(5, src).unwrap(), Outcome::Int(500_000_500_000));
+    }
 }
