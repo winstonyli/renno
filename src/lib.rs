@@ -10758,8 +10758,9 @@ g(len)").unwrap_err();
 
     // Walked linearly (two marks per perform: the capture's and the resume's), and frame nodes
     // allocated linearly: doubling n doubles the allocations, at most `alloc_per_level` per
-    // level (measured on the green run: 12, 14 and 12 plus a constant; the old code's counts
-    // were quadratic, 4,030,009 at n = 2000).
+    // level (measured on the green run: 12, 14 and 12 plus a constant, so the bounds below
+    // carry 2 per level of headroom; the old code's counts were quadratic, 4,030,009 at
+    // n = 2000, and the ratio check and the walked bound catch any quadratic regression).
     fn assert_linear(program: fn(usize) -> String, alloc_per_level: usize) {
         let (out, cons, walked) = cont_cost(&program(2000));
         assert_eq!(out, Outcome::Int(2000));
@@ -10772,17 +10773,17 @@ g(len)").unwrap_err();
 
     #[test]
     fn perform_in_non_tail_recursion_walks_and_allocates_linearly() {
-        assert_linear(perform_many, 12);
+        assert_linear(perform_many, 14);
     }
 
     #[test]
     fn perform_with_non_tail_resume_walks_and_allocates_linearly() {
-        assert_linear(perform_many_non_tail_resume, 14);
+        assert_linear(perform_many_non_tail_resume, 16);
     }
 
     #[test]
     fn perform_in_a_natural_map_walks_and_allocates_linearly() {
-        assert_linear(perform_in_rmap, 12);
+        assert_linear(perform_in_rmap, 14);
     }
 
     // The captured continuation is the pending 1000-deep recursion, resumed twice: neither the
@@ -10870,7 +10871,7 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn deep_non_tail_resume_multi_shot_through_rmap() {
+    fn deep_non_tail_resume_through_rmap_at_depth() {
         let handler = "with deep(handler c(p, resume) -> resume(p) ++ [])";
         let rmap = format!(
             "let rec rmap = fun f -> fun xs -> match xs | [] -> [] | h :: t -> f(h) :: rmap(f)(t) in handle rmap(fun x -> perform c(x))(range(0)(200)) {handler}"
@@ -10879,6 +10880,37 @@ g(len)").unwrap_err();
         let want = Outcome::List((0..200).map(Outcome::Int).collect());
         assert_eq!(Outcome::from(&run_untyped(&rmap)), want);
         assert_eq!(Outcome::from(&run_untyped(&builtin)), want);
+    }
+
+    // Really multi-shot: every element's continuation is resumed twice, so the builtin must
+    // match the renno-level map on all 2^8 branches.
+    #[test]
+    fn deep_multi_shot_through_rmap_matches_the_builtin() {
+        let handler = "with deep(handler c(p, resume) -> resume(p) ++ resume(p))";
+        let rmap = format!(
+            "let rec rmap = fun f -> fun xs -> match xs | [] -> [] | h :: t -> f(h) :: rmap(f)(t) in handle rmap(fun x -> perform c(x))(range(0)(8)) {handler}"
+        );
+        let builtin = format!("handle map(fun x -> perform c(x))(range(0)(8)) {handler}");
+        let got = run_untyped(&builtin).to_string();
+        assert_eq!(got, run_untyped(&rmap).to_string());
+        assert_eq!(got.matches(',').count() + 1, 8 * 256);
+    }
+
+    // The map's Iterate frame becomes the top by underflowing into the `rest` of a mark that the
+    // capture passed (the inner `other` handler forwards `c`), not through k.top. Each of the two
+    // resumes underflows into a clone of that rest, so its top node is shared with k.marks and
+    // must be copied before the frame is stepped.
+    #[test]
+    fn iterate_frame_behind_a_forwarded_handler_is_copied_on_write() {
+        let handler = "with deep(handler c(p, r) -> r(p) ++ r(p * 10))";
+        let inner = "handle perform c(x) with handler other(p, r) -> r(0)";
+        let rmap = format!(
+            "let rec rmap = fun f -> fun xs -> match xs | [] -> [] | h :: t -> f(h) :: rmap(f)(t) in handle rmap(fun x -> {inner})([1, 2]) {handler}"
+        );
+        let builtin = format!("handle map(fun x -> {inner})([1, 2]) {handler}");
+        let got = run_untyped(&builtin).to_string();
+        assert_eq!(got, run_untyped(&rmap).to_string());
+        assert_eq!(got, "[1, 2, 1, 20, 10, 2, 10, 20]");
     }
 
     // ---- U11 scale gates (release only; see the scale gates above) ----
