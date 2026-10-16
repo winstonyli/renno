@@ -1,3 +1,4 @@
+pub mod claimed;
 pub mod cont;
 pub mod env;
 pub mod expr;
@@ -10580,18 +10581,6 @@ g(len)").unwrap_err();
         assert!(writes <= N + 8, "writes {writes}");
     }
 
-    // A list built from a whole sequence of known length is one exactly-sized block built in
-    // one pass: no empty slot is created and then filled. (snoc re-copies the list each step,
-    // so the number of writes is quadratic; the cost per write is what is pinned.)
-    #[test]
-    fn snoc_builds_each_block_in_one_pass() {
-        let src = format!("let rec go = fun i -> fun acc -> if i == {N} then acc else go(i + 1)(acc ++ [i]) in len(go(0)([]))");
-        let (out, _, blocks, _) = list_cost(&src);
-        assert_eq!(out, Outcome::Int(N as i64));
-        assert_eq!(list::empties(), 0, "empties");
-        assert!(blocks <= 2 * N + 8, "blocks {blocks}");
-    }
-
     #[test]
     fn builtin_results_are_built_in_one_pass() {
         for (body, len) in [
@@ -10606,6 +10595,110 @@ g(len)").unwrap_err();
             assert_eq!(out, Outcome::Int(len as i64), "{body}");
             assert_eq!(list::empties(), 0, "{body}");
         }
+    }
+
+    // ---- V2 (docs/superpowers/plans/2026-10-16-v2-claim-append.md): `acc ++ [x]` claims ----
+
+    // At N = 2000 the exact counts are 6025 writes (2000 literals, 1 front-path write, copies of
+    // 3 + 7 + ... + 1023 = 2035, 1989 claims) and 2010 blocks; today's code makes ~2M writes.
+    #[test]
+    fn snoc_append_linear() {
+        let src = format!("let rec go = fun i -> fun acc -> if i == {N} then acc else go(i + 1)(acc ++ [i]) in len(go(0)([]))");
+        let (out, writes, blocks, _) = list_cost(&src);
+        assert_eq!(out, Outcome::Int(N as i64));
+        assert!(writes <= 4 * N + 16, "writes {writes}");
+        assert!(blocks <= N + 32, "blocks {blocks}");
+    }
+
+    #[test]
+    fn fold_snoc_linear() {
+        let src = format!("len(fold(fun acc -> fun x -> acc ++ [x + 1])([])(range(0)({N})))");
+        let (out, writes, blocks, _) = list_cost(&src);
+        assert_eq!(out, Outcome::Int(N as i64));
+        assert!(writes <= 5 * N + 16, "writes {writes}");
+        assert!(blocks <= N + 40, "blocks {blocks}");
+    }
+
+    // `[1, 2] ++ [1, 2] ++ ...` is left-associative: the growing left side is snocced onto.
+    #[test]
+    fn concat_list_chain_linear() {
+        let src = format!("len({})", vec!["[1, 2]"; 500].join(" ++ "));
+        // A 500-term chain is 500 deep for the parser and checker: list_cost on the interpreter's
+        // stack (it counts on the thread it runs on).
+        let (out, writes, _, _) = std::thread::Builder::new().stack_size(WORKER_STACK_SIZE).spawn(move || list_cost(&src)).unwrap().join().unwrap();
+        assert_eq!(out, Outcome::Int(1000));
+        assert!(writes <= 5 * 1000 + 16, "writes {writes}");
+    }
+
+    // P2 with a snoc: the result check re-tests only the claimed slot (interval seals).
+    fn prog_contract_snoc(n: usize) -> String {
+        format!(
+            "let d: Dyn = fun xs -> xs ++ [0] in let step: (List(Int) -> List(Int)) = d in \
+             let rec loop = fun i -> fun acc -> if i == 0 then len(acc) else loop(i - 1)(step(acc)) in loop({n})([])"
+        )
+    }
+
+    #[test]
+    fn snoc_under_a_result_check_is_linear() {
+        // Ruling (T-L1 report): not `assert_checks_linear`'s 3n + 16. Each call tests 2 steps (the
+        // claimed slot, plus the one step every call of this shape costs), and each copy-grow
+        // scans its new block once (D9): 3 + 7 + ... + 1023 = 2035 at n = 2000, so 6027 steps
+        // in all. Measured 3.02n for n = 500..8000 (quadratic would be 2M at n = 2000).
+        let (out, steps) = check_cost(&prog_contract_snoc(N));
+        assert_eq!(out, Outcome::Int(N as i64));
+        assert!(steps >= N, "the first check must scan the list: {steps} steps");
+        assert!(steps <= 4 * N + 64, "check steps {steps} for n = {N}");
+    }
+
+    // Pins (pass before and after): a claim is invisible to every other holder.
+    #[test]
+    fn snoc_claims_never_disturb_other_holders() {
+        let cases = [
+            // 1. Two snocs at one position: the first claims, the second branches.
+            (
+                "let a = [1, 2, 3] ++ [4] ++ [5] in let b = a ++ [6] in let c = a ++ [7] in (a, b, c)",
+                Outcome::List(vec![ints(&[1, 2, 3, 4, 5]), ints(&[1, 2, 3, 4, 5, 6]), ints(&[1, 2, 3, 4, 5, 7])]),
+            ),
+            // 2. Multi-shot: each resumption appends to the same captured view.
+            (
+                "let base = [1, 2, 3] ++ [4] ++ [5] in handle base ++ [perform c(0)] with deep(handler c(p, resume) -> resume(10) ++ resume(20) ++ base)",
+                ints(&[1, 2, 3, 4, 5, 10, 1, 2, 3, 4, 5, 20, 1, 2, 3, 4, 5]),
+            ),
+            // 3. A callback snocs onto the list `map` is iterating.
+            (
+                "let xs = [1, 2] ++ [3] ++ [4] in map(fun y -> xs ++ [y])(xs)",
+                Outcome::List(vec![ints(&[1, 2, 3, 4, 1]), ints(&[1, 2, 3, 4, 2]), ints(&[1, 2, 3, 4, 3]), ints(&[1, 2, 3, 4, 4])]),
+            ),
+            // 4. Tail views: snoc onto a tail, cons back on, snoc onto that.
+            (
+                "match [1, 2, 3] ++ [4] ++ [5] | h :: t -> (t ++ [9], t, h :: t, (h :: t) ++ [8]) | [] -> ([], [], [], [])",
+                Outcome::List(vec![ints(&[2, 3, 4, 5, 9]), ints(&[2, 3, 4, 5]), ints(&[1, 2, 3, 4, 5]), ints(&[1, 2, 3, 4, 5, 8])]),
+            ),
+            // 5. Operands from one block.
+            (
+                "let xs = [1, 2, 3] ++ [4] ++ [5] in match xs | h :: t -> (xs ++ t, t ++ xs, xs ++ xs, xs) | [] -> ([], [], [], [])",
+                Outcome::List(vec![
+                    ints(&[1, 2, 3, 4, 5, 2, 3, 4, 5]),
+                    ints(&[2, 3, 4, 5, 1, 2, 3, 4, 5]),
+                    ints(&[1, 2, 3, 4, 5, 1, 2, 3, 4, 5]),
+                    ints(&[1, 2, 3, 4, 5]),
+                ]),
+            ),
+        ];
+        for (src, want) in cases {
+            assert_eq!(run_source(src).expect(src), want, "{src}");
+        }
+    }
+
+    // A sealed list grows by a snoc claim of a Str (through Dyn): the claimed slot must be
+    // tested, not skipped as sealed.
+    #[test]
+    fn a_snoc_claimed_slot_is_checked_after_a_seal() {
+        let src = "let good: Dyn = fun xs -> xs ++ [0] in let g: (List(Int) -> List(Int)) = good in \
+                   let s: Dyn = \"s\" in let bad: Dyn = fun xs -> xs ++ [s] in let b: (List(Int) -> List(Int)) = bad in \
+                   let base = [1, 2, 3] ++ [4] ++ [5] in let x = g(base) in len(b(x))";
+        let err = run_source(src).expect_err("the claimed Str slot must fail the result check");
+        assert!(err.contains("found Str"), "{err}");
     }
 
     #[test]
@@ -10714,6 +10807,20 @@ g(len)").unwrap_err();
     fn scale_rev_acc_1m() {
         let src = "let rec ra = fun acc -> fun xs -> match xs | [] -> acc | h :: t -> ra(h :: acc)(t) in let r = ra([])(range(0)(1000000)) in (get(r)(0), len(r))";
         assert_eq!(finishes_within(5, src).unwrap(), ints(&[999_999, 1_000_000]));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_snoc_1m() {
+        let src = "let rec go = fun i -> fun acc -> if i == 1000000 then len(acc) else go(i + 1)(acc ++ [i]) in go(0)([])";
+        assert_eq!(finishes_within(5, src).unwrap(), Outcome::Int(1_000_000));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_fold_snoc_1m() {
+        let src = "len(fold(fun acc -> fun x -> acc ++ [x + 1])([])(range(0)(1000000)))";
+        assert_eq!(finishes_within(5, src).unwrap(), Outcome::Int(1_000_000));
     }
 
     #[test]

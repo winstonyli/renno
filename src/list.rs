@@ -2,27 +2,32 @@
 // the first cons that reaches them).
 //
 // One structure whose two extremes are an array (one block, built in bulk) and a cons list
-// (blocks of one slot). A block is a fixed-capacity array of write-once slots, filled
-// bottom-up; a view `(block, top)` sees `slots[..top]`, the head being `slots[top - 1]`, and
-// the rest of the list is whatever sits `below` the block. Consing onto a view whose next
-// slot is empty *claims* that slot, so building by repeated cons is O(1) amortized and
-// contiguous; the first cons above a position wins it, and every later cons at the same
-// position (a branch: `a = x :: xs`, `b = y :: xs`) starts a fresh block over the same
-// tail. A slot is written at most once, so no view's contents ever change and the structure
-// is persistent in safe Rust.
+// (blocks of one slot). A block is a fixed-capacity array of write-once slots (the claim
+// engine's storage, claimed.rs); a view `(block, lo, hi)` sees `slots[lo..hi]`, the head being
+// `slots[hi - 1]` and the last element `slots[lo]`, and the rest of the list is whatever sits
+// `below` the block. Consing onto a view whose next slot above is empty *claims* that slot,
+// and appending a short list to a single-block view whose next slot below is empty claims
+// those, so building by repeated cons or by `acc ++ [x]` is O(1) amortized and contiguous;
+// the first extension at a position wins it, and every later one at the same position (a
+// branch: `a = x :: xs`, `b = y :: xs`) starts a fresh block over the same tail. A slot is
+// written at most once, so no view's contents ever change and the structure is persistent in
+// safe Rust.
 //
 // Cost: `::` is amortized O(1) (one cons can open a block of twice the top block's capacity,
-// each block grows at most once), head and tail are O(1); `++` is O(|a|) whatever |b|; `get`
-// is O(1) on a bulk-built list (a literal, `range`, a builtin's result, a tuple) and
-// O(blocks) on a cons-built one (O(log n) when built linearly, up to O(n) for a list built
-// by repeated branching, as for a cons list).
+// each block grows at most once), head and tail are O(1); `++` is O(min(|a|, |b|)) when a
+// claim succeeds (amortized O(1) for `acc ++ [x]`) and O(|a|) otherwise; `get` is O(1) on a
+// bulk-built list (a literal, `range`, a builtin's result, a tuple) and O(blocks) on a
+// cons-built one (O(log n) when built linearly, up to O(n) for a list built by repeated
+// branching, as for a cons list).
 //
-// Memory: a view keeps alive every value consed into a free slot of its block, including by
-// a branch that was since dropped (see the spec, section 20, parked item M1).
+// Memory: a view keeps alive every value claimed into a free slot of its block, above or
+// below, including by a branch that was since dropped (see the spec, section 20, parked item
+// M1).
 
 use std::cell::{Cell, OnceCell};
 use std::rc::Rc;
 
+use crate::claimed::{Claimed, Side, Slots};
 use crate::value::Value;
 
 // Test-only operation counters: the complexity tests count operations instead of timing
@@ -86,60 +91,69 @@ fn count_hop() {
 pub struct List {
     // None: the empty list.
     block: Option<Rc<Block>>,
-    // This view sees `block.slots[..top]`; top >= 1 whenever `block` is Some.
-    top: usize,
-    // top + below.len, cached.
+    // This view sees `block.cells.slots[lo..hi]` (head `slots[hi - 1]`, last `slots[lo]`), then
+    // `block.below`. lo < hi whenever `block` is Some; lo > 0 only in a block whose `below` is
+    // empty.
+    lo: u32,
+    hi: u32,
+    // (hi - lo) + below.len, cached.
     len: usize,
 }
 
 struct Block {
-    // Physical order bottom-up: slots[top - 1] is a view's head.
-    slots: Box<[OnceCell<Value>]>,
-    // The list under slots[0].
+    // The slots (one written interval, containing every view) and the growth claim, set by
+    // the first copy that reserves room past this block and born set for a bulk block, so a
+    // second one never reserves a large block (claimed.rs).
+    cells: Claimed<Cells>,
+    // The list under the slots.
     below: List,
-    // The growth claim: set by the first cons that doubles on top of this block, and born
-    // set for a bulk block (sealed), so a second cons onto the same full block never
-    // reserves a large one.
-    grown: Cell<bool>,
     // What a check last proved about this block (see `Mark`).
     seal: Cell<Mark>,
 }
 
+type Cells = Box<[OnceCell<Value>]>;
+
 // The identity of a test as a seal records it: assigned by expr.rs's interner, never 0.
 pub type SealId = std::num::NonZeroU32;
 
-// One fact about immutable data: the view `(block, height)` (its slots `[..height]`, then
+// One fact about immutable data: the view `(block, lo..hi)` (its slots `[lo..hi]`, then
 // everything below the block) passes the test `#id` (id 0: nothing recorded). A slot is set
 // at most once and `below` never changes, so the fact stays true for the block's whole life
 // whoever wrote it: a seal is only ever overwritten by another true fact (last writer wins),
-// never invalidated. For an "every element passes" test the fact is closed under tails; any
-// other test's whole seal is read only at exactly this height (`has_whole_seal`).
+// never invalidated. For an "every element passes" test the fact is closed under sub-views
+// inside the interval; any other test's whole seal is read only at exactly this interval
+// (`has_whole_seal`).
 #[derive(Clone, Copy, Default)]
 struct Mark {
     id: u32,
-    height: u32,
+    lo: u32,
+    hi: u32,
 }
 
-// A height as an every-element seal stores it: saturated, which only weakens the fact (a
-// lower height is still true). A whole seal is exact-view only, so it never saturates
-// (`whole_mark`).
-fn saturate(top: usize) -> u32 {
-    u32::try_from(top).unwrap_or(u32::MAX)
+impl Mark {
+    fn covers(self, id: u32, lo: u32, hi: u32) -> bool {
+        self.id == id && self.lo <= lo && hi <= self.hi
+    }
 }
 
-// The seal a whole seal of `id` at view height `top` writes over `old`, or None: write
-// nothing. Nothing when the height does not fit (a saturated whole seal would also match a
-// different, shorter view), and nothing when `old` already covers at least this view (an
-// every-element seal written by the same walk, which a whole seal would clobber: a tail of
-// the list is then checked at its own `Ref` against `old`, O(1), instead of re-scanned).
-fn whole_mark(old: Mark, id: SealId, top: usize) -> Option<Mark> {
-    let height = u32::try_from(top).ok()?;
-    (old.id == 0 || old.height < height).then_some(Mark { id: id.get(), height })
+// A block index as a view stores it. Unreachable in practice (over 160 GB of Values), but a
+// run error rather than a silent wrap.
+fn idx(x: usize) -> u32 {
+    u32::try_from(x).unwrap_or_else(|_| crate::run_error!("a list block over {} elements", u32::MAX))
 }
 
-// Views are made three ways, each preserving "every view (b, top) has b.slots[..top] set":
-// a bulk build sets every slot at creation; a successful `OnceCell::set` at slot `top` makes
-// the view `top + 1`; a tail makes `top - 1`, and at `top == 1` returns `below`.
+// The seal a whole seal of `id` at the view `[lo, hi)` writes over `old`, or None: write
+// nothing. Nothing when `old` already covers at least this view (an every-element seal written
+// by the same walk, which a whole seal would clobber: a tail of the list is then checked at its
+// own `Ref` against `old`, O(1), instead of re-scanned); `old`'s id does not matter.
+fn whole_mark(old: Mark, id: SealId, lo: u32, hi: u32) -> Option<Mark> {
+    (old.id == 0 || !(old.lo <= lo && hi <= old.hi)).then_some(Mark { id: id.get(), lo, hi })
+}
+
+// Views are made three ways, each preserving "every view (b, lo, hi) has b.slots[lo..hi] set":
+// a bulk build sets every slot at creation; a claim past the written interval's frontier
+// (`hi` or `lo`) widens the interval and makes the view that claimed it longer; a tail makes
+// `hi - 1`, and at `hi - lo == 1` returns `below`.
 impl List {
     pub fn empty() -> List {
         List::default()
@@ -165,7 +179,7 @@ impl List {
         items.reverse();
         let cells: Vec<OnceCell<Value>> = items.into_iter().map(OnceCell::from).collect();
         let n = cells.len();
-        List::block(List::empty(), cells, n, true)
+        List::block(List::empty(), Claimed::new(cells.into_boxed_slice(), true), 0, n)
     }
 
     // From elements in bottom-first order, i.e. the last element of the list first: what a
@@ -177,20 +191,18 @@ impl List {
         if n == 0 {
             return List::empty();
         }
-        List::block(List::empty(), cells, n, true)
+        List::block(List::empty(), Claimed::new(cells.into_boxed_slice(), true), 0, n)
     }
 
-    // The one place a block is made: `cells` (bottom-first, already set) padded with empty
-    // slots up to `capacity`, over `below`.
-    fn block(below: List, mut cells: Vec<OnceCell<Value>>, capacity: usize, grown: bool) -> List {
-        let n = cells.len();
-        count_writes(n);
+    // The one place a block is made: `cells`, written in `[lo, hi)`, over `below`.
+    fn block(below: List, cells: Claimed<Cells>, lo: usize, hi: usize) -> List {
+        debug_assert!(lo == 0 || below.is_empty(), "internal: room below only in a single block");
+        let cap = cells.slots.len();
+        idx(cap);
+        count_writes(hi - lo);
         count_block();
-        if capacity > n {
-            count_empties(capacity - n);
-            cells.resize_with(capacity, OnceCell::new);
-        }
-        List { len: below.len + n, top: n, block: Some(Rc::new(Block { slots: cells.into_boxed_slice(), below, grown: Cell::new(grown), seal: Cell::default() })) }
+        count_empties(cap - (hi - lo));
+        List { len: below.len + (hi - lo), lo: lo as u32, hi: hi as u32, block: Some(Rc::new(Block { cells, below, seal: Cell::default() })) }
     }
 
     pub fn cons(&self, head: Value) -> List {
@@ -198,48 +210,37 @@ impl List {
     }
 
     // The one growth primitive: `items` (bottom-first) go on top of this list.
-    //   1. Claim: while the view's next slot exists and is empty, fill it.
+    //   1. Claim: fill the free slots above the view, as many as fit.
     //   2. A new block for what is left (below = the view so far). Its capacity is
-    //      `max(left, 2 * capacity)` when the view sits at the top of a full, unsealed block
-    //      and this call wins that block's growth claim, otherwise exactly `left`.
+    //      `max(left, 2 * (hi - lo))` when the view sits at the top of a full block and this
+    //      call wins that block's growth claim, otherwise exactly `left`.
     // So a list built by repeated cons grows in blocks of 1, 2, 4, ...; a cons onto a branch
     // point, a bulk list or a tail view gets an exact block.
     pub fn push_all(&self, mut items: impl ExactSizeIterator<Item = Value>) -> List {
-        let (mut top, mut len) = (self.top, self.len);
-        let mut refused = None;
+        let mut claimed = self.clone();
         if let Some(b) = &self.block {
-            while top < b.slots.len() {
-                let Some(x) = items.next() else { break };
-                match b.slots[top].set(x) {
-                    Ok(()) => {
-                        count_writes(1);
-                        top += 1;
-                        len += 1;
-                    }
-                    Err(x) => {
-                        refused = Some(x);
-                        break;
-                    }
-                }
-            }
+            let n = b.cells.claim_some(self.hi as usize, &mut items);
+            count_writes(n);
+            claimed.hi += n as u32;
+            claimed.len += n;
         }
-        let claimed = List { block: self.block.clone(), top, len };
-        let left = items.len() + usize::from(refused.is_some());
+        let left = items.len();
         if left == 0 {
             return claimed;
         }
         let capacity = match &claimed.block {
-            Some(b) if top == b.slots.len() && !b.grown.replace(true) => left.max(2 * b.slots.len()),
+            Some(b) if b.cells.should_grow(Side::High, claimed.hi as usize) => left.max(2 * (claimed.hi - claimed.lo) as usize),
             _ => left,
         };
-        let mut cells = Vec::with_capacity(capacity);
-        refused.into_iter().chain(items).for_each(|x| cells.push(OnceCell::from(x)));
-        List::block(claimed, cells, capacity, false)
+        let cells = Claimed::new(Cells::with_room(0, left, items, capacity - left), false);
+        List::block(claimed, cells, 0, left)
     }
 
-    // `self ++ b`: O(1) when either side is empty, otherwise O(|self|) and `b` is never
-    // copied: `self`'s elements are consed on top of it (a `[x] ++ acc` loop behaves exactly
-    // like `x :: acc`).
+    // `self ++ b`: O(1) when either side is empty. Otherwise the shorter side is written: when
+    // `b` is shorter and `self` is a view that can be extended in place or copied with room, `b`
+    // is claimed under `self` (`snoc_all`, amortized O(1) for `acc ++ [x]`); in every other
+    // case `self`'s elements are consed on top of `b`, which is never copied (a `[x] ++ acc`
+    // loop behaves exactly like `x :: acc`, and is O(|self|)).
     pub fn append(&self, b: &List) -> List {
         if self.is_empty() {
             return b.clone();
@@ -247,19 +248,48 @@ impl List {
         if b.is_empty() {
             return self.clone();
         }
+        if b.len < self.len {
+            if let Some(l) = self.snoc_all(b) {
+                return l;
+            }
+        }
         b.push_all(self.iter_rev().cloned())
+    }
+
+    // `self ++ items` by the low end of a block, or None when this view cannot take it:
+    //   1. Claim: a single-block view whose low neighbour slots are free (the engine refuses a
+    //      branch, whose neighbour is taken) takes `items` in place.
+    //   2. Copy-grow: a view at its low frontier that wins the block's growth claim is copied
+    //      into a fresh single block with as much room again below (amortized O(1) per later
+    //      claim).
+    // Otherwise None: a branch point pays the front path's cost and never reserves a block.
+    fn snoc_all(&self, items: &List) -> Option<List> {
+        let blk = self.block.as_ref()?;
+        let (lo, n) = (self.lo as usize, items.len);
+        // Only a single-block view snocs in place: an element under `slots[lo]` would land
+        // between the block and `below`.
+        if blk.below.is_empty() && blk.cells.claim(Side::Low, lo, items.iter().cloned()) {
+            count_writes(n);
+            return Some(List { block: self.block.clone(), lo: (lo - n) as u32, hi: self.hi, len: self.len + n });
+        }
+        if !blk.cells.should_grow(Side::Low, lo) {
+            return None;
+        }
+        let total = self.len + n;
+        let cells = Claimed::<Cells>::copy(Side::Low, total, items.iter_rev().chain(self.iter_rev()).cloned(), true);
+        Some(List::block(List::empty(), cells, total, 2 * total))
     }
 
     pub fn first(&self) -> Option<&Value> {
         let b = self.block.as_ref()?;
-        Some(b.slots[self.top - 1].get().expect("a view's slots are set"))
+        Some(b.cells.slots[self.hi as usize - 1].get().expect("a view's slots are set"))
     }
 
     // The head and the rest, in O(1).
     pub fn split_first(&self) -> Option<(&Value, List)> {
         let head = self.first()?;
         let b = self.block.as_ref()?;
-        let tail = if self.top == 1 { b.below.clone() } else { List { block: self.block.clone(), top: self.top - 1, len: self.len - 1 } };
+        let tail = if self.hi - self.lo == 1 { b.below.clone() } else { List { block: self.block.clone(), lo: self.lo, hi: self.hi - 1, len: self.len - 1 } };
         Some((head, tail))
     }
 
@@ -268,10 +298,10 @@ impl List {
     pub fn pop_front(&mut self) {
         let Some(b) = &self.block else { return };
         self.len -= 1;
-        if self.top == 1 {
+        if self.hi - self.lo == 1 {
             *self = b.below.clone();
         } else {
-            self.top -= 1;
+            self.hi -= 1;
         }
     }
 
@@ -281,28 +311,28 @@ impl List {
         if i >= self.len {
             return None;
         }
-        let (mut block, mut top, mut i) = (self.block.as_deref(), self.top, i);
+        let (mut block, mut lo, mut hi, mut i) = (self.block.as_deref(), self.lo as usize, self.hi as usize, i);
         loop {
             let b = block?;
             count_hop();
-            if i < top {
-                return b.slots[top - 1 - i].get();
+            if i < hi - lo {
+                return b.cells.slots[hi - 1 - i].get();
             }
-            i -= top;
-            top = b.below.top;
+            i -= hi - lo;
+            (lo, hi) = (b.below.lo as usize, b.below.hi as usize);
             block = b.below.block.as_deref();
         }
     }
 
     pub fn iter(&self) -> Iter<'_> {
-        Iter { block: self.block.as_deref(), pos: self.top, left: self.len }
+        Iter { block: self.block.as_deref(), pos: self.hi as usize, floor: self.lo as usize, left: self.len }
     }
 
     // The elements last to first, which is a block's slots in ascending order: no copy.
     pub fn iter_rev(&self) -> RevIter<'_> {
         let (mut segs, mut view) = (Vec::new(), self);
         while let Some(b) = &view.block {
-            segs.push(&b.slots[..view.top]);
+            segs.push(&b.cells.slots[view.lo as usize..view.hi as usize]);
             view = &b.below;
         }
         RevIter { cur: segs.pop().unwrap_or_default().iter(), segs, left: self.len }
@@ -315,11 +345,11 @@ impl List {
         v
     }
 
-    // What the walk's memo keys a compound value by: the block and the view's height (two
-    // views of one block differ in `top`; clones are equal).
-    pub fn identity(&self) -> (usize, usize) {
+    // What the walk's memo keys a compound value by: the block and the view's interval (two
+    // views of one block differ in `lo` or `hi`; clones are equal).
+    pub fn identity(&self) -> (usize, u64) {
         match &self.block {
-            Some(b) => (Rc::as_ptr(b) as usize, self.top),
+            Some(b) => (Rc::as_ptr(b) as usize, (u64::from(self.lo) << 32) | u64::from(self.hi)),
             None => (0, 0),
         }
     }
@@ -327,12 +357,12 @@ impl List {
     // ---- Seals: what a check does not need to test again ----
 
     // The elements, head first, that an every-element test `id` has not yet been proved for:
-    // in a block whose seal is `id` only the slots above the sealed height, and nothing below
-    // it (the seal covers everything under those slots); in any other block every slot, then
-    // the view below.
+    // in a block whose seal is `id` only the slots outside the sealed interval, and nothing
+    // below it (the seal covers everything under the block); in any other block every slot,
+    // then the view below.
     pub fn unsealed(&self, id: SealId) -> Unsealed<'_> {
-        let mut it = Unsealed { id: id.get(), block: None, pos: 0, floor: 0, more: false };
-        it.enter(self.block.as_deref(), self.top);
+        let mut it = Unsealed { id: id.get(), block: None, pos: 0, floor: 0, low: (0, 0), more: false };
+        it.enter(self.block.as_deref(), self.lo as usize, self.hi as usize);
         it
     }
 
@@ -341,30 +371,26 @@ impl List {
     pub fn is_sealed_every(&self, id: SealId) -> bool {
         match &self.block {
             None => true,
-            Some(b) => {
-                let s = b.seal.get();
-                s.id == id.get() && s.height as usize >= self.top
-            }
+            Some(b) => b.seal.get().covers(id.get(), self.lo, self.hi),
         }
     }
 
     // Records that every element of this view passes the test `id`, after a check passed
-    // them all. Each block of the chain is written top-down, at the height of the view the
-    // chain passes through (this view's `top`, then each block below's visible top), until a
-    // block already covers the rest: the same id at a height of at least the view's (stop),
-    // or a lower one (raise it, then stop: it already covered everything below).
+    // them all. Each block of the chain is written top-down, at the interval of the view the
+    // chain passes through (this view's, then each block below's), until a block already
+    // sealed for `id` is reached: that seal also asserts everything below, so the two
+    // intervals are unioned when they overlap or touch (every slot in the union passed), and
+    // the view's own interval replaces a disjoint one (the gap is unproved); then stop.
     pub fn seal_every(&self, id: SealId) {
-        let mut view = self;
+        let (id, mut view) = (id.get(), self);
         while let Some(b) = &view.block {
-            let height = saturate(view.top);
-            let s = b.seal.get();
-            if s.id == id.get() {
-                if s.height < height {
-                    b.seal.set(Mark { id: id.get(), height });
-                }
+            let (s, (lo, hi)) = (b.seal.get(), (view.lo, view.hi));
+            if s.id == id {
+                let m = if s.lo <= hi && lo <= s.hi { Mark { id, lo: s.lo.min(lo), hi: s.hi.max(hi) } } else { Mark { id, lo, hi } };
+                b.seal.set(m);
                 return;
             }
-            b.seal.set(Mark { id: id.get(), height });
+            b.seal.set(Mark { id, lo, hi });
             view = &b.below;
         }
     }
@@ -374,14 +400,14 @@ impl List {
     pub fn has_whole_seal(&self, id: SealId) -> bool {
         self.block.as_ref().is_some_and(|b| {
             let s = b.seal.get();
-            s.id == id.get() && s.height as usize == self.top
+            s.id == id.get() && s.lo == self.lo && s.hi == self.hi
         })
     }
 
     // Records the whole seal, unless that would lose a fact (`whole_mark`).
     pub fn seal_whole(&self, id: SealId) {
         if let Some(b) = &self.block {
-            if let Some(mark) = whole_mark(b.seal.get(), id, self.top) {
+            if let Some(mark) = whole_mark(b.seal.get(), id, self.lo, self.hi) {
                 b.seal.set(mark);
             }
         }
@@ -389,7 +415,7 @@ impl List {
 
     #[cfg(test)]
     fn capacity(&self) -> usize {
-        self.block.as_ref().map_or(0, |b| b.slots.len())
+        self.block.as_ref().map_or(0, |b| b.cells.slots.len())
     }
 }
 
@@ -399,11 +425,13 @@ impl FromIterator<Value> for List {
     }
 }
 
-// Logical order: a block's slots from `top - 1` down to 0, then the blocks below.
+// Logical order: a block's slots from `hi - 1` down to `lo`, then the blocks below.
 pub struct Iter<'a> {
     block: Option<&'a Block>,
-    // Slots of the current block still to yield (the next is `slots[pos - 1]`).
+    // Slots of the current block still to yield are `slots[floor..pos]`, the next being
+    // `slots[pos - 1]`.
     pos: usize,
+    floor: usize,
     left: usize,
 }
 
@@ -413,12 +441,13 @@ impl<'a> Iterator for Iter<'a> {
     fn next(&mut self) -> Option<&'a Value> {
         loop {
             let b = self.block?;
-            if self.pos > 0 {
+            if self.pos > self.floor {
                 self.pos -= 1;
                 self.left -= 1;
-                return Some(b.slots[self.pos].get().expect("a view's slots are set"));
+                return Some(b.cells.slots[self.pos].get().expect("a view's slots are set"));
             }
-            self.pos = b.below.top;
+            self.pos = b.below.hi as usize;
+            self.floor = b.below.lo as usize;
             self.block = b.below.block.as_deref();
         }
     }
@@ -432,10 +461,11 @@ impl<'a> Iterator for Iter<'a> {
     fn fold<B, F: FnMut(B, &'a Value) -> B>(mut self, init: B, mut f: F) -> B {
         let mut acc = init;
         while let Some(b) = self.block {
-            for cell in b.slots[..self.pos].iter().rev() {
+            for cell in b.cells.slots[self.floor..self.pos].iter().rev() {
                 acc = f(acc, cell.get().expect("a view's slots are set"));
             }
-            self.pos = b.below.top;
+            self.pos = b.below.hi as usize;
+            self.floor = b.below.lo as usize;
             self.block = b.below.block.as_deref();
         }
         acc
@@ -449,25 +479,29 @@ pub struct Unsealed<'a> {
     id: u32,
     block: Option<&'a Block>,
     // The slots still to yield in the current block are `slots[floor..pos]`, the next being
-    // `slots[pos - 1]`.
+    // `slots[pos - 1]`; then `slots[low.0..low.1]` (the part under a seal's interval).
     pos: usize,
     floor: usize,
+    low: (usize, usize),
     // Whether the view below the current block is still to be visited.
     more: bool,
 }
 
 impl<'a> Unsealed<'a> {
-    // Positions on the view `(block, top)`.
-    fn enter(&mut self, block: Option<&'a Block>, top: usize) {
+    // Positions on the view `(block, lo..hi)`.
+    fn enter(&mut self, block: Option<&'a Block>, lo: usize, hi: usize) {
         self.block = block;
-        self.pos = top;
+        self.pos = hi;
         let Some(b) = block else { return };
         let s = b.seal.get();
         if s.id == self.id {
-            self.floor = (s.height as usize).min(top);
+            let clamp = |x: u32| (x as usize).clamp(lo, hi);
+            self.floor = clamp(s.hi);
+            self.low = (lo, clamp(s.lo));
             self.more = false;
         } else {
-            self.floor = 0;
+            self.floor = lo;
+            self.low = (0, 0);
             self.more = true;
         }
     }
@@ -481,13 +515,18 @@ impl<'a> Iterator for Unsealed<'a> {
             let b = self.block?;
             if self.pos > self.floor {
                 self.pos -= 1;
-                return Some(b.slots[self.pos].get().expect("a view's slots are set"));
+                return Some(b.cells.slots[self.pos].get().expect("a view's slots are set"));
+            }
+            if self.low.1 > self.low.0 {
+                (self.floor, self.pos) = self.low;
+                self.low = (0, 0);
+                continue;
             }
             if !self.more {
                 self.block = None;
                 return None;
             }
-            self.enter(b.below.block.as_deref(), b.below.top);
+            self.enter(b.below.block.as_deref(), b.below.lo as usize, b.below.hi as usize);
         }
     }
 }
@@ -770,6 +809,7 @@ mod tests {
     #[test]
     fn sizes() {
         assert!(size_of::<List>() <= 24);
+        assert!(size_of::<Block>() <= 64);
         assert_eq!(size_of::<OnceCell<Value>>(), size_of::<Value>(), "a slot costs one Value");
         assert_eq!(size_of::<Value>(), 40);
     }
@@ -803,7 +843,7 @@ mod tests {
         let mut counter = 100;
         for _ in 0..4000 {
             let (l, m) = pool[r.next(pool.len())].clone();
-            let new = match r.next(6) {
+            let new = match r.next(8) {
                 0..=2 => {
                     counter += 1;
                     let mut m = m;
@@ -831,6 +871,146 @@ mod tests {
         for (l, m) in &pool {
             check(l, m);
         }
+    }
+
+    // ---- Snoc claims (V2) ----
+
+    // `[1, 2, 3] ++ [4] ++ [5]` as the machine builds it: a front-path chain, then one copy into a
+    // 10-slot block with room below: the elements sit in slots [5, 10).
+    fn roomy() -> List {
+        bulk(&[1, 2, 3]).append(&bulk(&[4])).append(&bulk(&[5]))
+    }
+
+    #[test]
+    fn a_snoc_claims_the_low_end_then_branches() {
+        let base = roomy();
+        check(&base, &[1, 2, 3, 4, 5]);
+        assert_eq!((base.capacity(), base.lo, base.hi), (10, 5, 10));
+        let a = base.append(&bulk(&[6]));
+        let b = base.append(&bulk(&[7]));
+        check(&base, &[1, 2, 3, 4, 5]);
+        check(&a, &[1, 2, 3, 4, 5, 6]);
+        check(&b, &[1, 2, 3, 4, 5, 7]);
+        assert_eq!(a.identity().0, base.identity().0, "the first snoc claimed a slot");
+        assert_ne!(b.identity().0, base.identity().0, "the second snoc at that position branched");
+        // A two-element snoc claims both slots.
+        let c = a.append(&bulk(&[8, 9]));
+        check(&c, &[1, 2, 3, 4, 5, 6, 8, 9]);
+        assert_eq!((c.identity().0, c.lo), (base.identity().0, 2));
+        // Cons, head and tail on a snoc-built view stay O(1) and correct.
+        check(&c.cons(val(0)), &[0, 1, 2, 3, 4, 5, 6, 8, 9]);
+        let (h, t) = c.split_first().unwrap();
+        assert_eq!(h.as_int(), 1);
+        check(&t, &[2, 3, 4, 5, 6, 8, 9]);
+        let u = t.append(&bulk(&[10]));
+        check(&u, &[2, 3, 4, 5, 6, 8, 9, 10]);
+        assert_eq!(u.identity().0, base.identity().0, "a tail view at the frontier claims too");
+        check(&c, &[1, 2, 3, 4, 5, 6, 8, 9]);
+        // Two views that differ only in `lo` have different identities.
+        assert_ne!(a.identity(), base.identity());
+        assert_eq!(a.identity(), a.clone().identity());
+    }
+
+    // The engine's growth rule (0A.1): only a view at the frontier grows. `b` is a branch, so
+    // it takes the exact front path: [7]'s bulk block, then an exact 5-slot block over it.
+    #[test]
+    fn a_branched_snoc_never_grows() {
+        let base = roomy();
+        let _a = base.append(&bulk(&[6]));
+        let b = base.append(&bulk(&[7]));
+        check(&b, &[1, 2, 3, 4, 5, 7]);
+        assert_eq!(b.capacity(), 5);
+    }
+
+    #[test]
+    fn snoc_growth_doubles_once_per_block() {
+        reset_counters();
+        let mut l = List::empty();
+        for i in 0..100 {
+            l = l.append(&bulk(&[i]));
+        }
+        let (writes, blocks, _) = counters();
+        // 100 literals, 1 front-path write, copies of 3 + 7 + 15 + 31 + 63 = 119, 93 claims.
+        assert_eq!((writes, blocks), (100 + 1 + 119 + 93, 100 + 1 + 5));
+        assert_eq!(empties(), 3 + 7 + 15 + 31 + 63);
+        check(&l, &(0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn snoc_growth_claim_is_taken_once() {
+        // Fill roomy's room (5 claims), so the view sits at the block's low edge.
+        let mut edge = roomy();
+        for i in 6..=10 {
+            edge = edge.append(&bulk(&[i]));
+        }
+        assert_eq!((edge.capacity(), edge.lo), (10, 0));
+        let first = edge.append(&bulk(&[11]));
+        assert_eq!(first.capacity(), 22, "the first snoc past the edge copies into a doubled block");
+        let second = edge.append(&bulk(&[12]));
+        assert_eq!(second.capacity(), 10, "the second takes the front path: an exact block");
+        check(&first, &(1..=11).collect::<Vec<_>>());
+        check(&second, &(1..=10).chain([12]).collect::<Vec<_>>());
+        // A bulk list is born grown: its first snoc takes the front path too.
+        assert_eq!(bulk(&[1, 2, 3]).append(&bulk(&[4])).capacity(), 3);
+        // Equal lengths take the front path (no empty slot, as today).
+        reset_counters();
+        check(&bulk(&[1, 2]).append(&bulk(&[3, 4])), &[1, 2, 3, 4]);
+        assert_eq!(empties(), 0);
+    }
+
+    #[test]
+    fn a_snoc_claimed_slot_below_a_seal_is_unsealed() {
+        let l = roomy();
+        l.seal_every(id(1));
+        let a = l.append(&bulk(&[6]));
+        assert_eq!(a.identity().0, l.identity().0);
+        assert_eq!(unsealed(&a, 1), [6]);
+        assert!(!a.is_sealed_every(id(1)));
+        a.seal_every(id(1));
+        for t in tails(&a).iter().chain(tails(&l).iter()) {
+            assert!(unsealed(t, 1).is_empty() && t.is_sealed_every(id(1)), "{:?}", ints(t));
+        }
+        // A snoc and a cons on the same sealed view: each sees only its own new slot.
+        let b = a.append(&bulk(&[7]));
+        let c = a.cons(val(0));
+        assert_eq!(unsealed(&b, 1), [7]);
+        assert_eq!(unsealed(&c, 1), [0]);
+    }
+
+    // l = [1..5] in slots [5, 10); a = [4, 5, 6] in [4, 7); b = [4, 5, 6, 7] in [3, 7);
+    // only6 = [6] in [4, 5); only7 = [7] in [3, 4).
+    fn intervals() -> (List, List, List, List, List) {
+        let l = roomy();
+        let mut short = l.clone();
+        for _ in 0..3 {
+            short.pop_front();
+        }
+        let a = short.append(&bulk(&[6]));
+        let b = a.append(&bulk(&[7]));
+        let last = |v: &List| tails(v).into_iter().find(|t| t.len() == 1).unwrap();
+        let (only6, only7) = (last(&a), last(&b));
+        assert_eq!((only6.lo, only6.hi, only7.lo, only7.hi), (4, 5, 3, 4));
+        (l, a, b, only6, only7)
+    }
+
+    #[test]
+    fn touching_seal_intervals_union() {
+        let (l, a, b, only6, _) = intervals();
+        l.seal_every(id(1));
+        only6.seal_every(id(1)); // [4, 5) touches [5, 10): one seal [4, 10)
+        assert!(l.is_sealed_every(id(1)) && a.is_sealed_every(id(1)) && only6.is_sealed_every(id(1)));
+        assert_eq!(unsealed(&b, 1), [7]);
+    }
+
+    #[test]
+    fn disjoint_seal_intervals_are_replaced_not_merged() {
+        let (l, _, b, _, only7) = intervals();
+        l.seal_every(id(1));
+        only7.seal_every(id(1)); // [3, 4) and [5, 10) leave slot 4 unproved: the view's own interval wins
+        assert!(only7.is_sealed_every(id(1)));
+        assert_eq!(unsealed(&l, 1), ints(&l), "the replaced interval is simply unknown again");
+        assert_eq!(unsealed(&b, 1), [4, 5, 6], "upper range of b above [3, 4)");
+        assert!(!b.is_sealed_every(id(1)));
     }
 
     // ---- Seals ----
@@ -890,7 +1070,7 @@ mod tests {
     #[test]
     fn a_claimed_slot_above_a_seal_is_unsealed() {
         let l = linear(5);
-        assert!(l.capacity() > l.top, "the top block has a free slot");
+        assert!(l.capacity() > l.hi as usize,"the top block has a free slot");
         l.seal_every(id(1));
         let a = l.cons(val(100));
         assert_eq!(a.identity().0, l.identity().0, "the cons claimed a slot");
@@ -971,30 +1151,26 @@ mod tests {
         assert_eq!(unsealed(&l, 2), ints(&l));
     }
 
+    // A whole seal is exact-view only, and never written over a seal covering at least this
+    // view (the every-element seal the same walk just wrote).
     #[test]
-    fn a_seal_height_saturates() {
-        assert_eq!(saturate(5), 5);
-        assert_eq!(saturate(usize::MAX), u32::MAX);
-    }
-
-    // A whole seal is exact-view only: it writes nothing for a height that does not fit (a
-    // saturated one would match a shorter view), and never over a seal covering at least
-    // this view (the every-element seal the same walk just wrote).
-    #[test]
-    fn a_whole_seal_never_saturates_and_never_clobbers_a_covering_seal() {
-        let none = Mark::default();
+    fn a_whole_seal_never_clobbers_a_covering_seal() {
         let w = id(7);
-        assert_eq!(whole_mark(none, w, 5).map(|m| (m.id, m.height)), Some((7, 5)));
-        assert!(whole_mark(none, w, u32::MAX as usize + 5).is_none());
-        assert!(whole_mark(none, w, u32::MAX as usize).is_some());
-        let every = Mark { id: 3, height: 5 };
-        assert!(whole_mark(every, w, 5).is_none() && whole_mark(every, w, 4).is_none());
-        assert_eq!(whole_mark(every, w, 6).map(|m| m.id), Some(7));
+        assert_eq!(whole_mark(Mark::default(), w, 0, 5).map(|m| (m.id, m.lo, m.hi)), Some((7, 0, 5)));
+        let every = Mark { id: 3, lo: 2, hi: 5 };
+        assert!(whole_mark(every, w, 2, 5).is_none() && whole_mark(every, w, 3, 4).is_none());
+        assert_eq!(whole_mark(every, w, 1, 5).map(|m| (m.id, m.lo, m.hi)), Some((7, 1, 5)));
+        assert_eq!(whole_mark(every, w, 2, 6).map(|m| m.id), Some(7));
         // Through the list: the every-element seal survives a whole seal at the same view.
         let l = bulk(&[1, 2, 3]);
         l.seal_every(id(3));
         l.seal_whole(id(7));
         assert!(l.is_sealed_every(id(3)) && !l.has_whole_seal(id(7)));
+        // A whole seal is exact on both ends: a snoc-extended view does not inherit it.
+        let r = roomy();
+        let a = r.append(&bulk(&[6]));
+        r.seal_whole(id(7));
+        assert!(r.has_whole_seal(id(7)) && !a.has_whole_seal(id(7)));
     }
 
     // The model: the element addresses some earlier `seal_every(id)` call covered. `unsealed`
@@ -1019,14 +1195,14 @@ mod tests {
         let mut graveyard: Vec<List> = Vec::new();
         for _ in 0..3000 {
             let l = pool[r.next(pool.len())].clone();
-            match r.next(7) {
+            match r.next(9) {
                 0..=2 => {
                     counter += 1;
                     pool.push(l.cons(val(counter)));
                 }
                 3 => pool.extend(l.split_first().map(|(_, t)| t)),
                 4 => pool.push(l.append(&pool[r.next(pool.len())].clone())),
-                _ => {
+                5 | 6 => {
                     let n = 1 + r.next(3) as u32;
                     l.seal_every(id(n));
                     covered[n as usize].extend(l.iter().map(addr));
@@ -1034,6 +1210,10 @@ mod tests {
                     // block's own seal, which another id may have overwritten since (sound,
                     // and the documented single-entry thrash).
                     assert!(l.unsealed(id(n)).next().is_none() && l.is_sealed_every(id(n)));
+                }
+                _ => {
+                    counter += 1;
+                    pool.push(l.append(&bulk(&[counter])));
                 }
             }
             if pool.len() > 600 {

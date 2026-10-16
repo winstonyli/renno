@@ -1035,12 +1035,12 @@ enum Step<'t, 'a> {
 }
 
 // An (alias, value identity) pair of the walk's memo.
-type MemoKey = (usize, (usize, usize));
+type MemoKey = (usize, (usize, u64));
 
 // A compound value's identity (its shared allocation; a list's includes the view's
-// height, as two views of one block are different lists), for the walk's memo of
+// interval, as two views of one block are different lists), for the walk's memo of
 // decided (alias, value) pairs. Scalars are as cheap to re-test as to look up.
-fn identity(v: &Value) -> Option<(usize, usize)> {
+fn identity(v: &Value) -> Option<(usize, u64)> {
     match v {
         Value::List(items) => Some(items.identity()),
         Value::Record(fields) => Some((Rc::as_ptr(fields) as usize, 0)),
@@ -2302,6 +2302,20 @@ mod tests {
         let value = Value::List(List::from_vec(vec![Value::List(short.clone()), Value::List(long)]));
         assert!(!test_holds(&pair, &defs, &[], &value));
         assert!(test_holds(&pair, &defs, &[], &Value::List(List::from_vec(vec![Value::List(short.clone()), Value::List(short)]))));
+    }
+
+    // The same for two views that differ only at the low end (a snoc claim).
+    #[test]
+    fn the_walk_memo_tells_two_snoc_views_of_one_block_apart() {
+        let one = |v: Value| List::from_vec(vec![v]);
+        let base = List::from_vec(vec![Value::Int(1), Value::Int(2), Value::Int(3)]).append(&one(Value::Int(4))).append(&one(Value::Int(5)));
+        let long = base.append(&one(Value::Str(Rc::from("x"))));
+        assert_eq!(base.identity().0, long.identity().0, "the snoc claimed a slot of the same block");
+        assert_ne!(base.identity(), long.identity());
+        let defs = [Test::list_of(Box::new(Test::Int))];
+        let pair = Test::TupleOf(vec![Test::reference(0), Test::reference(0)]);
+        assert!(!test_holds(&pair, &defs, &[], &Value::List(List::from_vec(vec![Value::List(base.clone()), Value::List(long)]))));
+        assert!(test_holds(&pair, &defs, &[], &Value::List(List::from_vec(vec![Value::List(base.clone()), Value::List(base)]))));
     }
 
     // `[nan] == [nan]` is false, so equality may not shortcut on a shared list.
