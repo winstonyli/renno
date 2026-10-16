@@ -10795,6 +10795,14 @@ g(len)").unwrap_err();
         assert!(walked <= 10, "walked {walked}");
     }
 
+    // Two handlers of the same effect: the nearest one handles it, before and after a resume.
+    #[test]
+    fn the_nearest_handler_of_an_effect_handles_it() {
+        assert_eq!(run_untyped("handle (handle perform e(0) with handler e(p, r) -> r(1)) with handler e(p, r) -> r(100)").as_int(), 1);
+        let deep = "handle (handle (perform e(0)) + (perform e(0)) with deep(handler e(p, r) -> r(1))) with deep(handler e(p, r) -> r(100))";
+        assert_eq!(run_untyped(deep).as_int(), 2);
+    }
+
     #[test]
     fn forwarding_marks_are_replayed_per_resume() {
         let src = "handle (handle (perform a(0)) + (perform b(0)) with deep(handler b(p, r) -> r(10))) with deep(handler a(p, r) -> r(1) + r(2))";
