@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, LenExpr, LenSlot, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, assign_seals, BinOp, CheckSpec, Expr, ExprRef, Lazy, LenExpr, LenSlot, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::machine::{eval_pure_in, pure_type, Pure, Stuck, ANNOTATION_FUEL};
 use crate::resolve::{group_kind, GroupKind, Resolved};
@@ -2105,7 +2105,7 @@ fn lower(lazy: &Lazy, env: &CheckEnv) -> Option<Rc<Lowered>> {
     let ty = &*lazy.ty;
     let mut visiting = Visiting::default();
     let mut defs = Defs::default();
-    let (test, to, then) = match boundary(ty, &mut visiting) {
+    let (mut test, to, mut then) = match boundary(ty, &mut visiting) {
         Boundary::None => return None,
         Boundary::Shape(to) => (shape_test(&to, env, &mut defs, &Visiting::default()), to, Then::Done),
         Boundary::Fun(fun_ty, param, ret) => (Test::Fun, fun_ty, wrap(lazy, &param, &ret)),
@@ -2114,7 +2114,8 @@ fn lower(lazy: &Lazy, env: &CheckEnv) -> Option<Rc<Lowered>> {
             (Test::Never, to, then)
         }
     };
-    let bodies = defs.bodies.into_iter().map(|body| body.expect("every alias body is built before shape_test returns")).collect();
+    let mut bodies: Vec<Test> = defs.bodies.into_iter().map(|body| body.expect("every alias body is built before shape_test returns")).collect();
+    assign_seals(&mut test, &mut bodies, &mut then);
     let check = CheckSpec { test, defs: bodies, to: to.clone(), span: env.span };
     Some(Rc::new(Lowered { check: Rc::new(check), slots: defs.lens, then }))
 }
@@ -2437,9 +2438,12 @@ fn shape_of(ty: &Type, env: &CheckEnv) -> Shape {
 // a variable has no value to compare against, so it is an Err.
 pub(crate) fn lower_test(ty: &Type) -> Result<(Test, Vec<Test>), String> {
     let infer = InferCtx::new();
-    let shape = shape_of(ty, &CheckEnv::new(&infer));
-    match shape.lens.is_empty() {
-        true => Ok((shape.test, shape.defs)),
+    let Shape { mut test, mut defs, lens } = shape_of(ty, &CheckEnv::new(&infer));
+    match lens.is_empty() {
+        true => {
+            assign_seals(&mut test, &mut defs, &mut Then::Done);
+            Ok((test, defs))
+        }
         false => Err("is: type has a free length variable".to_string()),
     }
 }
@@ -2461,14 +2465,14 @@ fn shape_test(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &Visiting) 
     let key = if compound { StackMemo::default().key(ty, 0, unguarded) } else { None };
     let Some(key) = key else { return shape_node(ty, env, defs, unguarded) };
     match defs.shared.get(&key).copied() {
-        Some(Some(i)) => Test::Ref(i),
+        Some(Some(i)) => Test::reference(i),
         Some(None) => {
             let i = defs.bodies.len();
             defs.bodies.push(None);
             defs.shared.insert(key, Some(i));
             let body = shape_node(ty, env, defs, unguarded);
             defs.bodies[i] = Some(body);
-            Test::Ref(i)
+            Test::reference(i)
         }
         None => {
             defs.keep.extend(unguarded.rec.iter().map(|(g, _)| g.clone()));
@@ -2488,7 +2492,7 @@ fn shape_node(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &Visiting) 
         Type::Str => Test::Str,
         Type::List(el) => match element(el, defs) {
             Test::Any => Test::List,
-            t => Test::ListOf(Box::new(t)),
+            t => Test::list_of(Box::new(t)),
         },
         Type::Fun(..) => Test::Fun,
         Type::Token(id) => Test::Token(*id),
@@ -2502,25 +2506,25 @@ fn shape_node(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &Visiting) 
         Type::Rec(g, k) if unguarded.has_rec(g, *k) => Test::Never,
         Type::Rec(g, k) if !unguarded.is_empty() => shape_test(&unfold(g, *k), env, defs, &unguarded.with_rec(g, *k)),
         Type::Rec(g, k) => match defs.rec_ids.get(&ById(ty.clone())) {
-            Some(&i) => Test::Ref(i),
+            Some(&i) => Test::reference(i),
             None => {
                 let i = defs.bodies.len();
                 defs.bodies.push(None);
                 defs.rec_ids.insert(ById(ty.clone()), i);
                 let body = shape_test(&unfold(g, *k), env, defs, &unguarded.with_rec(g, *k));
                 defs.bodies[i] = Some(body);
-                Test::Ref(i)
+                Test::reference(i)
             }
         },
         // A literal length is tested as is; any other index is read from a slot.
         Type::Indexed(wrapped, index) => match (wrapped.as_ref(), env.infer.resolve_index_deep(index)) {
             (Type::List(el), IndexExpr::Lit(k)) => match usize::try_from(k) {
-                Ok(k) => Test::ListLen(Box::new(element(el, defs)), k),
+                Ok(k) => Test::list_len(Box::new(element(el, defs)), k),
                 Err(_) => Test::Never,
             },
             (Type::List(el), _) => {
                 let slot = len_slot(index, env, defs);
-                Test::ListLenArg(Box::new(element(el, defs)), slot)
+                Test::list_len_arg(Box::new(element(el, defs)), slot)
             }
             (other, _) => shape_test(other, env, defs, unguarded),
         },

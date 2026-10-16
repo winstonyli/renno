@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, Frame, Meta, Node};
 use crate::env::{Env, PRELUDE};
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, Length, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::iterate::{step_shared, Iter, Next};
@@ -792,7 +792,7 @@ fn leaf(t: &Test, v: &Value) -> Option<bool> {
             matches!(v, Value::Closure(..) | Value::RecClosure(..) | Value::Continuation(_) | Value::Builtin(_) | Value::PartialBuiltin(..) | Value::Contract(_))
         }
         Test::Token(id) => matches!(v, Value::Token(t) if t == id),
-        Test::ListOf(_) | Test::ListLen(..) | Test::ListLenArg(..) | Test::TupleOf(_) | Test::RecordOf(_) | Test::Ref(_) | Test::Or(_) => return None,
+        Test::Elems { .. } | Test::TupleOf(_) | Test::RecordOf(_) | Test::Ref(..) | Test::Or(_) => return None,
     })
 }
 
@@ -1137,7 +1137,7 @@ fn walk<'t, 'a, const TRACK: bool>(
                 break 'step here;
             }
             match t {
-                Test::Ref(i) => {
+                Test::Ref(i, _) => {
                     if let Some(p) = identity(v) {
                         match memo.get(&(*i, p)) {
                             Some(true) => continue 'main,
@@ -1147,8 +1147,25 @@ fn walk<'t, 'a, const TRACK: bool>(
                     }
                     work.push(Step::Test(&defs[*i], v, node));
                 }
-                Test::ListOf(element) => {
+                Test::Elems { elem: element, len, .. } => {
                     let Value::List(items) = v else { break 'step here };
+                    match len {
+                        Length::Any => {}
+                        Length::Exact(len) => {
+                            if items.len() != *len {
+                                break 'step here;
+                            }
+                        }
+                        Length::Slot(slot) => match &lens[*slot] {
+                            Len::Exact(len) if items.len() == *len => {}
+                            Len::Any => {}
+                            Len::NoValue(name) => {
+                                no_value.get_or_insert(&**name);
+                                break 'step here;
+                            }
+                            Len::Exact(_) | Len::Never => break 'step here,
+                        },
+                    }
                     if leaf(element, v).is_some() {
                         // A scalar element test (`leaf` answers Some for those
                         // whatever the value): scan inline, nothing pushed.
@@ -1163,26 +1180,6 @@ fn walk<'t, 'a, const TRACK: bool>(
                                 break 'step Fail { node: n, depth: depth_of(nodes, n), found };
                             }
                         }
-                    }
-                    push_elements::<TRACK>(&mut work, nodes, node, items.iter().map(|x| (&**element, x)));
-                }
-                Test::ListLen(element, len) => {
-                    let Value::List(items) = v else { break 'step here };
-                    if items.len() != *len {
-                        break 'step here;
-                    }
-                    push_elements::<TRACK>(&mut work, nodes, node, items.iter().map(|x| (&**element, x)));
-                }
-                Test::ListLenArg(element, slot) => {
-                    let Value::List(items) = v else { break 'step here };
-                    match &lens[*slot] {
-                        Len::Exact(len) if items.len() == *len => {}
-                        Len::Any => {}
-                        Len::NoValue(name) => {
-                            no_value.get_or_insert(&**name);
-                            break 'step here;
-                        }
-                        Len::Exact(_) | Len::Never => break 'step here,
                     }
                     push_elements::<TRACK>(&mut work, nodes, node, items.iter().map(|x| (&**element, x)));
                 }
@@ -1965,7 +1962,7 @@ mod tests {
             Test::Or(vec![]),
             Test::Or(vec![Test::Int, Test::Float]),
             Test::Or(vec![Test::Never, Test::Bool]),
-            Test::Or(vec![Test::Int, Test::ListOf(Box::new(Test::Int))]),
+            Test::Or(vec![Test::Int, Test::list_of(Box::new(Test::Int))]),
         ];
         for t in &ors {
             for v in &values {
@@ -2012,7 +2009,7 @@ mod tests {
     #[test]
     fn deep_tests_follow_the_value_and_explain_names_the_failing_element() {
         let ints = |xs: &[i64]| Value::List(List::from_vec(xs.iter().map(|n| Value::Int(*n)).collect()));
-        let list_of_int = Test::ListOf(Box::new(Test::Int));
+        let list_of_int = Test::list_of(Box::new(Test::Int));
         assert!(test_holds(&list_of_int, &[], &[], &ints(&[1, 2])) && test_holds(&list_of_int, &[], &[], &ints(&[])));
         let mixed = Value::List(List::from_vec(vec![Value::Int(1), Value::Bool(true)]));
         assert!(!test_holds(&list_of_int, &[], &[], &mixed));
@@ -2028,13 +2025,13 @@ mod tests {
         assert_eq!(path, ["field b", "element 1"]);
 
         // let rec L = Union(Tuple(Int, L), Bool): the type body is defs[0], reached through Ref(0).
-        let defs = [Test::Or(vec![Test::TupleOf(vec![Test::Int, Test::Ref(0)]), Test::Bool])];
+        let defs = [Test::Or(vec![Test::TupleOf(vec![Test::Int, Test::reference(0)]), Test::Bool])];
         let pair = |a: Value, b: Value| Value::List(List::from_vec(vec![a, b]));
         let good = pair(Value::Int(1), pair(Value::Int(2), Value::Bool(true)));
         let bad = pair(Value::Int(1), pair(Value::Int(2), Value::Int(3)));
-        assert!(test_holds(&Test::Ref(0), &defs, &[], &good) && !test_holds(&Test::Ref(0), &defs, &[], &bad));
+        assert!(test_holds(&Test::reference(0), &defs, &[], &good) && !test_holds(&Test::reference(0), &defs, &[], &bad));
         let mut path = Vec::new();
-        assert_eq!(explain(&Test::Ref(0), &defs, &[], &bad, &mut path).type_name(), "Int");
+        assert_eq!(explain(&Test::reference(0), &defs, &[], &bad, &mut path).type_name(), "Int");
         assert_eq!(path, ["element 1", "element 1"]);
     }
 
@@ -2045,19 +2042,19 @@ mod tests {
     fn the_walker_handles_a_very_deep_spine_on_a_small_stack() {
         const DEPTH: usize = 100_000;
         let pair = |a: Value, b: Value| Value::List(List::from_vec(vec![a, b]));
-        let defs = [Test::Or(vec![Test::TupleOf(vec![Test::Int, Test::Ref(0)]), Test::Bool])];
+        let defs = [Test::Or(vec![Test::TupleOf(vec![Test::Int, Test::reference(0)]), Test::Bool])];
         let chain = |leaf: Value| (0..DEPTH).fold(leaf, |tail, i| pair(Value::Int(i as i64), tail));
         let good = chain(Value::Bool(true));
-        assert!(test_holds(&Test::Ref(0), &defs, &[], &good));
+        assert!(test_holds(&Test::reference(0), &defs, &[], &good));
         let bad = chain(Value::Str(Rc::from("x")));
-        assert!(!test_holds(&Test::Ref(0), &defs, &[], &bad));
+        assert!(!test_holds(&Test::reference(0), &defs, &[], &bad));
         let mut path = Vec::new();
-        assert_eq!(explain(&Test::Ref(0), &defs, &[], &bad, &mut path).type_name(), "Str");
+        assert_eq!(explain(&Test::reference(0), &defs, &[], &bad, &mut path).type_name(), "Str");
         assert_eq!(path.len(), DEPTH);
         // nested single-element lists: [[[...[Int]...]]] against ListOf(Ref) where the alias is [self] | Int
-        let list_defs = [Test::Or(vec![Test::Int, Test::ListOf(Box::new(Test::Ref(0)))])];
+        let list_defs = [Test::Or(vec![Test::Int, Test::list_of(Box::new(Test::reference(0)))])];
         let nest = (0..DEPTH).fold(Value::Int(1), |inner, _| Value::List(List::from_vec(vec![inner])));
-        assert!(test_holds(&Test::Ref(0), &list_defs, &[], &nest));
+        assert!(test_holds(&Test::reference(0), &list_defs, &[], &nest));
         // the nested chains cannot be dropped recursively on this stack
         std::mem::forget((good, bad, nest));
     }
@@ -2066,11 +2063,14 @@ mod tests {
     // answer, same path, same offending value on random (test, defs, value).
     fn holds_recursive(test: &Test, defs: &[Test], v: &Value) -> bool {
         match test {
-            Test::ListOf(t) => matches!(v, Value::List(items) if items.iter().all(|x| holds_recursive(t, defs, x))),
-            Test::ListLen(t, n) => matches!(v, Value::List(items) if items.len() == *n && items.iter().all(|x| holds_recursive(t, defs, x))),
+            Test::Elems { elem: t, len: Length::Any, .. } => matches!(v, Value::List(items) if items.iter().all(|x| holds_recursive(t, defs, x))),
+            Test::Elems { elem: t, len: Length::Exact(n), .. } => {
+                matches!(v, Value::List(items) if items.len() == *n && items.iter().all(|x| holds_recursive(t, defs, x)))
+            }
+            Test::Elems { len: Length::Slot(_), .. } => unreachable!("the oracle's tests have their slots substituted"),
             Test::TupleOf(ts) => matches!(v, Value::List(items) if items.len() == ts.len() && items.iter().zip(ts).all(|(x, t)| holds_recursive(t, defs, x))),
             Test::RecordOf(fs) => matches!(v, Value::Record(fields) if fs.iter().all(|(n, t)| find_field(fields, n).is_some_and(|x| holds_recursive(t, defs, x)))),
-            Test::Ref(i) => holds_recursive(&defs[*i], defs, v),
+            Test::Ref(i, _) => holds_recursive(&defs[*i], defs, v),
             Test::Or(alternatives) => alternatives.iter().any(|t| holds_recursive(t, defs, v)),
             scalar => leaf(scalar, v).expect("scalar"),
         }
@@ -2078,9 +2078,9 @@ mod tests {
 
     fn explain_recursive<'a>(test: &Test, defs: &[Test], v: &'a Value, path: &mut Vec<String>) -> &'a Value {
         match (test, v) {
-            (Test::Ref(i), _) => explain_recursive(&defs[*i], defs, v, path),
-            (Test::ListLen(_, n), Value::List(items)) if items.len() != *n => v,
-            (Test::ListOf(t), Value::List(items)) | (Test::ListLen(t, _), Value::List(items)) => match items.iter().position(|x| !holds_recursive(t, defs, x)) {
+            (Test::Ref(i, _), _) => explain_recursive(&defs[*i], defs, v, path),
+            (Test::Elems { len: Length::Exact(n), .. }, Value::List(items)) if items.len() != *n => v,
+            (Test::Elems { elem: t, .. }, Value::List(items)) => match items.iter().position(|x| !holds_recursive(t, defs, x)) {
                 Some(i) => {
                     path.push(format!("element {i}"));
                     explain_recursive(t, defs, items.get(i).expect("a failing element exists"), path)
@@ -2141,11 +2141,11 @@ mod tests {
             1 => Test::Bool,
             2 => Test::Any,
             3 => Test::Str,
-            4 if refs && r.below(2) == 0 => Test::Ref(r.below(2)),
+            4 if refs && r.below(2) == 0 => Test::reference(r.below(2)),
             4 => Test::Float,
-            5 => Test::ListOf(Box::new(random_test(r, depth - 1, true))),
-            6 if r.below(2) == 0 => Test::ListLenArg(Box::new(random_test(r, depth - 1, true)), r.below(4)),
-            6 => Test::ListLen(Box::new(random_test(r, depth - 1, true)), r.below(4)),
+            5 => Test::list_of(Box::new(random_test(r, depth - 1, true))),
+            6 if r.below(2) == 0 => Test::list_len_arg(Box::new(random_test(r, depth - 1, true)), r.below(4)),
+            6 => Test::list_len(Box::new(random_test(r, depth - 1, true)), r.below(4)),
             7 => Test::TupleOf((0..r.below(4)).map(|_| random_test(r, depth - 1, true)).collect()),
             8 => Test::RecordOf((0..r.below(4)).map(|i| (NAMES[i].to_string(), random_test(r, depth - 1, true))).collect()),
             _ => Test::Or((0..r.below(4)).map(|_| random_test(r, depth - 1, refs)).collect()),
@@ -2182,13 +2182,13 @@ mod tests {
     fn subst_lens(test: &Test, lens: &[Len]) -> Test {
         let go = |t: &Test| subst_lens(t, lens);
         match test {
-            Test::ListLenArg(t, slot) => match &lens[*slot] {
-                Len::Exact(k) => Test::ListLen(Box::new(go(t)), *k),
-                Len::Any => Test::ListOf(Box::new(go(t))),
+            Test::Elems { elem: t, len: Length::Slot(slot), .. } => match &lens[*slot] {
+                Len::Exact(k) => Test::list_len(Box::new(go(t)), *k),
+                Len::Any => Test::list_of(Box::new(go(t))),
                 Len::NoValue(_) | Len::Never => Test::Never,
             },
-            Test::ListOf(t) => Test::ListOf(Box::new(go(t))),
-            Test::ListLen(t, k) => Test::ListLen(Box::new(go(t)), *k),
+            Test::Elems { elem: t, len: Length::Any, .. } => Test::list_of(Box::new(go(t))),
+            Test::Elems { elem: t, len: Length::Exact(k), .. } => Test::list_len(Box::new(go(t)), *k),
             Test::TupleOf(ts) => Test::TupleOf(ts.iter().map(go).collect()),
             Test::RecordOf(fs) => Test::RecordOf(fs.iter().map(|(name, t)| (name.clone(), go(t))).collect()),
             Test::Or(ts) => Test::Or(ts.iter().map(go).collect()),
@@ -2200,7 +2200,7 @@ mod tests {
     fn a_length_slot_is_exact_any_or_no_value() {
         let lens = test_lens();
         let list = |n: i64| Value::List(List::from_vec((0..n).map(Value::Int).collect()));
-        let arg = |slot| Test::ListLenArg(Box::new(Test::Int), slot);
+        let arg = |slot| Test::list_len_arg(Box::new(Test::Int), slot);
         assert!(test_holds(&arg(0), &[], &lens, &list(2)));
         assert!(!test_holds(&arg(0), &[], &lens, &list(3)));
         assert!(test_holds(&arg(1), &[], &lens, &list(5)));
@@ -2217,7 +2217,7 @@ mod tests {
         assert_eq!(reached_no_value(&or, &[], &lens, &list(1)), Some("n"));
         assert!(test_holds(&or, &[], &lens, &Value::Bool(true)));
         // One slot shared by every element: [Vec(n)] with n = 2.
-        let nested = Test::ListOf(Box::new(Test::ListLenArg(Box::new(Test::Any), 0)));
+        let nested = Test::list_of(Box::new(Test::list_len_arg(Box::new(Test::Any), 0)));
         assert!(test_holds(&nested, &[], &lens, &Value::List(List::from_vec(vec![list(2), list(2)]))));
         let bad = Value::List(List::from_vec(vec![list(2), list(1)]));
         assert!(!test_holds(&nested, &[], &lens, &bad));
@@ -2233,8 +2233,8 @@ mod tests {
         let short = List::empty().cons(Value::Int(1)).cons(Value::Int(2));
         let long = short.cons(Value::Str(Rc::from("x")));
         assert_eq!(short.identity().0, long.identity().0, "the cons claimed a slot of the same block");
-        let defs = [Test::ListOf(Box::new(Test::Int))];
-        let pair = Test::TupleOf(vec![Test::Ref(0), Test::Ref(0)]);
+        let defs = [Test::list_of(Box::new(Test::Int))];
+        let pair = Test::TupleOf(vec![Test::reference(0), Test::reference(0)]);
         let value = Value::List(List::from_vec(vec![Value::List(short.clone()), Value::List(long)]));
         assert!(!test_holds(&pair, &defs, &[], &value));
         assert!(test_holds(&pair, &defs, &[], &Value::List(List::from_vec(vec![Value::List(short.clone()), Value::List(short)]))));
@@ -2309,18 +2309,20 @@ mod tests {
     }
 
     // What a test needs before it runs: its seal ids.
-    fn prepare(_test: &mut Test, _defs: &mut [Test; 2]) {}
+    fn prepare(test: &mut Test, defs: &mut [Test; 2]) {
+        crate::expr::assign_seals(test, defs, &mut Then::Done);
+    }
 
     #[test]
     fn checks_agree_with_the_recursive_definition_on_values_that_share_blocks() {
         let mut r = Rng(0x2545_F491_4F6C_DD1D);
         let pool = random_pool(&mut r, 160);
         let by_hand = [
-            Test::ListOf(Box::new(Test::Int)),
-            Test::ListOf(Box::new(Test::Or(vec![Test::Int, Test::Str]))),
-            Test::ListOf(Box::new(Test::ListOf(Box::new(Test::Int)))),
-            Test::ListLen(Box::new(Test::Int), 2),
-            Test::ListOf(Box::new(Test::TupleOf(vec![Test::Int, Test::Int]))),
+            Test::list_of(Box::new(Test::Int)),
+            Test::list_of(Box::new(Test::Or(vec![Test::Int, Test::Str]))),
+            Test::list_of(Box::new(Test::list_of(Box::new(Test::Int)))),
+            Test::list_len(Box::new(Test::Int), 2),
+            Test::list_of(Box::new(Test::TupleOf(vec![Test::Int, Test::Int]))),
         ];
         let mut tests: Vec<(Test, [Test; 2])> = Vec::new();
         for i in 0..60 {

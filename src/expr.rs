@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use cranelift_entity::{entity_impl, EntityRef, PrimaryMap};
 
+use crate::list::SealId;
 use crate::span::Span;
 use crate::index_expr::IndexExpr;
 use crate::types::Type;
@@ -124,24 +125,286 @@ pub enum Test {
     Fun,
     // The exact Value::Token with this id.
     Token(u64),
-    // A list every element of which passes.
-    ListOf(Box<Test>),
-    // A list of exactly this many elements, each passing (a Vec(k) with a literal k).
-    ListLen(Box<Test>, usize),
-    // A list as long as `lens[slot]` says (the values of the owning Lowered's
-    // `slots`, read when the check is entered), each element passing (a Vec(n)
-    // with a non-literal n).
-    ListLenArg(Box<Test>, usize),
+    // A list of the given length (`Length`), every element of which passes `elem`.
+    // `seal` names the every-element test for the list blocks' seals (None: never sealed).
+    Elems { elem: Box<Test>, len: Length, seal: Seal },
     // A list of exactly this many elements, position i passing tests[i].
     TupleOf(Vec<Test>),
     // A record with at least these fields, each field's value passing its
     // test (width-tolerant: other fields are never looked at).
     RecordOf(Vec<(String, Test)>),
     // `CheckSpec::defs[i]`: a recursive type's body, reached only through a
-    // container so the recursion consumes value structure.
-    Ref(usize),
+    // container so the recursion consumes value structure. `seal` names the whole
+    // test for a list or tuple block's exact-view seal.
+    Ref(usize, Seal),
     // Any alternative passes (a union, first match wins).
     Or(Vec<Test>),
+}
+
+// How long an `Elems` list must be.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Length {
+    // Any length (a plain `List(T)`).
+    Any,
+    // Exactly this many elements (a Vec(k) with a literal k).
+    Exact(usize),
+    // As long as `lens[slot]` says (the values of the owning Lowered's `slots`, read when
+    // the check is entered): a Vec(n) with a non-literal n.
+    Slot(usize),
+}
+
+// The identity of a test for the list blocks' seals (list.rs), or None: this test is
+// never sealed. Derived data, a cache key and not meaning, so it is invisible to equality
+// (every two Seals are equal) and to Debug: structural assertions on tests and snapshots do
+// not depend on the interner's order.
+#[derive(Clone, Copy, Default)]
+pub struct Seal(pub Option<SealId>);
+
+impl PartialEq for Seal {
+    fn eq(&self, _: &Seal) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for Seal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("_")
+    }
+}
+
+// The constructors of tests that carry no seal yet (assign_seals fills them in).
+impl Test {
+    pub fn list_of(elem: Box<Test>) -> Test {
+        Test::Elems { elem, len: Length::Any, seal: Seal::default() }
+    }
+
+    pub fn list_len(elem: Box<Test>, len: usize) -> Test {
+        Test::Elems { elem, len: Length::Exact(len), seal: Seal::default() }
+    }
+
+    pub fn list_len_arg(elem: Box<Test>, slot: usize) -> Test {
+        Test::Elems { elem, len: Length::Slot(slot), seal: Seal::default() }
+    }
+
+    pub fn reference(def: usize) -> Test {
+        Test::Ref(def, Seal::default())
+    }
+}
+
+// ---- Seal ids: structural, interned, lens-free (spec 21) ----
+//
+// A seal on a list block says "this view passes test #id" (list.rs). The id must be equal
+// exactly when the two tests mean the same, and must not keep any test alive, so it is a
+// structural key interned per thread: the interner holds keys (integers and names) and never
+// a Test, CheckSpec or Lazy. Keys are built bottom-up, each node once over its children's
+// ids, so assigning ids to a test is linear in its size.
+//
+// Per thread is sound because every value a seal can sit on is not Send (list blocks hold
+// Rc, and so do the CheckSpecs and Lazys that carry ids): a sealed block and a test carrying
+// an id always live on the thread that made both, so both drew their ids from that thread's
+// interner (check-time evaluations and the run share one thread, lib.rs
+// run_source_on_this_thread). If Rc ever became Arc this interner would have to be global.
+//
+// Equal id means equal meaning:
+//   - the id of an every-element test is `Every(rel(element test))`;
+//   - `rel` of a node is its tag, its scalar payload (a Token's id, a literal length, record
+//     field names in order) and its children's rels in order, and `rel(Ref(i))` is
+//     `RefLocal(i)`;
+//   - a node that reaches a `Ref` is rooted: its final id is `Rooted(G, rel)`, where G is
+//     the interned table of every def body's rel, so two such nodes are equal only under the
+//     same defs;
+//   - a test whose verdict reads a length slot gets no id (the slot's value changes from
+//     call to call): any node with an `Elems { len: Slot }` below it, and, if any def has one,
+//     every node that reaches a `Ref` (conservative). The slotted list's own length is
+//     checked natively outside the seal, so `Vec(n)` itself is sealed while `List(Vec(n))`
+//     is not.
+
+// The most keys one thread interns: past it a new test gets no id and behaves as before
+// (bounds the growth from run-time lowerings of ever-new types).
+const SEAL_CAP: usize = 65_536;
+
+const TAG_ANY: u8 = 0;
+const TAG_NEVER: u8 = 1;
+const TAG_INT: u8 = 2;
+const TAG_FLOAT: u8 = 3;
+const TAG_BOOL: u8 = 4;
+const TAG_STR: u8 = 5;
+const TAG_LIST: u8 = 6;
+const TAG_FUN: u8 = 7;
+const TAG_TOKEN: u8 = 8;
+const TAG_ELEMS_ANY: u8 = 9;
+const TAG_ELEMS_EXACT: u8 = 10;
+const TAG_TUPLE: u8 = 11;
+const TAG_RECORD: u8 = 12;
+const TAG_OR: u8 = 13;
+const TAG_REF: u8 = 14;
+const TAG_EVERY: u8 = 15;
+const TAG_TABLE: u8 = 16;
+const TAG_ROOTED: u8 = 17;
+
+#[derive(PartialEq, Eq, Hash)]
+struct Key {
+    tag: u8,
+    num: u64,
+    names: Vec<String>,
+    kids: Vec<u32>,
+}
+
+struct Interner {
+    keys: HashMap<Key, u32>,
+    cap: usize,
+}
+
+thread_local! {
+    static INTERNER: std::cell::RefCell<Interner> = std::cell::RefCell::new(Interner { keys: HashMap::new(), cap: SEAL_CAP });
+}
+
+// The id of `key`, or None when the interner is full.
+fn intern(tag: u8, num: u64, names: Vec<String>, kids: Vec<u32>) -> Option<u32> {
+    let key = Key { tag, num, names, kids };
+    INTERNER.with(|i| {
+        let mut i = i.borrow_mut();
+        if let Some(&id) = i.keys.get(&key) {
+            return Some(id);
+        }
+        if i.keys.len() >= i.cap {
+            return None;
+        }
+        let id = u32::try_from(i.keys.len() + 1).ok()?;
+        i.keys.insert(key, id);
+        Some(id)
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn set_seal_cap(cap: usize) {
+    INTERNER.with(|i| i.borrow_mut().cap = cap);
+}
+
+// What a subtree contributes to its parent's key.
+struct Info {
+    // The structural id of the node (None: it has none, see above).
+    rel: Option<u32>,
+    // Whether the node reaches a `Ref`.
+    refs: bool,
+    // Whether its verdict reads a length slot.
+    lens: bool,
+}
+
+// Assigns the seal ids of `test`, of the `defs` it reaches, and of every alternative test of
+// `then` (they all share the defs). A hand-built test that never goes through here carries
+// no ids and behaves as if seals did not exist.
+pub fn assign_seals(test: &mut Test, defs: &mut [Test], then: &mut Then) {
+    let mut ctx = SealCtx { table: None, def_lens: false };
+    // Pass 1: each def's rel and whether any contains a slot. A Ref's rel does not depend on
+    // the table, so the rels are complete before it exists.
+    let mut rels = Some(Vec::new());
+    for def in defs.iter_mut() {
+        let info = ctx.go(def, false);
+        ctx.def_lens |= info.lens;
+        rels = rels.zip(info.rel).map(|(mut v, r)| {
+            v.push(r);
+            v
+        });
+    }
+    ctx.table = rels.and_then(|kids| intern(TAG_TABLE, 0, Vec::new(), kids));
+    // Pass 2 writes the final ids.
+    for def in defs.iter_mut() {
+        ctx.go(def, true);
+    }
+    ctx.go(test, true);
+    ctx.alternatives(then);
+}
+
+struct SealCtx {
+    // G: the interned table of the def bodies (None: some def has no id, or there are none).
+    table: Option<u32>,
+    // Some def reads a length slot: every node that reaches a Ref gets no id.
+    def_lens: bool,
+}
+
+impl SealCtx {
+    fn alternatives(&self, then: &mut Then) {
+        if let Then::Pick(alts) = then {
+            for (test, then) in alts {
+                self.go(test, true);
+                self.alternatives(then);
+            }
+        }
+    }
+
+    // A rooted id: nodes that reach a Ref mean something only under the defs.
+    fn root(&self, id: u32, refs: bool) -> Option<u32> {
+        match (refs, self.def_lens, self.table) {
+            (false, _, _) => Some(id),
+            (true, false, Some(g)) => intern(TAG_ROOTED, u64::from(g), Vec::new(), vec![id]),
+            _ => None,
+        }
+    }
+
+    fn leaf(&self, tag: u8, num: u64) -> Info {
+        Info { rel: intern(tag, num, Vec::new(), Vec::new()), refs: false, lens: false }
+    }
+
+    // Combines the children's infos under one tag.
+    fn node(&self, tag: u8, names: Vec<String>, kids: Vec<Info>) -> Info {
+        let (refs, lens) = (kids.iter().any(|k| k.refs), kids.iter().any(|k| k.lens));
+        let rels: Option<Vec<u32>> = kids.iter().map(|k| k.rel).collect();
+        let rel = if lens { None } else { rels.and_then(|rels| intern(tag, 0, names, rels)) };
+        Info { rel, refs, lens }
+    }
+
+    // Bottom-up over `t`; with `write`, stores each list and Ref node's id.
+    fn go(&self, t: &mut Test, write: bool) -> Info {
+        match t {
+            Test::Any => self.leaf(TAG_ANY, 0),
+            Test::Never => self.leaf(TAG_NEVER, 0),
+            Test::Int => self.leaf(TAG_INT, 0),
+            Test::Float => self.leaf(TAG_FLOAT, 0),
+            Test::Bool => self.leaf(TAG_BOOL, 0),
+            Test::Str => self.leaf(TAG_STR, 0),
+            Test::List => self.leaf(TAG_LIST, 0),
+            Test::Fun => self.leaf(TAG_FUN, 0),
+            Test::Token(id) => self.leaf(TAG_TOKEN, *id),
+            Test::Elems { elem, len, seal } => {
+                let e = self.go(elem, write);
+                if write {
+                    // The every-element id ignores the length (checked natively each time).
+                    let id = if e.lens { None } else { e.rel.and_then(|r| intern(TAG_EVERY, 0, Vec::new(), vec![r])) };
+                    seal.0 = id.and_then(|id| self.root(id, e.refs)).and_then(SealId::new);
+                }
+                let lens = e.lens || matches!(len, Length::Slot(_));
+                let rel = match (len, e.rel) {
+                    _ if lens => None,
+                    (Length::Any, Some(r)) => intern(TAG_ELEMS_ANY, 0, Vec::new(), vec![r]),
+                    (Length::Exact(k), Some(r)) => intern(TAG_ELEMS_EXACT, *k as u64, Vec::new(), vec![r]),
+                    _ => None,
+                };
+                Info { rel, refs: e.refs, lens }
+            }
+            Test::TupleOf(ts) => {
+                let kids = ts.iter_mut().map(|t| self.go(t, write)).collect();
+                self.node(TAG_TUPLE, Vec::new(), kids)
+            }
+            Test::RecordOf(fields) => {
+                let names = fields.iter().map(|(name, _)| name.clone()).collect();
+                let kids = fields.iter_mut().map(|(_, t)| self.go(t, write)).collect();
+                self.node(TAG_RECORD, names, kids)
+            }
+            Test::Or(alts) => {
+                let kids = alts.iter_mut().map(|t| self.go(t, write)).collect();
+                self.node(TAG_OR, Vec::new(), kids)
+            }
+            Test::Ref(i, seal) => {
+                let lens = self.def_lens;
+                let rel = if lens { None } else { intern(TAG_REF, *i as u64, Vec::new(), Vec::new()) };
+                if write {
+                    seal.0 = rel.and_then(|r| self.root(r, true)).and_then(SealId::new);
+                }
+                Info { rel, refs: true, lens }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -635,4 +898,158 @@ pub fn fill_synthesized_spans(arena: &Arena, root: ExprRef, spans: &mut SpanMap)
         spans.push(s.unwrap_or(fallback));
     }
     debug_assert_eq!(spans.len(), total);
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+    use crate::types::Hc;
+
+    // The seal ids of a test in pre-order (None: no id), for the nodes that carry one.
+    fn seals(t: &Test, out: &mut Vec<Option<SealId>>) {
+        match t {
+            Test::Elems { elem, seal, .. } => {
+                out.push(seal.0);
+                seals(elem, out);
+            }
+            Test::Ref(_, seal) => out.push(seal.0),
+            Test::TupleOf(ts) | Test::Or(ts) => ts.iter().for_each(|t| seals(t, out)),
+            Test::RecordOf(fs) => fs.iter().for_each(|(_, t)| seals(t, out)),
+            _ => {}
+        }
+    }
+
+    // The id of the root of `test` after assign_seals (None: it has none).
+    fn root_id(mut test: Test, mut defs: Vec<Test>) -> Option<SealId> {
+        assign_seals(&mut test, &mut defs, &mut Then::Done);
+        let mut out = Vec::new();
+        seals(&test, &mut out);
+        out[0]
+    }
+
+    fn list_of(t: Test) -> Test {
+        Test::list_of(Box::new(t))
+    }
+
+    #[test]
+    fn equal_structures_get_equal_ids_wherever_they_are_lowered() {
+        let ty = Type::List(Hc::new(Type::Int));
+        let (a, defs) = crate::typecheck::lower_test(&ty).unwrap();
+        let (b, _) = crate::typecheck::lower_test(&ty).unwrap();
+        // A static boundary and an Unknown site lower through `lower`.
+        let lazy = Lazy::new(Rc::new(ty));
+        let lowered = crate::typecheck::lower_conform(&lazy, None).expect("a list is checked");
+        let (mut ids, mut other) = (Vec::new(), Vec::new());
+        seals(&a, &mut ids);
+        seals(&lowered.check.test, &mut other);
+        assert!(defs.is_empty() && ids[0].is_some());
+        assert_eq!(ids, other);
+        let mut again = Vec::new();
+        seals(&b, &mut again);
+        assert_eq!(ids, again);
+        // The same list tests built by hand agree with the lowered one, and `Length` is no part
+        // of an every-element id: a Vec(2) and a Vec(3) of Int share the element test.
+        assert_eq!(root_id(list_of(Test::Int), vec![]), ids[0]);
+        assert_eq!(root_id(Test::list_len(Box::new(Test::Int), 2), vec![]), ids[0]);
+        assert_eq!(root_id(Test::list_len(Box::new(Test::Int), 3), vec![]), ids[0]);
+        assert_eq!(root_id(Test::list_len_arg(Box::new(Test::Int), 0), vec![]), ids[0], "Vec(n) itself is sealed");
+    }
+
+    #[test]
+    fn different_structures_get_different_ids() {
+        let id = |t: Test| root_id(t, vec![]);
+        let distinct = [
+            list_of(Test::Int),
+            list_of(Test::Str),
+            list_of(Test::Token(1)),
+            list_of(Test::Token(2)),
+            list_of(Test::list_len(Box::new(Test::Int), 2)),
+            list_of(Test::list_len(Box::new(Test::Int), 3)),
+            list_of(Test::list_of(Box::new(Test::Int))),
+            list_of(Test::TupleOf(vec![Test::Int, Test::Str])),
+            list_of(Test::TupleOf(vec![Test::Str, Test::Int])),
+            list_of(Test::TupleOf(vec![Test::Int])),
+            list_of(Test::RecordOf(vec![("a".into(), Test::Int)])),
+            list_of(Test::RecordOf(vec![("b".into(), Test::Int)])),
+            list_of(Test::RecordOf(vec![("a".into(), Test::Int), ("b".into(), Test::Int)])),
+            list_of(Test::Or(vec![Test::Int, Test::Str])),
+            list_of(Test::Or(vec![Test::Str, Test::Int])),
+        ];
+        let ids: Vec<_> = distinct.iter().cloned().map(id).collect();
+        for (i, a) in ids.iter().enumerate() {
+            assert!(a.is_some(), "{:?}", distinct[i]);
+            for (j, b) in ids.iter().enumerate() {
+                assert_eq!(i == j, a == b, "{:?} vs {:?}", distinct[i], distinct[j]);
+            }
+        }
+    }
+
+    // A node that reaches a Ref is rooted in the def table: the same test over different defs
+    // has different ids, and the same defs give the same one.
+    #[test]
+    fn a_node_reaching_a_ref_is_rooted_in_its_defs() {
+        let over = |def: Test| root_id(list_of(Test::reference(0)), vec![def]);
+        let int_or_rec = |leaf: Test| Test::Or(vec![leaf, list_of(Test::reference(0))]);
+        let (a, b, c) = (over(int_or_rec(Test::Int)), over(int_or_rec(Test::Str)), over(int_or_rec(Test::Int)));
+        assert!(a.is_some() && b.is_some());
+        assert_ne!(a, b);
+        assert_eq!(a, c);
+        // The Ref's own whole-seal id is rooted too, and differs from any every-element id.
+        let mut test = Test::reference(0);
+        let mut defs = vec![int_or_rec(Test::Int)];
+        assign_seals(&mut test, &mut defs, &mut Then::Done);
+        let Test::Ref(_, whole) = &test else { panic!("a Ref") };
+        assert!(whole.0.is_some() && whole.0 != a);
+    }
+
+    #[test]
+    fn a_test_that_reads_a_length_slot_gets_no_id() {
+        let slotted = || Test::list_len_arg(Box::new(Test::Int), 0);
+        // The slotted list itself is sealed; a list of slotted lists is not.
+        assert!(root_id(slotted(), vec![]).is_some());
+        assert_eq!(root_id(list_of(slotted()), vec![]), None);
+        assert_eq!(root_id(list_of(Test::TupleOf(vec![Test::Int, slotted()])), vec![]), None);
+        assert_eq!(root_id(list_of(Test::Or(vec![Test::Int, list_of(slotted())])), vec![]), None);
+        // A def with a slot takes away the ids of everything reaching a Ref, and only those.
+        let defs = || vec![Test::Or(vec![Test::Int, slotted()])];
+        assert_eq!(root_id(list_of(Test::reference(0)), defs()), None);
+        assert_eq!(root_id(Test::reference(0), defs()), None);
+        assert!(root_id(list_of(Test::Int), defs()).is_some());
+    }
+
+    #[test]
+    fn every_alternative_of_a_pick_gets_ids_and_hand_built_tests_get_none() {
+        let hand = list_of(Test::Int);
+        let mut none = Vec::new();
+        seals(&hand, &mut none);
+        assert_eq!(none, [None]);
+        let mut test = Test::Never;
+        let mut then = Then::Pick(vec![
+            (list_of(Test::Int), Then::Done),
+            (Test::Bool, Then::Pick(vec![(list_of(Test::Str), Then::Done)])),
+        ]);
+        assign_seals(&mut test, &mut [], &mut then);
+        let Then::Pick(alts) = &then else { panic!("a Pick") };
+        let mut out = Vec::new();
+        seals(&alts[0].0, &mut out);
+        let Then::Pick(inner) = &alts[1].1 else { panic!("a nested Pick") };
+        seals(&inner[0].0, &mut out);
+        assert!(out.len() == 2 && out.iter().all(Option::is_some) && out[0] != out[1]);
+    }
+
+    // Past the cap a test gets no id (it behaves as before); under it ids are assigned.
+    #[test]
+    fn the_interner_stops_at_its_cap() {
+        set_seal_cap(0);
+        assert_eq!(root_id(list_of(Test::Int), vec![]), None);
+        set_seal_cap(3);
+        // The def table is key 1, Int key 2 and Every(Int) key 3: the inner list is sealed,
+        // but its parent's key is the fourth and does not fit.
+        let mut test = list_of(list_of(Test::Int));
+        assign_seals(&mut test, &mut [], &mut Then::Done);
+        let mut out = Vec::new();
+        seals(&test, &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].is_none() && out[1].is_some(), "{out:?}");
+    }
 }

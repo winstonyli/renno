@@ -9185,7 +9185,7 @@ g(len)").unwrap_err();
         // A variable index is read from a length slot (here v's length, through its witness):
         // one native Check, no desugared let/if and no synthesized `#len`/`#fail` call.
         let src = "let f = fun v: Vec(n) -> let d: Dyn = [1, 2] in let y: Vec(n) = d in 1 in f([1, 2])";
-        assert!(has_assert_check(src, expr::Test::ListLenArg(Box::new(expr::Test::Any), 0)));
+        assert!(has_assert_check(src, expr::Test::list_len_arg(Box::new(expr::Test::Any), 0)));
         let (arena, root) = elaborated_tree(src);
         assert!(tree_any(&arena, root, &|n| matches!(n, expr::Expr::Conform(_, s) if s.lens.iter().any(|l| matches!(*l.borrow(), expr::LenExpr::Witness(..))))));
         assert!(!tree_any(&arena, root, &|n| matches!(n, expr::Expr::Var(v) if v == "#len" || v == "#fail")));
@@ -9194,7 +9194,7 @@ g(len)").unwrap_err();
         assert_clean_rejection(&src.replace("[1, 2] in let y", "[1, 2, 3] in let y"), "type error: expected [Dyn](n), found List");
         // A literal length is one native test.
         let lit = "let d: Dyn = [1, 2] in let y: Vec(2) = d in 1";
-        assert!(has_assert_check(lit, expr::Test::ListLen(Box::new(expr::Test::Any), 2)));
+        assert!(has_assert_check(lit, expr::Test::list_len(Box::new(expr::Test::Any), 2)));
         assert_clean_rejection("let d: Dyn = [1, 2, 3] in let y: Vec(2) = d in 1", "type error: expected [Dyn](2), found List");
     }
 
@@ -9228,7 +9228,7 @@ g(len)").unwrap_err();
     #[test]
     fn a_union_with_a_vec_n_alternative_is_one_native_check() {
         let union = within("Vec(n) | Bool", "true");
-        let slot = expr::Test::ListLenArg(Box::new(expr::Test::Any), 0);
+        let slot = expr::Test::list_len_arg(Box::new(expr::Test::Any), 0);
         assert!(has_assert_check(&union, expr::Test::Or(vec![slot, expr::Test::Bool])));
         assert_eq!(run_source(&union).unwrap().as_int(), 1);
         assert_eq!(run_source(&within("Vec(n) | Bool", "[3, 4]")).unwrap().as_int(), 1);
@@ -9263,7 +9263,7 @@ g(len)").unwrap_err();
         let Expr::Let(name, ann, val, body) = arena[root].clone() else { panic!("not a let") };
         let witness = arena.push(Expr::Var("h".into()));
         let slot = std::rc::Rc::new(std::cell::RefCell::new(LenExpr::Witness(witness, "n".into())));
-        let test = Test::ListLenArg(Box::new(Test::Any), 0);
+        let test = Test::list_len_arg(Box::new(Test::Any), 0);
         let check_spec = std::rc::Rc::new(CheckSpec { test, defs: vec![], to: crate::types::Type::Dyn, span: None });
         let lazy = crate::expr::Lazy::new(std::rc::Rc::new(crate::types::Type::Dyn));
         lazy.lowered.set(Some(std::rc::Rc::new(crate::expr::Lowered { check: check_spec, slots: vec![crate::index_expr::IndexExpr::Var("n".into())], then: crate::expr::Then::Done }))).ok();
