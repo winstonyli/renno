@@ -134,7 +134,7 @@ impl List {
     // producer that can walk backwards (`range`, `reverse`) gives without a reversing pass.
     pub fn from_bottom_up(items: impl Iterator<Item = Value>) -> List {
         let mut cells = Vec::with_capacity(items.size_hint().0);
-        cells.extend(items.map(OnceCell::from));
+        items.for_each(|x| cells.push(OnceCell::from(x)));
         let n = cells.len();
         if n == 0 {
             return List::empty();
@@ -195,7 +195,7 @@ impl List {
             _ => left,
         };
         let mut cells = Vec::with_capacity(capacity);
-        cells.extend(refused.into_iter().chain(items).map(OnceCell::from));
+        refused.into_iter().chain(items).for_each(|x| cells.push(OnceCell::from(x)));
         List::block(claimed, cells, capacity, false)
     }
 
@@ -260,7 +260,9 @@ impl List {
 
     // A copy of the elements in order: for the cold paths that want a slice.
     pub fn to_vec(&self) -> Vec<Value> {
-        self.iter().cloned().collect()
+        let mut v = Vec::with_capacity(self.len);
+        self.iter().for_each(|x| v.push(x.clone()));
+        v
     }
 
     // What the walk's memo keys a compound value by: the block and the view's height (two
@@ -311,6 +313,20 @@ impl<'a> Iterator for Iter<'a> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.left, Some(self.left))
     }
+
+    // Internal iteration (what `for_each` and the bulk builders use): one tight loop per
+    // block, with none of `next`'s per-element block check.
+    fn fold<B, F: FnMut(B, &'a Value) -> B>(mut self, init: B, mut f: F) -> B {
+        let mut acc = init;
+        while let Some(b) = self.block {
+            for cell in b.slots[..self.pos].iter().rev() {
+                acc = f(acc, cell.get().expect("a view's slots are set"));
+            }
+            self.pos = b.below.top;
+            self.block = b.below.block.as_deref();
+        }
+        acc
+    }
 }
 
 impl ExactSizeIterator for Iter<'_> {}
@@ -338,6 +354,19 @@ impl<'a> Iterator for RevIter<'a> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.left, Some(self.left))
+    }
+
+    fn fold<B, F: FnMut(B, &'a Value) -> B>(mut self, init: B, mut f: F) -> B {
+        let mut acc = init;
+        for cell in self.cur.by_ref() {
+            acc = f(acc, cell.get().expect("a view's slots are set"));
+        }
+        while let Some(seg) = self.segs.pop() {
+            for cell in seg {
+                acc = f(acc, cell.get().expect("a view's slots are set"));
+            }
+        }
+        acc
     }
 }
 
