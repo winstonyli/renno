@@ -29,7 +29,7 @@ fn let_chain_source(n: usize) -> String {
 
 // A single `perform`, resumed n times from one handler clause -- multi-
 // shot resume repeated n times from the SAME captured continuation.
-// Exercises Cont::append's splice-and-replay path.
+// Exercises Meta::resume's push-back of the captured segment.
 fn multishot_source(n: usize) -> String {
     let resumes: Vec<String> = (1..=n).map(|i| format!("resume({i})")).collect();
     format!(
@@ -40,8 +40,8 @@ fn multishot_source(n: usize) -> String {
 
 // n sequential (not multi-shot) occurrences of the same effect under a
 // deep handler -- each one gets its own freshly-reinstalled handler
-// instance. Exercises Frame::HandlerMark's reinstall (now an Rc clone,
-// not six field clones) repeated n times.
+// instance. Exercises the deep handler's reinstall (the matched handler
+// pushed back as a mark by Meta::resume) repeated n times.
 fn deep_chain_source(n: usize) -> String {
     let mut src = String::new();
     for i in 0..n {
