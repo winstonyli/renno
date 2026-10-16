@@ -1579,17 +1579,13 @@ fn dispatch_builtin(b: Builtin, mut args: Vec<Value>) -> Value {
         // Higher-order: collect_builtin_arg sends these to start_iteration.
         Builtin::Map | Builtin::Fold | Builtin::Filter | Builtin::Sort => unreachable!("internal: a higher-order builtin is started, not dispatched"),
         Builtin::Reverse => match args.pop() {
-            Some(Value::List(items)) => {
-                let mut items = items.to_vec();
-                items.reverse();
-                Value::List(List::from_vec(items))
-            }
+            Some(Value::List(items)) => Value::List(List::from_bottom_up(items.iter().cloned())),
             _ => crate::run_error!("reverse expects a list"),
         },
         Builtin::Range => {
             let (end, start) = (args.pop(), args.pop());
             match (start, end) {
-                (Some(Value::Int(start)), Some(Value::Int(end))) => Value::List((start..end).map(Value::Int).collect()),
+                (Some(Value::Int(start)), Some(Value::Int(end))) => Value::List(List::from_bottom_up((start..end).rev().map(Value::Int))),
                 _ => crate::run_error!("range expects two ints"),
             }
         }

@@ -115,16 +115,44 @@ impl List {
         self.len == 0
     }
 
-    // The bulk build: one exactly-sized, sealed block.
-    pub fn from_vec(items: Vec<Value>) -> List {
-        let len = items.len();
-        if len == 0 {
+    // The bulk builds: one exactly-sized, sealed block, made in one pass over the elements
+    // (every slot is created already set).
+    //
+    // From a head-first Vec: the Vec is reversed in place and its allocation becomes the
+    // block's storage (a Value and an OnceCell<Value> have the same layout).
+    pub fn from_vec(mut items: Vec<Value>) -> List {
+        if items.is_empty() {
             return List::empty();
         }
-        count_writes(len);
+        items.reverse();
+        let cells: Vec<OnceCell<Value>> = items.into_iter().map(OnceCell::from).collect();
+        let n = cells.len();
+        List::block(List::empty(), cells, n, true)
+    }
+
+    // From elements in bottom-first order, i.e. the last element of the list first: what a
+    // producer that can walk backwards (`range`, `reverse`) gives without a reversing pass.
+    pub fn from_bottom_up(items: impl Iterator<Item = Value>) -> List {
+        let mut cells = Vec::with_capacity(items.size_hint().0);
+        cells.extend(items.map(OnceCell::from));
+        let n = cells.len();
+        if n == 0 {
+            return List::empty();
+        }
+        List::block(List::empty(), cells, n, true)
+    }
+
+    // The one place a block is made: `cells` (bottom-first, already set) padded with empty
+    // slots up to `capacity`, over `below`.
+    fn block(below: List, mut cells: Vec<OnceCell<Value>>, capacity: usize, grown: bool) -> List {
+        let n = cells.len();
+        count_writes(n);
         count_block();
-        let slots: Box<[OnceCell<Value>]> = items.into_iter().rev().map(OnceCell::from).collect();
-        List { block: Some(Rc::new(Block { slots, below: List::empty(), grown: Cell::new(true) })), top: len, len }
+        if capacity > n {
+            count_empties(capacity - n);
+            cells.resize_with(capacity, OnceCell::new);
+        }
+        List { len: below.len + n, top: n, block: Some(Rc::new(Block { slots: cells.into_boxed_slice(), below, grown: Cell::new(grown) })) }
     }
 
     pub fn cons(&self, head: Value) -> List {
@@ -166,14 +194,9 @@ impl List {
             Some(b) if top == b.slots.len() && !b.grown.replace(true) => left.max(2 * b.slots.len()),
             _ => left,
         };
-        count_writes(left);
-        count_block();
-        count_empties(capacity);
-        let slots: Box<[OnceCell<Value>]> = (0..capacity).map(|_| OnceCell::new()).collect();
-        for (slot, x) in slots.iter().zip(refused.into_iter().chain(items)) {
-            let _ = slot.set(x);
-        }
-        List { len: claimed.len + left, block: Some(Rc::new(Block { slots, below: claimed, grown: Cell::new(false) })), top: left }
+        let mut cells = Vec::with_capacity(capacity);
+        cells.extend(refused.into_iter().chain(items).map(OnceCell::from));
+        List::block(claimed, cells, capacity, false)
     }
 
     // `self ++ b`: O(1) when either side is empty, otherwise O(|self|) and `b` is never
@@ -186,7 +209,7 @@ impl List {
         if b.is_empty() {
             return self.clone();
         }
-        b.push_all(self.to_vec().into_iter().rev())
+        b.push_all(self.iter_rev().cloned())
     }
 
     pub fn first(&self) -> Option<&Value> {
@@ -223,6 +246,16 @@ impl List {
 
     pub fn iter(&self) -> Iter<'_> {
         Iter { block: self.block.as_deref(), pos: self.top, left: self.len }
+    }
+
+    // The elements last to first, which is a block's slots in ascending order: no copy.
+    pub fn iter_rev(&self) -> RevIter<'_> {
+        let (mut segs, mut view) = (Vec::new(), self);
+        while let Some(b) = &view.block {
+            segs.push(&b.slots[..view.top]);
+            view = &b.below;
+        }
+        RevIter { cur: segs.pop().unwrap_or_default().iter(), segs, left: self.len }
     }
 
     // A copy of the elements in order: for the cold paths that want a slice.
@@ -282,6 +315,34 @@ impl<'a> Iterator for Iter<'a> {
 
 impl ExactSizeIterator for Iter<'_> {}
 
+// Bottom-first: the block chain's slices, deepest block first.
+pub struct RevIter<'a> {
+    cur: std::slice::Iter<'a, OnceCell<Value>>,
+    // The slices still to visit, the next one last.
+    segs: Vec<&'a [OnceCell<Value>]>,
+    left: usize,
+}
+
+impl<'a> Iterator for RevIter<'a> {
+    type Item = &'a Value;
+
+    fn next(&mut self) -> Option<&'a Value> {
+        loop {
+            if let Some(cell) = self.cur.next() {
+                self.left -= 1;
+                return Some(cell.get().expect("a view's slots are set"));
+            }
+            self.cur = self.segs.pop()?.iter();
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl ExactSizeIterator for RevIter<'_> {}
+
 // A chain of blocks (a list built by repeated branching) can be a million deep: drop it in a
 // loop, the same pattern as cont.rs's and frame.rs's Drop, not by recursion.
 impl Drop for Block {
@@ -335,6 +396,42 @@ mod tests {
         }
         assert_eq!(seen, want);
         assert!(rest.is_empty());
+    }
+
+    // The bulk builds create every slot already set (no empty slot) and one block each.
+    #[test]
+    fn bulk_builds_are_one_pass_and_agree() {
+        for n in [0i64, 1, 2, 7, 1000] {
+            let want: Vec<i64> = (0..n).collect();
+            let rev: Vec<i64> = want.iter().rev().copied().collect();
+            reset_counters();
+            let a = List::from_vec(want.iter().map(|&x| val(x)).collect());
+            let b = List::from_bottom_up((0..n).rev().map(val));
+            let c = a.append(&b);
+            let d = List::from_bottom_up(a.iter().cloned());
+            assert_eq!(empties(), 0, "n = {n}");
+            check(&a, &want);
+            check(&b, &want);
+            check(&d, &rev);
+            let both: Vec<i64> = want.iter().chain(&want).copied().collect();
+            check(&c, &both);
+            assert_eq!(a.capacity(), want.len());
+            assert_eq!(d.capacity(), want.len());
+        }
+    }
+
+    // iter_rev walks a many-block list (cons-built, branched, appended) bottom-first.
+    #[test]
+    fn iter_rev_is_the_reverse_of_iter() {
+        let l = linear(100);
+        let branched = l.cons(val(-1));
+        let joined = bulk(&[7, 8, 9]).append(&branched);
+        for x in [&List::empty(), &l, &branched, &joined, &l.split_first().unwrap().1] {
+            let mut want = ints(x);
+            want.reverse();
+            assert_eq!(x.iter_rev().len(), want.len());
+            assert_eq!(x.iter_rev().map(Value::as_int).collect::<Vec<_>>(), want);
+        }
     }
 
     #[test]
