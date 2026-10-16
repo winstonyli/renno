@@ -1,11 +1,17 @@
-// Step-driven native computations: the higher-order builtins (map, filter, fold, sort) as
-// state machines the evaluator drives one callback at a time (machine::iterate), so the
-// state lives in a Frame::Iterate on the continuation instead of in a native Rust loop.
-// That is what lets an effect performed in a callback reach the handler around the
-// builtin call, multi-shot included, and keeps a callback from nesting the native stack.
+// Step-driven native computations: the machine's one mechanism for native code that keeps
+// partial state across sub-evaluations. The higher-order builtins (map, filter, fold, sort)
+// are state machines driven one callback at a time; a literal's elements and a `let rec`
+// group's values accumulate the same way, one sub-expression at a time. The state lives in a
+// Frame::Iterate on the continuation (machine::iterate), not in a native Rust loop, so an
+// effect performed in a callback reaches the handler around the builtin call, multi-shot
+// included, and a callback cannot nest the native stack.
 
 use std::rc::Rc;
 
+use crate::env::Env;
+use crate::expr::{ExprRef, SpanMap};
+use crate::frame::Bindings;
+use crate::types::{close_group, Type};
 use crate::value::Value;
 
 // What a step-driven computation asks the machine to do next.
@@ -15,9 +21,17 @@ pub enum Next {
     // call: fold's f(acc)(x), sort's cmp(a)(b)). The final result is fed back to `step`.
     // The frame stays.
     Call { f: Value, a: Value, b: Option<Value> },
+    // Evaluate the expression in the environment and feed its value back to `step`. The
+    // frame stays.
+    Eval(ExprRef, Env),
+    // Pop the frame, then evaluate (a `let rec` group's body).
+    Tail(ExprRef, Env),
     // Finished: pop the frame and continue with this value.
     Done(Value),
 }
+
+// The bindings of a `let rec` (Expr::LetRec's first field).
+pub type LetRecBindings = Rc<Vec<(String, Option<ExprRef>, ExprRef)>>;
 
 // The state of one running builtin. A Frame::Iterate holds it in an `Rc`, shared copy-on-
 // write: a capture by `perform` and a splice by `resume` are reference-count bumps, and the
@@ -33,6 +47,17 @@ pub enum Iter {
     Fold { f: Value, items: Rc<Vec<Value>>, i: usize },
     // Boxed: much larger than the others.
     Sort(Box<Sort>),
+    // A list or tuple literal (`record` None) or a record literal's field values, evaluated
+    // left to right; `remaining` is reversed so `pop` takes the next, `done` holds the values.
+    Elems { record: Option<Rc<Vec<String>>>, remaining: Vec<ExprRef>, done: Vec<Value>, env: Env },
+    // A non-group `let rec`: the values run in the outer scope, then `body` runs on a frame
+    // of them (same order as the names).
+    LetRec { remaining: Vec<ExprRef>, done: Vec<Value>, body: ExprRef, env: Env },
+    // A `let rec` of unannotated calls (resolve::GroupKind::Types): its values run in
+    // `vals_env`, a frame of one placeholder type per name (`ids`); `done` holds the finished
+    // ones. After the last, close_group builds the recursive types and `body` runs in a frame
+    // of the finished values on `env`.
+    TypeGroup { bindings: LetRecBindings, body: ExprRef, ids: Rc<[u64]>, done: Vec<Value>, env: Env, vals_env: Env },
 }
 
 fn list(items: Vec<Value>) -> Value {
@@ -77,10 +102,72 @@ impl Iter {
         (Iter::Sort(Box::new(sort)), next)
     }
 
-    // Feeds one callback result. The driver calls this only through `Rc::make_mut`, so the
-    // `mem::take`s below never empty a state a captured continuation holds.
-    pub fn step(&mut self, v: Value) -> Next {
+    // Starts a list/tuple literal (`record` None) or a record literal's values: the state and
+    // the first expression to evaluate. `items` is never empty (an empty list literal is a
+    // constant, and a tuple or record has at least one element).
+    pub fn elems(record: Option<Rc<Vec<String>>>, mut items: Vec<ExprRef>, env: Env) -> (Iter, ExprRef) {
+        items.reverse();
+        let first = items.pop().expect("an elems literal has at least one element");
+        (Iter::Elems { record, remaining: items, done: Vec::new(), env }, first)
+    }
+
+    // Starts a non-group `let rec`: the state and the first value to evaluate (the parser
+    // never emits an empty group).
+    pub fn let_rec(mut values: Vec<ExprRef>, body: ExprRef, env: Env) -> (Iter, ExprRef) {
+        values.reverse();
+        let first = values.pop().expect("the parser never emits an empty group");
+        (Iter::LetRec { remaining: values, done: Vec::new(), body, env }, first)
+    }
+
+    // Feeds one result: a callback's, or an evaluated element's. The driver calls this only
+    // through `Rc::make_mut`, so the `mem::take`s below never empty a state a captured
+    // continuation holds. `spans` is for a type group's error.
+    pub fn step(&mut self, v: Value, spans: &SpanMap) -> Next {
         match self {
+            Iter::Elems { record, remaining, done, env } => {
+                done.push(v);
+                match remaining.pop() {
+                    Some(next) => Next::Eval(next, env.clone()),
+                    None => {
+                        let done = std::mem::take(done);
+                        Next::Done(match record {
+                            None => list(done),
+                            Some(names) => Value::Record(Rc::new(names.iter().cloned().zip(done).collect())),
+                        })
+                    }
+                }
+            }
+            Iter::LetRec { remaining, done, body, env } => {
+                done.push(v);
+                match remaining.pop() {
+                    Some(next) => Next::Eval(next, env.clone()),
+                    None => {
+                        let mut frame = Bindings::default();
+                        for v in std::mem::take(done) {
+                            frame.push(v);
+                        }
+                        Next::Tail(*body, frame.extend(env))
+                    }
+                }
+            }
+            Iter::TypeGroup { bindings, body, ids, done, env, vals_env } => {
+                done.push(v);
+                if done.len() < bindings.len() {
+                    return Next::Eval(bindings[done.len()].2, vals_env.clone());
+                }
+                let done = std::mem::take(done);
+                let results: Vec<Option<Type>> = done.iter().map(|v| if let Value::Type(t) = v { Some((**t).clone()) } else { None }).collect();
+                let names: Vec<Rc<str>> = bindings.iter().map(|(n, _, _)| Rc::from(n.as_str())).collect();
+                let closed = close_group(&names, ids, &results).unwrap_or_else(|(i, _)| {
+                    crate::machine::set_current_span(spans.get(bindings[i].2).copied());
+                    crate::run_error!("recursive type {} is not built by a type constructor", names[i])
+                });
+                let mut frame = Bindings::default();
+                for (v, c) in done.into_iter().zip(closed) {
+                    frame.push(c.map_or(v, |t| Value::Type(Rc::new(t))));
+                }
+                Next::Tail(*body, frame.extend(env))
+            }
             Iter::Map { f, items, i, out } => {
                 out.push(v);
                 *i += 1;
@@ -283,7 +370,7 @@ mod tests {
             match next {
                 Next::Call { a, b: Some(b), .. } => {
                     asked += 1;
-                    next = iter.step(Value::Bool(answer(int(&a), int(&b))));
+                    next = iter.step(Value::Bool(answer(int(&a), int(&b))), &SpanMap::new());
                 }
                 Next::Done(Value::List(out)) => return (out.iter().map(int).collect(), asked),
                 _ => panic!("a sort asks two-argument questions and finishes with a list"),
@@ -371,7 +458,7 @@ mod tests {
                     }
                     let ans = coin.next() & 1 == 0;
                     stream.push(ans);
-                    next = iter.step(Value::Bool(ans));
+                    next = iter.step(Value::Bool(ans), &SpanMap::new());
                 }
                 let fork = (iter.clone(), next.clone());
                 // Each copy finishes with its own answer stream.
@@ -383,7 +470,7 @@ mod tests {
                             Next::Call { .. } => {
                                 let ans = c.next() % 3 != bias;
                                 full.push(ans);
-                                nx = it.step(Value::Bool(ans));
+                                nx = it.step(Value::Bool(ans), &SpanMap::new());
                             }
                             Next::Done(Value::List(out)) => break out.iter().map(int).collect::<Vec<_>>(),
                             _ => unreachable!(),
@@ -404,14 +491,14 @@ mod tests {
         let mut seen = Vec::new();
         while let Next::Call { a, b: None, .. } = next {
             seen.push(int(&a));
-            next = it.step(Value::Int(int(&a) * 10));
+            next = it.step(Value::Int(int(&a) * 10), &SpanMap::new());
         }
         assert_eq!(seen, [1, 2, 3]);
         assert!(matches!(&next, Next::Done(Value::List(out)) if out.iter().map(int).collect::<Vec<_>>() == [10, 20, 30]));
 
         let (mut it, mut next) = Iter::filter(Value::Bool(true), items.clone());
         while let Next::Call { a, .. } = next {
-            next = it.step(Value::Bool(int(&a) != 2));
+            next = it.step(Value::Bool(int(&a) != 2), &SpanMap::new());
         }
         assert!(matches!(&next, Next::Done(Value::List(out)) if out.iter().map(int).collect::<Vec<_>>() == [1, 3]));
 
@@ -419,7 +506,7 @@ mod tests {
         let mut seen = Vec::new();
         while let Next::Call { a, b: Some(b), .. } = next {
             seen.push((int(&a), int(&b)));
-            next = it.step(Value::Int(int(&a) + int(&b)));
+            next = it.step(Value::Int(int(&a) + int(&b)), &SpanMap::new());
         }
         assert_eq!(seen, [(100, 1), (101, 2), (103, 3)]);
         assert!(matches!(next, Next::Done(Value::Int(106))));

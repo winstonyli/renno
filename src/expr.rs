@@ -378,7 +378,7 @@ pub enum Expr {
     // `(a, b, c)` -- a fixed-arity product, elaborated with types::
     // Type::Tuple (per-position types, no widening, unlike ListLit just
     // below). Evaluates to a plain Value::List at runtime (machine.rs
-    // reuses ListLit's own Frame::ListElems machinery unchanged) -- no
+    // reuses ListLit's own Iter::Elems machinery unchanged) -- no
     // new Value kind needed. Always 2+ items: parser::atom_leaf's LParen
     // arm only builds this once it's seen a comma: a single parenthesized
     // expression with no comma stays ordinary grouping.
@@ -390,7 +390,7 @@ pub enum Expr {
     // field value, unlike Tuple's own sibling arm this is NOT rewritten
     // away -- see Value::Record's own doc comment for why records need
     // their own name-keyed runtime kind), and machine.rs evaluates it
-    // directly via Frame::RecordElems into a Value::Record.
+    // directly via Iter::Elems into a Value::Record.
     Record(Rc<Vec<(String, ExprRef)>>),
     // `p.x` -- reads field `x` off a record. Parser-emitted and
     // typecheck-consumed only: elaborate_node's own FieldAccess arm
@@ -437,7 +437,7 @@ pub enum Expr {
     // mutation or an AST-rewriting Y-combinator encoding); otherwise the
     // values evaluate in the outer scope and the names are bound only for
     // `body`, non-recursively (see resolve.rs's LetRec arm and machine.rs's
-    // Frame::LetRecBody fallback). A single binding (`let rec f = ... in
+    // Iter::LetRec fallback). A single binding (`let rec f = ... in
     // ...`, no `and`) is just the length-1 case of the direct-group form --
     // no separate representation for plain self-recursion.
     LetRec(Rc<Vec<(String, Option<ExprRef>, ExprRef)>>, ExprRef),

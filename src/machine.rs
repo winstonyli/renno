@@ -10,7 +10,7 @@ use crate::index_expr::IndexExpr;
 use crate::iterate::{Iter, Next};
 use crate::resolve::{group_kind, resolve, GroupKind, Resolved, VarRef};
 use crate::span::Span;
-use crate::types::{close_group, first_free, fresh_rec_id, EffectRow, Hc, RecVar, Type};
+use crate::types::{first_free, fresh_rec_id, EffectRow, Hc, RecVar, Type};
 use crate::util::find_field;
 use crate::value::{Builtin, Contract, HandlerData, SiteCtx, TypeCtor, Value};
 
@@ -222,7 +222,7 @@ pub fn eval_type(arena: &Arena, ann: ExprRef, spans: &SpanMap) -> Result<Type, S
 pub fn pure_type(outcome: Pure) -> Result<Rc<Type>, String> {
     match outcome {
         // A placeholder of a recursive type group that has not closed yet can never
-        // become an annotation, whether bare or nested (see Frame::TypeGroupBody).
+        // become an annotation, whether bare or nested (see Iter::TypeGroup).
         Pure::Done(Value::Type(t)) => match first_free(&t) {
             Some(name) => Err(format!("recursive type {name} is used before it is built")),
             None => Ok(t),
@@ -269,8 +269,8 @@ fn unshared_top(cont: &mut Cont) -> &mut ContNode {
     Rc::get_mut(&mut cont.0).expect("internal: just unshared")
 }
 
-// Feeds `value`, a callback's result, to the Iterate frame on top of `cont`.
-fn iterate(cont: &mut Cont, value: Value) -> Control {
+// Feeds `value`, a callback's (or an element's) result, to the Iterate frame on top of `cont`.
+fn iterate(cont: &mut Cont, value: Value, spans: &SpanMap) -> Control {
     let ContNode::Frame(Frame::Iterate { state, pending }, _) = unshared_top(cont) else {
         unreachable!("internal: iterate is called on an Iterate frame")
     };
@@ -280,7 +280,7 @@ fn iterate(cont: &mut Cont, value: Value) -> Control {
         return Control::Apply(b);
     }
     // Copy-on-write: copies the state only if a captured continuation still holds it.
-    let next = Rc::make_mut(state).step(value);
+    let next = Rc::make_mut(state).step(value, spans);
     follow(cont, next)
 }
 
@@ -299,12 +299,22 @@ fn follow(cont: &mut Cont, next: Next) -> Control {
             *cont = Cont::cons(Frame::AppArg { func: f, callee_span: None }, cont.clone());
             Control::Apply(a)
         }
+        Next::Eval(expr, env) => Control::Eval(expr, env),
+        Next::Tail(expr, env) => {
+            pop(cont);
+            Control::Eval(expr, env)
+        }
         Next::Done(v) => {
-            let ContNode::Frame(_, rest) = &*cont.0 else { unreachable!("internal: follow is called on an Iterate frame") };
-            *cont = rest.clone();
+            pop(cont);
             Control::Apply(v)
         }
     }
+}
+
+// Drops the Iterate frame on top of `cont`.
+fn pop(cont: &mut Cont) {
+    let ContNode::Frame(_, rest) = &*cont.0 else { unreachable!("internal: follow is called on an Iterate frame") };
+    *cont = rest.clone();
 }
 
 // What a saturated builtin call does: yields a value, or starts a step-driven computation
@@ -319,7 +329,7 @@ fn enter(dispatch: Dispatch, cont: &mut Cont) -> Control {
     match dispatch {
         Dispatch::Value(v) | Dispatch::Iterate(_, Next::Done(v)) => Control::Apply(v),
         Dispatch::Iterate(iter, next) => {
-            *cont = Cont::cons(Frame::Iterate { state: Rc::new(iter), pending: None }, cont.clone());
+            *cont = Cont::cons(Frame::iterate(iter), cont.clone());
             follow(cont, next)
         }
     }
@@ -330,23 +340,14 @@ fn enter(dispatch: Dispatch, cont: &mut Cont) -> Control {
 // instance (`run_loop::<false>`) compiles without them: no cost on the hot path.
 fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Cont, spans: &SpanMap, resolved: &Resolved, mut fuel: u64) -> Result<Value, Stuck> {
     loop {
-        // A list, record or type-group accumulator frame that only this evaluation holds is
-        // moved, not cloned, so building n elements is O(n). A frame a captured
-        // continuation shares falls through to the cloning arms below.
-        if matches!(control, Control::Apply(_)) {
-            if let Some((frame, rest)) = cont.take_unshared_elems() {
-                let Control::Apply(value) = control else { unreachable!() };
-                (control, cont) = advance_elems(arena, spans, frame, rest, value);
-                continue;
-            }
-            // A higher-order builtin between callbacks takes the result first. None can run
-            // in check mode (only type constructors dispatch there), so that instance
-            // compiles without the test.
-            if !PURE && matches!(&*cont.0, ContNode::Frame(Frame::Iterate { .. }, _)) {
-                let Control::Apply(value) = control else { unreachable!() };
-                control = iterate(&mut cont, value);
-                continue;
-            }
+        // Native code between sub-evaluations (a higher-order builtin's callbacks, a
+        // literal's elements, a `let rec` group's values) takes the result first. Its state is
+        // changed in place when only this evaluation holds it, so building n elements is
+        // O(n); one a captured continuation shares is copied first.
+        if matches!(control, Control::Apply(_)) && matches!(&*cont.0, ContNode::Frame(Frame::Iterate { .. }, _)) {
+            let Control::Apply(value) = control else { unreachable!() };
+            control = iterate(&mut cont, value, spans);
+            continue;
         }
         match control {
             Control::Eval(expr, env) => {
@@ -428,34 +429,26 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                 Expr::TypeLit(t) => control = Control::Apply(Value::Type(t.clone())),
                 // Always 2+ items (see Expr::Tuple's own doc comment), so
                 // unlike ListLit there's no empty-case to special-case --
-                // same left-to-right Frame::ListElems machinery either way,
+                // same left-to-right Iter::Elems machinery either way,
                 // building a plain Value::List.
                 Expr::Tuple(items) => {
-                    let mut remaining = items.clone();
-                    remaining.reverse();
-                    let first = remaining.pop().expect("Expr::Tuple always has at least 2 items");
-                    cont = Cont::cons(Frame::ListElems { remaining, done: Vec::new(), env: env.clone() }, cont);
+                    let (iter, first) = Iter::elems(None, items.clone(), env.clone());
+                    cont = Cont::cons(Frame::iterate(iter), cont);
                     control = Control::Eval(first, env);
                 }
-                // Same left-to-right remaining/done accumulation shape as
-                // LetRec's own non-group fallback just below (Frame::
-                // LetRecBody) -- not ListElems, since the final wrap
-                // differs (Value::Record, not Value::List; see
-                // Frame::RecordElems's own doc comment, including how it
-                // differs from LetRecBody's own shape). Always 1+ fields:
+                // The same Iter::Elems machinery, with the field names
+                // (fixed for the whole record) zipped back in at the end
+                // into a Value::Record instead of a bare Value::List (see
+                // Value::Record's own doc comment for why records need a
+                // name-keyed runtime shape). Always 1+ fields:
                 // parser::parse_record_fields rejects `{}` (see its own
                 // doc comment), the same "no
                 // empty case to special-case" guarantee Tuple's own arm
                 // above relies on.
                 Expr::Record(fields) => {
                     let names: Rc<Vec<String>> = Rc::new(fields.iter().map(|(n, _)| n.clone()).collect());
-                    let mut remaining: Vec<ExprRef> = fields.iter().map(|(_, v)| *v).collect();
-                    remaining.reverse();
-                    let first = remaining.pop().expect("parse_record_fields rejects an empty record");
-                    cont = Cont::cons(
-                        Frame::RecordElems { names, remaining, done: Vec::new(), env: env.clone() },
-                        cont,
-                    );
+                    let (iter, first) = Iter::elems(Some(names), fields.iter().map(|(_, v)| *v).collect(), env.clone());
+                    cont = Cont::cons(Frame::iterate(iter), cont);
                     control = Control::Eval(first, env);
                 }
                 // Reachable only if this tree skipped typecheck::check --
@@ -481,15 +474,8 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                     if items.is_empty() {
                         control = Control::Apply(Value::List(Rc::new(Vec::new())));
                     } else {
-                        // Reversed so ListElems can pop() (O(1)) instead of
-                        // remove(0) as each element finishes.
-                        let mut remaining = items.clone();
-                        remaining.reverse();
-                        let first = remaining.pop().unwrap();
-                        cont = Cont::cons(
-                            Frame::ListElems { remaining, done: Vec::new(), env: env.clone() },
-                            cont,
-                        );
+                        let (iter, first) = Iter::elems(None, items.clone(), env.clone());
+                        cont = Cont::cons(Frame::iterate(iter), cont);
                         control = Control::Eval(first, env);
                     }
                 }
@@ -522,7 +508,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                         // Rule P: every value is an unannotated call, so the group
                         // builds recursive types. The values run in a frame [names…]
                         // of placeholders (one fresh id per name); once all have
-                        // run, close_group ties the knot (Frame::TypeGroupBody).
+                        // run, close_group ties the knot (Iter::TypeGroup).
                         let ids: Rc<[u64]> = bindings.iter().map(|_| fresh_rec_id()).collect();
                         let mut frame = Bindings::default();
                         for ((name, _, _), id) in bindings.iter().zip(ids.iter()) {
@@ -530,7 +516,8 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                         }
                         let vals_env = frame.extend(&env);
                         let first = bindings[0].2; // parser never emits an empty group
-                        cont = Cont::cons(Frame::TypeGroupBody { group: expr, ids, done: Vec::new(), env, vals_env: vals_env.clone() }, cont);
+                        let iter = Iter::TypeGroup { bindings: bindings.clone(), body: *body, ids, done: Vec::new(), env, vals_env: vals_env.clone() };
+                        cont = Cont::cons(Frame::iterate(iter), cont);
                         control = Control::Eval(first, vals_env);
                     } else if kind == GroupKind::Functions {
                         // Every value is a direct Lambda: build the group
@@ -554,14 +541,9 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                         // Plain group (spec §2 fallback): values
                         // evaluate in the OUTER scope, left to right, and the
                         // names are bound plainly (non-recursively) for the
-                        // body only. Reversed, same reason as ListLit: pop().
-                        let mut remaining: Vec<ExprRef> = bindings.iter().map(|(_, _, v)| *v).collect();
-                        remaining.reverse();
-                        let first = remaining.pop().unwrap(); // parser never emits an empty group
-                        cont = Cont::cons(
-                            Frame::LetRecBody { remaining, done: Vec::new(), body: *body, env: env.clone() },
-                            cont,
-                        );
+                        // body only (Iter::LetRec).
+                        let (iter, first) = Iter::let_rec(bindings.iter().map(|(_, _, v)| *v).collect(), *body, env.clone());
+                        cont = Cont::cons(Frame::iterate(iter), cont);
                         control = Control::Eval(first, env);
                     }
                 }
@@ -702,33 +684,6 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                             cont = rest;
                             control = Control::Eval(body, env.push1(value));
                         }
-                        Frame::LetRecBody { remaining, done, body, env } => {
-                            let (mut remaining, mut done, body, env) = (remaining.clone(), done.clone(), *body, env.clone());
-                            done.push(value);
-                            cont = rest;
-                            match remaining.pop() {
-                                Some(next) => {
-                                    cont = Cont::cons(Frame::LetRecBody { remaining, done, body, env: env.clone() }, cont);
-                                    control = Control::Eval(next, env);
-                                }
-                                None => {
-                                    // Non-group fallback: bind every value
-                                    // (same order as the names) in one frame.
-                                    let mut frame = Bindings::default();
-                                    for v in done {
-                                        frame.push(v);
-                                    }
-                                    control = Control::Eval(body, frame.extend(&env));
-                                }
-                            }
-                        }
-                        // The shared case (a captured continuation holds this frame): copy it.
-                        // The unshared one is moved by take_unshared_elems, so a group of n
-                        // values costs O(n), not O(n^2).
-                        Frame::TypeGroupBody { group, ids, done, env, vals_env } => {
-                            (control, cont) =
-                                advance_type_group(arena, spans, *group, ids.clone(), done.clone(), env.clone(), vals_env.clone(), rest, value);
-                        }
                         Frame::Iterate { .. } => unreachable!("internal: an Iterate frame is fed at the top of the loop"),
                         Frame::MatchArms { arms, env } => {
                             let (arms, env) = (arms.clone(), env.clone());
@@ -765,46 +720,6 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                             let (then_, else_, env) = (*then_, *else_, env.clone());
                             cont = rest;
                             control = Control::Eval(if value.as_bool() { then_ } else { else_ }, env);
-                        }
-                        // The shared case only (a captured continuation holds this frame, so it
-                        // keeps its own copy): the unshared one is advance_elems.
-                        Frame::ListElems { remaining, done, env } => {
-                            let (mut remaining, mut done, env) = (remaining.clone(), done.clone(), env.clone());
-                            done.push(value);
-                            cont = rest;
-                            match remaining.pop() {
-                                Some(next) => {
-                                    cont = Cont::cons(Frame::ListElems { remaining, done, env: env.clone() }, cont);
-                                    control = Control::Eval(next, env);
-                                }
-                                None => control = Control::Apply(Value::List(Rc::new(done))),
-                            }
-                        }
-                        // Same left-to-right accumulation as ListElems just
-                        // above (and as Frame::LetRecBody's own fallback
-                        // below, which has no `names` of its own to zip
-                        // back in), differing only in the final wrap:
-                        // `names` (fixed for the whole record) zipped
-                        // together with `done` into a Value::Record instead
-                        // of a bare Value::List.
-                        Frame::RecordElems { names, remaining, done, env } => {
-                            let (names, mut remaining, mut done, env) =
-                                (names.clone(), remaining.clone(), done.clone(), env.clone());
-                            done.push(value);
-                            cont = rest;
-                            match remaining.pop() {
-                                Some(next) => {
-                                    cont = Cont::cons(
-                                        Frame::RecordElems { names, remaining, done, env: env.clone() },
-                                        cont,
-                                    );
-                                    control = Control::Eval(next, env);
-                                }
-                                None => {
-                                    let fields = names.iter().cloned().zip(done).collect();
-                                    control = Control::Apply(Value::Record(Rc::new(fields)));
-                                }
-                            }
                         }
                         // Decided while `frame` is still borrowed (nothing
                         // is cloned); `cont` is reassigned after its last use.
@@ -848,67 +763,6 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                 control = perform(&mut cont, &effect, payload);
             }
         }
-    }
-}
-
-// A type group (`group`, a LetRec of unannotated calls) receives the value of its next member:
-// evaluate the next one in the placeholder frame, or, after the last, close the group and run
-// its body on the finished types (Frame::TypeGroupBody).
-#[allow(clippy::too_many_arguments)]
-fn advance_type_group(
-    arena: &Arena,
-    spans: &SpanMap,
-    group: ExprRef,
-    ids: Rc<[u64]>,
-    mut done: Vec<Value>,
-    env: Env,
-    vals_env: Env,
-    rest: Cont,
-    value: Value,
-) -> (Control, Cont) {
-    let Expr::LetRec(bindings, body) = &arena[group] else { unreachable!("a type group frame names a LetRec") };
-    done.push(value);
-    if done.len() < bindings.len() {
-        let next = bindings[done.len()].2;
-        let cont = Cont::cons(Frame::TypeGroupBody { group, ids, done, env, vals_env: vals_env.clone() }, rest);
-        return (Control::Eval(next, vals_env), cont);
-    }
-    let results: Vec<Option<Type>> = done.iter().map(|v| if let Value::Type(t) = v { Some((**t).clone()) } else { None }).collect();
-    let names: Vec<Rc<str>> = bindings.iter().map(|(n, _, _)| Rc::from(n.as_str())).collect();
-    let closed = close_group(&names, &ids, &results).unwrap_or_else(|(i, _)| {
-        set_current_span(spans.get(bindings[i].2).copied());
-        crate::run_error!("recursive type {} is not built by a type constructor", names[i])
-    });
-    let mut frame = Bindings::default();
-    for (v, c) in done.into_iter().zip(closed) {
-        frame.push(c.map_or(v, |t| Value::Type(Rc::new(t))));
-    }
-    (Control::Eval(*body, frame.extend(&env)), rest)
-}
-
-// The ListElems, RecordElems or TypeGroupBody frame `frame` (popped, with `rest` below it)
-// receives the value of its next element. Same step as the borrowing arms in run_loop, on owned data.
-fn advance_elems(arena: &Arena, spans: &SpanMap, frame: Frame, rest: Cont, value: Value) -> (Control, Cont) {
-    match frame {
-        Frame::TypeGroupBody { group, ids, done, env, vals_env } => advance_type_group(arena, spans, group, ids, done, env, vals_env, rest, value),
-        Frame::ListElems { mut remaining, mut done, env } => {
-            done.push(value);
-            match remaining.pop() {
-                Some(next) => (Control::Eval(next, env.clone()), Cont::cons(Frame::ListElems { remaining, done, env }, rest)),
-                None => (Control::Apply(Value::List(Rc::new(done))), rest),
-            }
-        }
-        Frame::RecordElems { names, mut remaining, mut done, env } => {
-            done.push(value);
-            match remaining.pop() {
-                Some(next) => (Control::Eval(next, env.clone()), Cont::cons(Frame::RecordElems { names, remaining, done, env }, rest)),
-                None => {
-                    let fields = names.iter().cloned().zip(done).collect();
-                    (Control::Apply(Value::Record(Rc::new(fields))), rest)
-                }
-            }
-        }
-        _ => unreachable!("internal: take_unshared_elems returns only elems frames"),
     }
 }
 
@@ -1417,7 +1271,7 @@ fn path_text(path: &[String]) -> String {
     format!("{}, ... {} more ..., {}", path[..KEEP].join(", "), path.len() - 2 * KEEP, path[path.len() - KEEP..].join(", "))
 }
 
-fn set_current_span(span: Option<Span>) {
+pub(crate) fn set_current_span(span: Option<Span>) {
     if let Some(s) = span {
         CURRENT_SPAN.with(|c| c.set(Some(s)));
     }

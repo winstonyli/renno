@@ -1115,6 +1115,19 @@ mod tests {
         assert_eq!(run_untyped(src).as_int(), 56);
     }
 
+    // A perform inside a literal or a `let rec` group's value, resumed more than once: each
+    // resumption continues from the elements finished at the capture (expectations recorded
+    // from 898df97, before literals ran as Iter::Elems).
+    #[test]
+    fn multi_shot_inside_literals_and_let_rec_groups_keeps_each_branchs_elements() {
+        let h = "deep(handler choose(p, resume) -> resume(p) ++ resume(p * 10))";
+        assert_eq!(run_untyped("handle [1, perform choose(10), 3] with deep(handler choose(p, resume) -> resume(10) ++ resume(20))").to_string(), "[1, 10, 3, 1, 20, 3]");
+        assert_eq!(run_untyped(&format!("handle [perform choose(1), perform choose(2), 3] with {h}")).to_string(), "[1, 2, 3, 1, 20, 3, 10, 2, 3, 10, 20, 3]");
+        assert_eq!(run_untyped(&format!("handle let rec x = perform choose(1) and y = perform choose(2) in [x, y] with {h}")).to_string(), "[1, 2, 1, 20, 10, 2, 10, 20]");
+        let record = "let r = handle {x: perform a(1), y: perform a(2)} with deep(handler a(p, resume) -> resume(p * 10)) in r.x + r.y";
+        assert_eq!(run_source(record).unwrap().as_int(), 30);
+    }
+
     // The callbacks run on the heap, not the native stack: nested 100000 deep on a
     // default 2 MiB test thread.
     #[test]
@@ -7943,7 +7956,7 @@ g(len)").unwrap_err();
         assert_eq!(run_source(src).unwrap(), Outcome::Int(9));
     }
 
-    // Non-group `let rec` fallback (Frame::LetRecBody, machine.rs's
+    // Non-group `let rec` fallback (Iter::LetRec, machine.rs's
     // Expr::LetRec else-branch): `x` and `w` are not functions, so they
     // evaluate left to right in the OUTER scope (both see the lambda's `z`,
     // neither sees the other) and are bound plainly for the body only.

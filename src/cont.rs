@@ -24,15 +24,6 @@ pub enum Frame {
     AppFunc { arg: ExprRef, env: Env, callee_span: Option<Span> },
     AppArg { func: Value, callee_span: Option<Span> },
     LetBody { body: ExprRef, env: Env },
-    // Non-group `let rec` fallback (see machine.rs's Expr::LetRec arm):
-    // evaluating the binding values left to right in the OUTER scope;
-    // `remaining`/`done` mirror ListElems's accumulation shape.
-    LetRecBody { remaining: Vec<ExprRef>, done: Vec<Value>, body: ExprRef, env: Env },
-    // A `let rec` of unannotated calls (resolve::GroupKind::Types): its values run
-    // in `vals_env`, a frame of one placeholder type per name (`ids`); `done`
-    // holds the finished ones. After the last, types::close_group builds the
-    // recursive types and the body runs in a frame of the finished values on `env`.
-    TypeGroupBody { group: ExprRef, ids: Rc<[u64]>, done: Vec<Value>, env: Env, vals_env: Env },
     // Scrutinee has just been evaluated to `value` -- try `arms` in order.
     MatchArms { arms: Rc<Vec<(Pattern, Option<ExprRef>, ExprRef)>>, env: Env },
     // A pattern matched (binding `guard_env`) but its arm has a guard,
@@ -55,22 +46,6 @@ pub enum Frame {
     BinOpL { op: BinOp, rhs: ExprRef, env: Env, l_span: Option<Span>, r_span: Option<Span> },
     BinOpR { op: BinOp, lhs: Value, l_span: Option<Span>, r_span: Option<Span> },
     If { then_: ExprRef, else_: ExprRef, env: Env },
-    // Evaluates a list literal's elements left to right. `remaining` are
-    // not-yet-evaluated; `done` accumulates results in order.
-    ListElems { remaining: Vec<ExprRef>, done: Vec<Value>, env: Env },
-    // Evaluating a record's field VALUES left to right -- `names` is the
-    // fixed, full field-name list for the whole record (needed once every
-    // value is in, to zip back together into the final Value::Record;
-    // LetRecBody just above accumulates `remaining`/`done` the same way,
-    // but has no `names` field of its own -- its fallback just binds the
-    // finished values in order via a runtime Bindings frame, since the
-    // resolver already fixed each name's slot by position, with no
-    // Value::Record-shaped result to zip back together). Not ListElems:
-    // that always wraps its `done` as a plain Value::List, which is right
-    // for Tuple/ListLit but wrong here -- see Value::Record's own doc
-    // comment for why records need a
-    // name-keyed runtime shape ListElems has no way to produce.
-    RecordElems { names: Rc<Vec<String>>, remaining: Vec<ExprRef>, done: Vec<Value>, env: Env },
     // The operand of an Expr::Conform whose type needs nothing beyond its
     // native test (`Then::Done`) has just evaluated -- test it against the
     // spec, with the length slots read when the Conform was entered.
@@ -91,9 +66,10 @@ pub enum Frame {
     // (one pointer bump) instead of six separately-cloned fields, and one
     // definition instead of two structurally-identical ones to keep in sync.
     HandlerMark(Rc<HandlerData>),
-    // A higher-order builtin (map, filter, fold, sort) between callbacks: machine::iterate
-    // feeds each callback's result to `state` and applies the callback to the next
-    // element, so the builtin's progress lives on the continuation, where `perform` can
+    // Native code between sub-evaluations: a higher-order builtin (map, filter, fold, sort)
+    // between callbacks, a list/tuple/record literal between elements, a `let rec` group
+    // between values. machine::iterate feeds each result to `state`, which says what to
+    // evaluate or apply next, so the progress lives on the continuation, where `perform` can
     // capture it and `resume` can replay it (multi-shot). `state` is shared copy-on-write:
     // cloning this frame (a capture, a splice) is an Rc bump, and the driver copies the
     // state only when it is about to change one a captured continuation still holds.
@@ -113,6 +89,13 @@ pub enum ContNode {
     Frame(Frame, Cont),
 }
 
+impl Frame {
+    // A fresh Iterate frame for a state that has no second argument pending.
+    pub fn iterate(state: Iter) -> Frame {
+        Frame::Iterate { state: Rc::new(state), pending: None }
+    }
+}
+
 impl Cont {
     pub fn nil() -> Cont {
         Cont(Rc::new(ContNode::Nil))
@@ -120,21 +103,6 @@ impl Cont {
 
     pub fn cons(frame: Frame, rest: Cont) -> Cont {
         Cont(Rc::new(ContNode::Frame(frame, rest)))
-    }
-
-    // The top frame and the rest, moved out, when the top frame is a ListElems,
-    // RecordElems or TypeGroupBody that nothing else holds (the single-shot case); None
-    // otherwise, in particular when a captured continuation shares it and must keep its
-    // own copy. Lets those frames pass their accumulated elements on without cloning
-    // them, so a literal (or type group) of n elements costs O(n), not O(n^2).
-    pub fn take_unshared_elems(&mut self) -> Option<(Frame, Cont)> {
-        if !matches!(&*self.0, ContNode::Frame(Frame::ListElems { .. } | Frame::RecordElems { .. } | Frame::TypeGroupBody { .. }, _)) || Rc::strong_count(&self.0) != 1 {
-            return None;
-        }
-        match Rc::try_unwrap(std::mem::replace(&mut self.0, Rc::new(ContNode::Nil))) {
-            Ok(ContNode::Frame(frame, rest)) => Some((frame, rest)),
-            _ => unreachable!("internal: an unshared elems frame is a uniquely owned Frame node"),
-        }
     }
 
     // Fold `frames` onto `tail`, frames[0] ending up closest to the top
