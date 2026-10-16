@@ -1014,7 +1014,9 @@ enum Step<'t, 'a> {
     // have passed: a present failing field is reported before the record).
     FailAt(&'a Value, u32),
     // Everything above this entered (alias, value) has passed: remember it.
-    Mark(MemoKey),
+    // A list entered through a `Ref` with an id also gets its whole seal (read only at this
+    // exact view).
+    Mark(MemoKey, Option<(&'a List, SealId)>),
     // Every element of this list passed the every-element test: seal it (never in a tracked
     // walk). Popped only after the elements pushed above it all passed; an `Or` rewind drops it.
     Seal(&'a List, SealId),
@@ -1120,8 +1122,11 @@ fn walk<'t, 'a, const TRACK: bool>(
                     choices.pop();
                     continue 'main;
                 }
-                Step::Mark(key) => {
+                Step::Mark(key, whole) => {
                     memo.insert(key, true);
+                    if let Some((items, id)) = whole {
+                        items.seal_whole(id);
+                    }
                     continue 'main;
                 }
                 Step::Seal(items, id) => {
@@ -1144,12 +1149,19 @@ fn walk<'t, 'a, const TRACK: bool>(
                 break 'step here;
             }
             match t {
-                Test::Ref(i, _) => {
+                Test::Ref(i, seal) => {
+                    let whole = match (seal.0.filter(|_| !TRACK), v) {
+                        (Some(id), Value::List(items)) => Some((items, id)),
+                        _ => None,
+                    };
+                    if whole.is_some_and(|(items, id)| items.has_whole_seal(id)) {
+                        continue 'main;
+                    }
                     if let Some(p) = identity(v) {
                         match memo.get(&(*i, p)) {
                             Some(true) => continue 'main,
                             Some(false) => break 'step here,
-                            None => work.push(Step::Mark((*i, p))),
+                            None => work.push(Step::Mark((*i, p), whole)),
                         }
                     }
                     work.push(Step::Test(&defs[*i], v, node));
@@ -1249,7 +1261,7 @@ fn walk<'t, 'a, const TRACK: bool>(
             }
             // The aliases entered since this `Or` started contain the failure.
             for step in work.drain(choice.height..) {
-                if let Step::Mark(key) = step {
+                if let Step::Mark(key, _) = step {
                     memo.insert(key, false);
                 }
             }

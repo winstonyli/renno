@@ -11042,6 +11042,27 @@ g(len)").unwrap_err();
         assert!((N..=4 * N + 16).contains(&steps), "check steps {steps} for n = {N}");
     }
 
+    // T5: recursion through tuple-encoded lists through a site check. Each tail is a tuple
+    // reached at a `Ref` position of the one root check, so only whole seals can make the
+    // later calls O(1).
+    fn prog_tuple_recursion(n: usize) -> String {
+        format!(
+            "let build = fun n -> (let rec b = fun i -> if i == 0 then false else (i, b(i - 1)) in b(n)) in \
+             let mk = fun T -> (let rec L = Union(Tuple(T, L), Bool) in (let rec go = fun x: L -> match x | (h, t) -> 1 + go(t) | _ -> 0 in go)) in \
+             mk(Int)(build({n}))"
+        )
+    }
+
+    // Each level costs four tested nodes (the union, the tuple, its Int and its Ref) twice, once
+    // in the first walk and once in the call's own check, so the bound is 10n, not the scalar
+    // lists' 3n; without whole seals it is about 4n^2.
+    #[test]
+    fn recursion_through_tuple_encoded_lists_checks_linearly() {
+        let (out, steps) = check_cost(&prog_tuple_recursion(N));
+        assert_eq!(out, Outcome::Int(N as i64));
+        assert!((N..=10 * N + 16).contains(&steps), "check steps {steps} for n = {N}");
+    }
+
     // The 20k counter runs: release, with the scale gates.
     #[test]
     #[ignore]
