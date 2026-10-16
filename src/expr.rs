@@ -251,12 +251,12 @@ struct Key {
 }
 
 struct Interner {
-    keys: HashMap<Key, u32>,
+    keys: crate::types::FxMap<Key, u32>,
     cap: usize,
 }
 
 thread_local! {
-    static INTERNER: std::cell::RefCell<Interner> = std::cell::RefCell::new(Interner { keys: HashMap::new(), cap: SEAL_CAP });
+    static INTERNER: std::cell::RefCell<Interner> = std::cell::RefCell::new(Interner { keys: Default::default(), cap: SEAL_CAP });
 }
 
 // The id of `key`, or None when the interner is full.
@@ -295,7 +295,7 @@ struct Info {
 // `then` (they all share the defs). A hand-built test that never goes through here carries
 // no ids and behaves as if seals did not exist.
 pub fn assign_seals(test: &mut Test, defs: &mut [Test], then: &mut Then) {
-    let mut ctx = SealCtx { table: None, def_lens: false };
+    let mut ctx = SealCtx { top: Default::default(), table: None, def_lens: false };
     // Pass 1: each def's rel and whether any contains a slot. A Ref's rel does not depend on
     // the table, so the rels are complete before it exists.
     let mut rels = Some(Vec::new());
@@ -307,16 +307,20 @@ pub fn assign_seals(test: &mut Test, defs: &mut [Test], then: &mut Then) {
             v
         });
     }
-    ctx.table = rels.and_then(|kids| intern(TAG_TABLE, 0, Vec::new(), kids));
+    // No defs, no Ref to root: skip the table key (the common `is(List(Int))` lowering).
+    ctx.table = if defs.is_empty() { None } else { rels.and_then(|kids| intern(TAG_TABLE, 0, Vec::new(), kids)) };
     // Pass 2 writes the final ids.
     for def in defs.iter_mut() {
         ctx.go(def, true);
     }
+    ctx.top.set(true);
     ctx.go(test, true);
     ctx.alternatives(then);
 }
 
 struct SealCtx {
+    // The next `go` is on a root test, whose own structural key nobody reads (no parent).
+    top: std::cell::Cell<bool>,
     // G: the interned table of the def bodies (None: some def has no id, or there are none).
     table: Option<u32>,
     // Some def reads a length slot: every node that reaches a Ref gets no id.
@@ -327,6 +331,7 @@ impl SealCtx {
     fn alternatives(&self, then: &mut Then) {
         if let Then::Pick(alts) = then {
             for (test, then) in alts {
+                self.top.set(true);
                 self.go(test, true);
                 self.alternatives(then);
             }
@@ -356,6 +361,7 @@ impl SealCtx {
 
     // Bottom-up over `t`; with `write`, stores each list and Ref node's id.
     fn go(&self, t: &mut Test, write: bool) -> Info {
+        let top = self.top.replace(false);
         match t {
             Test::Any => self.leaf(TAG_ANY, 0),
             Test::Never => self.leaf(TAG_NEVER, 0),
@@ -375,7 +381,7 @@ impl SealCtx {
                 }
                 let lens = e.lens || matches!(len, Length::Slot(_));
                 let rel = match (len, e.rel) {
-                    _ if lens => None,
+                    _ if lens || top => None,
                     (Length::Any, Some(r)) => intern(TAG_ELEMS_ANY, 0, Vec::new(), vec![r]),
                     (Length::Exact(k), Some(r)) => intern(TAG_ELEMS_EXACT, *k as u64, Vec::new(), vec![r]),
                     _ => None,
@@ -1042,9 +1048,9 @@ mod seal_tests {
     fn the_interner_stops_at_its_cap() {
         set_seal_cap(0);
         assert_eq!(root_id(list_of(Test::Int), vec![]), None);
-        set_seal_cap(3);
-        // The def table is key 1, Int key 2 and Every(Int) key 3: the inner list is sealed,
-        // but its parent's key is the fourth and does not fit.
+        set_seal_cap(2);
+        // Int is key 1 and Every(Int) key 2: the inner list is sealed, but its parent's key
+        // is the third and does not fit.
         let mut test = list_of(list_of(Test::Int));
         assign_seals(&mut test, &mut [], &mut Then::Done);
         let mut out = Vec::new();
