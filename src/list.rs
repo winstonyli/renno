@@ -514,6 +514,10 @@ mod tests {
         check(&c, &[0, 1, 2, 3, 4]);
         // And so does a second one: no doubling anywhere.
         assert_eq!(l.cons(val(7)).capacity(), 1);
+        // The bottom-up build (range, reverse) is sealed the same way.
+        let r = List::from_bottom_up((1..=4).rev().map(val));
+        assert_eq!(r.cons(val(0)).capacity(), 1);
+        assert_eq!(r.cons(val(7)).capacity(), 1);
     }
 
     #[test]
