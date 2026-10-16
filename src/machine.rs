@@ -4,11 +4,11 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, Frame, Meta, Node};
 use crate::env::{Env, PRELUDE};
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, Length, LenExpr, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, Length, LenExpr, Lowered, Pattern, ConformSpec, Seal, SpanMap, Test, Then, TypeSource};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::iterate::{step_shared, Iter, Next};
-use crate::list::List;
+use crate::list::{List, SealId};
 use crate::resolve::{group_kind, resolve, GroupKind, Resolved, VarRef};
 use crate::span::Span;
 use crate::types::{first_free, fresh_rec_id, EffectRow, Hc, RecVar, Type};
@@ -1015,6 +1015,9 @@ enum Step<'t, 'a> {
     FailAt(&'a Value, u32),
     // Everything above this entered (alias, value) has passed: remember it.
     Mark(MemoKey),
+    // Every element of this list passed the every-element test: seal it (never in a tracked
+    // walk). Popped only after the elements pushed above it all passed; an `Or` rewind drops it.
+    Seal(&'a List, SealId),
 }
 
 // An (alias, value identity) pair of the walk's memo.
@@ -1121,6 +1124,10 @@ fn walk<'t, 'a, const TRACK: bool>(
                     memo.insert(key, true);
                     continue 'main;
                 }
+                Step::Seal(items, id) => {
+                    items.seal_every(id);
+                    continue 'main;
+                }
                 Step::FailAt(v, node) => break 'step Fail { node, depth: depth_of(nodes, node), found: v },
                 Step::Test(t, v, node) => {
                     if !TRACK {
@@ -1147,7 +1154,7 @@ fn walk<'t, 'a, const TRACK: bool>(
                     }
                     work.push(Step::Test(&defs[*i], v, node));
                 }
-                Test::Elems { elem: element, len, .. } => {
+                Test::Elems { elem: element, len, seal } => {
                     let Value::List(items) = v else { break 'step here };
                     match len {
                         Length::Any => {}
@@ -1165,6 +1172,28 @@ fn walk<'t, 'a, const TRACK: bool>(
                             }
                             Len::Exact(_) | Len::Never => break 'step here,
                         },
+                    }
+                    // A tracked walk (the failure explanation) ignores seals.
+                    if let Some(id) = seal.0.filter(|_| !TRACK) {
+                        if items.is_sealed_every(id) {
+                            continue 'main;
+                        }
+                        if leaf(element, v).is_some() {
+                            let mut tested = 0;
+                            let bad = items.unsealed(id).any(|x| {
+                                tested += 1;
+                                leaf(element, x) == Some(false)
+                            });
+                            count_check_steps(tested);
+                            if bad {
+                                break 'step here;
+                            }
+                            items.seal_every(id);
+                        } else {
+                            work.push(Step::Seal(items, id));
+                            push_elements::<TRACK>(&mut work, nodes, node, items.unsealed(id).map(|x| (&**element, x)));
+                        }
+                        continue 'main;
                     }
                     if leaf(element, v).is_some() {
                         // A scalar element test (`leaf` answers Some for those
@@ -1243,6 +1272,17 @@ fn test_holds(test: &Test, defs: &[Test], lens: &[Len], v: &Value) -> bool {
         // the value's tag, with no work list or choice point.
         None => match test {
             Test::Or(alternatives) if alternatives.iter().all(|a| leaf(a, v).is_some()) => alternatives.iter().any(|a| leaf(a, v) == Some(true)),
+            // The walk's O(1) sealed query, asked before it allocates a work list (the length
+            // is still checked first, as the walk does).
+            Test::Elems { len, seal: Seal(Some(id)), .. }
+                if matches!(v, Value::List(items) if items.is_sealed_every(*id) && match len {
+                    Length::Any => true,
+                    Length::Exact(n) => items.len() == *n,
+                    Length::Slot(_) => false,
+                }) =>
+            {
+                true
+            }
             _ => walk::<false>(test, defs, lens, v, &mut Vec::new(), &mut None).is_none(),
         },
     }
