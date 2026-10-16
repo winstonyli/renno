@@ -10801,6 +10801,15 @@ g(len)").unwrap_err();
         assert_eq!(run_untyped(src).as_int(), 23);
     }
 
+    // Two marks are passed, each with its own surroundings (`* 10`, then `+ 100`): they must run
+    // in the order they were nested, on every resume. (6 * 10 + 100) + (8 * 10 + 100) = 340.
+    #[test]
+    fn forwarded_marks_resume_in_their_original_order() {
+        let body = "handle (handle (handle (perform a(0)) + 1 with deep(handler b(p, r) -> r(0))) * 10 with deep(handler c(p, r) -> r(0))) + 100";
+        assert_eq!(run_untyped(&format!("{body} with deep(handler a(p, r) -> r(5) + r(7))")).as_int(), 340);
+        assert_eq!(run_untyped(&format!("{body} with handler a(p, r) -> r(5) + r(7)")).as_int(), 340);
+    }
+
     #[test]
     fn shallow_matched_handler_is_not_reinstalled_but_an_inner_one_is() {
         let both = "handle (handle (perform a(0)) + (perform b(0)) with deep(handler b(p, r) -> r(10))) with handler a(p, r) -> r(1) + r(2)";
