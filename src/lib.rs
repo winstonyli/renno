@@ -11198,5 +11198,8 @@ g(len)").unwrap_err();
     fn a_sealed_list_still_has_its_length_checked() {
         let err = run_err("let d: Dyn = [1, 2, 3] in let a: List(Int) = d in let b: Vec(2) = d in 0");
         assert!(err.starts_with("line 1, column 67: type error: expected [Dyn](2), found List"), "{err}");
+        // Both crossings share the every-element id of Int: the length is what differs.
+        let err = run_err("let d: Dyn = [1, 2, 3] in let a: List(Int) = d in let b: Indexed(List(Int), 2) = d in 0");
+        assert!(err.starts_with("line 1, column 82: type error: expected [Int](2), found List"), "{err}");
     }
 }
