@@ -11,6 +11,7 @@ pub mod machine;
 pub mod parser;
 pub mod resolve;
 pub mod span;
+pub mod text;
 pub mod typecheck;
 pub mod types;
 pub mod util;
@@ -10727,6 +10728,94 @@ g(len)").unwrap_err();
         assert_eq!(hops, 12274);
     }
 
+    // ---- V2 strings: `s ++ "a"` and `"a" ++ s` claim buffer room ----
+
+    // The program's outcome and (bytes placed into string storage, string allocations).
+    fn str_cost(src: &str) -> (Outcome, usize, usize) {
+        text::reset_counters();
+        let v = run_source_on_this_thread(src).expect("runs");
+        let (bytes, bufs) = text::counters();
+        (Outcome::from(&v), bytes, bufs)
+    }
+
+    // At N = 2000 about 6026 bytes (2000 literal bytes, 2 for the first exact copy, copies of
+    // 3 + 7 + ... + 1023, 1989 claims); today's code writes ~2M.
+    #[test]
+    fn strloop_linear() {
+        let src = format!("let rec f = fun n -> fun s -> if n == 0 then len(s) else f(n - 1)(s ++ \"a\") in f({N})(\"\")");
+        let (out, bytes, bufs) = str_cost(&src);
+        assert_eq!(out, Outcome::Int(N as i64));
+        assert!(bytes <= 4 * N + 16, "bytes {bytes}");
+        assert!(bufs <= N + 32, "bufs {bufs}");
+    }
+
+    #[test]
+    fn str_prepend_loop_linear() {
+        let src = format!("let rec f = fun n -> fun s -> if n == 0 then len(s) else f(n - 1)(\"a\" ++ s) in f({N})(\"\")");
+        let (out, bytes, _) = str_cost(&src);
+        assert_eq!(out, Outcome::Int(N as i64));
+        assert!(bytes <= 4 * N + 16, "bytes {bytes}");
+    }
+
+    // `h ++ sep ++ rest` parses as `(h ++ sep) ++ rest`: a prepend onto the long right side.
+    #[test]
+    fn rjoin_linear() {
+        let src = format!(
+            "let rec rjoin = fun xs -> fun sep -> match xs | [] -> \"\" | [x] -> x | h :: t -> h ++ sep ++ rjoin(t)(sep) in \
+             len(rjoin(map(to_str)(range(0)({N})))(\",\"))"
+        );
+        let (out, bytes, _) = str_cost(&src);
+        let l = 6890 + (N - 1); // the digits of 0..2000, plus the separators
+        assert_eq!(out, Outcome::Int(l as i64));
+        assert!(bytes <= 6 * l + 16, "bytes {bytes}");
+    }
+
+    #[test]
+    fn fold_str_linear() {
+        let src = format!("len(fold(fun acc -> fun x -> acc ++ to_str(x))(\"\")(range(0)({N})))");
+        let (out, bytes, _) = str_cost(&src);
+        assert_eq!(out, Outcome::Int(6890));
+        assert!(bytes <= 5 * 6890 + 16, "bytes {bytes}");
+    }
+
+    // Pins (pass before and after).
+    #[test]
+    fn string_claims_never_disturb_other_holders() {
+        let s = |x: &str| Outcome::Str(x.to_string());
+        let cases = [
+            // 1. Two appends at one position, then an append onto the winner.
+            (
+                "let base = \"a\" ++ \"b\" ++ \"c\" in let g = base ++ \"d\" in let h = base ++ \"e\" in (g, h, base, g ++ \"f\", h)",
+                Outcome::List(vec![s("abcd"), s("abce"), s("abc"), s("abcdf"), s("abce")]),
+            ),
+            // 2. Multi-shot: the first resumption claims, the second copies.
+            (
+                "let base = \"a\" ++ \"b\" ++ \"c\" in handle base ++ (perform c(0)) with deep(handler c(p, resume) -> resume(\"x\") ++ \"|\" ++ resume(\"y\") ++ \"|\" ++ base)",
+                s("abcx|abcy|abc"),
+            ),
+            // 3. Two prepends at one position.
+            ("let r = \"x\" ++ (\"y\" ++ \"zz\") in (\"1\" ++ r, \"2\" ++ r, r)", Outcome::List(vec![s("1xyzz"), s("2xyzz"), s("xyzz")])),
+            // 4. Operands from one buffer.
+            (
+                "let s = \"ab\" ++ \"cd\" in let t = s ++ \"e\" in (t ++ t, s ++ s, t, s)",
+                Outcome::List(vec![s("abcdeabcde"), s("abcdabcd"), s("abcde"), s("abcd")]),
+            ),
+            // 5. Multi-byte characters across claims.
+            (
+                "let s = \"é\" ++ \"a\" in let t = s ++ \"ü\" in (len(t), t, \"ü\" ++ t, s)",
+                Outcome::List(vec![Outcome::Int(3), s("éaü"), s("üéaü"), s("éa")]),
+            ),
+            // 6. Equality and string patterns read a grown string.
+            (
+                "let s = \"ab\" ++ \"c\" ++ \"d\" in (s == \"abcd\", s ++ \"e\" == \"abcde\", match s ++ \"x\" | \"abcdx\" -> 1 | _ -> 0)",
+                Outcome::List(vec![Outcome::Bool(true), Outcome::Bool(true), Outcome::Int(1)]),
+            ),
+        ];
+        for (src, want) in cases {
+            assert_eq!(run_source(src).expect(src), want, "{src}");
+        }
+    }
+
     // ---- semantic pins: hold before and after the representation change ----
 
     #[test]
@@ -10845,6 +10934,29 @@ g(len)").unwrap_err();
         let src = "let rec build = fun i -> fun acc -> if i == 0 then acc else build(i - 1)(i :: acc) in let xs = build(1000000)([]) in \
                    let rec go = fun i -> fun s -> if i == 1000000 then s else go(i + 1)(s + get(xs)(i)) in go(0)(0)";
         assert_eq!(finishes_within(5, src).unwrap(), Outcome::Int(500_000_500_000));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_strloop_1m() {
+        let src = "let rec f = fun n -> fun s -> if n == 0 then len(s) else f(n - 1)(s ++ \"a\") in f(1000000)(\"\")";
+        assert_eq!(finishes_within(5, src).unwrap(), Outcome::Int(1_000_000));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_rjoin_300k() {
+        let src = "let rec rjoin = fun xs -> fun sep -> match xs | [] -> \"\" | [x] -> x | h :: t -> h ++ sep ++ rjoin(t)(sep) in len(rjoin(map(to_str)(range(0)(300000)))(\",\"))";
+        // digits of 0..300000: 10 + 180 + 2700 + 36000 + 450000 + 1200000 = 1688890, plus 299999 separators
+        assert_eq!(finishes_within(3, src).unwrap(), Outcome::Int(1_988_889));
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_fold_str_1m() {
+        let src = "len(fold(fun acc -> fun x -> acc ++ to_str(x))(\"\")(range(0)(1000000)))";
+        // digits of 0..1000000: 5888890
+        assert_eq!(finishes_within(5, src).unwrap(), Outcome::Int(5_888_890));
     }
 
     // --- U11 perform capture cost (docs/superpowers/plans/2026-10-16-u11-perform-capture-cost.md) ---

@@ -9,6 +9,7 @@ use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::iterate::{step_shared, Iter, Next};
 use crate::list::{List, SealId};
+use crate::text::Text;
 use crate::resolve::{group_kind, resolve, GroupKind, Resolved, VarRef};
 use crate::span::Span;
 use crate::types::{first_free, fresh_rec_id, EffectRow, Hc, RecVar, Type};
@@ -419,7 +420,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                 Expr::Int(n) => control = Control::Apply(Value::Int(*n)),
                 Expr::Float(x) => control = Control::Apply(Value::Float(*x)),
                 Expr::Bool(b) => control = Control::Apply(Value::Bool(*b)),
-                Expr::Str(s) => control = Control::Apply(Value::Str(Rc::from(s.as_str()))),
+                Expr::Str(s) => control = Control::Apply(Value::Str(Text::from(s.as_str()))),
                 Expr::Token(id) => control = Control::Apply(Value::Token(*id)),
                 Expr::TypeLit(t) => control = Control::Apply(Value::Type(t.clone())),
                 // Always 2+ items (see Expr::Tuple's own doc comment), so
@@ -1506,7 +1507,7 @@ fn apply_binop(op: BinOp, lhs: Value, rhs: Value, l_span: Option<Span>, r_span: 
         },
         BinOp::Eq => Value::Bool(value_eq(&lhs, &rhs)),
         BinOp::Concat => match (&lhs, &rhs) {
-            (Value::Str(a), Value::Str(b)) => Value::Str(Rc::from(format!("{a}{b}"))),
+            (Value::Str(a), Value::Str(b)) => Value::Str(a.concat(b)),
             (Value::List(a), Value::List(b)) => Value::List(a.append(b)),
             _ => {
                 // Whichever operand isn't Str/List is the actual culprit;
@@ -1652,7 +1653,7 @@ fn dispatch_builtin(b: Builtin, mut args: Vec<Value>) -> Value {
             None => crate::run_error!("print expects one argument"),
         },
         Builtin::ToStr => match args.pop() {
-            Some(v) => Value::Str(Rc::from(v.to_string())),
+            Some(v) => Value::Str(Text::from(v.to_string())),
             None => crate::run_error!("to_str expects one argument"),
         },
         // Higher-order: collect_builtin_arg sends these to start_iteration.
@@ -1679,7 +1680,7 @@ fn dispatch_builtin(b: Builtin, mut args: Vec<Value>) -> Value {
                             _ => crate::run_error!("join expects a list of strings"),
                         })
                         .collect();
-                    Value::Str(Rc::from(strs.join(&*sep)))
+                    Value::Str(Text::from(strs.join(&sep)))
                 }
                 _ => crate::run_error!("join expects a list and a string"),
             }
@@ -2044,7 +2045,7 @@ mod tests {
         assert!(holds(&Test::Int, &Value::Int(1)) && !holds(&Test::Int, &Value::Float(1.0)));
         assert!(holds(&Test::Float, &Value::Float(1.0)) && !holds(&Test::Float, &Value::Int(1)));
         assert!(holds(&Test::Bool, &Value::Bool(false)) && !holds(&Test::Bool, &Value::Int(0)));
-        assert!(holds(&Test::Str, &Value::Str(Rc::from("a"))) && !holds(&Test::Str, &Value::Int(0)));
+        assert!(holds(&Test::Str, &Value::Str(Text::from("a"))) && !holds(&Test::Str, &Value::Int(0)));
         assert!(holds(&Test::List, &list(0)) && !holds(&Test::List, &record));
         assert!(holds(&Test::Fun, &closure) && !holds(&Test::Fun, &Value::Int(0)));
         assert!(holds(&Test::Token(7), &Value::Token(7)) && !holds(&Test::Token(7), &Value::Token(8)));
@@ -2110,7 +2111,7 @@ mod tests {
         let chain = |leaf: Value| (0..DEPTH).fold(leaf, |tail, i| pair(Value::Int(i as i64), tail));
         let good = chain(Value::Bool(true));
         assert!(test_holds(&Test::reference(0), &defs, &[], &good));
-        let bad = chain(Value::Str(Rc::from("x")));
+        let bad = chain(Value::Str(Text::from("x")));
         assert!(!test_holds(&Test::reference(0), &defs, &[], &bad));
         let mut path = Vec::new();
         assert_eq!(explain(&Test::reference(0), &defs, &[], &bad, &mut path).type_name(), "Str");
@@ -2220,7 +2221,7 @@ mod tests {
         match if depth == 0 { r.below(4) } else { r.below(8) } {
             0 => Value::Int(1),
             1 => Value::Bool(true),
-            2 => Value::Str(Rc::from("s")),
+            2 => Value::Str(Text::from("s")),
             3 => Value::Float(1.0),
             4 | 5 => Value::List(List::from_vec((0..r.below(4)).map(|_| random_value(r, depth - 1)).collect())),
             _ => {
@@ -2295,7 +2296,7 @@ mod tests {
     #[test]
     fn the_walk_memo_tells_two_views_of_one_block_apart() {
         let short = List::empty().cons(Value::Int(1)).cons(Value::Int(2));
-        let long = short.cons(Value::Str(Rc::from("x")));
+        let long = short.cons(Value::Str(Text::from("x")));
         assert_eq!(short.identity().0, long.identity().0, "the cons claimed a slot of the same block");
         let defs = [Test::list_of(Box::new(Test::Int))];
         let pair = Test::TupleOf(vec![Test::reference(0), Test::reference(0)]);
@@ -2309,7 +2310,7 @@ mod tests {
     fn the_walk_memo_tells_two_snoc_views_of_one_block_apart() {
         let one = |v: Value| List::from_vec(vec![v]);
         let base = List::from_vec(vec![Value::Int(1), Value::Int(2), Value::Int(3)]).append(&one(Value::Int(4))).append(&one(Value::Int(5)));
-        let long = base.append(&one(Value::Str(Rc::from("x"))));
+        let long = base.append(&one(Value::Str(Text::from("x"))));
         assert_eq!(base.identity().0, long.identity().0, "the snoc claimed a slot of the same block");
         assert_ne!(base.identity(), long.identity());
         let defs = [Test::list_of(Box::new(Test::Int))];
@@ -2357,7 +2358,7 @@ mod tests {
     fn element(r: &mut Rng, pool: &[Value]) -> Value {
         match r.below(8) {
             0 => Value::Bool(true),
-            1 => Value::Str(Rc::from("s")),
+            1 => Value::Str(Text::from("s")),
             2 if !pool.is_empty() => pool[r.below(pool.len())].clone(),
             _ => Value::Int(r.below(3) as i64),
         }

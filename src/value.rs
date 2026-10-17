@@ -5,6 +5,7 @@ use crate::cont::Captured;
 use crate::env::Env;
 use crate::expr::{ExprRef, Lazy, Len, ConformSpec};
 use crate::list::List;
+use crate::text::Text;
 use crate::types::{first_free, Type};
 
 // A handler as data: which effect it handles, the clause body, the env it
@@ -209,7 +210,7 @@ pub enum Value {
     // Float).
     Float(f64),
     Bool(bool),
-    Str(Rc<str>),
+    Str(Text),
     // What an `opaque` expression evaluates to -- a DISTINCT kind from
     // Int specifically so it can never be confused with (or forged as) a
     // real Int value: Pattern::Int can never match it. Never a legal type
