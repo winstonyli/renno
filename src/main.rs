@@ -108,9 +108,15 @@ fn run_and_print(src: &str) {
 
 fn main() {
     renno::util::quiet_run_errors();
-    match std::env::args().nth(1) {
+    let path = std::env::args().nth(1);
+    // The whole program on the big-stack thread: the REPL's parse, and the printing and
+    // dropping of a result (see on_big_stack).
+    let finished = renno::on_big_stack(move || match path {
         Some(path) => run_file(&path),
         None => repl(),
+    });
+    if finished.is_err() {
+        std::process::exit(101);
     }
 }
 

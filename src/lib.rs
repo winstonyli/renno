@@ -34,11 +34,11 @@ use value::{Outcome, Value};
 // deep source: parser::parse and typecheck::elaborate are plain recursive
 // descent over native Rust stack frames -- machine::run is trampolined
 // and has no such limit, but the front end does. A chain of ~1000 nested
-// `let`s is enough to overflow the default stack. Rather than trying to
-// bound "how deep is too deep" (fragile, and the real limit depends on
-// build settings), run the whole pipeline on a dedicated thread with a
-// much larger stack -- the standard fix for recursive-descent parsers
-// (rustc does the same for deeply nested expressions).
+// `let`s is enough to overflow the default stack. So the whole pipeline
+// runs on a dedicated thread with a much larger stack (rustc does the
+// same for deeply nested expressions), and parser::MAX_NESTING bounds
+// how deep a program may nest, so that stack provably holds it in every
+// build (the limit is measured against the unoptimized build's frames).
 const WORKER_STACK_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 
 // parse -> typecheck -> run, catching panics (including a stack overflow
@@ -53,12 +53,16 @@ const WORKER_STACK_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 // Arc's atomic-refcount cost just for this one seam.
 pub fn run_source(src: &str) -> Result<Outcome, String> {
     let src = src.to_string();
-    std::thread::Builder::new()
-        .stack_size(WORKER_STACK_SIZE)
-        .spawn(move || run_source_on_this_thread(&src).map(|v| Outcome::from(&v)))
-        .expect("failed to spawn interpreter worker thread")
-        .join()
+    on_big_stack(move || run_source_on_this_thread(&src).map(|v| Outcome::from(&v)))
         .unwrap_or_else(|_| Err("internal error: interpreter worker thread panicked".to_string()))
+}
+
+// `f` on a thread with the worker stack, which `Err` reports panicking. The binary runs
+// everything on one (parse in the REPL, run, print, drop): printing and dropping a
+// deeply nested Outcome recurses over the native stack, and the 1 MiB main thread's
+// holds about 4,000 levels where this one's holds about a million.
+pub fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> std::thread::Result<T> {
+    std::thread::Builder::new().stack_size(WORKER_STACK_SIZE).spawn(f).expect("failed to spawn interpreter worker thread").join()
 }
 
 // A deliberate run-time error (util::RunError) reports as is; any other panic is an
@@ -11466,7 +11470,9 @@ g(len)").unwrap_err();
 
     // Programs with `n` levels of one construct. Each ends in `1` and the nested value is
     // never the result, so nothing prints it.
-    fn nested_shapes() -> Vec<(&'static str, Box<dyn Fn(usize) -> String>)> {
+    type Shape = (&'static str, Box<dyn Fn(usize) -> String>);
+
+    fn nested_shapes() -> Vec<Shape> {
         let wrap = |open: &'static str, close: &'static str| -> Box<dyn Fn(usize) -> String> {
             Box::new(move |n| format!("let x = {}1{} in 1", open.repeat(n), close.repeat(n)))
         };
@@ -11484,6 +11490,8 @@ g(len)").unwrap_err();
             ("call-chain", Box::new(|n| format!("let f: Dyn = 1 in if false then f{} else 1", "(1)".repeat(n)))),
             ("pattern", Box::new(|n| format!("let t = {}1{} in match t | {}_{} -> 1", "(".repeat(n), ",1)".repeat(n), "(".repeat(n), ",_)".repeat(n)))),
             ("annotation", Box::new(|n| format!("let x: {}Int{} = {}1{} in 1", "[".repeat(n), "]".repeat(n), "[".repeat(n), "]".repeat(n)))),
+            // An index expression is not an arena node: only the parser counts its depth.
+            ("index", Box::new(|n| format!("let d: Dyn = [1] in let x: Vec(1{}) = d in 1", "*1".repeat(n)))),
             ("fun type", Box::new(|n| format!("let d: Dyn = fun a -> a in let f: {}Int{} = d in 1", "(Int -> ".repeat(n), ")".repeat(n)))),
         ]
     }
@@ -11499,18 +11507,42 @@ g(len)").unwrap_err();
         for (name, make) in nested_shapes() {
             for n in [parser::MAX_NESTING + 10, 1_000_000] {
                 let err = run_source(&make(n)).expect_err(name);
-                assert!(err.contains(&too_deep()), "{name} at {n}: {err}");
+                assert!(err.contains(&too_deep()), "{name} at {n}: {}", err.lines().next().unwrap());
             }
         }
     }
 
-    // Just inside the budget the same programs run in this (possibly unoptimized) build:
-    // the budget is measured against the worker's stack.
+    // The largest `n` for which `make(n)` is not over the budget, found by bisection (the
+    // budget is monotone in n). Every program tried either runs to 1 or is the nesting
+    // error, so the deepest accepted one has run through parse, check and run in this
+    // (possibly unoptimized) build: the budget is measured against the worker's stack.
+    fn deepest_accepted(name: &str, make: &dyn Fn(usize) -> String) -> usize {
+        let accepted = |n: usize| match run_source(&make(n)) {
+            Ok(v) => {
+                assert_eq!(v, Outcome::Int(1), "{name} at {n}");
+                true
+            }
+            Err(e) => {
+                assert!(e.contains(&too_deep()), "{name} at {n}: {}", e.lines().next().unwrap());
+                false
+            }
+        };
+        let (mut lo, mut hi) = (1, parser::MAX_NESTING + 10);
+        assert!(accepted(lo) && !accepted(hi), "{name}");
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            *(if accepted(mid) { &mut lo } else { &mut hi }) = mid;
+        }
+        lo
+    }
+
+    // Each construct reaches a good part of the budget (a level of some takes two of its
+    // units), so the budget is not wasted on bookkeeping.
     #[test]
     fn nesting_inside_the_budget_runs() {
         for (name, make) in nested_shapes() {
-            let result = run_source(&make(parser::MAX_NESTING - 20));
-            assert_eq!(result, Ok(Outcome::Int(1)), "{name}");
+            let n = deepest_accepted(name, &make);
+            assert!(n >= parser::MAX_NESTING / 3, "{name}: only {n} levels");
         }
     }
 
@@ -11525,15 +11557,17 @@ g(len)").unwrap_err();
             ("{a: ", "}.a"),
             ("match (", ", 0) | (v, _) -> v"),
         ];
-        let n = parser::MAX_NESTING - 20;
-        let (mut open, mut close) = (String::new(), String::new());
-        for i in 0..n {
-            let (o, c) = layers[i % layers.len()];
-            open.push_str(o);
-            close.insert_str(0, c);
-        }
-        let src = format!("let x = {open}1{close} in 1");
-        assert_eq!(run_source(&src), Ok(Outcome::Int(1)));
+        let make = |n: usize| {
+            let (mut open, mut close) = (String::new(), String::new());
+            for i in 0..n {
+                let (o, c) = layers[i % layers.len()];
+                open.push_str(o);
+                close.insert_str(0, c);
+            }
+            format!("let x = {open}1{close} in 1")
+        };
+        let n = deepest_accepted("mixed", &make);
+        assert!(n >= parser::MAX_NESTING / 3, "mixed: only {n} layers");
     }
 
     // A let/fun chain is flattened by the parser, the checker and the resolver, so it

@@ -7,16 +7,28 @@ use crate::span::Span;
 use crate::types::{Hc, Type};
 use crate::util::find_field;
 
+// The nesting budget: how many levels of native recursion a program may ask of the passes
+// that walk it by recursion (the parser, then typecheck, and the Drop of a pattern or a
+// type). Every such pass takes a bounded stack frame per level, and a deeper program
+// would overflow the stack and abort the process, so a deeper program is an error here,
+// once, before any of them runs. A `let`/`fun` chain is not a level (parser, checker and
+// resolver all walk it by iteration). Real programs nest well under 100.
+//
+// Measured at 2,000: the worker's 256 MiB stack holds about 4,700 levels of the most
+// expensive pass (typecheck's elaborate) in an unoptimized build, 66,000 in release, so
+// the budget leaves the unoptimized build more than 2x headroom (see docs/superpowers/
+// plans/u10-report.md; nesting_inside_the_budget_runs pins it for every construct).
 pub const MAX_NESTING: usize = 2000;
 
 pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
     let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
-    let mut p = Parser { tokens, tok_spans, pos: 0, arena: Arena::new(), expr_spans: SpanMap::new(), src };
+    let mut p = Parser { tokens, tok_spans, pos: 0, depth: 0, arena: Arena::new(), expr_spans: SpanMap::new(), src };
     let root = p.expr()?;
     if p.pos != p.tokens.len() {
         let span = p.span_at();
         return Err(p.err_at(span, format!("trailing tokens after expression: {:?}", &p.tokens[p.pos..])));
     }
+    p.check_tree_depth(root)?;
     Ok((p.arena, p.expr_spans, root))
 }
 
@@ -28,7 +40,7 @@ pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
 #[cfg(test)]
 pub fn parse_type_string(src: &str) -> Result<Type, String> {
     let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
-    let mut p = Parser { tokens, tok_spans, pos: 0, arena: Arena::new(), expr_spans: SpanMap::new(), src };
+    let mut p = Parser { tokens, tok_spans, pos: 0, depth: 0, arena: Arena::new(), expr_spans: SpanMap::new(), src };
     let ty = p.parse_fun_type()?;
     crate::machine::eval_type(&p.arena, ty, &p.expr_spans)
 }
@@ -37,6 +49,8 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     tok_spans: Vec<Span>,
     pos: usize,
+    // Open recursive calls that `nested` counts, against MAX_NESTING.
+    depth: usize,
     arena: Arena,
     expr_spans: SpanMap,
     src: &'a str,
@@ -83,6 +97,51 @@ impl<'a> Parser<'a> {
 
     fn err_at(&self, span: Span, msg: String) -> String {
         span.format_error(self.src, &msg)
+    }
+
+    fn too_deep(&self, span: Span) -> String {
+        self.err_at(span, format!("expression nested too deeply (limit {MAX_NESTING})"))
+    }
+
+    // One more level of recursion, or the nesting error. `leave(k)` gives back k levels.
+    fn enter(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING {
+            return Err(self.too_deep(self.span_at()));
+        }
+        Ok(())
+    }
+
+    // `f` one level deeper. Every recursive parse function that is not a loop re-enters
+    // itself through this (or is the wrapper around one that does).
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, String>) -> Result<T, String> {
+        self.enter()?;
+        let r = f(self);
+        self.depth -= 1;
+        r
+    }
+
+    // The nesting of the finished tree. The parser also builds depth in loops (`1 + 1 + ..`,
+    // `f(a)(b)..`, `a || b || ..`) that `nested` never sees, and a parenthesis adds no node,
+    // so this is a second, independent count: what typecheck and the later passes will
+    // recurse through. The body of a `let`/`let rec`/`fun` is the next link of a chain they
+    // walk by iteration, so reaching it costs no level. Iterative.
+    fn check_tree_depth(&self, root: ExprRef) -> Result<(), String> {
+        let mut stack = vec![(root, 0usize)];
+        let mut kids = Vec::new();
+        while let Some((n, depth)) = stack.pop() {
+            if depth > MAX_NESTING {
+                return Err(self.too_deep(self.expr_spans[n]));
+            }
+            let chain_body = match &self.arena[n] {
+                Expr::Let(_, _, _, body) | Expr::LetRec(_, body) | Expr::Lambda(_, _, body) => Some(*body),
+                _ => None,
+            };
+            kids.clear();
+            self.arena[n].children(&mut kids);
+            stack.extend(kids.iter().map(|&k| (k, if Some(k) == chain_body { depth } else { depth + 1 })));
+        }
+        Ok(())
     }
 
     // Walks `e`'s whole expression tree looking for an Expr::Perform node
@@ -455,31 +514,36 @@ impl<'a> Parser<'a> {
     // at the bottom.
     fn parse_index_expr(&mut self) -> Result<IndexExpr, String> {
         let mut lhs = self.parse_index_term()?;
+        // Each `+`/`-` makes the tree one level deeper (an index is not in the arena, so
+        // check_tree_depth never sees it); the levels are given back at the end.
+        let mut built = 0;
         loop {
-            match self.peek() {
-                Some(Token::Plus) => {
-                    self.bump();
-                    let rhs = self.parse_index_term()?;
-                    lhs = IndexExpr::Add(Rc::new(lhs), Rc::new(rhs));
-                }
-                Some(Token::Minus) => {
-                    self.bump();
-                    let rhs = self.parse_index_term()?;
-                    lhs = IndexExpr::Sub(Rc::new(lhs), Rc::new(rhs));
-                }
+            let op = match self.peek() {
+                Some(Token::Plus) => IndexExpr::Add,
+                Some(Token::Minus) => IndexExpr::Sub,
                 _ => break,
-            }
+            };
+            self.bump();
+            self.enter()?;
+            built += 1;
+            let rhs = self.parse_index_term()?;
+            lhs = op(Rc::new(lhs), Rc::new(rhs));
         }
+        self.depth -= built;
         Ok(lhs)
     }
 
     fn parse_index_term(&mut self) -> Result<IndexExpr, String> {
         let mut lhs = self.parse_index_atom()?;
+        let mut built = 0;
         while matches!(self.peek(), Some(Token::Star)) {
             self.bump();
+            self.enter()?;
+            built += 1;
             let rhs = self.parse_index_atom()?;
             lhs = IndexExpr::Mul(Rc::new(lhs), Rc::new(rhs));
         }
+        self.depth -= built;
         Ok(lhs)
     }
 
@@ -488,7 +552,7 @@ impl<'a> Parser<'a> {
             Some(Token::Int(n)) => Ok(IndexExpr::Lit(n)),
             Some(Token::Ident(name)) => Ok(IndexExpr::Var(name)),
             Some(Token::LParen) => {
-                let inner = self.parse_index_expr()?;
+                let inner = self.nested(Self::parse_index_expr)?;
                 self.expect(&Token::RParen)?;
                 Ok(inner)
             }
@@ -527,7 +591,7 @@ impl<'a> Parser<'a> {
     // `A -> B` is `#Fun((A, B))`; `A ->{e} B` is `#Fun((A, "e", B))`.
     fn parse_fun_type(&mut self) -> Result<ExprRef, String> {
         let start = self.span_at().start;
-        let atom = self.parse_type()?;
+        let atom = self.nested(Self::parse_type)?;
         if matches!(self.peek(), Some(Token::Arrow)) {
             self.bump();
             let row = if matches!(self.peek(), Some(Token::LBrace)) && self.peek_is_row_var() {
@@ -540,7 +604,7 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            let ret = self.parse_fun_type()?;
+            let ret = self.nested(Self::parse_fun_type)?;
             let items = match row {
                 Some(row) => vec![atom, row, ret],
                 None => vec![atom, ret],
@@ -553,10 +617,10 @@ impl<'a> Parser<'a> {
 
     // pattern := pattern_atom ("::" pattern)?  (right-assoc, `h :: t`)
     fn pattern(&mut self) -> Result<Pattern, String> {
-        let head = self.pattern_atom()?;
+        let head = self.nested(Self::pattern_atom)?;
         if matches!(self.peek(), Some(Token::ColonColon)) {
             self.bump();
-            let tail = self.pattern()?;
+            let tail = self.nested(Self::pattern)?;
             Ok(Pattern::Cons(Box::new(head), Box::new(tail)))
         } else {
             Ok(head)
@@ -638,7 +702,7 @@ impl<'a> Parser<'a> {
 
     // expr := or_expr
     fn expr(&mut self) -> Result<ExprRef, String> {
-        self.or_expr()
+        self.nested(Self::or_expr)
     }
 
     // or_expr := and_expr ("||" and_expr)*  (left-associative, loosest of
@@ -743,7 +807,7 @@ impl<'a> Parser<'a> {
         let lhs = self.add()?;
         if matches!(self.peek(), Some(Token::ColonColon)) {
             self.bump();
-            let rhs = self.cons()?;
+            let rhs = self.nested(Self::cons)?;
             let span = Span { start, end: self.span_before().end };
             Ok(self.push_spanned(Expr::BinOp(BinOp::Cons, lhs, rhs), span))
         } else {
@@ -803,14 +867,14 @@ impl<'a> Parser<'a> {
         if matches!(self.peek(), Some(Token::Minus)) {
             let start = self.span_at().start;
             self.bump();
-            let operand = self.unary()?;
+            let operand = self.nested(Self::unary)?;
             let span = Span { start, end: self.span_before().end };
             let zero = self.push_spanned(Expr::Int(0), span);
             Ok(self.push_spanned(Expr::BinOp(BinOp::Sub, zero, operand), span))
         } else if matches!(self.peek(), Some(Token::Bang)) {
             let start = self.span_at().start;
             self.bump();
-            let operand = self.unary()?;
+            let operand = self.nested(Self::unary)?;
             let span = Span { start, end: self.span_before().end };
             Ok(self.negate(operand, span))
         } else {
