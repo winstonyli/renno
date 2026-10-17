@@ -23,6 +23,7 @@ pub mod value;
 // Frame::cons/Env frame push/closure Env capture is a small Rc::new, and the
 // interpreter is allocation-bound, not logic-bound. mimalloc specializes in
 // exactly this workload shape (many small, short-lived allocations).
+#[cfg(not(miri))] // Miri cannot call mimalloc's C functions; it uses its own allocator
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
