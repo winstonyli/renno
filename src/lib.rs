@@ -11461,4 +11461,97 @@ g(len)").unwrap_err();
         let err = run_err("let d: Dyn = [1, 2, 3] in let a: List(Int) = d in let b: Indexed(List(Int), 2) = d in 0");
         assert!(err.starts_with("line 1, column 82: type error: expected [Int](2), found List"), "{err}");
     }
+
+    // ---- nesting budget (docs/superpowers/plans/u10-report.md) ----
+
+    // Programs with `n` levels of one construct. Each ends in `1` and the nested value is
+    // never the result, so nothing prints it.
+    fn nested_shapes() -> Vec<(&'static str, Box<dyn Fn(usize) -> String>)> {
+        let wrap = |open: &'static str, close: &'static str| -> Box<dyn Fn(usize) -> String> {
+            Box::new(move |n| format!("let x = {}1{} in 1", open.repeat(n), close.repeat(n)))
+        };
+        vec![
+            ("list", wrap("[", "]")),
+            ("else-if", wrap("if false then 1 else ", "")),
+            ("paren", wrap("(", ")")),
+            ("tuple", wrap("(", ",1)")),
+            ("record", wrap("{a: ", "}")),
+            ("match", wrap("match 1 | _ -> ", "")),
+            ("negation", wrap("- ", "")),
+            ("cons", Box::new(|n| format!("let x = {}[] in 1", "1 :: ".repeat(n)))),
+            // Built left to right by a loop in the parser, not by recursion.
+            ("left-assoc", Box::new(|n| format!("let x = 1{} in 1", "+1".repeat(n)))),
+            ("call-chain", Box::new(|n| format!("let f: Dyn = 1 in if false then f{} else 1", "(1)".repeat(n)))),
+            ("pattern", Box::new(|n| format!("let t = {}1{} in match t | {}_{} -> 1", "(".repeat(n), ",1)".repeat(n), "(".repeat(n), ",_)".repeat(n)))),
+            ("annotation", Box::new(|n| format!("let x: {}Int{} = {}1{} in 1", "[".repeat(n), "]".repeat(n), "[".repeat(n), "]".repeat(n)))),
+            ("fun type", Box::new(|n| format!("let d: Dyn = fun a -> a in let f: {}Int{} = d in 1", "(Int -> ".repeat(n), ")".repeat(n)))),
+        ]
+    }
+
+    fn too_deep() -> String {
+        format!("expression nested too deeply (limit {})", parser::MAX_NESTING)
+    }
+
+    // Past the budget every construct is a clean error, however far past: the parser's own
+    // recursion and the tree pass after it both stop before any later pass can overflow.
+    #[test]
+    fn nesting_past_the_budget_is_a_clean_error() {
+        for (name, make) in nested_shapes() {
+            for n in [parser::MAX_NESTING + 10, 1_000_000] {
+                let err = run_source(&make(n)).expect_err(name);
+                assert!(err.contains(&too_deep()), "{name} at {n}: {err}");
+            }
+        }
+    }
+
+    // Just inside the budget the same programs run in this (possibly unoptimized) build:
+    // the budget is measured against the worker's stack.
+    #[test]
+    fn nesting_inside_the_budget_runs() {
+        for (name, make) in nested_shapes() {
+            let result = run_source(&make(parser::MAX_NESTING - 20));
+            assert_eq!(result, Ok(Outcome::Int(1)), "{name}");
+        }
+    }
+
+    // One program that alternates constructs all the way down, the deepest allowed.
+    #[test]
+    fn mixed_nesting_inside_the_budget_runs() {
+        let layers: [(&str, &str); 6] = [
+            ("[", "]"),
+            ("(fun a -> a)(", ")"),
+            ("let y = ", " in y"),
+            ("match 1 | _ -> ", ""),
+            ("{a: ", "}.a"),
+            ("match (", ", 0) | (v, _) -> v"),
+        ];
+        let n = parser::MAX_NESTING - 20;
+        let (mut open, mut close) = (String::new(), String::new());
+        for i in 0..n {
+            let (o, c) = layers[i % layers.len()];
+            open.push_str(o);
+            close.insert_str(0, c);
+        }
+        let src = format!("let x = {open}1{close} in 1");
+        assert_eq!(run_source(&src), Ok(Outcome::Int(1)));
+    }
+
+    // A let/fun chain is flattened by the parser, the checker and the resolver, so it
+    // costs no native stack and the budget does not count it.
+    #[test]
+    fn a_long_let_chain_is_inside_the_budget() {
+        let src = format!("{}0", "let x = 1 in ".repeat(5 * parser::MAX_NESTING));
+        assert_eq!(run_source(&src), Ok(Outcome::Int(0)));
+    }
+
+    // A value nested far deeper than any source is: built by a loop, converted to an
+    // Outcome on the worker, printed and dropped on a worker-sized stack.
+    #[test]
+    fn a_deeply_nested_value_converts_prints_and_drops() {
+        let depth = 100_000;
+        let src = format!("let rec nest = fun n -> fun acc -> if n == 0 then acc else nest(n - 1)([acc]) in nest({depth})(1)");
+        let outcome = run_source(&src).expect("runs");
+        let text = std::thread::Builder::new().stack_size(WORKER_STACK_SIZE).spawn(move || outcome.to_string()).unwrap().join().unwrap();
+        assert_eq!(text, format!("{}1{}", "[".repeat(depth), "]".repeat(depth)));
+    }
 }

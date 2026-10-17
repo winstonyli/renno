@@ -7,6 +7,8 @@ use crate::span::Span;
 use crate::types::{Hc, Type};
 use crate::util::find_field;
 
+pub const MAX_NESTING: usize = 2000;
+
 pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
     let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
     let mut p = Parser { tokens, tok_spans, pos: 0, arena: Arena::new(), expr_spans: SpanMap::new(), src };
