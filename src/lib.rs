@@ -6207,7 +6207,7 @@ g(len)").unwrap_err();
         );
 
         let mut infer = InferCtx::new();
-        let ctx = extend_generalized(&Ctx::empty(), "identity_vec", identity_vec_ty, &infer, None);
+        let ctx = extend_generalized(&Ctx::empty(), "identity_vec", identity_vec_ty, &mut infer, None);
 
         // Extracts the index-variable name inside `Fun(Int, Fun(Vec(idx), Vec(idx)))`.
         fn index_var_name(ty: &Type) -> String {
@@ -6244,15 +6244,54 @@ g(len)").unwrap_err();
         use crate::typecheck::{extend, extend_generalized, Ctx, InferCtx};
         use types::{EffectRow, Type};
 
-        let infer = InferCtx::new();
+        let mut infer = InferCtx::new();
         let mut ctx = Ctx::empty();
         for i in 0..3 {
             let a = Hc::new(Type::Var(format!("a{i}")));
-            ctx = extend_generalized(&ctx, &format!("id{i}"), Type::Fun(a.clone(), EffectRow::Dyn, a), &infer, None);
+            ctx = extend_generalized(&ctx, &format!("id{i}"), Type::Fun(a.clone(), EffectRow::Dyn, a), &mut infer, None);
         }
         assert!(ctx.open_vars(&infer).is_empty());
-        let ctx = extend(&ctx, "x", Type::Var("b".to_string()));
+        let ctx = extend(&ctx, "x", Type::Var("b".to_string()), &mut infer);
         assert_eq!(ctx.open_vars(&infer).len(), 1);
+    }
+
+    // U8b invariant I: a variable a scope holds has a level, and binding it lowers every
+    // variable of its solution to that level, of all three sorts; a failed trial leaves no
+    // trace in the levels, and a variable no scope holds has none.
+    #[test]
+    fn binding_a_levelled_variable_lowers_its_solution_and_rolls_back() {
+        use crate::index_expr::IndexExpr;
+        use crate::span::Span;
+        use crate::typecheck::{extend, unify_trial, Ctx, InferCtx};
+        use crate::typecheck::TyVar;
+        use std::rc::Rc;
+        use types::{EffectRow, Type};
+        let var = |n: &str| Type::Var(n.to_string());
+        let span = Span { start: 0, end: 0 };
+        let mut infer = InferCtx::new();
+        let ctx = Ctx::empty().deeper();
+        let ctx = extend(&ctx, "x", var("x"), &mut infer);
+        assert_eq!(infer.levels.get(&TyVar::Type("x".into())), Some(1));
+        assert_eq!(infer.levels.get(&TyVar::Type("y".into())), None);
+
+        // x := List(y -> z): y, z and the row r drop to x's level; the index n of an Indexed
+        // component does too.
+        let fun = Type::Fun(Hc::new(var("y")), EffectRow::Var("r".into()), Hc::new(var("z")));
+        let idx = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Int))), Rc::new(IndexExpr::Var("n".into())));
+        let sol = Type::List(Hc::new(Type::Tuple(Hc::new(vec![fun, idx]))));
+        assert!(unify_trial(&var("x"), &sol, &mut infer, span).is_ok());
+        for v in [TyVar::Type("y".into()), TyVar::Type("z".into()), TyVar::Row("r".into()), TyVar::Index("n".into())] {
+            assert_eq!(infer.levels.get(&v), Some(1), "{v:?}");
+        }
+
+        // A levelled w bound inside a failing trial: its solution's variable must not keep a level.
+        extend(&ctx, "w", var("w"), &mut infer);
+        let before = infer.levels.clone();
+        let t1 = Type::Tuple(Hc::new(vec![var("w"), Type::Int]));
+        let t2 = Type::Tuple(Hc::new(vec![Type::List(Hc::new(var("q"))), Type::Bool]));
+        assert!(unify_trial(&t1, &t2, &mut infer, span).is_err());
+        assert_eq!(infer.levels.get(&TyVar::Type("q".into())), None);
+        assert_eq!(infer.levels.get(&TyVar::Type("w".into())), before.get(&TyVar::Type("w".into())));
     }
 
     // Generalization is blocked exactly where a binder still holds the variable:
@@ -6560,7 +6599,7 @@ g(len)").unwrap_err();
         // Int elements: a Dyn-element Vec(n) into [Int] is a real crossing and
         // is checked; this test is about the index-forgetting widening alone.
         let vec_ty = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
-        let ctx = extend_generalized(&Ctx::empty(), "x", vec_ty, &infer, None);
+        let ctx = extend_generalized(&Ctx::empty(), "x", vec_ty, &mut infer, None);
 
         let mut arena = Arena::new();
         let mut spans = SpanMap::new();
@@ -6697,7 +6736,7 @@ g(len)").unwrap_err();
         let mut infer = InferCtx::new();
         // Int elements: see if_check_mode_accepts_branches_that_only_agree_via_the_expected_type.
         let vec_ty = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Int))), Rc::new(IndexExpr::Var("n".to_string())));
-        let ctx = extend_generalized(&Ctx::empty(), "v", vec_ty, &infer, None);
+        let ctx = extend_generalized(&Ctx::empty(), "v", vec_ty, &mut infer, None);
 
         let mut arena = Arena::new();
         let mut spans = SpanMap::new();
@@ -7522,7 +7561,7 @@ g(len)").unwrap_err();
         let rec = Type::Rec(rec_list(), 0);
         let mut infer = InferCtx::new();
         let scrut_ty = Type::Indexed(Hc::new(rec.clone()), Rc::new(IndexExpr::Var("n".to_string())));
-        let ctx = extend(&Ctx::empty(), "v", scrut_ty);
+        let ctx = extend(&Ctx::empty(), "v", scrut_ty, &mut infer);
         let expected = Type::Indexed(Hc::new(rec), Rc::new(IndexExpr::Lit(1)));
         let result = check_against(&mut arena, root, &expected, &ctx, &spans, &mut infer);
         assert!(result.is_err(), "expected a real index conflict from the base alternative's n=0 hypothesis, got: {result:?}");
@@ -7546,7 +7585,7 @@ g(len)").unwrap_err();
         let rec = Type::Rec(rec_list(), 0);
         let mut infer = InferCtx::new();
         let scrut_ty = Type::Indexed(Hc::new(rec.clone()), Rc::new(IndexExpr::Var("n".to_string())));
-        let ctx = extend(&Ctx::empty(), "v", scrut_ty);
+        let ctx = extend(&Ctx::empty(), "v", scrut_ty, &mut infer);
         let expected = Type::Indexed(
             Hc::new(rec),
             Rc::new(IndexExpr::Sub(Rc::new(IndexExpr::Var("n".to_string())), Rc::new(IndexExpr::Lit(1)))),
@@ -10218,7 +10257,7 @@ g(len)").unwrap_err();
             },
             other => panic!("{other:?}"),
         };
-        let infer = InferCtx::new();
+        let mut infer = InferCtx::new();
 
         // No entry: both are introduced, as two separate variables of their own sort.
         let mut intro = Vec::new();
@@ -10231,7 +10270,7 @@ g(len)").unwrap_err();
         assert!(i1.starts_with("n#") && r1.starts_with("n#"));
 
         // The scope with them open: an existential binder shares both, introducing nothing.
-        let ctx = Ctx::empty().with_annot(&intro);
+        let ctx = Ctx::empty().with_annot(&intro, &mut infer);
         assert!(intro.iter().all(|(_, e)| ctx.open_vars(&infer).contains(&e.var)));
         let mut again = Vec::new();
         assert_eq!(names(&open_annotation(&ann, &ctx, false, &mut again)), (i1.clone(), r1.clone()));
@@ -10243,7 +10282,7 @@ g(len)").unwrap_err();
         assert!(i2 != i1 && r2 != r1 && shadow.len() == 2 && shadow.iter().all(|(_, e)| e.universal));
 
         // ...and shares a universal one, whatever the binder kind.
-        let inner = ctx.with_annot(&shadow);
+        let inner = ctx.with_annot(&shadow, &mut infer);
         for universal in [true, false] {
             let mut none = Vec::new();
             assert_eq!(names(&open_annotation(&ann, &inner, universal, &mut none)), (i2.clone(), r2.clone()));
