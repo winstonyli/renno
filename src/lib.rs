@@ -3243,7 +3243,8 @@ g(len)").unwrap_err();
     // stack: dependencies are indices, not an `Rc` chain.
     #[test]
     fn annotated_type_let_chain_is_o1_stack_construction_and_teardown() {
-        let n = 50_000;
+        // Two links per step: 50,000 links, the chain cap (parser::MAX_CHAIN).
+        let n = 25_000;
         let mut src = String::from("let T0 = Int in ");
         for i in 1..n {
             src.push_str(&format!("let T{i} = T{} in let x{i}: T{i} = 1 in ", i - 1));
@@ -11490,6 +11491,8 @@ g(len)").unwrap_err();
             ("call-chain", Box::new(|n| format!("let f: Dyn = 1 in if false then f{} else 1", "(1)".repeat(n)))),
             ("pattern", Box::new(|n| format!("let t = {}1{} in match t | {}_{} -> 1", "(".repeat(n), ",1)".repeat(n), "(".repeat(n), ",_)".repeat(n)))),
             ("annotation", Box::new(|n| format!("let x: {}Int{} = {}1{} in 1", "[".repeat(n), "]".repeat(n), "[".repeat(n), "]".repeat(n)))),
+            // The parser walks a guard's whole subtree (for `perform`) before any depth count.
+            ("guard", Box::new(|n| format!("match 1 | x if 0{} >= 0 -> 1 | _ -> 2", "+1".repeat(n)))),
             // An index expression is not an arena node: only the parser counts its depth.
             ("index", Box::new(|n| format!("let d: Dyn = [1] in let x: Vec(1{}) = d in 1", "*1".repeat(n)))),
             ("fun type", Box::new(|n| format!("let d: Dyn = fun a -> a in let f: {}Int{} = d in 1", "(Int -> ".repeat(n), ")".repeat(n)))),
@@ -11570,12 +11573,35 @@ g(len)").unwrap_err();
         assert!(n >= parser::MAX_NESTING / 3, "mixed: only {n} layers");
     }
 
-    // A let/fun chain is flattened by the parser, the checker and the resolver, so it
-    // costs no native stack and the budget does not count it.
+    // A let/fun chain is flattened by the parser, the checker and the resolver, so it is
+    // not a nesting level; it has a cap of its own (parser::MAX_CHAIN), small per link.
+    type Chain = (&'static str, Box<dyn Fn(usize) -> String>, Outcome);
+
+    fn chains() -> Vec<Chain> {
+        vec![
+            ("let", Box::new(|n| format!("{}0", "let x = 1 in ".repeat(n))), Outcome::Int(0)),
+            ("let rec", Box::new(|n| format!("{}0", "let rec f = fun a -> a in ".repeat(n))), Outcome::Int(0)),
+            ("fun", Box::new(|n| format!("{}0", "fun a -> ".repeat(n))), Outcome::Function),
+            ("let and fun", Box::new(|n| format!("{}0", "let x = 1 in fun a -> ".repeat(n / 2))), Outcome::Function),
+        ]
+    }
+
     #[test]
-    fn a_long_let_chain_is_inside_the_budget() {
-        let src = format!("{}0", "let x = 1 in ".repeat(5 * parser::MAX_NESTING));
-        assert_eq!(run_source(&src), Ok(Outcome::Int(0)));
+    fn a_chain_up_to_the_cap_runs() {
+        for (name, make, want) in chains() {
+            assert_eq!(run_source(&make(parser::MAX_CHAIN)), Ok(want), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_chain_past_the_cap_is_a_clean_error() {
+        let want = format!("let/fun chain too long (limit {})", parser::MAX_CHAIN);
+        for (name, make, _) in chains() {
+            for n in [parser::MAX_CHAIN + 10, 1_000_000] {
+                let err = run_source(&make(n)).expect_err(name);
+                assert!(err.contains(&want), "{name} at {n}: {}", err.lines().next().unwrap());
+            }
+        }
     }
 
     // A value nested far deeper than any source is: built by a loop, converted to an

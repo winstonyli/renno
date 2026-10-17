@@ -20,6 +20,15 @@ use crate::util::find_field;
 // plans/u10-report.md; nesting_inside_the_budget_runs pins it for every construct).
 pub const MAX_NESTING: usize = 2000;
 
+// The longest `let`/`let rec`/`fun` chain. A chain that rebinds one name (`let x = 1 in let
+// x = 1 in ..`) costs native stack per link in the checker (a scheme's definition holds the
+// scope before its binder, which holds the previous scheme: a drop path as long as the
+// chain); measured in the unoptimized build on the 256 MiB worker it overflows at about
+// 106,000 links (a `fun` chain: none below 397,000; a chain of distinct names: none at
+// 1,000,000, but one cap keeps the rule simple). 50,000 keeps 2x headroom for the worst,
+// and is the longest chain the tests build.
+pub const MAX_CHAIN: usize = 50_000;
+
 pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
     let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
     let mut p = Parser { tokens, tok_spans, pos: 0, depth: 0, arena: Arena::new(), expr_spans: SpanMap::new(), src };
@@ -125,13 +134,18 @@ impl<'a> Parser<'a> {
     // `f(a)(b)..`, `a || b || ..`) that `nested` never sees, and a parenthesis adds no node,
     // so this is a second, independent count: what typecheck and the later passes will
     // recurse through. The body of a `let`/`let rec`/`fun` is the next link of a chain they
-    // walk by iteration, so reaching it costs no level. Iterative.
+    // walk by iteration, so reaching it costs no level, but a chain of them is still bounded
+    // (MAX_CHAIN: the resolver, the checker's contexts and the drops of what they build cost
+    // stack per link, a small one). Iterative.
     fn check_tree_depth(&self, root: ExprRef) -> Result<(), String> {
-        let mut stack = vec![(root, 0usize)];
+        let mut stack = vec![(root, 0usize, 0usize)];
         let mut kids = Vec::new();
-        while let Some((n, depth)) = stack.pop() {
+        while let Some((n, depth, chain)) = stack.pop() {
             if depth > MAX_NESTING {
                 return Err(self.too_deep(self.expr_spans[n]));
+            }
+            if chain > MAX_CHAIN {
+                return Err(self.err_at(self.expr_spans[n], format!("let/fun chain too long (limit {MAX_CHAIN})")));
             }
             let chain_body = match &self.arena[n] {
                 Expr::Let(_, _, _, body) | Expr::LetRec(_, body) | Expr::Lambda(_, _, body) => Some(*body),
@@ -139,7 +153,7 @@ impl<'a> Parser<'a> {
             };
             kids.clear();
             self.arena[n].children(&mut kids);
-            stack.extend(kids.iter().map(|&k| (k, if Some(k) == chain_body { depth } else { depth + 1 })));
+            stack.extend(kids.iter().map(|&k| if Some(k) == chain_body { (k, depth, chain + 1) } else { (k, depth + 1, 0) }));
         }
         Ok(())
     }
@@ -155,12 +169,15 @@ impl<'a> Parser<'a> {
     // analysis -- upgrade only if a real guard is rejected by this in
     // practice.
     fn contains_perform(arena: &Arena, e: ExprRef) -> bool {
-        if matches!(arena[e], Expr::Perform(..)) {
-            return true;
+        // Iterative: this runs at parse time, before the depth walk can bound the subtree.
+        let mut stack = vec![e];
+        while let Some(n) = stack.pop() {
+            if matches!(arena[n], Expr::Perform(..)) {
+                return true;
+            }
+            arena[n].children(&mut stack);
         }
-        let mut kids = Vec::new();
-        arena[e].children(&mut kids);
-        kids.into_iter().any(|k| Self::contains_perform(arena, k))
+        false
     }
 
     // The only way an Expr node should ever be added to the arena --
