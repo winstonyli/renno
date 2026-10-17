@@ -1027,6 +1027,17 @@ mod tests {
         assert!(!b.is_sealed_every(id(1)));
     }
 
+    // The other order: the low interval [3, 4) is recorded first, then the disjoint [5, 10) is
+    // sealed. Slot 4 is still unproved (this is what `lo <= s.hi` in the union test guards).
+    #[test]
+    fn a_disjoint_seal_below_the_recorded_one_does_not_union() {
+        let (l, _, b, _, only7) = intervals();
+        only7.seal_every(id(1)); // [3, 4)
+        l.seal_every(id(1)); // [5, 10) is disjoint: replaces, never [3, 10)
+        assert_eq!(unsealed(&b, 1), [6, 7], "slots 4 and 3 are outside [5, 10); slot 4 holds 6");
+        assert!(!b.is_sealed_every(id(1)));
+    }
+
     // ---- Seals ----
 
     fn id(n: u32) -> SealId {
@@ -1095,7 +1106,7 @@ mod tests {
         assert_eq!(unsealed(&b, 1), [200]);
         // The first view is untouched by either.
         assert!(unsealed(&l, 1).is_empty());
-        // Sealing the claimed view raises the height and covers it.
+        // Sealing the claimed view widens the sealed interval to cover it.
         a.seal_every(id(1));
         assert!(unsealed(&a, 1).is_empty() && unsealed(&a.cons(val(300)), 1) == [300]);
         assert_eq!(unsealed(&b, 1), [200]);
@@ -1125,7 +1136,8 @@ mod tests {
         assert!(unsealed(&l, 1).is_empty());
     }
 
-    // A lower recorded height is never raised by a lower view, and a higher view raises it.
+    // A shorter view's seal never shrinks a recorded interval that contains it, and a longer
+    // view widens it.
     #[test]
     fn sealing_a_shorter_view_never_lowers_the_coverage() {
         let l = linear(3);
@@ -1134,7 +1146,7 @@ mod tests {
         top.seal_every(id(1));
         mid.seal_every(id(1));
         assert!(unsealed(&top, 1).is_empty(), "the shorter view's seal must not shrink the longer one's");
-        // In the other order the longer view raises the height.
+        // In the other order the longer view widens the interval.
         let l = linear(3);
         let mid = l.split_first().map(|(_, t)| t).unwrap();
         mid.seal_every(id(1));
@@ -1144,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_seal_holds_only_at_its_exact_height() {
+    fn a_whole_seal_holds_only_at_its_exact_interval() {
         let l = linear(3);
         let short = l.split_first().map(|(_, t)| t).unwrap();
         assert!(!l.has_whole_seal(id(1)));
