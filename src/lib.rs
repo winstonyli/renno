@@ -3144,6 +3144,22 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn a_let_under_many_lambdas_does_no_scope_walk() {
+        // U8 q1: `fun x -> let rec f = fun a -> a in` repeated n times. Every `let` sits under
+        // n lambda parameters, so a generalization that walked the scope would cost O(n) per
+        // `let` and O(n^2) in all. By levels it costs the size of the `let`'s own type.
+        let work = |n: usize| {
+            let src = "fun x -> let rec f = fun a -> a in ".repeat(n) + "0";
+            typecheck::LEVEL_WORK.with(|c| c.set(0));
+            run_source_on_this_thread(&src).expect("typechecks");
+            typecheck::LEVEL_WORK.with(|c| c.get())
+        };
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0, "the counter must see the generalizations");
+        assert!(large < small * 6, "level work grew from {small} to {large} for 4x the lets");
+    }
+
+    #[test]
     fn a_partial_builtin_called_once_hands_over_its_args_without_cloning() {
         let shared = |src: &str, want: i64| {
             machine::PARTIAL_SHARED.with(|c| c.set(0));
@@ -6236,12 +6252,12 @@ g(len)").unwrap_err();
         assert_ne!(name_a, name_b, "two separate lookups of a generalized index variable must get INDEPENDENT fresh names");
     }
 
-    // A `let` quantifies the variables of its type that no enclosing scope has
-    // open. A chain of polymorphic lets therefore leaves nothing open however
-    // long it is, and a monomorphic binding opens exactly its own variable.
+    // A `let` quantifies the variables of its type whose level is above its own. A chain of
+    // polymorphic lets leaves no variable levelled however long it is, and a monomorphic
+    // binding gives its own variable the scope's level, so a `let` at that level keeps it.
     #[test]
-    fn polymorphic_let_chain_leaves_no_open_variable() {
-        use crate::typecheck::{extend, extend_generalized, Ctx, InferCtx};
+    fn polymorphic_let_chain_leaves_no_levelled_variable() {
+        use crate::typecheck::{extend, extend_generalized, lookup, Ctx, InferCtx, TyVar};
         use types::{EffectRow, Type};
 
         let mut infer = InferCtx::new();
@@ -6249,10 +6265,16 @@ g(len)").unwrap_err();
         for i in 0..3 {
             let a = Hc::new(Type::Var(format!("a{i}")));
             ctx = extend_generalized(&ctx, &format!("id{i}"), Type::Fun(a.clone(), EffectRow::Dyn, a), &mut infer, None);
+            assert_eq!(infer.levels.get(&TyVar::Type(format!("a{i}"))), None);
         }
-        assert!(ctx.open_vars(&infer).is_empty());
         let ctx = extend(&ctx, "x", Type::Var("b".to_string()), &mut infer);
-        assert_eq!(ctx.open_vars(&infer).len(), 1);
+        assert_eq!(infer.levels.get(&TyVar::Type("b".into())), Some(0));
+        // A `let` at level 0 does not quantify b (a lookup returns it unrenamed) but does
+        // quantify a variable nothing holds (a lookup mints a fresh name).
+        let ctx = extend_generalized(&ctx, "y", Type::Var("b".to_string()), &mut infer, None);
+        assert_eq!(lookup(&ctx, "y", &mut infer), Type::Var("b".to_string()));
+        let ctx = extend_generalized(&ctx, "z", Type::Var("c".to_string()), &mut infer, None);
+        assert_ne!(lookup(&ctx, "z", &mut infer), Type::Var("c".to_string()));
     }
 
     // U8b invariant I: a variable a scope holds has a level, and binding it lowers every
@@ -10271,7 +10293,7 @@ g(len)").unwrap_err();
 
         // The scope with them open: an existential binder shares both, introducing nothing.
         let ctx = Ctx::empty().with_annot(&intro, &mut infer);
-        assert!(intro.iter().all(|(_, e)| ctx.open_vars(&infer).contains(&e.var)));
+        assert!(intro.iter().all(|(_, e)| infer.levels.get(&e.var) == Some(0)));
         let mut again = Vec::new();
         assert_eq!(names(&open_annotation(&ann, &ctx, false, &mut again)), (i1.clone(), r1.clone()));
         assert!(again.is_empty());

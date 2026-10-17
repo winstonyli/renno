@@ -72,11 +72,12 @@ impl From<Mismatch> for TypeError {
 //
 // THE RULE, one place for all three sorts (and any future one):
 // generalize(ctx, ty) = freevars(ty) MINUS freevars(ctx) -- never quantify
-// over a name that's still free somewhere still open in the enclosing
-// scope. The mechanism is the `open` set every Ctx carries (see Ctx):
-// `freevars(ctx)` is read from it, not by walking the bindings, so a `let`
-// costs the size of its own type plus the number of variables currently
-// open, however many bindings precede it. Index variables a pending
+// over a name that's still free somewhere in the enclosing scope. The
+// mechanism is a level per variable (InferCtx::levels) and a level per scope
+// (Ctx::level): a scope holding a variable, or unification binding a
+// variable it holds, lowers the variable to the scope's level, and a `let`
+// at level `d` quantifies the variables above `d`. A `let` costs the size of
+// its own type, however many bindings precede it. Index variables a pending
 // obligation still needs are excluded on top (see `generalizable`).
 pub(crate) struct Scheme {
     // The variables generalized over this binding, of all three sorts,
@@ -118,7 +119,7 @@ pub(crate) enum TyVar {
 }
 
 // Every variable of every sort `ty` mentions, as written: no substitution
-// is consulted (callers resolve first, or reopen the names later).
+// is consulted (callers resolve first, or follow the names later).
 pub(crate) fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
     fn go(ty: &Type, out: &mut BTreeSet<TyVar>, seen: &mut Visited) {
         if !ty.summary().any(Summary::VAR | Summary::ROWVAR | Summary::INDEXED) || !seen.first(ty) {
@@ -156,27 +157,12 @@ fn index_names(vars: BTreeSet<TyVar>) -> BTreeSet<String> {
     vars.into_iter().filter_map(|v| if let TyVar::Index(name) = v { Some(name) } else { None }).collect()
 }
 
-// The variables a stored name stands for now: a Type or Index variable that
-// unification has since bound stands for the variables of what it was bound
-// to; a Row variable is never bound.
-fn reopen(var: &TyVar, infer: &InferCtx) -> BTreeSet<TyVar> {
-    match var {
-        TyVar::Row(_) => BTreeSet::from([var.clone()]),
-        TyVar::Type(name) => {
-            vars_in(&infer.resolve_deep(&Type::Var(name.clone())))
-        }
-        TyVar::Index(name) => {
-            free_index_vars(&infer.resolve_index_deep(&IndexExpr::Var(name.clone()))).into_iter().map(TyVar::Index).collect()
-        }
-    }
-}
-
-// A scope: the visible bindings, the variables still open in it (i.e. free in
-// some binding's type and not quantified by that binding), and the annotation
-// variables its binders introduced. All three are persistent, so extending a
-// scope is cheap and an enclosing scope is untouched: a `let` may quantify
-// only a variable no enclosing scope has open, and an annotation variable is
-// visible exactly in the scope that introduced it.
+// A scope: the visible bindings, the annotation variables its binders
+// introduced, and its level (how many `let` right-hand sides enclose it).
+// All are persistent, so extending a scope is cheap and an enclosing scope
+// is untouched: a `let` may quantify only a variable above its own level
+// (no enclosing scope holds it), and an annotation variable is visible
+// exactly in the scope that introduced it.
 //
 // Constructing and dropping a 50k-binding chain on the default stack is
 // pinned by let_chain_is_o1_stack_construction_and_teardown. A `CheckDef`
@@ -186,17 +172,8 @@ fn reopen(var: &TyVar, infer: &InferCtx) -> BTreeSet<TyVar> {
 pub(crate) struct Ctx {
     // Innermost binding of each name; a shadowed one is no longer reachable.
     binds: HashTrieMap<String, Rc<Scheme>>,
-    // As written when each binding was added, union-only: a shadowed
-    // binding keeps its variables open (its type may still mention them
-    // through values already built from it). A binding's own quantified
-    // names are not added: the scheme is sealed, since lookup renames them
-    // before any later read. open_vars reads the names
-    // through the substitution as it stands, so a rollback in `unify_trial`
-    // or a match arm's hypotheses cannot leave it stale.
-    open: HashTrieSet<TyVar>,
     // The annotation variables in scope, keyed by the row or index name as the user wrote it
-    // (never a `TyVar::Type`): the fresh variable each denotes here (open_annotation). A scoped
-    // annotation variable is also in `open`: it is free in the context.
+    // (never a `TyVar::Type`): the fresh variable each denotes here (open_annotation).
     annot: HashTrieMap<TyVar, AnnotVar>,
     // How many `let` right-hand sides enclose this scope (U8b); `Ctx::empty()` is 0. A `let`
     // at level `d` quantifies the variables whose level is above `d` (InferCtx::levels).
@@ -215,8 +192,6 @@ pub(crate) struct Levels {
 }
 
 impl Levels {
-    // Read by tests only until `generalizable` decides by level.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn get(&self, v: &TyVar) -> Option<u32> {
         match v {
             TyVar::Type(n) => self.ty.get(n),
@@ -260,6 +235,7 @@ impl<'a> Lowerer<'a> {
 
     // Mirrors `vars_in` node for node, but follows a bound variable to its solution.
     fn ty(&mut self, t: &Type) {
+        level_work();
         if !t.summary().any(Summary::VAR | Summary::ROWVAR | Summary::INDEXED) || !self.seen.first(t) {
             return;
         }
@@ -298,12 +274,14 @@ impl<'a> Lowerer<'a> {
 
     // Rows are never bound, so there is no solution to follow.
     fn row(&mut self, name: &str) {
+        level_work();
         if !self.skipped(|v| if let TyVar::Row(n) = v { Some(n) } else { None }, name) {
             Levels::lower(&mut self.levels.row, name, self.to);
         }
     }
 
     fn index(&mut self, e: &IndexExpr) {
+        level_work();
         match e {
             IndexExpr::Var(name) => {
                 if self.skipped(|v| if let TyVar::Index(n) = v { Some(n) } else { None }, name) {
@@ -340,7 +318,7 @@ pub(crate) struct AnnotVar {
 
 impl Ctx {
     pub(crate) fn empty() -> Ctx {
-        Ctx { binds: HashTrieMap::new(), open: HashTrieSet::new(), annot: HashTrieMap::new(), level: 0 }
+        Ctx { binds: HashTrieMap::new(), annot: HashTrieMap::new(), level: 0 }
     }
 
     // This scope one `let` right-hand side deeper.
@@ -353,7 +331,6 @@ impl Ctx {
     pub(crate) fn with_annot(&self, entries: &[(TyVar, AnnotVar)], infer: &mut InferCtx) -> Ctx {
         let mut ctx = self.clone();
         for (written, entry) in entries {
-            ctx.open = ctx.open.insert(entry.var.clone());
             ctx.annot = ctx.annot.insert(written.clone(), entry.clone());
             let mut lowerer = Lowerer::new(infer, self.level, &[]);
             match &entry.var {
@@ -376,37 +353,7 @@ impl Ctx {
 
     fn bind(&self, name: &str, scheme: Scheme, infer: &mut InferCtx) -> Ctx {
         Lowerer::new(infer, self.level, &scheme.quantified).ty(&scheme.ty);
-        let mut open = self.open.clone();
-        for var in vars_in(&scheme.ty) {
-            if !scheme.quantified.contains(&var) && !open.contains(&var) {
-                open = open.insert(var);
-            }
-        }
-        Ctx { binds: self.binds.insert(name.to_string(), Rc::new(scheme)), open, annot: self.annot.clone(), level: self.level }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn open_vars(&self, infer: &InferCtx) -> BTreeSet<TyVar> {
-        self.open.iter().flat_map(|v| reopen(v, infer)).collect()
-    }
-
-    // The members of `candidates` that are open: open_vars(infer) restricted to them, without
-    // building the whole set (a context with many open variables is walked once per `let`).
-    fn open_among(&self, candidates: &BTreeSet<TyVar>, infer: &InferCtx) -> BTreeSet<TyVar> {
-        let mut found = BTreeSet::new();
-        for v in self.open.iter() {
-            if let TyVar::Type(name) = v
-                && let Type::Var(n) = infer.resolve_deep(&Type::Var(name.clone()))
-            {
-                let r = TyVar::Type(n);
-                if candidates.contains(&r) {
-                    found.insert(r);
-                }
-                continue;
-            }
-            found.extend(reopen(v, infer).into_iter().filter(|r| candidates.contains(r)));
-        }
-        found
+        Ctx { binds: self.binds.insert(name.to_string(), Rc::new(scheme)), annot: self.annot.clone(), level: self.level }
     }
 }
 
@@ -623,9 +570,9 @@ fn fallible_check(arena: &Arena, root: ExprRef, spans: &SpanMap, infer: &InferCt
 // through every elaborate()/elaborate_node() call as `&mut InferCtx` --
 // see the design spec's own "Data model" section for the full rationale
 // (functional substitution over union-find). Generalization does NOT
-// live here -- no level counter, no birth-level tracking -- it reads the
-// per-scope open-variable set Ctx carries (THE RULE at Scheme); this
-// struct is just a substitution.
+// live here, only the levels it reads: `levels` (THE RULE at Scheme) is
+// the level of every variable some scope holds, lowered together with the
+// substitution; the rest of this struct is the substitution.
 //
 // `unify` is now called unconditionally from Expr::App/BinOp::Cons/If/
 // Match/ListLit (Tasks 4-6), so `subst` and every method below are live
@@ -1164,6 +1111,18 @@ fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, don
     Ok(())
 }
 
+// Per-let generalization work (U8b): candidate level lookups and `Lowerer` visits. Test-only.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LEVEL_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn level_work() {
+    #[cfg(test)]
+    LEVEL_WORK.with(|c| c.set(c.get() + 1));
+}
+
 #[cfg(test)]
 thread_local! {
     // How many pairs fits_resolved walked.
@@ -1387,7 +1346,7 @@ pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type, infer: &mut InferCtx) -> C
 
 // `let`-binding: generalizes over row, type and index variables alike,
 // by THE RULE stated at Scheme -- the variables of `ty` that no enclosing
-// scope has open (`generalizable`).
+// scope holds (`generalizable`).
 //
 // Why the exclusion matters, e.g. for row variables (confirmed reachable:
 // `let f = fun cb: (Dyn ->{e} Dyn) -> let g = cb in g in f(fun y -> perform
@@ -1434,7 +1393,7 @@ pub(crate) fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &mut In
 }
 
 // The variables of `ty` (already resolve_deep'ed) that this `let` may
-// quantify: those no enclosing scope has open. An index variable a pending
+// quantify: those no enclosing scope holds (level above the `let`'s). An index variable a pending
 // obligation still needs is decided by whoever binds it later, inside the
 // function containing the crossing; generalizing it would give each use a
 // fresh copy and leave the obligation unresolvable (spec
@@ -1444,11 +1403,15 @@ fn generalizable(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<TyVar> {
     if candidates.is_empty() {
         return Vec::new();
     }
-    let mut open = ctx.open_among(&candidates, infer);
-    if candidates.iter().any(|v| matches!(v, TyVar::Index(_))) {
-        open.extend(pending_obligation_vars(infer).into_iter().map(TyVar::Index));
-    }
-    candidates.difference(&open).cloned().collect()
+    let pending = if candidates.iter().any(|v| matches!(v, TyVar::Index(_))) { pending_obligation_vars(infer) } else { BTreeSet::new() };
+    candidates
+        .into_iter()
+        .filter(|v| {
+            level_work();
+            infer.levels.get(v).is_none_or(|l| l > ctx.level)
+        })
+        .filter(|v| !matches!(v, TyVar::Index(n) if pending.contains(n)))
+        .collect()
 }
 
 // Every index-variable name free anywhere inside `e` -- IndexExpr has
@@ -5592,14 +5555,11 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // whole-map assignment.
             fn restore_index_key(infer: &mut InferCtx, index_key: &Option<String>, prior_index_value: &Option<Option<IndexExpr>>) {
                 if let (Some(k), Some(prior)) = (index_key, prior_index_value) {
-                    match prior {
-                        Some(v) => {
-                            infer.index_subst.insert_mut(k.clone(), v.clone());
-                        }
-                        None => {
-                            infer.index_subst.remove_mut(k);
-                        }
-                    }
+                    // The refinement target is the resolved scrutinee index, so it is unbound on
+                    // entry. Re-inserting a prior binding would also need its variables lowered to
+                    // the key's level (U8b); nothing needs it, so it is asserted away.
+                    debug_assert!(prior.is_none(), "match refinement target {k} was already bound");
+                    infer.index_subst.remove_mut(k);
                 }
             }
             // The fresh cons-arm length variable m is made rigid and stays so: it is
