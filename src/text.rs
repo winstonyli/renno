@@ -86,7 +86,15 @@ impl Slots for ByteSlots {
     }
 
     // The bytes are written before the frontier moves past them (the SAFETY argument in Deref).
+    // The engine's callers check `room` first, but `claim_some` writes even when it found none
+    // (zero items); this storage enforces locally that a write starts at its frontier, so the
+    // frontier can never move back over written bytes.
     fn write(&self, side: Side, at: usize, items: impl Iterator<Item = u8>) {
+        let frontier = match side {
+            Side::High => self.hi.get(),
+            Side::Low => self.lo.get(),
+        };
+        assert_eq!(at, frontier, "internal: ByteSlots::write off its frontier");
         let mut k = 0;
         for x in items {
             let i = match side {
@@ -147,8 +155,9 @@ impl Deref for Text {
                 let cells = &buf.slots.bytes[*lo..*hi];
                 // SAFETY: (1) Cell<u8> is repr(transparent) over u8. (2) Nothing writes these
                 // bytes while the borrow lives: `ByteSlots::write` and `with_room` write a byte
-                // only while it lies outside [slots.lo, slots.hi) (the engine checks `room`
-                // first), after which it is inside that interval for the buffer's whole life,
+                // only while it lies outside [slots.lo, slots.hi) (`write` asserts locally that
+                // it starts at the frontier, and the engine checks `room` before it), after
+                // which it is inside that interval for the buffer's whole life,
                 // and every view lies inside it; Rc and Cell make Text !Send and !Sync, so no
                 // other thread writes. (3) UTF-8: every view is a concatenation of whole &strs
                 // written at its claimed edge, so it starts and ends on char boundaries.
@@ -281,6 +290,30 @@ mod tests {
         assert_eq!(buf_of(&s.concat(&t(""))), buf_of(&s));
         assert!(t("abcd") == s && s != t("abc"));
         assert_eq!(s.to_string(), "abcd");
+    }
+
+    // The engine's `claim_some` writes zero items even when `room` is None. A zero-item write
+    // at a branch point must not move the frontier back (a later append would then overwrite
+    // a byte of the branch's "é"), so `ByteSlots::write` itself refuses any write that is not
+    // at its frontier. The probe calls `claim_some` directly, so it pins the local invariant.
+    #[test]
+    #[should_panic(expected = "internal: ByteSlots::write")]
+    fn a_write_off_the_frontier_is_refused() {
+        let base = roomy();
+        let _branch = base.concat(&t("é")); // claims bytes 4..6; base's hi (4) is now a branch point
+        let Repr::Grow { buf, .. } = &base.0 else { panic!("roomy is a Grow") };
+        buf.claim_some(4, &mut std::iter::empty::<u8>());
+    }
+
+    // Two copies from a full buffer at its frontier: the first gets room, the second is exact.
+    #[test]
+    fn growth_is_claimed_once_per_buffer() {
+        let full = t("ab").concat(&t("c")); // exact: 3 bytes, no room
+        assert_eq!(cap(&full), 3);
+        let a = full.concat(&t("x"));
+        let b = full.concat(&t("y"));
+        assert_eq!((&*a, &*b, &*full), ("abcx", "abcy", "abc"));
+        assert_eq!((cap(&a), cap(&b)), (8, 4), "the first copy reserved room, the second is exact");
     }
 
     #[test]
