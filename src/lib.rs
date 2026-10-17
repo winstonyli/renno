@@ -10640,14 +10640,15 @@ g(len)").unwrap_err();
 
     #[test]
     fn snoc_under_a_result_check_is_linear() {
-        // Ruling (T-L1 report): not `assert_checks_linear`'s 3n + 16. Each call tests 2 steps (the
-        // claimed slot, plus the one step every call of this shape costs), and each copy-grow
-        // scans its new block once (D9): 3 + 7 + ... + 1023 = 2035 at n = 2000, so 6027 steps
-        // in all. Measured 3.02n for n = 500..8000 (quadratic would be 2M at n = 2000).
+        // Not `assert_checks_linear`'s 3n + 16. machine.rs counts 1 step per popped Step::Test
+        // and 1 per unsealed slot, so each call costs 2 steps (the Test, then the one claimed
+        // slot), and each copy-grow scans its new block once (D9, seals are not transferred):
+        // 3 + 7 + ... + 1023 = 2035 at n = 2000. 6027 steps in all, 3.02n for n = 500..8000
+        // (quadratic would be 2M at n = 2000).
         let (out, steps) = check_cost(&prog_contract_snoc(N));
         assert_eq!(out, Outcome::Int(N as i64));
         assert!(steps >= N, "the first check must scan the list: {steps} steps");
-        assert!(steps <= 4 * N + 64, "check steps {steps} for n = {N}");
+        assert!(steps <= 7 * N / 2 + 64, "check steps {steps} for n = {N}");
     }
 
     // Pins (pass before and after): a claim is invisible to every other holder.

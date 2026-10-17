@@ -267,7 +267,8 @@ impl List {
         let blk = self.block.as_ref()?;
         let (lo, n) = (self.lo as usize, items.len);
         // Only a single-block view snocs in place: an element under `slots[lo]` would land
-        // between the block and `below`.
+        // between the block and `below`. (Defence in depth: a block with a `below` has lo == 0,
+        // so the engine would refuse anyway.)
         if blk.below.is_empty() && blk.cells.claim(Side::Low, lo, items.iter().cloned()) {
             count_writes(n);
             return Some(List { block: self.block.clone(), lo: (lo - n) as u32, hi: self.hi, len: self.len + n });
