@@ -95,6 +95,19 @@ impl Scheme {
     }
 }
 
+// A scheme's definition holds the scope before its binder, which holds the previous schemes
+// (Scheme -> CheckDef -> Ctx -> Scheme ..): when a name is rebound the shadowed scheme is
+// reachable only through that chain, so a plain drop is one native frame group per link of
+// the shadowing run. The definition is dropped through `bounded_drop`, which keeps the
+// nesting of such drops bounded.
+impl Drop for Scheme {
+    fn drop(&mut self) {
+        if let Some(def) = self.def.take() {
+            crate::util::bounded_drop(def);
+        }
+    }
+}
+
 // A type variable of any of the three sorts a Scheme can quantify: an
 // effect-row variable, a Type::Var, or an index variable.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -4265,7 +4278,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         // inference, so this is deliberately narrower
                         // than general HM polymorphic recursion.
                         Some(ty) => extend_generalized(&val_ctx, name, ty.clone(), infer, Some(group.clone())),
-                        None => val_ctx.bind(name, Scheme { def: Some(group.clone()), ..Scheme::mono(infer.fresh_var(name)) }),
+                        None => val_ctx.bind(name, Scheme { quantified: Vec::new(), ty: infer.fresh_var(name), def: Some(group.clone()) }),
                     };
                 }
                 // The pre-bindings above are built first: the group's own universals are

@@ -20,15 +20,6 @@ use crate::util::find_field;
 // plans/u10-report.md; nesting_inside_the_budget_runs pins it for every construct).
 pub const MAX_NESTING: usize = 2000;
 
-// The longest `let`/`let rec`/`fun` chain. A chain that rebinds one name (`let x = 1 in let
-// x = 1 in ..`) costs native stack per link in the checker (a scheme's definition holds the
-// scope before its binder, which holds the previous scheme: a drop path as long as the
-// chain); measured in the unoptimized build on the 256 MiB worker it overflows at about
-// 106,000 links (a `fun` chain: none below 397,000; a chain of distinct names: none at
-// 1,000,000, but one cap keeps the rule simple). 50,000 keeps 2x headroom for the worst,
-// and is the longest chain the tests build.
-pub const MAX_CHAIN: usize = 50_000;
-
 pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
     let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(src)?.into_iter().unzip();
     let mut p = Parser { tokens, tok_spans, pos: 0, depth: 0, arena: Arena::new(), expr_spans: SpanMap::new(), src };
@@ -134,18 +125,14 @@ impl<'a> Parser<'a> {
     // `f(a)(b)..`, `a || b || ..`) that `nested` never sees, and a parenthesis adds no node,
     // so this is a second, independent count: what typecheck and the later passes will
     // recurse through. The body of a `let`/`let rec`/`fun` is the next link of a chain they
-    // walk by iteration, so reaching it costs no level, but a chain of them is still bounded
-    // (MAX_CHAIN: the resolver, the checker's contexts and the drops of what they build cost
-    // stack per link, a small one). Iterative.
+    // walk by iteration, so reaching it costs no level (a chain is unbounded: what the
+    // checker builds along it, scopes and types, drops through util::bounded_drop). Iterative.
     fn check_tree_depth(&self, root: ExprRef) -> Result<(), String> {
-        let mut stack = vec![(root, 0usize, 0usize)];
+        let mut stack = vec![(root, 0usize)];
         let mut kids = Vec::new();
-        while let Some((n, depth, chain)) = stack.pop() {
+        while let Some((n, depth)) = stack.pop() {
             if depth > MAX_NESTING {
                 return Err(self.too_deep(self.expr_spans[n]));
-            }
-            if chain > MAX_CHAIN {
-                return Err(self.err_at(self.expr_spans[n], format!("let/fun chain too long (limit {MAX_CHAIN})")));
             }
             let chain_body = match &self.arena[n] {
                 Expr::Let(_, _, _, body) | Expr::LetRec(_, body) | Expr::Lambda(_, _, body) => Some(*body),
@@ -153,7 +140,7 @@ impl<'a> Parser<'a> {
             };
             kids.clear();
             self.arena[n].children(&mut kids);
-            stack.extend(kids.iter().map(|&k| if Some(k) == chain_body { (k, depth, chain + 1) } else { (k, depth + 1, 0) }));
+            stack.extend(kids.iter().map(|&k| if Some(k) == chain_body { (k, depth) } else { (k, depth + 1) }));
         }
         Ok(())
     }

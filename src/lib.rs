@@ -3243,8 +3243,7 @@ g(len)").unwrap_err();
     // stack: dependencies are indices, not an `Rc` chain.
     #[test]
     fn annotated_type_let_chain_is_o1_stack_construction_and_teardown() {
-        // Two links per step: 50,000 links, the chain cap (parser::MAX_CHAIN).
-        let n = 25_000;
+        let n = 50_000;
         let mut src = String::from("let T0 = Int in ");
         for i in 1..n {
             src.push_str(&format!("let T{i} = T{} in let x{i}: T{i} = 1 in ", i - 1));
@@ -11573,35 +11572,66 @@ g(len)").unwrap_err();
         assert!(n >= parser::MAX_NESTING / 3, "mixed: only {n} layers");
     }
 
-    // A let/fun chain is flattened by the parser, the checker and the resolver, so it is
-    // not a nesting level; it has a cap of its own (parser::MAX_CHAIN), small per link.
-    type Chain = (&'static str, Box<dyn Fn(usize) -> String>, Outcome);
+    const CHAIN_LINKS: usize = 1_000_000;
 
-    fn chains() -> Vec<Chain> {
-        vec![
-            ("let", Box::new(|n| format!("{}0", "let x = 1 in ".repeat(n))), Outcome::Int(0)),
-            ("let rec", Box::new(|n| format!("{}0", "let rec f = fun a -> a in ".repeat(n))), Outcome::Int(0)),
-            ("fun", Box::new(|n| format!("{}0", "fun a -> ".repeat(n))), Outcome::Function),
-            ("let and fun", Box::new(|n| format!("{}0", "let x = 1 in fun a -> ".repeat(n / 2))), Outcome::Function),
-        ]
+    // `body(i)` is link i; `end` is what follows the last one.
+    fn chain(links: usize, body: impl Fn(usize) -> String, end: &str) -> String {
+        let mut src = String::new();
+        for i in 0..links {
+            src.push_str(&body(i));
+        }
+        src.push_str(end);
+        src
+    }
+
+    // run_source puts the whole pipeline on a WORKER_STACK_SIZE thread.
+    #[test]
+    fn a_million_link_rebinding_chain_runs() {
+        assert_eq!(run_source(&chain(CHAIN_LINKS, |_| "let x = 1 in ".into(), "x")), Ok(Outcome::Int(1)));
+    }
+
+    // The rest take 40-130 s each unoptimized, so they run in release (`cargo test --release`);
+    // the rebinding and fun chains above and below are the two that overflowed.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "scale test: cargo test --release")]
+    fn a_million_link_distinct_chain_runs() {
+        assert_eq!(run_source(&chain(CHAIN_LINKS, |i| format!("let x{i} = 1 in "), "x0")), Ok(Outcome::Int(1)));
     }
 
     #[test]
-    fn a_chain_up_to_the_cap_runs() {
-        for (name, make, want) in chains() {
-            assert_eq!(run_source(&make(parser::MAX_CHAIN)), Ok(want), "{name}");
-        }
+    #[cfg_attr(debug_assertions, ignore = "scale test: cargo test --release")]
+    fn a_million_link_let_rec_chains_run() {
+        let rebinding = chain(CHAIN_LINKS, |_| "let rec f = fun a -> a in ".into(), "f(1)");
+        assert_eq!(run_source(&rebinding), Ok(Outcome::Int(1)));
+        let distinct = chain(CHAIN_LINKS, |i| format!("let rec f{i} = fun a -> a in "), "f0(1)");
+        assert_eq!(run_source(&distinct), Ok(Outcome::Int(1)));
     }
 
     #[test]
-    fn a_chain_past_the_cap_is_a_clean_error() {
-        let want = format!("let/fun chain too long (limit {})", parser::MAX_CHAIN);
-        for (name, make, _) in chains() {
-            for n in [parser::MAX_CHAIN + 10, 1_000_000] {
-                let err = run_source(&make(n)).expect_err(name);
-                assert!(err.contains(&want), "{name} at {n}: {}", err.lines().next().unwrap());
-            }
+    fn a_million_link_fun_chain_runs() {
+        assert_eq!(run_source(&chain(CHAIN_LINKS, |_| "fun a -> ".into(), "0")), Ok(Outcome::Function));
+    }
+
+    // (A `let rec` under many `fun`s is quadratic in the number of open variables, which is
+    // unrelated to stack depth; the mixes here avoid that shape.)
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "scale test: cargo test --release")]
+    fn a_million_link_mixed_chains_run() {
+        let lets = chain(CHAIN_LINKS / 3, |_| "let x = 1 in let rec f = fun a -> a in let rec f = fun a -> a in ".into(), "f(x)");
+        assert_eq!(run_source(&lets), Ok(Outcome::Int(1)));
+        let funs = chain(CHAIN_LINKS / 2, |_| "let x = 1 in fun a -> ".into(), "0");
+        assert_eq!(run_source(&funs), Ok(Outcome::Function));
+    }
+
+    // A type nested a million deep (a `fun` chain's type) drops on the test thread's small stack.
+    #[test]
+    fn a_deeply_nested_type_drops_on_a_small_stack() {
+        use types::{EffectRow, Type};
+        let mut t = Type::Int;
+        for _ in 0..CHAIN_LINKS {
+            t = Type::Fun(Hc::new(Type::Int), EffectRow::pure(), Hc::new(t));
         }
+        drop(t);
     }
 
     // A value nested far deeper than any source is: built by a loop, converted to an

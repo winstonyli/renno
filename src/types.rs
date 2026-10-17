@@ -3,6 +3,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,7 +128,7 @@ pub trait Interned: Sized + 'static {
     fn exact_hash(&self, h: &mut FxHasher);
 }
 
-pub struct Hc<T: Interned>(Rc<HcBox<T>>);
+pub struct Hc<T: Interned>(ManuallyDrop<Rc<HcBox<T>>>);
 
 impl<T: Interned> Hc<T> {
     pub fn new(value: T) -> Hc<T> {
@@ -143,7 +144,7 @@ impl<T: Interned> Hc<T> {
                         if let Some(found) = weak.upgrade()
                             && found.value.exact_eq(&value)
                         {
-                            return Hc(found);
+                            return Hc(ManuallyDrop::new(found));
                         }
                     }
                     let node = Rc::new(HcBox { summary: value.summary(), value });
@@ -168,7 +169,7 @@ impl<T: Interned> Hc<T> {
                 table.entries = table.buckets.values().map(|b| 1 + b.more.len()).sum();
                 table.sweep_at = 2 * table.entries + 1024;
             }
-            Hc(node)
+            Hc(ManuallyDrop::new(node))
         })
     }
 
@@ -186,9 +187,22 @@ impl<T: Interned> Hc<T> {
     }
 }
 
+// A type's nodes own each other (a `Fun` its parameter and result), so a plain drop of a
+// deeply nested type recurses over the native stack: `fun a -> fun a -> ... 0` is as deep a
+// type as it has links. The last owner of a node drops it through `bounded_drop`.
+impl<T: Interned> Drop for Hc<T> {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is taken exactly once, here, and never used again.
+        let rc = unsafe { ManuallyDrop::take(&mut self.0) };
+        if Rc::strong_count(&rc) == 1 {
+            crate::util::bounded_drop(rc);
+        }
+    }
+}
+
 impl<T: Interned> Clone for Hc<T> {
     fn clone(&self) -> Hc<T> {
-        Hc(self.0.clone())
+        Hc(ManuallyDrop::new(Rc::clone(&self.0)))
     }
 }
 
