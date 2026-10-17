@@ -10,6 +10,12 @@ use crate::resolve::{group_kind, GroupKind, Resolved};
 use crate::span::Span;
 use crate::value::Value;
 use rpds::{HashTrieMap, HashTrieSet};
+
+// The scope and substitution maps, hashed with the crate's cheap hasher (their keys are short
+// names, hashed on every lookup; the default SipHash was ~11% of a generalized-let chain).
+type FxBuild = std::hash::BuildHasherDefault<crate::types::FxHasher>;
+type TrieMap<K, V> = HashTrieMap<K, V, archery::RcK, FxBuild>;
+type TrieSet<T> = HashTrieSet<T, archery::RcK, FxBuild>;
 use crate::types::{consistent, each_child, is_big, row_consistent, unfold, ById, EffectRow, Hc, Interned, NodeMemo, RecGroup, RecRef, RecVar, Rebuild, Summary, Type, Visited, FxMap, FxSet};
 use crate::util::find_field;
 mod relate;
@@ -171,10 +177,10 @@ fn index_names(vars: BTreeSet<TyVar>) -> BTreeSet<String> {
 #[derive(Clone)]
 pub(crate) struct Ctx {
     // Innermost binding of each name; a shadowed one is no longer reachable.
-    binds: HashTrieMap<String, Rc<Scheme>>,
+    binds: TrieMap<String, Rc<Scheme>>,
     // The annotation variables in scope, keyed by the row or index name as the user wrote it
     // (never a `TyVar::Type`): the fresh variable each denotes here (open_annotation).
-    annot: HashTrieMap<TyVar, AnnotVar>,
+    annot: TrieMap<TyVar, AnnotVar>,
     // How many `let` right-hand sides enclose this scope (U8b); `Ctx::empty()` is 0. A `let`
     // at level `d` quantifies the variables whose level is above `d` (InferCtx::levels).
     level: u32,
@@ -186,9 +192,9 @@ pub(crate) struct Ctx {
 // level is infinity. Persistent, so `unify_trial` snapshots it in O(1) like the substitution.
 #[derive(Clone, Default)]
 pub(crate) struct Levels {
-    ty: HashTrieMap<String, u32>,
-    row: HashTrieMap<String, u32>,
-    index: HashTrieMap<String, u32>,
+    ty: TrieMap<String, u32>,
+    row: TrieMap<String, u32>,
+    index: TrieMap<String, u32>,
 }
 
 impl Levels {
@@ -202,7 +208,7 @@ impl Levels {
     }
 
     // Lowers `map[name]` to `to`; true when it changed (absent counts as infinity).
-    fn lower(map: &mut HashTrieMap<String, u32>, name: &str, to: u32) -> bool {
+    fn lower(map: &mut TrieMap<String, u32>, name: &str, to: u32) -> bool {
         if map.get(name).is_some_and(|l| *l <= to) {
             return false;
         }
@@ -216,8 +222,8 @@ impl Levels {
 // unification binds a levelled variable to a type mentioning it). `skip` names variables left
 // alone (a scheme's own quantified ones, sealed).
 struct Lowerer<'a> {
-    subst: &'a HashTrieMap<String, Type>,
-    index_subst: &'a HashTrieMap<String, IndexExpr>,
+    subst: &'a TrieMap<String, Type>,
+    index_subst: &'a TrieMap<String, IndexExpr>,
     levels: &'a mut Levels,
     to: u32,
     skip: &'a [TyVar],
@@ -318,7 +324,7 @@ pub(crate) struct AnnotVar {
 
 impl Ctx {
     pub(crate) fn empty() -> Ctx {
-        Ctx { binds: HashTrieMap::new(), annot: HashTrieMap::new(), level: 0 }
+        Ctx { binds: TrieMap::default(), annot: TrieMap::default(), level: 0 }
     }
 
     // This scope one `let` right-hand side deeper.
@@ -581,7 +587,7 @@ pub(crate) struct InferCtx {
     // Grows monotonically as unify() binds variables; never shrinks --
     // no backtracking, matching this checker's existing single-pass
     // character everywhere else.
-    subst: HashTrieMap<String, Type>,
+    subst: TrieMap<String, Type>,
     // Grows monotonically exactly like `subst`, for the same reason --
     // no backtracking anywhere in this checker. A SEPARATE map from
     // `subst`: an index variable (IndexExpr::Var) and a type variable
@@ -589,7 +595,7 @@ pub(crate) struct InferCtx {
     // plain Strings -- conflating them would let an ordinary generic
     // function's own type-var name collide with an unrelated Vec's
     // own index-var name.
-    pub(crate) index_subst: HashTrieMap<String, IndexExpr>,
+    pub(crate) index_subst: TrieMap<String, IndexExpr>,
     // The level of every variable a scope has held (U8b), rolled back with the substitution by
     // unify_trial. Invariant: if a levelled variable is bound, everything its solution mentions
     // has a level at most its own (the match-arm hypotheses are the one exception).
@@ -630,7 +636,7 @@ pub(crate) struct InferCtx {
     // variable. Grows like `subst` and is snapshotted/restored with it by
     // unify_trial (a failed trial must not leak flags); propagated by
     // `lookup` and `unify`.
-    dyn_sunk: HashTrieSet<String>,
+    dyn_sunk: TrieSet<String>,
     // Every name some binder in the arena binds (check). A
     // name in an annotation that no binder has can only be a prelude name or
     // unbound, so annotation_type skips the scope walk for it: without this,
@@ -665,8 +671,8 @@ pub(crate) struct InferCtx {
 impl InferCtx {
     pub(crate) fn new() -> InferCtx {
         InferCtx {
-            subst: HashTrieMap::new(),
-            index_subst: HashTrieMap::new(),
+            subst: TrieMap::default(),
+            index_subst: TrieMap::default(),
             levels: Levels::default(),
             rigid_index: HashSet::new(),
             index_witness: Vec::new(),
@@ -674,7 +680,7 @@ impl InferCtx {
             pendings: RefCell::new(Vec::new()),
             resume_row: None,
             repeatable_depth: 0,
-            dyn_sunk: HashTrieSet::new(),
+            dyn_sunk: TrieSet::default(),
             bound_names: HashSet::new(),
             defs: Vec::new(),
             resolved: Resolved::default(),
