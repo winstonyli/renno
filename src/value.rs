@@ -210,6 +210,7 @@ pub enum Value {
     // Float).
     Float(f64),
     Bool(bool),
+    // A flat string or a view of a growable buffer that `++` extends in place; see text.rs.
     Str(Text),
     // What an `opaque` expression evaluates to -- a DISTINCT kind from
     // Int specifically so it can never be confused with (or forged as) a

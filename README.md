@@ -126,6 +126,8 @@ in map(fun x -> x * 2)([1, 2, 3])   -- [2, 4, 6]
 
 List cost: `x :: xs` is amortized O(1) and `h :: t` and the head and tail of a pattern are O(1), so a recursion over a list is linear; `a ++ b` writes the shorter side: O(|b|) when `b` is shorter and a claim succeeds, amortized O(1) for `acc ++ [x]` in a loop, and O(|a|) otherwise (O(1) when either side is empty; a snoc onto a cons-built or branched list copies once into a block with room); `get(xs)(i)` is O(1) on a list built in bulk (a literal, `range`, a builtin's result) and O(log n) on one built by consing (O(n) in the worst case, a list built by repeated branching, as for a cons list). The representation is a claim-list (`src/list.rs`). Memory is not always bounded by the old copy-per-tail behaviour: a list keeps alive every value consed (or snocced, at the block's low end) into a free slot of its block, even by a branch that was then discarded (a 10-million-element list consed onto a shared list and dropped stays reachable while any view of that block lives).
 
+String cost: `s ++ t` writes the shorter side into a growable byte buffer when the longer operand's edge is the buffer's frontier, so a builder loop (`s ++ "a"`, `"a" ++ s`, `acc ++ to_str(x)`, `h ++ sep ++ rest`) is amortized O(1) per step at either end; any other `++` copies once (O(|s| + |t|), with as much room again when it was at the frontier). Literals, `to_str` and `join` results are flat single allocations. A grown string keeps up to 2x of its buffer alive, and a view keeps the whole buffer alive. `len` is still O(n) (it counts chars). The representation is `src/text.rs`.
+
 ### Tuples and hand-rolled sum types
 
 ```
@@ -255,7 +257,8 @@ More complete examples for every feature above live in [`examples/`](examples/).
 - `env.rs` — `env::PRELUDE`, the single builtin table both `resolve.rs` (assigning `VarRef::Prelude` indices) and `machine.rs` (looking a builtin up by that index) read.
 - `value.rs` — runtime value representation.
 - `list.rs` — the list representation: a claim-list (a VList whose growth slots the first cons claims), with O(1) cons, head and tail, and amortized O(1) snoc, on the shared claim engine, and an O(1) bulk `get`.
-- `claimed.rs` — the claim engine: write-once storage whose written slots form one interval; a view at the frontier extends in place, any other view copies. Backs lists (and strings, Phase S).
+- `claimed.rs` — the claim engine: write-once storage whose written slots form one interval; a view at the frontier extends in place, any other view copies. Backs lists and strings.
+- `text.rs` — strings: `Text`, a flat `Rc<str>` or a view of a growable byte buffer (the second `Slots` storage, `ByteSlots`) that `++` extends through the claim engine; its `Deref` to `str` holds the crate's one `unsafe`, checked under Miri.
 - `span.rs` — source locations and the snippet-with-caret error rendering shared by every error path.
 
 `run_source` (`lib.rs`) runs the whole parse → typecheck → run pipeline on a dedicated large-stack worker thread, since the parser and type checker are ordinary native recursive descent (unlike the machine, which is trampolined).
