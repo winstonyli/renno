@@ -162,8 +162,52 @@ pub fn tokenize(src: &str) -> Result<Vec<(Token, Span)>, String> {
         let span = Span { start: span.start, end: span.end };
         match result {
             Ok(tok) => tokens.push((tok, span)),
-            Err(_) => return Err(span.format_error(src, "lex error")),
+            Err(_) => {
+                let bad = src[span.start..].chars().next().unwrap_or(' ');
+                let msg = if bad == '"' { "unterminated string literal".to_string() } else { format!("unexpected character `{bad}`") };
+                return Err(span.format_error(src, &msg));
+            }
         }
     }
     Ok(tokens)
+}
+
+impl Token {
+    // Source text of the fixed tokens the parser asks for by name (`expect`), for
+    // "expected `)`" messages. `fixed_token_text_lexes_back_to_its_token` keeps this
+    // table honest against the `#[token]` attributes above.
+    pub fn text(&self) -> &'static str {
+        match self {
+            Token::Arrow => "->",
+            Token::Comma => ",",
+            Token::Else => "else",
+            Token::Equals => "=",
+            Token::In => "in",
+            Token::LParen => "(",
+            Token::Pipe => "|",
+            Token::RBrace => "}",
+            Token::RBracket => "]",
+            Token::RParen => ")",
+            Token::Then => "then",
+            Token::With => "with",
+            _ => "a different token",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_token_text_lexes_back_to_its_token() {
+        for t in [
+            Token::Arrow, Token::Comma, Token::Else, Token::Equals, Token::In, Token::LParen,
+            Token::Pipe, Token::RBrace, Token::RBracket, Token::RParen, Token::Then, Token::With,
+        ] {
+            let lexed = tokenize(t.text()).unwrap();
+            assert_eq!(lexed.len(), 1);
+            assert_eq!(lexed[0].0, t);
+        }
+    }
 }

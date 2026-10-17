@@ -46,6 +46,10 @@ impl Span {
     // multi-line labels -- is exactly what annotate-snippets (rustc's own
     // choice) or ariadne already solve; a second hand-rolled span in one
     // message isn't worth reinventing that.
+    pub fn text<'a>(&self, src: &'a str) -> &'a str {
+        src.get(self.start..self.end).unwrap_or("")
+    }
+
     pub fn snippet(&self, src: &str) -> String {
         let (line_no, col) = self.line_col(src);
         let line_text = src.lines().nth(line_no - 1).unwrap_or("");

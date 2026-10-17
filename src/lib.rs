@@ -4846,11 +4846,28 @@ g(len)").unwrap_err();
     // `type` is no keyword (Stage D): it is an ordinary name, and the old
     // `type N = T in e` form is a plain trailing-tokens parse error.
     #[test]
+    fn syntax_errors_name_the_offending_source_text() {
+        let cases = [
+            ("1 < 2 < 3", "column 7: comparisons don't chain: parenthesize one side of `<`"),
+            ("1 + 2 )", "column 7: unexpected `)` after the expression"),
+            ("let x = 1 in x @", "column 16: unexpected character `@`"),
+            ("\"abc", "column 1: unterminated string literal"),
+            ("let = 1 in 2", "column 5: expected an identifier, found `=`"),
+            ("(1 + 2", "expected `)`, found end of input"),
+        ];
+        for (src, want) in cases {
+            let err = run_source(src).unwrap_err();
+            assert!(err.contains(want), "{src}: {err}");
+            assert!(!err.contains("Some(") && !err.contains("lex error"), "{src}: {err}");
+        }
+    }
+
+    #[test]
     fn type_is_an_ordinary_name() {
         assert_eq!(run_source("let type = 5 in type").unwrap().as_int(), 5);
         assert_eq!(run_source("let r = {type: 1} in r.type").unwrap().as_int(), 1);
         let err = run_source("type MyInt = Int in 1").unwrap_err();
-        assert!(err.starts_with("line 1, column 12: trailing tokens after expression"), "{err}");
+        assert!(err.starts_with("line 1, column 12: unexpected `=` after the expression"), "{err}");
         assert!(run_source("fun type -> type").is_ok());
     }
 

@@ -26,7 +26,7 @@ pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
     let root = p.expr()?;
     if p.pos != p.tokens.len() {
         let span = p.span_at();
-        return Err(p.err_at(span, format!("trailing tokens after expression: {:?}", &p.tokens[p.pos..])));
+        return Err(p.err_at(span, format!("unexpected `{}` after the expression", span.text(src))));
     }
     p.check_tree_depth(root)?;
     Ok((p.arena, p.expr_spans, root))
@@ -93,6 +93,14 @@ impl<'a> Parser<'a> {
             .get(self.pos.saturating_sub(1))
             .copied()
             .unwrap_or(Span { start: self.src.len(), end: self.src.len() })
+    }
+
+    // How an error names the token bump() just consumed: its source text, or the end of input.
+    fn found(&self, tok: &Option<Token>) -> String {
+        match tok {
+            Some(_) => format!("`{}`", self.span_before().text(self.src)),
+            None => "end of input".to_string(),
+        }
     }
 
     fn err_at(&self, span: Span, msg: String) -> String {
@@ -181,14 +189,14 @@ impl<'a> Parser<'a> {
     fn expect(&mut self, want: &Token) -> Result<(), String> {
         match self.bump() {
             Some(ref t) if t == want => Ok(()),
-            other => Err(self.err_at(self.span_before(), format!("expected {want:?}, found {other:?}"))),
+            other => Err(self.err_at(self.span_before(), format!("expected `{}`, found {}", want.text(), self.found(&other)))),
         }
     }
 
     fn ident(&mut self) -> Result<String, String> {
         match self.bump() {
             Some(Token::Ident(s)) => Ok(s),
-            other => Err(self.err_at(self.span_before(), format!("expected identifier, found {other:?}"))),
+            other => Err(self.err_at(self.span_before(), format!("expected an identifier, found {}", self.found(&other)))),
         }
     }
 
@@ -474,7 +482,7 @@ impl<'a> Parser<'a> {
                 let span = Span { start, end: self.span_before().end };
                 Ok(self.push_spanned(Expr::Int(n), span))
             }
-            other => Err(self.err_at(self.span_before(), format!("expected a type, found {other:?}"))),
+            other => Err(self.err_at(self.span_before(), format!("expected a type, found {}", self.found(&other)))),
         }
     }
 
@@ -560,7 +568,7 @@ impl<'a> Parser<'a> {
                 self.expect(&Token::RParen)?;
                 Ok(inner)
             }
-            other => Err(self.err_at(self.span_before(), format!("expected an index expression, found {other:?}"))),
+            other => Err(self.err_at(self.span_before(), format!("expected an index expression, found {}", self.found(&other)))),
         }
     }
 
@@ -700,7 +708,7 @@ impl<'a> Parser<'a> {
                 self.expect(&Token::RBracket)?;
                 Ok(Pattern::List(items))
             }
-            other => Err(self.err_at(self.span_before(), format!("expected a pattern, found {other:?}"))),
+            other => Err(self.err_at(self.span_before(), format!("expected a pattern, found {}", self.found(&other)))),
         }
     }
 
@@ -758,6 +766,10 @@ impl<'a> Parser<'a> {
             Some(tok) => {
                 self.bump();
                 let rhs = self.cons()?;
+                if matches!(self.peek(), Some(Token::EqEq | Token::Lt | Token::Gt | Token::LtEq | Token::GtEq | Token::BangEq)) {
+                    let at = self.span_at();
+                    return Err(self.err_at(at, format!("comparisons don't chain: parenthesize one side of `{}`", at.text(self.src))));
+                }
                 let span = Span { start, end: self.span_before().end };
                 // Only `==`/`<` are real BinOps -- `>`/`<=`/`>=`/`!=` are
                 // sugar over them (flipped operands, or negated), same
