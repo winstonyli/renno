@@ -3126,6 +3126,24 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn identical_closed_types_fit_without_a_walk() {
+        // `let x_i: T_i = []` fits a list type of depth i; the same node on both sides must
+        // not cost its depth (U8 q2: quadratic before the reflexive shortcut in fits_in).
+        let walks = |n: usize| {
+            let mut src = String::from("let T0 = Int in ");
+            for i in 1..=n {
+                src.push_str(&format!("let T{i} = List(T{}) in let x{i}: T{i} = [] in ", i - 1));
+            }
+            src.push('0');
+            typecheck::FITS_WALKS.with(|c| c.set(0));
+            assert_eq!(run_source_on_this_thread(&src).expect("runs").as_int(), 0);
+            typecheck::FITS_WALKS.with(|c| c.get())
+        };
+        let (small, large) = (walks(100), walks(400));
+        assert!(large < small * 6, "walks grew from {small} to {large} for 4x the lets");
+    }
+
+    #[test]
     fn a_partial_builtin_called_once_hands_over_its_args_without_cloning() {
         let shared = |src: &str, want: i64| {
             machine::PARTIAL_SHARED.with(|c| c.set(0));

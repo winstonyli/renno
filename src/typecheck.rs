@@ -247,8 +247,28 @@ impl Ctx {
         Ctx { binds: self.binds.insert(name.to_string(), Rc::new(scheme)), open, annot: self.annot.clone() }
     }
 
+    #[cfg(test)]
     pub(crate) fn open_vars(&self, infer: &InferCtx) -> BTreeSet<TyVar> {
         self.open.iter().flat_map(|v| reopen(v, infer)).collect()
+    }
+
+    // The members of `candidates` that are open: open_vars(infer) restricted to them, without
+    // building the whole set (a context with many open variables is walked once per `let`).
+    fn open_among(&self, candidates: &BTreeSet<TyVar>, infer: &InferCtx) -> BTreeSet<TyVar> {
+        let mut found = BTreeSet::new();
+        for v in self.open.iter() {
+            if let TyVar::Type(name) = v
+                && let Type::Var(n) = infer.resolve_deep(&Type::Var(name.clone()))
+            {
+                let r = TyVar::Type(n);
+                if candidates.contains(&r) {
+                    found.insert(r);
+                }
+                continue;
+            }
+            found.extend(reopen(v, infer).into_iter().filter(|r| candidates.contains(r)));
+        }
+        found
     }
 }
 
@@ -978,6 +998,11 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
 fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
     let required = infer.resolve(required);
     let actual = infer.resolve(actual);
+    // The same interned node on both sides, with nothing in it to bind or rescue: it fits
+    // itself, and walking it would cost its depth.
+    if !required.summary().any(Summary::VAR | Summary::ROWVAR | Summary::INDEXED | Summary::FREE | Summary::REC) && required.exact_eq(&actual) {
+        return Ok(());
+    }
     let key = (is_big(&required) || is_big(&actual)).then(|| (ById(required.clone()), ById(actual.clone())));
     if key.as_ref().is_some_and(|k| done.contains(k)) {
         return Ok(());
@@ -987,7 +1012,15 @@ fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, don
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    // How many pairs fits_resolved walked.
+    pub(crate) static FITS_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
+    #[cfg(test)]
+    FITS_WALKS.with(|c| c.set(c.get() + 1));
     let mismatch = || Mismatch::Expected { expected: required.clone(), found: actual.clone(), span };
     match (required, actual) {
         (Type::Fun(req_param, req_row, req_ret), Type::Fun(act_param, act_row, act_ret)) => {
@@ -1256,7 +1289,7 @@ fn generalizable(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<TyVar> {
     if candidates.is_empty() {
         return Vec::new();
     }
-    let mut open = ctx.open_vars(infer);
+    let mut open = ctx.open_among(&candidates, infer);
     if candidates.iter().any(|v| matches!(v, TyVar::Index(_))) {
         open.extend(pending_obligation_vars(infer).into_iter().map(TyVar::Index));
     }
