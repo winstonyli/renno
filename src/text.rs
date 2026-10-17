@@ -43,15 +43,22 @@ fn count_claim(bytes: usize) {
     BYTES.with(|c| c.set(c.get() + bytes));
 }
 
+// The representation is private: safe code outside this module cannot build a `Grow` with an
+// arbitrary range, which is what makes the SAFETY argument in `Deref` hold for all safe code.
+// Rc makes Text !Send and !Sync (pinned by a test below).
 #[derive(Clone)]
-pub enum Text {
+pub struct Text(Repr);
+
+#[derive(Clone)]
+enum Repr {
     Flat(Rc<str>),
     Grow { buf: Rc<Claimed<ByteSlots>>, lo: usize, hi: usize },
 }
 
 // A `Cell<u8>` cannot tell an unwritten byte from a written 0, so unlike list slots this
-// storage keeps its written interval explicitly. Only these methods write `bytes`.
-pub struct ByteSlots {
+// storage keeps its written interval explicitly. Only these methods write `bytes`. The type
+// is private, so nothing outside this module can call them.
+struct ByteSlots {
     bytes: Box<[Cell<u8>]>,
     lo: Cell<usize>,
     hi: Cell<usize>,
@@ -109,14 +116,14 @@ impl Text {
         let back = self.len() >= b.len();
         let (side, longer) = if back { (Side::High, self) } else { (Side::Low, b) };
         let mut grow = false;
-        if let Text::Grow { buf, lo, hi } = longer {
+        if let Repr::Grow { buf, lo, hi } = &longer.0 {
             let (lo, hi) = (*lo, *hi);
             let claimed = if back { buf.claim(side, hi, b.bytes()) } else { buf.claim(side, lo, self.bytes().rev()) };
             if claimed {
                 let n = if back { b.len() } else { self.len() };
                 count_claim(n);
                 let (lo, hi) = if back { (lo, hi + n) } else { (lo - n, hi) };
-                return Text::Grow { buf: buf.clone(), lo, hi };
+                return Text(Repr::Grow { buf: buf.clone(), lo, hi });
             }
             grow = buf.should_grow(side, if back { hi } else { lo });
         }
@@ -126,7 +133,7 @@ impl Text {
         count_new(n);
         let buf = Claimed::<ByteSlots>::copy(side, n, self.bytes().chain(b.bytes()), grow);
         let lo = buf.slots.lo.get();
-        Text::Grow { buf: Rc::new(buf), lo, hi: lo + n }
+        Text(Repr::Grow { buf: Rc::new(buf), lo, hi: lo + n })
     }
 }
 
@@ -134,9 +141,9 @@ impl Deref for Text {
     type Target = str;
 
     fn deref(&self) -> &str {
-        match self {
-            Text::Flat(s) => s,
-            Text::Grow { buf, lo, hi } => {
+        match &self.0 {
+            Repr::Flat(s) => s,
+            Repr::Grow { buf, lo, hi } => {
                 let cells = &buf.slots.bytes[*lo..*hi];
                 // SAFETY: (1) Cell<u8> is repr(transparent) over u8. (2) Nothing writes these
                 // bytes while the borrow lives: `ByteSlots::write` and `with_room` write a byte
@@ -170,14 +177,14 @@ impl PartialEq for Text {
 impl From<&str> for Text {
     fn from(s: &str) -> Text {
         count_new(s.len());
-        Text::Flat(Rc::from(s))
+        Text(Repr::Flat(Rc::from(s)))
     }
 }
 
 impl From<String> for Text {
     fn from(s: String) -> Text {
         count_new(s.len());
-        Text::Flat(Rc::from(s))
+        Text(Repr::Flat(Rc::from(s)))
     }
 }
 
@@ -190,17 +197,28 @@ mod tests {
     }
 
     fn buf_of(x: &Text) -> Option<*const Claimed<ByteSlots>> {
-        match x {
-            Text::Grow { buf, .. } => Some(Rc::as_ptr(buf)),
-            Text::Flat(_) => None,
+        match &x.0 {
+            Repr::Grow { buf, .. } => Some(Rc::as_ptr(buf)),
+            Repr::Flat(_) => None,
         }
     }
 
     fn cap(x: &Text) -> usize {
-        match x {
-            Text::Grow { buf, .. } => buf.slots.bytes.len(),
-            Text::Flat(s) => s.len(),
+        match &x.0 {
+            Repr::Grow { buf, .. } => buf.slots.bytes.len(),
+            Repr::Flat(s) => s.len(),
         }
+    }
+
+    // Compile-time check that Text is !Send: if it were Send, `f` would be ambiguous.
+    #[test]
+    fn text_is_not_send() {
+        trait AmbiguousIfSend<A> {
+            fn f() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+        <Text as AmbiguousIfSend<_>>::f();
     }
 
     // The engine's generic model test (T-L1), run for the byte storage: the claim, branch,
