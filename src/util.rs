@@ -36,15 +36,32 @@ pub fn bounded_drop<T: 'static>(value: T) {
         let _ = DROP_QUEUE.try_with(|q| q.borrow_mut().push(Box::new(value)));
         return;
     }
-    DROP_NEST.with(|n| n.set(nest + 1));
-    drop(value);
-    DROP_NEST.with(|n| n.set(nest));
+    {
+        let _restore = Nested::enter(nest);
+        drop(value);
+    }
     if nest == 0 {
         while let Some(item) = DROP_QUEUE.with(|q| q.borrow_mut().pop()) {
-            DROP_NEST.with(|n| n.set(1));
+            let _restore = Nested::enter(0);
             drop(item);
-            DROP_NEST.with(|n| n.set(0));
         }
+    }
+}
+
+// Sets the nesting to `outer + 1` and puts `outer` back when dropped, also on unwind: a
+// panicking drop must not leave the counter raised, or later drops would all queue.
+struct Nested(usize);
+
+impl Nested {
+    fn enter(outer: usize) -> Nested {
+        DROP_NEST.with(|n| n.set(outer + 1));
+        Nested(outer)
+    }
+}
+
+impl Drop for Nested {
+    fn drop(&mut self) {
+        let _ = DROP_NEST.try_with(|n| n.set(self.0));
     }
 }
 
@@ -69,4 +86,58 @@ pub fn quiet_run_errors() {
             default(info);
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A chain whose every link drops its successor through bounded_drop; the last one may panic.
+    struct Link {
+        next: Option<Box<Link>>,
+        panics: bool,
+    }
+
+    impl Drop for Link {
+        fn drop(&mut self) {
+            if let Some(next) = self.next.take() {
+                bounded_drop(next);
+            }
+            if self.panics && !std::thread::panicking() {
+                panic!("a panicking drop");
+            }
+        }
+    }
+
+    fn chain(len: usize, panics: bool) -> Link {
+        let mut head = Link { next: None, panics };
+        for _ in 0..len {
+            head = Link { next: Some(Box::new(head)), panics: false };
+        }
+        head
+    }
+
+    fn nest() -> usize {
+        DROP_NEST.with(|n| n.get())
+    }
+
+    // The default test-thread stack (~2 MiB) would overflow on a plain recursive drop here.
+    #[test]
+    fn a_long_chain_drops_on_a_small_stack_and_leaves_the_counter_at_zero() {
+        drop(chain(1_000_000, false));
+        assert_eq!(nest(), 0);
+    }
+
+    #[test]
+    fn a_panicking_drop_restores_the_counter_and_the_queue_stays_drainable() {
+        for len in [0, 10, 1000] {
+            let link = chain(len, true);
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bounded_drop(link))).is_err(), "len {len}");
+            assert_eq!(nest(), 0, "len {len}");
+            // Whatever the panic left queued is dropped by the next outermost drop.
+            drop(chain(1_000_000, false));
+            assert_eq!(nest(), 0);
+            assert!(DROP_QUEUE.with(|q| q.borrow().is_empty()), "len {len}");
+        }
+    }
 }

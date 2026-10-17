@@ -11590,7 +11590,8 @@ g(len)").unwrap_err();
         assert_eq!(run_source(&chain(CHAIN_LINKS, |_| "let x = 1 in ".into(), "x")), Ok(Outcome::Int(1)));
     }
 
-    // The rest take 40-130 s each unoptimized, so they run in release (`cargo test --release`);
+    // The rest are slow unoptimized (measured: the distinct chain 42 s, the two let rec chains
+    // together 130 s; the mixed test not timed), so they run in release (`cargo test --release`);
     // the rebinding and fun chains above and below are the two that overflowed.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "scale test: cargo test --release")]

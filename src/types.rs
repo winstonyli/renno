@@ -3,7 +3,6 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,26 +79,26 @@ impl Summary {
     }
 }
 
-pub struct HcBox<T> {
+pub struct HcBox<T: Interned> {
     summary: Summary,
     value: T,
 }
 
 // The table of live nodes of one payload type: buckets by exact hash, holding weak
 // references so a node dies with its last user. Swept when it has doubled since the last sweep.
-pub struct Table<T> {
+pub struct Table<T: Interned> {
     buckets: HashMap<u64, Bucket<T>, BuildHasherDefault<KeyHasher>>,
     entries: usize,
     sweep_at: usize,
 }
 
 // The nodes sharing one hash: almost always a single one.
-struct Bucket<T> {
+struct Bucket<T: Interned> {
     first: Weak<HcBox<T>>,
     more: Vec<Weak<HcBox<T>>>,
 }
 
-impl<T> Default for Table<T> {
+impl<T: Interned> Default for Table<T> {
     fn default() -> Table<T> {
         Table { buckets: HashMap::default(), entries: 0, sweep_at: 1024 }
     }
@@ -121,14 +120,14 @@ impl Hasher for KeyHasher {
     }
 }
 
-pub trait Interned: Sized + 'static {
+pub trait Interned: Sized + Default + 'static {
     fn table() -> &'static LocalKey<RefCell<Table<Self>>>;
     fn summary(&self) -> Summary;
     fn exact_eq(&self, other: &Self) -> bool;
     fn exact_hash(&self, h: &mut FxHasher);
 }
 
-pub struct Hc<T: Interned>(ManuallyDrop<Rc<HcBox<T>>>);
+pub struct Hc<T: Interned>(Rc<HcBox<T>>);
 
 impl<T: Interned> Hc<T> {
     pub fn new(value: T) -> Hc<T> {
@@ -144,7 +143,7 @@ impl<T: Interned> Hc<T> {
                         if let Some(found) = weak.upgrade()
                             && found.value.exact_eq(&value)
                         {
-                            return Hc(ManuallyDrop::new(found));
+                            return Hc(found);
                         }
                     }
                     let node = Rc::new(HcBox { summary: value.summary(), value });
@@ -169,7 +168,7 @@ impl<T: Interned> Hc<T> {
                 table.entries = table.buckets.values().map(|b| 1 + b.more.len()).sum();
                 table.sweep_at = 2 * table.entries + 1024;
             }
-            Hc(ManuallyDrop::new(node))
+            Hc(node)
         })
     }
 
@@ -189,20 +188,17 @@ impl<T: Interned> Hc<T> {
 
 // A type's nodes own each other (a `Fun` its parameter and result), so a plain drop of a
 // deeply nested type recurses over the native stack: `fun a -> fun a -> ... 0` is as deep a
-// type as it has links. The last owner of a node drops it through `bounded_drop`.
-impl<T: Interned> Drop for Hc<T> {
+// type as it has links. A node's payload is dropped through `bounded_drop` (the `Default`
+// left behind owns nothing).
+impl<T: Interned> Drop for HcBox<T> {
     fn drop(&mut self) {
-        // SAFETY: `self.0` is taken exactly once, here, and never used again.
-        let rc = unsafe { ManuallyDrop::take(&mut self.0) };
-        if Rc::strong_count(&rc) == 1 {
-            crate::util::bounded_drop(rc);
-        }
+        crate::util::bounded_drop(std::mem::take(&mut self.value));
     }
 }
 
 impl<T: Interned> Clone for Hc<T> {
     fn clone(&self) -> Hc<T> {
-        Hc(ManuallyDrop::new(Rc::clone(&self.0)))
+        Hc(self.0.clone())
     }
 }
 
@@ -379,9 +375,11 @@ impl Interned for Vec<(String, Type)> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+// `Default` is what a dropped node's payload is replaced with (HcBox::drop); never read.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Type {
     Dyn,
+    #[default]
     Int,
     // A second, DISTINCT numeric type from Int -- not generally consistent
     // with it (types::consistent has no Int<->Float arm; a [Float]-
