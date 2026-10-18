@@ -14,7 +14,7 @@ renno is a language-design and implementation study, not a production language. 
 
 - **Algebraic effects**: `perform`/`handle`, first-class handler values, deep and shallow semantics, and genuine multi-shot resumption (a captured continuation can be resumed zero, one, or many times).
 - **Gradual typing**: every position is `Dyn` unless annotated. Annotated code is checked statically and pays no runtime cost; annotated boundaries crossed by an unannotated (`Dyn`) value get a runtime check inserted automatically.
-- **Closed and row-polymorphic effect typing**: `check()` statically rejects a program if it can prove an effect is never handled. Row-polymorphic function types (`(Dyn ->{e} Dyn)`) let effect-safety survive through higher-order calls.
+- **Row-polymorphic effect typing**: `check()` statically rejects a program if it can prove an effect is never handled. Row variables are inferred and unified; unannotated higher-order functions are effect-polymorphic; a lambda's row is open; a signature's `->{e}` is rigid.
 - **`let rec` and mutual recursion**: `let rec f = ... and g = ... in ...` — any function in the group can call any sibling (including itself) by name.
 - **Pattern matching**: literals, lists (`[]`, `[a, b]`, `h :: t`), tuples, and records, with static exhaustiveness and reachability checking wherever those are cheaply provable.
 - **Tuples**: `(a, b, c)` — a fixed-arity, per-position-typed product, distinct from a variable-length `List`. Desugars to a plain list at runtime (no new value representation), typed `Type::Tuple` for real positional structural comparison. `(p, q)` also works as a pattern, sugar for `[p, q]`.
