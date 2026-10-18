@@ -16,7 +16,7 @@ use rpds::{HashTrieMap, HashTrieSet};
 type FxBuild = std::hash::BuildHasherDefault<crate::types::FxHasher>;
 type TrieMap<K, V> = HashTrieMap<K, V, archery::RcK, FxBuild>;
 type TrieSet<T> = HashTrieSet<T, archery::RcK, FxBuild>;
-use crate::types::{consistent, each_child, is_big, row_consistent, surface_name, unfold, ById, Row, Hc, Interned, NodeMemo, RecGroup, RecRef, RecVar, Rebuild, Summary, Tail, Type, Visited, FxMap, FxSet};
+use crate::types::{consistent, each_child, is_big, surface_name, OPENED_ROW, unfold, ById, Row, Hc, Interned, NodeMemo, RecGroup, RecRef, RecVar, Rebuild, Summary, Tail, Type, Visited, FxMap, FxSet};
 use crate::util::find_field;
 mod relate;
 use self::relate::{relate, relate_cast};
@@ -386,6 +386,8 @@ impl Ctx {
     }
 
     fn bind(&self, name: &str, scheme: Scheme, infer: &mut InferCtx) -> Ctx {
+        #[cfg(debug_assertions)]
+        assert_no_closed_arrow_row(&scheme.ty);
         Lowerer::new(infer, self.level, &scheme.quantified).ty(&scheme.ty);
         self.bind_lowered(name, scheme)
     }
@@ -796,7 +798,7 @@ impl InferCtx {
     // either an unbound variable or a concrete shape, but NOT recursing
     // into a Fun/List/Tuple/Record's own NESTED positions. This is what
     // `unify`'s own structural recursion needs internally at each level
-    // (mirroring how little `subst_type`/`resolve_row` already resolve
+    // (mirroring how little `subst_type` already resolves
     // at a time) -- it is NOT enough on its own to hand back a complete,
     // fully-substituted result type to some OTHER caller; see
     // `resolve_deep` for that.
@@ -881,8 +883,15 @@ impl InferCtx {
         Row::new(row.labels().map(String::from).chain(extra).collect(), tail.clone())
     }
 
+    // A fresh instance of quantified row variable `v` (lookup): same base and rank, no level.
+    fn instance_row(&mut self, v: &str) -> Row {
+        let rank = self.levels.rank(v);
+        Row::var(self.fresh_row(rank, v, None))
+    }
+
     // Binds row variable `name` (unbound) to `row`, lowering what `row` mentions to `name`'s level.
     fn bind_row(&mut self, name: &str, row: Row) {
+        debug_assert!(!self.row_subst.contains_key(name), "row variable {name} is already bound");
         if let Some(l) = self.levels.row.get(name).copied() {
             Lowerer::new(self, l, &[]).row_value(&row);
         }
@@ -1229,6 +1238,10 @@ pub(crate) fn union_rows(a: &Row, b: &Row, infer: &mut InferCtx, span: Span) -> 
                         span,
                     ));
                 }
+                // One rigid, one flexible: the flexible tail binds to the rigid one without
+                // checking the flexible side's extra labels (spec 3.1 ruling; unlike row_plan,
+                // which would refuse a rigid tail that has to absorb them). The union's own
+                // labels carry them, so nothing is lost.
                 (true, false) => (x.clone(), y.clone()),
                 (false, true) => (y.clone(), x.clone()),
                 (false, false) => {
@@ -1241,6 +1254,12 @@ pub(crate) fn union_rows(a: &Row, b: &Row, infer: &mut InferCtx, span: Span) -> 
         }
     };
     Ok(Row::new(labels(), tail))
+}
+
+// A row mismatch between two function types, printed with their rows resolved. Built only on
+// the failing path; a success never resolves anything.
+fn row_mismatch(expected: &Type, found: &Type, infer: &InferCtx, span: Span) -> Mismatch {
+    Mismatch::Expected { expected: infer.resolve_deep(expected), found: infer.resolve_deep(found), span }
 }
 
 fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
@@ -1284,13 +1303,10 @@ fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: 
             unify_in(wa, wb, infer, span, done)?;
             Ok(unify_index(ia, ib, infer, span)?)
         }
-        (Type::Fun(p1, _r1, ret1), Type::Fun(p2, _r2, ret2)) => {
+        (Type::Fun(p1, r1, ret1), Type::Fun(p2, r2, ret2)) => {
             unify_in(p1, p2, infer, span, done)?;
-            unify_in(ret1, ret2, infer, span, done)
-            // Row unification is out of scope here -- effect rows already
-            // have their own, separate, unrelated generalize/instantiate
-            // mechanism (bind_row_vars/resolve_row), untouched by this
-            // plan; two Fun types unify on their param/return shape only.
+            unify_in(ret1, ret2, infer, span, done)?;
+            if unify_rows(r1, r2, infer) { Ok(()) } else { Err(row_mismatch(t2, t1, infer, span)) }
         }
         (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
             a.iter().zip(b.iter()).try_for_each(|(x, y)| unify_in(x, y, infer, span, done))
@@ -1315,17 +1331,18 @@ fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: 
 // for every case that isn't specifically Fun or Record. That delegation
 // first tries unify_trial (binds Type::Vars on success, leaves no trace
 // on failure); if that trial fails, the pair is still accepted unless
-// relate() refutes it -- unify_fits must never be stricter than
-// coerce_check, since it runs right after coerce() as a pure add-on
-// (binding Vars), not a second gate. See the catch-all below.
+// relate() refutes it -- unify_fits is never stricter than coerce_check
+// except at a Fun's effect row, which it binds exactly and does not rescue
+// (spec 2.3, stage 1 (iv)): such a failure is a real type error reported
+// after the gate. See the catch-all below.
 fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
     fits_in(required, actual, infer, span, &mut FxSet::default())
 }
 
 // `done` holds the big pairs this call has already accepted, relate rescue included. That is
-// safe under the contract above (never stricter than coerce_check): a remembered acceptance
-// cannot add strictness, and every caller propagates an error with `?`, so a failure ends the
-// call.
+// safe: a remembered acceptance cannot add strictness (rows it bound stay equal, a rescue is
+// only for pairs outside a Fun's row), and every caller propagates an error with `?`, so a
+// failure ends the call.
 fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
     let required = infer.resolve(required);
     let actual = infer.resolve(actual);
@@ -1369,10 +1386,8 @@ fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Spa
         (Type::Fun(req_param, req_row, req_ret), Type::Fun(act_param, act_row, act_ret)) => {
             fits_in(act_param, req_param, infer, span, done)?;
             fits_in(req_ret, act_ret, infer, span, done)?;
-            if !row_consistent(req_row, act_row) {
-                return Err(mismatch());
-            }
-            Ok(())
+            // Rows are bound, not rescued (spec 2.3): this arm may be stricter than coerce_check.
+            if unify_rows(req_row, act_row, infer) { Ok(()) } else { Err(row_mismatch(required, actual, infer, span)) }
         }
         (Type::Record(req_fields), Type::Record(act_fields)) => {
             for (name, req_ty) in req_fields.iter() {
@@ -1517,8 +1532,7 @@ pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
             let row_vars = names(|v| if let TyVar::Row(n) = v { Some(n) } else { None });
             let type_vars = names(|v| if let TyVar::Type(n) = v { Some(n) } else { None });
             let index_vars = names(|v| if let TyVar::Index(n) = v { Some(n) } else { None });
-            let row_subst: HashMap<String, Row> =
-                row_vars.iter().map(|v| (v.clone(), Row::var(fresh_row_name(v)))).collect();
+            let row_subst: HashMap<String, Row> = row_vars.iter().map(|v| (v.clone(), infer.instance_row(v))).collect();
             let type_subst: HashMap<String, Type> =
                 type_vars.iter().map(|v| (v.clone(), infer.fresh_var(v))).collect();
             // An instance of a quantified variable that reaches a Dyn sink
@@ -1600,6 +1614,8 @@ pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type, infer: &mut InferCtx) -> C
 // `def` is the binder's definition, which an annotation naming it evaluates.
 pub(crate) fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &mut InferCtx, def: Option<Rc<CheckDef>>) -> Ctx {
     let ty = infer.resolve_deep(&ty);
+    #[cfg(debug_assertions)]
+    assert_no_closed_arrow_row(&ty);
     let quantified = generalizable(ctx, &ty, infer);
     ctx.bind_lowered(name, Scheme { quantified, ty, def })
 }
@@ -1678,32 +1694,6 @@ fn fresh_index_name(base: &str) -> String {
     format!("{base}#{n}")
 }
 
-fn resolve_row(row: &Row, subst: &HashMap<String, Row>) -> Row {
-    match &row.tail {
-        Tail::Var(name) => subst.get(name).cloned().unwrap_or_else(|| row.clone()),
-        _ => row.clone(),
-    }
-}
-
-// Recurses into every Type variant vars_in also recurses into
-// (Fun/List/Tuple/Union/Record), so a row variable this function finds
-// reachable is also one this function can rename -- the two are meant to
-// stay in lockstep, since a variable extend_generalized captured (via
-// vars_in) but subst_type then failed to touch would keep its
-// literal original name at every instantiation instead of getting a
-// fresh one per reference, silently breaking per-reference row
-// polymorphism for whatever's inside that untouched variant.
-//
-// The Union and Record arms are UNVERIFIED by any test: no renno program
-// was found where a shared-vs-fresh row-var name inside a Union or
-// Record actually changes typecheck's verdict or runtime behavior --
-// row_consistent treats any Tail::Var as consistent with anything
-// regardless of name, and the only way to get a callable Fun back out of
-// a Union/Record is by pattern-matching it, which types the result Dyn
-// regardless of what precision subst_type preserved going in. Kept
-// anyway, on the same "recurse everywhere vars_in does" principle
-// the Fun/List/Tuple arms already establish -- correct by construction,
-// not by a failing case this fixed.
 // Index-expression analog of subst_type's own Type::Var arm -- renames a
 // bare IndexExpr::Var per index_subst (built fresh per lookup() call, one
 // entry per generalized index variable), leaving Lit and any variable not
@@ -1753,7 +1743,7 @@ impl Rebuild for SubstType<'_> {
                 Some(Some(Type::Indexed(wrapped2.map_or_else(|| wrapped.clone(), Hc::new), Rc::new(index2))))
             }
             Type::Fun(param, row, ret) => {
-                let (param2, row2, ret2) = (self.walk(param), resolve_row(row, self.row_subst), self.walk(ret));
+                let (param2, row2, ret2) = (self.walk(param), rename_row(row, self.row_subst), self.walk(ret));
                 if param2.is_none() && ret2.is_none() && row2 == *row {
                     return Some(None);
                 }
@@ -1764,31 +1754,15 @@ impl Rebuild for SubstType<'_> {
     }
 }
 
-// Where a row variable actually gets bound to something concrete: `param`
-// is the callee's OWN declared parameter type (e.g. `(Dyn ->{e} Dyn)`),
-// `arg` is the actual argument's inferred type at this call site (e.g.
-// `(Dyn -> Dyn)` with a Closed({choose}) row, from an ordinary unannotated
-// closure). Every row variable found in `param`'s structure whose matching
-// position in `arg` is concrete gets bound in `subst`; the caller applies
-// that substitution to the call's return type (and its own row) so the
-// variable's meaning flows out of this one application.
-fn bind_row_vars(param: &Type, arg: &Type, subst: &mut HashMap<String, Row>) {
-    // Binding is first-wins, so a pair already walked adds nothing.
-    fn go(param: &Type, arg: &Type, subst: &mut HashMap<String, Row>, seen: &mut FxSet<(ById, ById)>) {
-        if !param.summary().any(Summary::ROWVAR) || (is_big(param) && !seen.insert((ById(param.clone()), ById(arg.clone())))) {
-            return;
-        }
-        if let (Type::Fun(p1, r1, p2), Type::Fun(a1, r2, a2)) = (param, arg) {
-            if let Tail::Var(name) = &r1.tail {
-                if !matches!(r2.tail, Tail::Var(_)) {
-                    subst.entry(name.clone()).or_insert_with(|| r2.clone());
-                }
-            }
-            go(p1, a1, subst, seen);
-            go(p2, a2, subst, seen);
-        }
+// `row` with its variable tail replaced per `map` (the replacement's labels join `row`'s).
+fn rename_row(row: &Row, map: &HashMap<String, Row>) -> Row {
+    match &row.tail {
+        Tail::Var(name) => match map.get(name) {
+            Some(r) => Row::new(row.labels().chain(r.labels()).map(String::from).collect(), r.tail.clone()),
+            None => row.clone(),
+        },
+        _ => row.clone(),
     }
-    go(param, arg, subst, &mut FxSet::default());
 }
 
 // "must be callable" -- the shape used wherever we need to check a value is
@@ -4505,6 +4479,41 @@ fn type_lit(arena: &mut Arena, ty: Type) -> ExprRef {
     arena.push(Expr::TypeLit(Rc::new(ty)))
 }
 
+// D10 (spec 3.1): the row of a function type the checker builds from an expression row. A
+// closed row (a pure or concretely-performing body) gets a fresh opened tail held at `level`:
+// an arrow row is an upper bound, so `A ->{R} B` is usable where `A ->{R, X} B` is expected.
+// Every Type::Fun built from an expression row goes through here (the only two such sites are
+// the Fun frame and MakeHandler's `resume`), so no checker-built arrow row is ever closed.
+// Annotation rows never reach here closed: a written arrow is `Dyn` (bare `->`) or `Var` (`->{e}`)
+// (machine.rs:1714-1719; `->{}` does not parse, parser.rs:600-609), and `any_fun` and D2's shape
+// are `Dyn`/`Var`. So no `Type::Fun` in a context type or the root type has a closed row, which
+// the debug assertion below checks.
+fn arrow_row(row: Row, level: u32, infer: &mut InferCtx) -> Row {
+    if row.tail != Tail::Closed {
+        return row;
+    }
+    let tail = infer.fresh_row(RowRank::Opened, OPENED_ROW, Some(level));
+    Row::new(row.labels().map(String::from).collect(), Tail::Var(tail))
+}
+
+// Debug-only D10 check: no `Fun` in a type the checker stores has a closed row.
+#[cfg(debug_assertions)]
+fn assert_no_closed_arrow_row(t: &Type) {
+    // A shared big node is walked once (DAG-shaped types from types-as-values); an explicit
+    // stack, since a type can be a million links deep.
+    let mut seen = Visited::new();
+    let mut todo = vec![t.clone()];
+    while let Some(t) = todo.pop() {
+        if !seen.first(&t) {
+            continue;
+        }
+        if let Type::Fun(_, row, _) = &t {
+            debug_assert!(row.tail != Tail::Closed, "closed arrow row {row} reached a stored type: build it through arrow_row");
+        }
+        each_child(&t, &mut |c| todo.push(c.clone()));
+    }
+}
+
 fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx, mode: Mode) -> Result<(Type, Row, ExprRef), TypeError> {
     // Peels off a run of leading `let`/`fun` prefixes iteratively -- a
     // match per iteration, not a recursive call -- so a long chain of
@@ -4910,7 +4919,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             PendingElab::Let { var, bound_ty, val_row, val, def } => {
                 // Matches the original Let arm: body's type propagates
                 // through unchanged, row is the union of val's and body's.
-                result_row = Row::union(&val_row, &result_row);
+                result_row = union_rows(&val_row, &result_row, infer, spans[expr])?;
                 // A type let only annotations read is dead at run time
                 // (settle_erasure).
                 let ann = type_lit(arena, bound_ty);
@@ -4923,7 +4932,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // through unchanged, row is the union of every binding's
                 // plus body's.
                 for (_, _, val_row, _) in &bindings {
-                    result_row = Row::union(val_row, &result_row);
+                    result_row = union_rows(val_row, &result_row, infer, spans[expr])?;
                 }
                 // A type group stays annotation-free: rule P (resolve::group_kind) reads
                 // the elaborated tree too, and a TypeLit annotation would make it Plain.
@@ -4952,7 +4961,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // Matches the original Lambda arm: the body's row is
                 // embedded in the Fun type, not propagated -- evaluating
                 // the Lambda expression itself is always pure.
-                result_ty = Type::Fun(Hc::new(param_ty.clone()), result_row, Hc::new(result_ty));
+                let row = arrow_row(result_row, ctx.level, infer);
+                result_ty = Type::Fun(Hc::new(param_ty.clone()), row, Hc::new(result_ty));
                 result_row = Row::pure();
                 if witness {
                     let w = infer.index_witness.pop().expect("a Fun frame's witness is the innermost one");
@@ -5161,7 +5171,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                                             } else {
                                                 check_against(arena, item, &step_items[i], ctx, spans, infer)?
                                             };
-                                            row = Row::union(&row, &item_row);
+                                            row = union_rows(&row, &item_row, infer, spans[item])?;
                                             refs.push(item2);
                                         }
                                         return Ok((expected.clone(), row, arena.push(Expr::Tuple(refs))));
@@ -5190,7 +5200,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     }
                     None => elaborate(arena, item, ctx, spans, infer)?,
                 };
-                row = Row::union(&row, &item_row);
+                row = union_rows(&row, &item_row, infer, spans[item])?;
                 tys.push(item_ty);
                 refs.push(item2);
             }
@@ -5211,7 +5221,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let mut field_refs = Vec::with_capacity(fields.len());
             for (name, field_expr) in fields.iter() {
                 let (field_ty, field_row, field2) = elaborate(arena, *field_expr, ctx, spans, infer)?;
-                row = Row::union(&row, &field_row);
+                row = union_rows(&row, &field_row, infer, spans[*field_expr])?;
                 field_tys.push((name.clone(), field_ty));
                 field_refs.push((name.clone(), field2));
             }
@@ -5273,7 +5283,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     }
                     None => elaborate(arena, item, ctx, spans, infer)?,
                 };
-                row = Row::union(&row, &item_row);
+                row = union_rows(&row, &item_row, infer, spans[item])?;
                 refs.push(item2);
                 item_tys.push(item_ty.clone());
                 elem_ty = Some(match elem_ty {
@@ -5329,15 +5339,9 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // (`Vec(n)`, `Indexed(T, n)`, bare or nested in a tuple/list) gets its argument CHECKED against it, so a
             // list/tuple literal argument can satisfy the index -- Synth
             // alone gives a plain un-indexed List/Tuple that never can.
-            // Deliberately limited to such parameters, and to ones with no
-            // free row variables: Check mode would otherwise drop the
-            // argument's own synthesized type, which bind_row_vars below
-            // needs to bind effect-row variables.
+            // Row variables in the parameter are bound by Check mode's own final unify_fits.
             let (a_ty, a_row, a2) = match &f_ty {
-                Type::Fun(param_ty, ..) if {
-                    let p = infer.resolve_deep(param_ty);
-                    contains_indexed(&p) && !vars_in(&p).iter().any(|v| matches!(v, TyVar::Row(_)))
-                } => {
+                Type::Fun(param_ty, ..) if contains_indexed(&infer.resolve_deep(param_ty)) => {
                     let param_resolved = infer.resolve_deep(param_ty);
                     let (row, a2) = check_against(arena, a, &param_resolved, ctx, spans, infer)?;
                     (param_resolved, row, a2)
@@ -5384,41 +5388,13 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // to the argument's type and with it the evidence.
                     let sunk = infer.is_dyn_sunk(&param_ty_resolved);
                     let a3 = coerce_check(arena, a2, &a_ty, &param_ty_resolved, spans[a], &CheckEnv::new(infer))?;
-                    let mut row_subst = HashMap::new();
-                    // Deliberately the RAW param_ty here, not
-                    // param_ty_resolved -- row variables only ever
-                    // originate from an explicit `->{e}` annotation
-                    // (bind_row_vars's own doc comment), and an
-                    // explicitly-annotated param_ty is never a bare
-                    // Type::Var in the first place, so resolving it here
-                    // would always be a no-op. Keeping this call on the
-                    // same raw reference unify() and the row/type
-                    // substitution below already use, rather than
-                    // introducing a third variant, is simpler with no
-                    // behavior difference.
-                    bind_row_vars(param_ty, &a_ty, &mut row_subst);
-                    let call_row2 = resolve_row(call_row, &row_subst);
+                    // Binds type, index and row variables of the parameter, at any depth.
                     unify_fits(param_ty, &a_ty, infer, spans[a])?;
-                    // param_ty_resolved is stale after unify_fits (it still
-                    // shows the Var an unannotated `apply(f)` just bound), so
-                    // the cast re-resolves both sides.
                     // A parameter variable that feeds a Dyn sink in the callee's
                     // body is cast like a Dyn parameter.
                     let cast_to = if sunk { &Type::Dyn } else { param_ty };
                     let a3 = coerce_cast(arena, a3, &a_ty, cast_to, &CheckEnv::at(infer, spans[a]));
-                    // resolve_deep alone only ever consults infer.subst
-                    // (ordinary Type::Var bindings) -- it knows nothing
-                    // about row_subst, built separately just above.
-                    // Apply row_subst first (subst_type with an empty
-                    // type_subst leaves every Type::Var untouched, only
-                    // touching Tail::Var positions), then
-                    // resolve_deep to layer in whatever unify() just
-                    // bound -- the two substitutions act on disjoint
-                    // parts of the type (Row positions vs Type::Var
-                    // positions), so composing them in either order gives
-                    // the same result.
-                    let ret_ty2 = infer.resolve_deep(&subst_type(ret_ty, &row_subst, &HashMap::new(), &HashMap::new()));
-                    (call_row2, ret_ty2, arena.push(Expr::App(f2, a3)))
+                    (call_row.clone(), infer.resolve_deep(ret_ty), arena.push(Expr::App(f2, a3)))
                 }
                 // NEW: the callee itself isn't known to be a function
                 // YET -- an unannotated parameter (Task 2) starts life as
@@ -5453,7 +5429,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 }
                 other => return Err(TypeError(format!("cannot call a value of type {}", other.brief()), spans[f])),
             };
-            let row = Row::union(&Row::union(&f_row, &a_row), &call_row);
+            let row = union_rows(&union_rows(&f_row, &a_row, infer, spans[expr])?, &call_row, infer, spans[expr])?;
             Ok((ret_ty, row, app2))
         }
 
@@ -5472,7 +5448,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                             let tail_expected = Type::Indexed(wrapped.clone(), Rc::new(IndexExpr::Sub(idx.clone(), Rc::new(IndexExpr::Lit(1)))));
                             let (l_row, l2) = check_against(arena, l, &elem_ty, ctx, spans, infer)?;
                             let (r_row, r2) = check_against(arena, r, &tail_expected, ctx, spans, infer)?;
-                            let row = Row::union(&l_row, &r_row);
+                            let row = union_rows(&l_row, &r_row, infer, spans[expr])?;
                             return Ok((expected.clone(), row, arena.push(Expr::BinOp(op, l2, r2))));
                         }
                     }
@@ -5480,7 +5456,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             }
             let (l_ty, l_row, l2) = elaborate(arena, l, ctx, spans, infer)?;
             let (r_ty, r_row, r2) = elaborate(arena, r, ctx, spans, infer)?;
-            let row = Row::union(&l_row, &r_row);
+            let row = union_rows(&l_row, &r_row, infer, spans[expr])?;
             match op {
                 // Arithmetic and ordering: both operands must be Int or
                 // Float (mixing promotes to Float) -- see coerce_numeric's
@@ -5667,7 +5643,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             };
             // Only one branch runs, but which one isn't known statically,
             // so the possible effects are the union of both.
-            let row = Row::union(&c_row, &Row::union(&t_row, &e_row));
+            let row = union_rows(&c_row, &union_rows(&t_row, &e_row, infer, spans[expr])?, infer, spans[expr])?;
             Ok((result_ty, row, arena.push(Expr::If(c3, t2, e2))))
         }
 
@@ -5678,14 +5654,14 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // The handler receives the payload as Dyn.
             infer.note_dyn_sink(&payload_ty);
             let payload2 = coerce_cast(arena, payload2, &payload_ty, &Type::Dyn, &CheckEnv::at(infer, spans[payload]));
-            let row = Row::union(&payload_row, &Row::single(&effect));
+            let row = union_rows(&payload_row, &Row::single(&effect), infer, spans[expr])?;
             Ok((Type::Dyn, row, arena.push(Expr::Perform(effect, payload2))))
         }
 
         Expr::Handle { body, handler } => {
             let (_, body_row, body2) = elaborate(arena, body, ctx, spans, infer)?;
             let discharged = discharged_effect(arena, handler);
-            infer.resume_row = discharged.as_ref().map(|effect| body_row.remove(effect));
+            infer.resume_row = discharged.as_ref().map(|effect| infer.flatten_row(&body_row).remove(effect));
             let handler_result = elaborate(arena, handler, ctx, spans, infer);
             infer.resume_row = None;
             let (handler_ty, handler_row, handler2) = handler_result?;
@@ -5706,10 +5682,10 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // statically tell which one that is. An unknown handler (a
             // variable, a parameter) may catch anything: the row becomes Dyn.
             let row = match discharged {
-                Some(effect) => body_row.remove(&effect),
+                Some(effect) => infer.flatten_row(&body_row).remove(&effect),
                 None => Row::dyn_(),
             };
-            let row = Row::union(&row, &handler_row);
+            let row = union_rows(&row, &handler_row, infer, spans[expr])?;
             Ok((Type::Dyn, row, arena.push(Expr::Handle { body: body2, handler: handler2 })))
         }
 
@@ -5927,7 +5903,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     Some(g) => {
                         let (guard_ty, guard_row, g2) = elaborate(arena, *g, &arm_ctx, spans, infer)?;
                         let g3 = coerce(arena, g2, &guard_ty, &Type::Bool, spans[*g], &CheckEnv::new(infer))?;
-                        row = Row::union(&row, &guard_row);
+                        row = union_rows(&row, &guard_row, infer, spans[*g])?;
                         Some(g3)
                     }
                     None => None,
@@ -5957,7 +5933,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     }
                     Mode::Check(expected) => check_against(arena, *body, expected, &arm_ctx, spans, infer)?,
                 };
-                row = Row::union(&row, &arm_row);
+                row = union_rows(&row, &arm_row, infer, spans[*body])?;
                 new_arms.push((pat.clone(), guard2, body2));
             }
             // Final restore, after the WHOLE arm loop completes -- on top
@@ -6010,7 +5986,10 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         Expr::MakeHandler { effect, payload_var, resume_var, body } => {
             let resume_row = infer.resume_row.take();
             let resume_ty = match &resume_row {
-                Some(row) => Type::Fun(Hc::new(Type::Dyn), row.clone(), Hc::new(Type::Dyn)),
+                Some(row) => {
+                    let row = arrow_row(row.clone(), ctx.level, infer);
+                    Type::Fun(Hc::new(Type::Dyn), row, Hc::new(Type::Dyn))
+                }
                 None => Type::Dyn,
             };
             let inner_ctx = extend(&extend(ctx, &payload_var, Type::Dyn, infer), &resume_var, resume_ty, infer);
@@ -6047,21 +6026,18 @@ fn binder_names(arena: &Arena) -> HashSet<String> {
 pub fn check(arena: &mut Arena, root: ExprRef, spans: &SpanMap) -> Result<ExprRef, TypeError> {
     let mut infer = InferCtx::new();
     infer.bound_names = binder_names(arena);
-    let (_, row, elaborated) = elaborate(arena, root, &Ctx::empty(), spans, &mut infer)?;
+    let (_ty, row, elaborated) = elaborate(arena, root, &Ctx::empty(), spans, &mut infer)?;
+    #[cfg(debug_assertions)]
+    assert_no_closed_arrow_row(&_ty);
     resolve_pendings(arena, &infer);
     resolve_obligations(arena, &infer);
     settle_erasure(arena, spans, &mut infer);
-    if row.tail == Tail::Closed && !row.entries.is_empty() {
-        let names: Vec<&str> = row.labels().collect();
-        Err(TypeError(
-            format!(
-                "unhandled effect{}: {}",
-                if names.len() > 1 { "s" } else { "" },
-                names.join(", ")
-            ),
-            spans[root],
-        ))
-    } else {
-        Ok(elaborated)
+    // A still-unresolved variable tail is defaulted to closed (pure remainder, spec 3.1): known
+    // labels are unhandled whatever the tail is; only a Dyn row (information lost) escapes.
+    let row = infer.flatten_row(&row);
+    if row.is_dyn() || row.entries.is_empty() {
+        return Ok(elaborated);
     }
+    let names: Vec<&str> = row.labels().collect();
+    Err(TypeError(format!("unhandled effect{}: {}", if names.len() > 1 { "s" } else { "" }, names.join(", ")), spans[root]))
 }

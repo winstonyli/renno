@@ -541,18 +541,6 @@ impl Row {
         }
         Row::new(self.labels().filter(|l| *l != effect).map(String::from).collect(), self.tail.clone())
     }
-
-    // Today's union, ported unchanged (a variable mixed with anything but itself or nothing
-    // collapses to Dyn). Deleted by the precise `union_rows` (stage 1 Task 4).
-    pub fn union(a: &Row, b: &Row) -> Row {
-        match (&a.tail, &b.tail) {
-            (Tail::Var(x), Tail::Var(y)) if x == y => a.clone(),
-            (Tail::Var(_), Tail::Closed) if b.entries.is_empty() => a.clone(),
-            (Tail::Closed, Tail::Var(_)) if a.entries.is_empty() => b.clone(),
-            (Tail::Var(_), _) | (_, Tail::Var(_)) | (Tail::Dyn, _) | (_, Tail::Dyn) => Row::dyn_(),
-            (Tail::Closed, Tail::Closed) => Row::new(a.labels().chain(b.labels()).map(String::from).collect(), Tail::Closed),
-        }
-    }
 }
 
 // ---- Recursive types -------------------------------------------------------------------

@@ -10374,9 +10374,14 @@ g(len)").unwrap_err();
 
     #[test]
     fn effect_row_variables_are_shared_when_nested_and_independent_when_siblings() {
-        // Nested: the inner `e` is the outer parameter's, so the row is not re-generalized.
+        // Nested: the inner `e` is the outer parameter's. Under D10 the pure `h` fits `{choose}`
+        // (its row is opened), so the call runs (it was a rejection before stage 1)...
         let src = "let k = fun cb: (Dyn ->{e} Dyn) -> fun h: (Dyn ->{e} Dyn) -> h in handle k(fun y -> perform choose(y))(fun z -> z)(1) with handler choose(p, resume) -> resume(p)";
-        rejects(src, "type mismatch: expected (Dyn ->{choose} Dyn), found (Dyn ->{} Dyn)");
+        assert_eq!(run_source(src).unwrap().to_string(), "1");
+        // ...and sharing shows: `h` returned under `e := {choose | ..}` carries `choose`, so the
+        // same call under a handler for another effect is a static unhandled `choose`.
+        let src = "let k = fun cb: (Dyn ->{e} Dyn) -> fun h: (Dyn ->{e} Dyn) -> h in handle k(fun y -> perform choose(y))(fun z -> z)(1) with handler other(p, resume) -> resume(p)";
+        assert!(static_error(src).is_some_and(|e| e.contains("unhandled effect: choose")), "{:?}", static_error(src));
         // Siblings: two lets each quantify their own `e`.
         let src = "let k = fun cb: (Dyn ->{e} Dyn) -> cb in let m = fun cb: (Dyn ->{e} Dyn) -> cb in handle m(k(fun y -> perform choose(y)))(1) with handler choose(p, resume) -> resume(p)";
         assert_eq!(run_source(src).unwrap().to_string(), "1");
@@ -11842,5 +11847,162 @@ g(len)").unwrap_err();
         infer.restore(snap);
         assert_eq!(infer.resolve_deep(&fun).to_string(), "(Int ->{} Int)");
         assert_eq!(infer.levels.get(&TyVar::Row(b)), None);
+    }
+
+    // ---- one row sort, stage 1: wiring (D10, precise union, exact Fun rows) ----
+
+    // The type error `check` reports for `src`, or None when it typechecks: separates a static
+    // rejection from a run-time one.
+    fn static_error(src: &str) -> Option<String> {
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        typecheck::check(&mut arena, root, &spans).err().map(|e| e.0)
+    }
+
+    fn runs_to(src: &str, want: &str) {
+        assert_eq!(run_source(src).map(|o| o.to_string()), Ok(want.to_string()), "{src}");
+    }
+
+    #[test]
+    fn pure_implementations_fit_declared_effect_polymorphic_types() {
+        // D10 (spec 3.1): a lambda's closed row is opened, so a1 to a3 keep running.
+        runs_to("let k: (Int -> (Int ->{e} Int)) = fun n -> fun x -> n in k(1)(2)", "1");
+        runs_to("let g: ((Int ->{e} Int) -> (Int ->{e} Int)) = fun f -> fun x -> x + 1 in g(fun y -> y)(3)", "4");
+        runs_to("let g: ((Int ->{e} Int) -> (Int ->{e} Int)) = fun f -> fun x -> x + 1 in handle g(fun y -> perform a(y))(3) with handler a(p, resume) -> resume(p)", "4");
+    }
+
+    #[test]
+    fn pure_and_performing_callbacks_share_a_row_and_still_run() {
+        runs_to("let both = fun f -> fun g -> (f(1), g(2)) in handle both(fun x -> x)(fun y -> perform a(y)) with handler a(p, resume) -> resume(p + 10)", "[1, 12]");
+        runs_to("let compose = fun f -> fun g -> fun x -> f(g(x)) in handle compose(fun x -> x + 1)(fun y -> perform a(y))(1) with handler a(p, resume) -> resume(p * 10)", "11");
+        // Review 8 M7 / probe m1: no extra generalization condition.
+        runs_to("let both = fun f -> fun g -> (f(1), g(2)) in let y = (fun f -> (f(1), f))(fun x -> x) in match y | (n, h) -> handle both(h)(fun z -> perform a(z)) with handler a(p, k) -> k(10)", "[1, 10]");
+        // `resume` is opened like a lambda (MakeHandler): r1 and rv.
+        runs_to("let both = fun f -> fun g -> (f(1), g(2)) in handle handle perform a(0) + 1 with handler a(p, k) -> both(k)(fun y -> perform b(y)) with handler b(p, k) -> k(7)", "[2, 7]");
+        runs_to("let both = fun f -> fun g -> (f(1), g(2)) in handle handle perform a(0) + 1 with handler a(p, k) -> both(fun y -> perform b(y))(k) with handler b(p, k) -> k(7)", "[7, 3]");
+    }
+
+    #[test]
+    fn recursion_with_a_row_variable_parameter_still_runs() {
+        // i1: annotated `let rec` is instantiated fresh at its recursive call.
+        runs_to("let rec f: ((Dyn ->{e} Dyn) -> Int -> Int) = fun g -> fun n -> if n == 0 then g(0) else f(fun x -> perform a(x))(n - 1) in handle f(fun x -> x)(2) with handler a(p, resume) -> resume(5)", "5");
+        // i2: unannotated, monomorphic `e`; the outer call still fits (its row is opened).
+        runs_to("let rec f = fun g: (Dyn ->{e} Dyn) -> fun n -> if n == 0 then g(0) else f(fun x -> perform a(x))(n - 1) in handle f(fun x -> x)(2) with handler a(p, resume) -> resume(5)", "5");
+    }
+
+    #[test]
+    fn a_precise_row_escaping_a_handler_is_unhandled_only_when_called() {
+        // h2/h3 (spec 3.1 Handle): `{b | e}` survives the handler for `a`.
+        let h2 = "let k = fun f: (Int ->{e} Int) -> handle (perform b(0) + f(1)) with handler a(p, resume) -> resume(p) in 0";
+        assert_eq!(static_error(h2), None);
+        runs_to(h2, "0");
+        let h3 = "let k = fun f: (Int ->{e} Int) -> handle (perform b(0) + f(1)) with handler a(p, resume) -> resume(p) in k(fun x -> x)";
+        assert!(static_error(h3).is_some_and(|e| e.contains("unhandled effect: b")), "{:?}", static_error(h3));
+    }
+
+    #[test]
+    fn union_of_two_row_variables_unifies_them() {
+        // Spec stage 1 gate: precise union binds `Var a ∪ Var b`. Two flexible user tails tie,
+        // so the second (e2) survives and e1 is bound to it.
+        let err = run_source("let both = fun f: (Int ->{e1} Int) -> fun g: (Int ->{e2} Int) -> f(1) + g(1) in let z: Int = both in z").unwrap_err();
+        assert!(err.contains("found ((Int ->{e2} Int) ->{} ((Int ->{e2} Int) ->{e2} Int))"), "{err}");
+    }
+
+    #[test]
+    fn a_function_join_keeps_both_branches_effects() {
+        // Probe e1 and its swap (spec 3.1 Function join): neither branch's effect is lost.
+        for src in [
+            "let f = if true then (fun x -> perform a(x)) else (fun x -> 1) in f(1)",
+            "let f = if true then (fun x -> 1) else (fun x -> perform a(x)) in f(1)",
+            "let l = (fun x: Int -> 1) :: [fun x: Int -> perform a(x)] in match l | h :: t -> h(1) | _ -> 0",
+            "let r = if true then {f: fun x -> perform a(x)} else {f: fun x -> 1} in r.f(1)",
+        ] {
+            assert!(static_error(src).is_some_and(|e| e.contains("unhandled effect: a")), "{src}: {:?}", static_error(src));
+        }
+    }
+
+    #[test]
+    fn list_of_lambdas_message_shows_the_joined_row() {
+        // Review Focus 1: a bound opened tail prints its labels.
+        let err = run_source("let f = fun x -> 1 in let l = [f, fun x -> perform a(x)] in let z: Int = l in z").unwrap_err();
+        assert!(err.contains("found [(Dyn ->{a} Int)]"), "{err}");
+    }
+
+    #[test]
+    fn effects_survive_aliases_records_and_unknown_handlers() {
+        // Review Focus 2 and 4: generalizing an opened tail or projecting a field keeps the effect.
+        for src in ["let g = fun x -> perform a(x) in let h = g in h(1)", "let r = {f: fun x -> perform a(x)} in r.f(1)"] {
+            assert!(static_error(src).is_some_and(|e| e.contains("unhandled effect: a")), "{src}: {:?}", static_error(src));
+        }
+        // Review Focus 3: a handler through a variable gives a Dyn row, which absorbs.
+        runs_to("let h = handler a(p, k) -> k(1) in handle perform a(0) with h", "1");
+    }
+
+    #[test]
+    fn row_plan_cells_the_other_tests_do_not_reach() {
+        use crate::typecheck::{row_compatible, unify_rows, InferCtx, RowRank};
+        use types::{surface_name, Row, Tail};
+        let mut infer = InferCtx::new();
+        // Flexible/flexible, equal label sets: no split, the loser binds to the winner. Equal
+        // rank ties go to the second argument; a higher rank wins whatever the order.
+        let (a, b) = (infer.fresh_row(RowRank::User, "e1", None), infer.fresh_row(RowRank::User, "e2", None));
+        assert!(unify_rows(&row_of(&["x"], Tail::Var(a.clone())), &row_of(&["x"], Tail::Var(b.clone())), &mut infer));
+        assert_eq!(infer.flatten_row(&Row::var(a.clone())).tail, Tail::Var(b.clone()), "tie: the second survives");
+        assert_eq!(infer.flatten_row(&Row::var(b.clone())), Row::var(b.clone()));
+        let (c, d) = (infer.fresh_row(RowRank::User, "e3", None), infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None));
+        assert!(unify_rows(&Row::var(c.clone()), &Row::var(d.clone()), &mut infer));
+        assert_eq!(infer.flatten_row(&Row::var(d.clone())).tail, Tail::Var(c.clone()), "User beats Opened though it is first");
+        // Split where the first argument wins (higher rank): sigma is named after it.
+        let (f, g) = (infer.fresh_row(RowRank::User, "ef", None), infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None));
+        assert!(unify_rows(&row_of(&["x"], Tail::Var(f.clone())), &row_of(&["y"], Tail::Var(g.clone())), &mut infer));
+        let Tail::Var(sigma) = infer.flatten_row(&Row::var(f)).tail else { panic!("tail") };
+        assert_eq!(surface_name(&sigma), "ef");
+        // The same tail with different labels cannot unify, flexible or not; with equal labels it is a no-op.
+        let h = infer.fresh_row(RowRank::User, "eh", None);
+        assert!(!row_compatible(&row_of(&["x"], Tail::Var(h.clone())), &row_of(&["y"], Tail::Var(h.clone())), &infer));
+        assert!(!unify_rows(&row_of(&["x"], Tail::Var(h.clone())), &row_of(&["y"], Tail::Var(h.clone())), &mut infer));
+        assert!(unify_rows(&row_of(&["x"], Tail::Var(h.clone())), &row_of(&["x"], Tail::Var(h.clone())), &mut infer));
+        // Closed against rigid: nowhere for the rest to go, in either order, even when empty.
+        let r = infer.fresh_row(RowRank::User, "er", None);
+        infer.rigid_row.insert(r.clone());
+        for (x, y) in [(Row::pure(), Row::var(r.clone())), (Row::var(r.clone()), Row::pure()), (Row::single("a"), row_of(&["a"], Tail::Var(r.clone())))] {
+            assert!(!row_compatible(&x, &y, &infer), "{x} vs {y}");
+            assert!(!unify_rows(&x, &y, &mut infer), "{x} vs {y}");
+        }
+        // Rigid against flexible: the flexible one binds to the rigid one, in either order.
+        for flexible_first in [true, false] {
+            let flex = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+            let (x, y) = if flexible_first { (Row::var(flex.clone()), Row::var(r.clone())) } else { (Row::var(r.clone()), Row::var(flex.clone())) };
+            assert!(unify_rows(&x, &y, &mut infer));
+            assert_eq!(infer.flatten_row(&Row::var(flex)).tail, Tail::Var(r.clone()));
+            assert_eq!(infer.flatten_row(&Row::var(r.clone())), Row::var(r.clone()), "the rigid tail stays unbound");
+        }
+    }
+
+    #[test]
+    fn resolve_deep_flattens_bound_row_tails_in_every_position() {
+        use crate::typecheck::{unify_rows, InferCtx, RowRank};
+        use types::{Row, Tail, Type};
+        let mut infer = InferCtx::new();
+        let (a, b) = (infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None), infer.fresh_row(RowRank::User, "e", None));
+        let fun = |name: &str| Type::Fun(Hc::new(Type::Int), Row::var(name), Hc::new(Type::Int));
+        // a := {x | b}, so `{a}` is `{x | b}`: a chain of two bindings.
+        let c = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        assert!(unify_rows(&Row::var(a.clone()), &row_of(&["x"], Tail::Var(b.clone())), &mut infer));
+        assert!(unify_rows(&Row::var(b.clone()), &row_of(&["y"], Tail::Var(c.clone())), &mut infer));
+        let flat = infer.flatten_row(&Row::var(a.clone())).to_string();
+        assert_eq!(flat, "{x, y | e}");
+        let shapes = [
+            ("list", Type::List(Hc::new(fun(&a)))),
+            ("tuple", Type::Tuple(Hc::new(vec![Type::Int, fun(&a)]))),
+            ("record", Type::Record(Hc::new(vec![("f".to_string(), fun(&a))]))),
+            ("union", Type::Union(Hc::new(vec![Type::Int, fun(&a)]))),
+            ("nested fun", Type::Fun(Hc::new(fun(&a)), Row::pure(), Hc::new(Type::Int))),
+            ("under rec", Type::Rec(rec_group(&["L"], vec![Type::Union(Hc::new(vec![Type::Int, Type::Fun(Hc::new(rec_bound(0, 0)), Row::var(a.clone()), Hc::new(Type::Int))]))]), 0)),
+        ];
+        for (what, ty) in shapes {
+            let resolved = infer.resolve_deep(&ty);
+            let shown = if let Type::Rec(g, i) = &resolved { types::unfold(g, *i).to_string() } else { resolved.to_string() };
+            assert!(shown.contains("{x, y | e}"), "{what}: {shown}");
+        }
     }
 }
