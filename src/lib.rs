@@ -12028,6 +12028,34 @@ g(len)").unwrap_err();
         }
     }
 
+    // flatten_row path-compresses long chains of bound row variables (a list of n lambdas makes n
+    // of them); the compressed form must follow later bindings and vanish on rollback.
+    #[test]
+    fn flatten_row_compression_follows_later_bindings_and_rolls_back() {
+        use crate::typecheck::{unify_rows, InferCtx, RowRank};
+        use types::{Row, Tail};
+        let mut infer = InferCtx::new();
+        let vars: Vec<String> = (0..2000).map(|_| infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None)).collect();
+        for w in vars.windows(2) {
+            assert!(unify_rows(&Row::var(w[0].clone()), &row_of(&["x"], Tail::Var(w[1].clone())), &mut infer));
+        }
+        let head = vars[0].clone();
+        let first = infer.flatten_row(&Row::var(head.clone()));
+        let Tail::Var(last) = first.tail.clone() else { panic!("{first:?}") };
+        assert_eq!(infer.flatten_row(&Row::var(head.clone())), first, "a second walk starts from the compressed form");
+        // The end gets bound later: the compressed prefix continues through it.
+        let snap = infer.snapshot();
+        let end = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        assert!(unify_rows(&Row::var(last.clone()), &row_of(&["z"], Tail::Var(end.clone())), &mut infer));
+        let extended = infer.flatten_row(&Row::var(head.clone()));
+        assert_eq!(extended.tail, infer.flatten_row(&Row::var(last.clone())).tail);
+        assert_ne!(extended.tail, first.tail);
+        assert!(extended.labels().any(|l| l == "z"));
+        // Rolled back: the binding, and what was compressed through it, is gone.
+        infer.restore(snap);
+        assert_eq!(infer.flatten_row(&Row::var(head)), first);
+    }
+
     #[test]
     fn resolve_deep_flattens_bound_row_tails_in_every_position() {
         use crate::typecheck::{unify_rows, InferCtx, RowRank};

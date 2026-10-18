@@ -200,7 +200,8 @@ pub(crate) struct Levels {
     ty: TrieMap<String, u32>,
     row: TrieMap<String, u32>,
     index: TrieMap<String, u32>,
-    // The rank of every row variable minted as `Opened` or `Fresh`; absent is `User`.
+    // The rank of every row variable minted as `Fresh`; an absent one is `Opened` if its name is
+    // an opened tail's (every lambda mints one, so it is not stored), else `User`.
     // Persistent, rolled back with the levels.
     rank: TrieMap<String, RowRank>,
 }
@@ -216,7 +217,7 @@ pub(crate) enum RowRank {
 
 impl Levels {
     pub(crate) fn rank(&self, row: &str) -> RowRank {
-        self.rank.get(row).copied().unwrap_or(RowRank::User)
+        self.rank.get(row).copied().unwrap_or(if surface_name(row) == OPENED_ROW { RowRank::Opened } else { RowRank::User })
     }
 
     pub(crate) fn get(&self, v: &TyVar) -> Option<u32> {
@@ -639,6 +640,8 @@ pub(crate) struct InferCtx {
     // Effect-row variables bound by unification (spec 2.1): a variable tail's solution is a row
     // (more labels and another tail). Write-once per name, like `subst`.
     row_subst: TrieMap<String, Row>,
+    // Path-compression cache of `flatten_row` (see there); cleared when `row_subst` is rolled back.
+    flat_rows: RefCell<FxMap<String, Row>>,
     // Row variables `unify_rows` must not bind: a let-annotated signature's while its value is
     // checked (D6), as `rigid_index` is for index variables.
     pub(crate) rigid_row: HashSet<String>,
@@ -721,6 +724,7 @@ impl InferCtx {
             subst: TrieMap::default(),
             index_subst: TrieMap::default(),
             row_subst: TrieMap::default(),
+            flat_rows: RefCell::new(FxMap::default()),
             rigid_row: HashSet::new(),
             levels: Levels::default(),
             rigid_index: HashSet::new(),
@@ -866,7 +870,7 @@ impl InferCtx {
         if let Some(level) = level {
             Levels::lower(&mut self.levels.row, &name, level);
         }
-        if rank != RowRank::User {
+        if rank == RowRank::Fresh {
             self.levels.rank.insert_mut(name.clone(), rank);
         }
         name
@@ -874,18 +878,40 @@ impl InferCtx {
 
     // `row` with every bound tail followed: all the labels it is known to have and its final
     // tail (unbound variable, Closed or Dyn).
+    //
+    // The chains are path-compressed through `flat_rows`: a variable's flattened form, kept
+    // from the first walk, is a prefix of its later one (bindings only grow), so a walk resumes
+    // from its end. Without it a chain of n fresh row variables (one per lambda in a list) is
+    // re-walked on every resolve, quadratic. `restore` clears it: a rollback unbinds variables.
     pub(crate) fn flatten_row(&self, row: &Row) -> Row {
-        let mut tail = &row.tail;
-        let mut extra: Vec<String> = Vec::new();
-        while let Tail::Var(name) = tail {
+        let Tail::Var(first) = &row.tail else { return row.clone() };
+        // The variables walked (not already compressed to their end) with their own labels.
+        let mut path: Vec<(String, usize)> = Vec::new();
+        let mut cache = self.flat_rows.borrow_mut();
+        let mut labels: Vec<String> = Vec::new();
+        let mut tail = Tail::Var(first.clone());
+        while let Tail::Var(name) = &tail {
+            if let Some(done) = cache.get(name.as_str()) {
+                // Entries are prefixes: the cached end may have been bound since, so go on.
+                labels.extend(done.labels().map(String::from));
+                tail = done.tail.clone();
+                continue;
+            }
             let Some(bound) = self.row_subst.get(name) else { break };
-            extra.extend(bound.labels().map(String::from));
-            tail = &bound.tail;
+            path.push((name.clone(), labels.len()));
+            labels.extend(bound.labels().map(String::from));
+            tail = bound.tail.clone();
         }
-        if extra.is_empty() && *tail == row.tail {
+        if path.len() > 1 {
+            // Each walked variable flattens to the labels from its own on, and the final tail.
+            for (name, from) in path {
+                cache.insert(name, Row::new(labels[from..].to_vec(), tail.clone()));
+            }
+        }
+        if labels.is_empty() && tail == row.tail {
             return row.clone();
         }
-        Row::new(row.labels().map(String::from).chain(extra).collect(), tail.clone())
+        Row::new(row.labels().map(String::from).chain(labels).collect(), tail)
     }
 
     // A fresh instance of quantified row variable `v` (lookup): same base and rank, no level.
@@ -917,6 +943,7 @@ impl InferCtx {
         self.subst = s.subst;
         self.index_subst = s.index_subst;
         self.row_subst = s.row_subst;
+        self.flat_rows.get_mut().clear();
         self.dyn_sunk = s.dyn_sunk;
         self.levels = s.levels;
     }
