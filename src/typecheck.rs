@@ -16,7 +16,7 @@ use rpds::{HashTrieMap, HashTrieSet};
 type FxBuild = std::hash::BuildHasherDefault<crate::types::FxHasher>;
 type TrieMap<K, V> = HashTrieMap<K, V, archery::RcK, FxBuild>;
 type TrieSet<T> = HashTrieSet<T, archery::RcK, FxBuild>;
-use crate::types::{consistent, each_child, is_big, row_consistent, unfold, ById, Row, Hc, Interned, NodeMemo, RecGroup, RecRef, RecVar, Rebuild, Summary, Tail, Type, Visited, FxMap, FxSet};
+use crate::types::{consistent, each_child, is_big, row_consistent, surface_name, unfold, ById, Row, Hc, Interned, NodeMemo, RecGroup, RecRef, RecVar, Rebuild, Summary, Tail, Type, Visited, FxMap, FxSet};
 use crate::util::find_field;
 mod relate;
 use self::relate::{relate, relate_cast};
@@ -195,9 +195,25 @@ pub(crate) struct Levels {
     ty: TrieMap<String, u32>,
     row: TrieMap<String, u32>,
     index: TrieMap<String, u32>,
+    // The rank of every row variable minted as `Opened` or `Fresh`; absent is `User`.
+    // Persistent, rolled back with the levels.
+    rank: TrieMap<String, RowRank>,
+}
+
+// How a row variable came to be, which decides which tail survives when two flexible tails meet
+// (spec 3.1 Precedence): a user-named one beats a D2/D8 fresh one beats a D10 opened one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RowRank {
+    Opened,
+    Fresh,
+    User,
 }
 
 impl Levels {
+    pub(crate) fn rank(&self, row: &str) -> RowRank {
+        self.rank.get(row).copied().unwrap_or(RowRank::User)
+    }
+
     pub(crate) fn get(&self, v: &TyVar) -> Option<u32> {
         match v {
             TyVar::Type(n) => self.ty.get(n),
@@ -224,6 +240,7 @@ impl Levels {
 struct Lowerer<'a> {
     subst: &'a TrieMap<String, Type>,
     index_subst: &'a TrieMap<String, IndexExpr>,
+    row_subst: &'a TrieMap<String, Row>,
     levels: &'a mut Levels,
     to: u32,
     skip: &'a [TyVar],
@@ -232,7 +249,7 @@ struct Lowerer<'a> {
 
 impl<'a> Lowerer<'a> {
     fn new(infer: &'a mut InferCtx, to: u32, skip: &'a [TyVar]) -> Lowerer<'a> {
-        Lowerer { subst: &infer.subst, index_subst: &infer.index_subst, levels: &mut infer.levels, to, skip, seen: Visited::new() }
+        Lowerer { subst: &infer.subst, index_subst: &infer.index_subst, row_subst: &infer.row_subst, levels: &mut infer.levels, to, skip, seen: Visited::new() }
     }
 
     fn skipped(&self, sort: fn(&TyVar) -> Option<&String>, name: &str) -> bool {
@@ -260,9 +277,7 @@ impl<'a> Lowerer<'a> {
                 }
             }
             Type::Fun(param, row, ret) => {
-                if let Tail::Var(name) = &row.tail {
-                    self.row(name);
-                }
+                self.row_value(row);
                 self.ty(param);
                 self.ty(ret);
             }
@@ -278,11 +293,24 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    // Rows are never bound, so there is no solution to follow.
+    // A row variable, then its solution if bound (same invariant as `ty`'s Var arm).
     fn row(&mut self, name: &str) {
         level_work();
-        if !self.skipped(|v| if let TyVar::Row(n) = v { Some(n) } else { None }, name) {
-            Levels::lower(&mut self.levels.row, name, self.to);
+        if self.skipped(|v| if let TyVar::Row(n) = v { Some(n) } else { None }, name) {
+            return;
+        }
+        if Levels::lower(&mut self.levels.row, name, self.to) {
+            let row_subst = self.row_subst;
+            if let Some(bound) = row_subst.get(name) {
+                self.row_value(bound);
+            }
+        }
+    }
+
+    // A row's variables (payloads are Dyn in stage 1, so only the tail).
+    fn row_value(&mut self, row: &Row) {
+        if let Tail::Var(name) = &row.tail {
+            self.row(name);
         }
     }
 
@@ -601,9 +629,16 @@ pub(crate) struct InferCtx {
     // function's own type-var name collide with an unrelated Vec's
     // own index-var name.
     pub(crate) index_subst: TrieMap<String, IndexExpr>,
+    // Effect-row variables bound by unification (spec 2.1): a variable tail's solution is a row
+    // (more labels and another tail). Write-once per name, like `subst`.
+    row_subst: TrieMap<String, Row>,
+    // Row variables `unify_rows` must not bind: a let-annotated signature's while its value is
+    // checked (D6), as `rigid_index` is for index variables.
+    pub(crate) rigid_row: HashSet<String>,
     // The level of every variable a scope has held (U8b), rolled back with the substitution by
-    // unify_trial. Invariant: if a levelled variable is bound, everything its solution mentions
-    // has a level at most its own (the match-arm hypotheses are the one exception).
+    // unify_trial. Invariant: if a levelled variable (of any sort) is bound, everything its
+    // solution mentions has a level at most its own (the match-arm hypotheses are the one
+    // exception).
     pub(crate) levels: Levels,
     // Index variables that unify_index_expr must NOT bind: the free index
     // variables of an annotated binding's signature (the fresh ones its
@@ -678,6 +713,8 @@ impl InferCtx {
         InferCtx {
             subst: TrieMap::default(),
             index_subst: TrieMap::default(),
+            row_subst: TrieMap::default(),
+            rigid_row: HashSet::new(),
             levels: Levels::default(),
             rigid_index: HashSet::new(),
             index_witness: Vec::new(),
@@ -784,7 +821,9 @@ impl InferCtx {
     // free-variable collection (Task 7).
     pub(crate) fn resolve_deep(&self, ty: &Type) -> Type {
         // Only a bound variable or a bound index can change anything.
-        let relevant = (if self.subst.is_empty() { 0 } else { Summary::VAR }) | (if self.index_subst.is_empty() { 0 } else { Summary::INDEXED });
+        let relevant = (if self.subst.is_empty() { 0 } else { Summary::VAR })
+            | (if self.index_subst.is_empty() { 0 } else { Summary::INDEXED })
+            | (if self.row_subst.is_empty() { 0 } else { Summary::ROWVAR });
         ResolveDeep { infer: self, relevant, memo: NodeMemo::default() }.walk(ty).unwrap_or_else(|| ty.clone())
     }
 
@@ -813,6 +852,70 @@ impl InferCtx {
             other => other,
         }
     }
+
+    // Mints a row variable `base#k` of `rank`, held at `level` if given.
+    pub(crate) fn fresh_row(&mut self, rank: RowRank, base: &str, level: Option<u32>) -> String {
+        let name = fresh_row_name(base);
+        if let Some(level) = level {
+            Levels::lower(&mut self.levels.row, &name, level);
+        }
+        if rank != RowRank::User {
+            self.levels.rank.insert_mut(name.clone(), rank);
+        }
+        name
+    }
+
+    // `row` with every bound tail followed: all the labels it is known to have and its final
+    // tail (unbound variable, Closed or Dyn).
+    pub(crate) fn flatten_row(&self, row: &Row) -> Row {
+        let mut tail = &row.tail;
+        let mut extra: Vec<String> = Vec::new();
+        while let Tail::Var(name) = tail {
+            let Some(bound) = self.row_subst.get(name) else { break };
+            extra.extend(bound.labels().map(String::from));
+            tail = &bound.tail;
+        }
+        if extra.is_empty() && *tail == row.tail {
+            return row.clone();
+        }
+        Row::new(row.labels().map(String::from).chain(extra).collect(), tail.clone())
+    }
+
+    // Binds row variable `name` (unbound) to `row`, lowering what `row` mentions to `name`'s level.
+    fn bind_row(&mut self, name: &str, row: Row) {
+        if let Some(l) = self.levels.row.get(name).copied() {
+            Lowerer::new(self, l, &[]).row_value(&row);
+        }
+        self.row_subst.insert_mut(name.to_string(), row);
+    }
+
+    pub(crate) fn snapshot(&self) -> InferSnapshot {
+        InferSnapshot {
+            subst: self.subst.clone(),
+            index_subst: self.index_subst.clone(),
+            row_subst: self.row_subst.clone(),
+            dyn_sunk: self.dyn_sunk.clone(),
+            levels: self.levels.clone(),
+        }
+    }
+
+    pub(crate) fn restore(&mut self, s: InferSnapshot) {
+        self.subst = s.subst;
+        self.index_subst = s.index_subst;
+        self.row_subst = s.row_subst;
+        self.dyn_sunk = s.dyn_sunk;
+        self.levels = s.levels;
+    }
+}
+
+// Everything a failed trial must roll back (unify_trial; the deferred join_ty uses it too).
+// Persistent maps, so taking one is O(1). Not `Snapshot`: that name is the snapshot_type walker's.
+pub(crate) struct InferSnapshot {
+    subst: TrieMap<String, Type>,
+    index_subst: TrieMap<String, IndexExpr>,
+    row_subst: TrieMap<String, Row>,
+    dyn_sunk: TrieSet<String>,
+    levels: Levels,
 }
 
 // `InferCtx::resolve_deep` as a walk: a bound variable is followed to its solution and an
@@ -845,6 +948,14 @@ impl Rebuild for ResolveDeep<'_> {
                     return Some(None);
                 }
                 Some(Some(Type::Indexed(wrapped2.map_or_else(|| wrapped.clone(), Hc::new), Rc::new(index2))))
+            }
+            Type::Fun(param, row, ret) if matches!(row.tail, Tail::Var(_)) => {
+                let row2 = self.infer.flatten_row(row);
+                let (param2, ret2) = (self.walk(param), self.walk(ret));
+                if param2.is_none() && ret2.is_none() && row2 == *row {
+                    return Some(None);
+                }
+                Some(Some(Type::Fun(param2.map_or_else(|| param.clone(), Hc::new), row2, ret2.map_or_else(|| ret.clone(), Hc::new))))
             }
             _ => None,
         }
@@ -1020,6 +1131,116 @@ fn unify_in(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut F
     unify_resolved(&t1, &t2, infer, span, done)?;
     done.extend(key);
     Ok(())
+}
+
+// What making two rows equal takes (spec 2.1): None when it cannot be done. Shared by
+// unify_rows (applies it) and row_compatible (only asks), so the two cannot disagree.
+enum RowPlan {
+    Nothing,
+    // Bind this (flexible, unbound) tail to this row.
+    Bind(String, Row),
+    // Two distinct flexible tails, at least one side with labels the other lacks: a fresh tail
+    // named and ranked after `winner` takes both: a := {only_b | σ}, b := {only_a | σ}.
+    Split { a: String, b: String, only_a: Vec<String>, only_b: Vec<String>, winner: String },
+}
+
+fn row_plan(r1: &Row, r2: &Row, infer: &InferCtx) -> Option<RowPlan> {
+    let (r1, r2) = (infer.flatten_row(r1), infer.flatten_row(r2));
+    if r1.is_dyn() || r2.is_dyn() {
+        return Some(RowPlan::Nothing);
+    }
+    let only1: Vec<String> = r1.labels().filter(|l| !r2.has(l)).map(String::from).collect();
+    let only2: Vec<String> = r2.labels().filter(|l| !r1.has(l)).map(String::from).collect();
+    let flexible = |n: &str| !infer.rigid_row.contains(n);
+    match (&r1.tail, &r2.tail) {
+        (Tail::Closed, Tail::Closed) => (only1.is_empty() && only2.is_empty()).then_some(RowPlan::Nothing),
+        (Tail::Var(a), Tail::Closed) => (flexible(a) && only1.is_empty()).then(|| RowPlan::Bind(a.clone(), Row::new(only2, Tail::Closed))),
+        (Tail::Closed, Tail::Var(b)) => (flexible(b) && only2.is_empty()).then(|| RowPlan::Bind(b.clone(), Row::new(only1, Tail::Closed))),
+        (Tail::Var(a), Tail::Var(b)) if a == b => (only1.is_empty() && only2.is_empty()).then_some(RowPlan::Nothing),
+        (Tail::Var(a), Tail::Var(b)) => match (flexible(a), flexible(b)) {
+            (false, false) => None,
+            (false, true) => only2.is_empty().then(|| RowPlan::Bind(b.clone(), Row::new(only1, Tail::Var(a.clone())))),
+            (true, false) => only1.is_empty().then(|| RowPlan::Bind(a.clone(), Row::new(only2, Tail::Var(b.clone())))),
+            (true, true) => {
+                let (winner, loser) = row_winner(a, b, infer);
+                if only1.is_empty() && only2.is_empty() {
+                    Some(RowPlan::Bind(loser.to_string(), Row::var(winner)))
+                } else {
+                    Some(RowPlan::Split { a: a.clone(), b: b.clone(), only_a: only1, only_b: only2, winner: winner.to_string() })
+                }
+            }
+        },
+        (Tail::Dyn, _) | (_, Tail::Dyn) => unreachable!("Dyn handled above"),
+    }
+}
+
+// Which of two distinct flexible tails survives (spec 3.1 Precedence): the higher rank, the
+// second on a tie. Returns (winner, loser).
+fn row_winner<'a>(a: &'a str, b: &'a str, infer: &InferCtx) -> (&'a str, &'a str) {
+    if infer.levels.rank(a) > infer.levels.rank(b) { (a, b) } else { (b, a) }
+}
+
+// Makes two rows equal, binding flexible tails; false (nothing bound) when it cannot.
+pub(crate) fn unify_rows(r1: &Row, r2: &Row, infer: &mut InferCtx) -> bool {
+    match row_plan(r1, r2, infer) {
+        None => false,
+        Some(RowPlan::Nothing) => true,
+        Some(RowPlan::Bind(name, row)) => {
+            infer.bind_row(&name, row);
+            true
+        }
+        Some(RowPlan::Split { a, b, only_a, only_b, winner }) => {
+            let rank = infer.levels.rank(&winner);
+            let sigma = infer.fresh_row(rank, surface_name(&winner), None);
+            infer.bind_row(&a, Row::new(only_b, Tail::Var(sigma.clone())));
+            infer.bind_row(&b, Row::new(only_a, Tail::Var(sigma)));
+            true
+        }
+    }
+}
+
+// Could unify_rows make the two rows equal? Binds nothing (relate's effect-row test, 2.3).
+pub(crate) fn row_compatible(r1: &Row, r2: &Row, infer: &InferCtx) -> bool {
+    row_plan(r1, r2, infer).is_some()
+}
+
+// The effects of running both of two sibling computations (spec 3.1, ruling D1(b)): precise,
+// identifying tails. `{a | ρ} ∪ {b}` is `{a, b | ρ}`; two distinct variable tails are unified
+// (the loser binds to the winner); two distinct rigid tails are a type error at `span`.
+pub(crate) fn union_rows(a: &Row, b: &Row, infer: &mut InferCtx, span: Span) -> Result<Row, TypeError> {
+    let (a, b) = (infer.flatten_row(a), infer.flatten_row(b));
+    if a.tail == Tail::Closed && a.entries.is_empty() {
+        return Ok(b);
+    }
+    if b.tail == Tail::Closed && b.entries.is_empty() {
+        return Ok(a);
+    }
+    let labels = || a.labels().chain(b.labels()).map(String::from).collect::<Vec<_>>();
+    let tail = match (&a.tail, &b.tail) {
+        (Tail::Dyn, _) | (_, Tail::Dyn) => return Ok(Row::dyn_()),
+        (Tail::Closed, Tail::Closed) => Tail::Closed,
+        (Tail::Var(v), Tail::Closed) | (Tail::Closed, Tail::Var(v)) => Tail::Var(v.clone()),
+        (Tail::Var(x), Tail::Var(y)) if x == y => Tail::Var(x.clone()),
+        (Tail::Var(x), Tail::Var(y)) => {
+            let (winner, loser) = match (infer.rigid_row.contains(x), infer.rigid_row.contains(y)) {
+                (true, true) => {
+                    return Err(TypeError(
+                        format!("effect row variables {} and {} are fixed by the signature and cannot be combined", surface_name(x), surface_name(y)),
+                        span,
+                    ));
+                }
+                (true, false) => (x.clone(), y.clone()),
+                (false, true) => (y.clone(), x.clone()),
+                (false, false) => {
+                    let (w, l) = row_winner(x, y, infer);
+                    (w.to_string(), l.to_string())
+                }
+            };
+            infer.bind_row(&loser, Row::var(winner.clone()));
+            Tail::Var(winner)
+        }
+    };
+    Ok(Row::new(labels(), tail))
 }
 
 fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
@@ -1249,37 +1470,17 @@ fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Spa
 // the Global Constraint requires a failed unify() to behave EXACTLY like
 // today's widen-to-Dyn -- not silently leave a partial binding that
 // relocates the rejection to some LATER, unrelated use of that same
-// variable. This wrapper snapshots infer.subst AND infer.index_subst
-// before trying, and restores both on failure, so a failed trial
-// genuinely leaves no trace (see final review Finding 1 -- index_subst
-// didn't exist yet when this wrapper's own doc comment was first
-// written, and unify() only started writing to it once Task 3 wired
-// unify_index_expr in).
+// variable. Rolls back everything `InferSnapshot` holds.
 //
 // pub(crate), not private, only because this project's own test
 // convention (see unify_index_expr's neighbors) keeps tests in
 // src/lib.rs -- a different module -- rather than because anything
 // outside typecheck.rs is meant to call this directly.
 pub(crate) fn unify_trial(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
-    // The three maps are persistent (rpds), so each snapshot is an O(1) share, not a copy.
-    let snapshot = infer.subst.clone();
-    // unify() (Task 3) now writes to index_subst too, via
-    // unify_index_expr's own bare-variable-bind arm -- a failed trial
-    // must roll that back as well, or a later, unrelated index
-    // comparison would silently see a binding this trial never actually
-    // committed to.
-    let index_snapshot = infer.index_subst.clone();
-    // The Dyn-sink flags travel with variable aliasing in unify(), so a
-    // failed trial must drop the flags it spread as well.
-    let sunk_snapshot = infer.dyn_sunk.clone();
-    // Lowering walks all three sorts, so the level maps are rolled back as one.
-    let levels_snapshot = infer.levels.clone();
+    let snapshot = infer.snapshot();
     let result = unify(t1, t2, infer, span);
     if result.is_err() {
-        infer.subst = snapshot;
-        infer.index_subst = index_snapshot;
-        infer.dyn_sunk = sunk_snapshot;
-        infer.levels = levels_snapshot;
+        infer.restore(snapshot);
     }
     result
 }
@@ -1389,9 +1590,9 @@ pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type, infer: &mut InferCtx) -> C
 // generalized (and lookup freshens it before any later use can unify
 // against it) or stays free in `ctx` (and downstream consumers that
 // read it back out re-resolve it themselves -- see Expr::App's own
-// `let f_ty = infer.resolve(&f_ty);`). resolve_deep leaves Row
-// untouched (it only walks Type positions), so this doesn't affect
-// row-variable generalization at all.
+// `let f_ty = infer.resolve(&f_ty);`). resolve_deep also flattens
+// bound row tails, so the stored type names each row variable it still has literally
+// (generalization and `lookup` rename by name).
 // pub(crate): the production binder (let, let rec, lambda) and, for the same test-access reason as Ctx/unify_index_expr
 // above -- extend_generalized/lookup together are what this task's
 // own unit test exercises directly, bypassing the separate Expr::App

@@ -1112,12 +1112,19 @@ pub(crate) fn surface_name(name: &str) -> &str {
     name.split('#').next().unwrap_or(name)
 }
 
+// The base of an opened arrow-row tail (D10): a lambda's closed row gets a fresh tail `'#k`.
+// Not an identifier, so no written `->{e}` can produce it. An unbound one prints as nothing.
+pub(crate) const OPENED_ROW: &str = "'";
+
 impl fmt::Display for Row {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let labels = self.labels().collect::<Vec<_>>().join(", ");
         match &self.tail {
             Tail::Dyn => write!(f, "Dyn"),
-            Tail::Var(name) => write!(f, "{{{}}}", surface_name(name)),
-            Tail::Closed => write!(f, "{{{}}}", self.labels().collect::<Vec<_>>().join(", ")),
+            Tail::Closed => write!(f, "{{{labels}}}"),
+            Tail::Var(name) if surface_name(name) == OPENED_ROW => write!(f, "{{{labels}}}"),
+            Tail::Var(name) if labels.is_empty() => write!(f, "{{{}}}", surface_name(name)),
+            Tail::Var(name) => write!(f, "{{{labels} | {}}}", surface_name(name)),
         }
     }
 }

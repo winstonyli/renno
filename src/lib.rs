@@ -11741,4 +11741,106 @@ g(len)").unwrap_err();
         let text = std::thread::Builder::new().stack_size(WORKER_STACK_SIZE).spawn(move || outcome.to_string()).unwrap().join().unwrap();
         assert_eq!(text, format!("{}1{}", "[".repeat(depth), "]".repeat(depth)));
     }
+
+    // ---- one row sort, stage 1 (docs/superpowers/plans/2026-10-18-one-row-sort-stage1.md) ----
+
+    fn row_of(labels: &[&str], tail: types::Tail) -> types::Row {
+        types::Row::new(labels.iter().map(|s| s.to_string()).collect(), tail)
+    }
+
+    #[test]
+    fn rows_print_labels_then_a_named_tail_and_hide_an_opened_one() {
+        use types::Tail;
+        assert_eq!(row_of(&["b", "a"], Tail::Closed).to_string(), "{a, b}");
+        assert_eq!(row_of(&["a"], Tail::Var("e#3".into())).to_string(), "{a | e}");
+        assert_eq!(row_of(&[], Tail::Var("e#3".into())).to_string(), "{e}");
+        assert_eq!(row_of(&[], Tail::Var("'#7".into())).to_string(), "{}");
+        assert_eq!(row_of(&["a"], Tail::Var("'#7#9".into())).to_string(), "{a}");
+        assert_eq!(row_of(&["a"], Tail::Dyn).to_string(), "Dyn");
+    }
+
+    #[test]
+    fn row_unification_extends_flexible_tails_and_refuses_rigid_ones() {
+        use crate::typecheck::{row_compatible, unify_rows, InferCtx, RowRank};
+        use types::{surface_name, Row, Tail};
+        let mut infer = InferCtx::new();
+        let a = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        let b = infer.fresh_row(RowRank::User, "e", None);
+        // {x | a} ~ {y | b}: both flexible with extras: one fresh tail takes both, named after
+        // the higher-ranked side (User beats Opened).
+        assert!(unify_rows(&row_of(&["x"], Tail::Var(a.clone())), &row_of(&["y"], Tail::Var(b.clone())), &mut infer));
+        let (fa, fb) = (infer.flatten_row(&Row::var(a.clone())), infer.flatten_row(&Row::var(b.clone())));
+        assert_eq!(fa.labels().collect::<Vec<_>>(), ["y"]);
+        assert_eq!(fb.labels().collect::<Vec<_>>(), ["x"]);
+        assert_eq!(fa.tail, fb.tail);
+        let Tail::Var(sigma) = &fa.tail else { panic!("{fa:?}") };
+        assert_eq!(surface_name(sigma), "e");
+        // Closed against closed: equal label sets only.
+        assert!(unify_rows(&Row::single("a"), &Row::single("a"), &mut infer));
+        assert!(!unify_rows(&Row::single("a"), &Row::pure(), &mut infer));
+        // A flexible tail against a closed row absorbs the other side's extras, not its own.
+        let c = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        assert!(!unify_rows(&row_of(&["z"], Tail::Var(c.clone())), &Row::single("a"), &mut infer));
+        assert!(unify_rows(&Row::var(c.clone()), &Row::single("a"), &mut infer));
+        assert_eq!(infer.flatten_row(&Row::var(c)).to_string(), "{a}");
+        // Rigid tails: never extended, never meet another rigid tail; a flexible one binds to them.
+        let e1 = infer.fresh_row(RowRank::User, "e1", None);
+        let e2 = infer.fresh_row(RowRank::User, "e2", None);
+        infer.rigid_row.insert(e1.clone());
+        infer.rigid_row.insert(e2.clone());
+        let d = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        assert!(!row_compatible(&Row::var(e1.clone()), &row_of(&["a"], Tail::Var(d.clone())), &infer));
+        assert!(!row_compatible(&Row::var(e1.clone()), &Row::var(e2.clone()), &infer));
+        assert!(row_compatible(&Row::var(e1.clone()), &Row::var(d.clone()), &infer));
+        assert!(unify_rows(&Row::var(d.clone()), &Row::var(e1.clone()), &mut infer));
+        assert_eq!(infer.flatten_row(&Row::var(d)).tail, Tail::Var(e1));
+        // A Dyn tail is compatible with anything and binds nothing.
+        let g = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        assert!(unify_rows(&Row::dyn_(), &row_of(&["q"], Tail::Var(g.clone())), &mut infer));
+        assert_eq!(infer.flatten_row(&Row::var(g.clone())), Row::var(g));
+    }
+
+    #[test]
+    fn row_union_is_precise_and_identifies_tails() {
+        use crate::span::Span;
+        use crate::typecheck::{union_rows, InferCtx, RowRank};
+        use types::{Row, Tail};
+        let sp = Span { start: 0, end: 0 };
+        let mut infer = InferCtx::new();
+        let a = infer.fresh_row(RowRank::User, "a", None);
+        let b = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        assert_eq!(union_rows(&Row::single("x"), &Row::var(a.clone()), &mut infer, sp).unwrap().to_string(), "{x | a}");
+        // Var b ∪ Var a unifies the two tails (b, the opened one, binds to a) and is that tail.
+        let u = union_rows(&Row::var(b.clone()), &row_of(&["y"], Tail::Var(a.clone())), &mut infer, sp).unwrap();
+        assert_eq!(u.to_string(), "{y | a}");
+        assert_eq!(infer.flatten_row(&Row::var(b)).tail, Tail::Var(a));
+        assert_eq!(union_rows(&Row::single("x"), &Row::single("y"), &mut infer, sp).unwrap().to_string(), "{x, y}");
+        assert!(union_rows(&Row::dyn_(), &Row::single("y"), &mut infer, sp).unwrap().is_dyn());
+        let e1 = infer.fresh_row(RowRank::User, "e1", None);
+        let e2 = infer.fresh_row(RowRank::User, "e2", None);
+        infer.rigid_row.insert(e1.clone());
+        infer.rigid_row.insert(e2.clone());
+        let err = union_rows(&Row::var(e1), &Row::var(e2), &mut infer, sp).unwrap_err();
+        assert!(err.0.contains("effect row variables e1 and e2 are fixed by the signature"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_bound_row_tail_resolves_deeply_lowers_levels_and_rolls_back() {
+        use crate::typecheck::{unify_rows, InferCtx, RowRank, TyVar};
+        use types::{Row, Tail, Type};
+        let mut infer = InferCtx::new();
+        let a = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, Some(1));
+        let b = infer.fresh_row(RowRank::User, "e", None);
+        let fun = Type::Fun(Hc::new(Type::Int), Row::var(a.clone()), Hc::new(Type::Int));
+        let snap = infer.snapshot();
+        assert!(unify_rows(&Row::var(a.clone()), &row_of(&["x"], Tail::Var(b.clone())), &mut infer));
+        assert_eq!(infer.resolve_deep(&fun).to_string(), "(Int ->{x | e} Int)");
+        // {a} ~ {x | b} splits (both tails flexible, b's side has x): a := {x | σ}, b := {σ}.
+        // σ is what a's solution mentions, so it is lowered to a's level.
+        let Tail::Var(sigma) = infer.flatten_row(&Row::var(a.clone())).tail else { panic!("tail") };
+        assert_eq!(infer.levels.get(&TyVar::Row(sigma)), Some(1), "a solution's tail is lowered to the bound variable's level");
+        infer.restore(snap);
+        assert_eq!(infer.resolve_deep(&fun).to_string(), "(Int ->{} Int)");
+        assert_eq!(infer.levels.get(&TyVar::Row(b)), None);
+    }
 }
