@@ -5403,15 +5403,18 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // unannotated callback's parameter type become known
                 // from how it's called, the crux of my_map's own
                 // correlation (see the design spec's own Motivation and
-                // "Where unify is called", site 2).
+                // "Where unify is called", site 2). (D2: the shape's row is a
+                // fresh variable, not Dyn.)
                 Type::Var(_) => {
                     let param_ty = infer.fresh_var("param");
                     let ret_ty = infer.fresh_var("ret");
-                    let fun_shape = Type::Fun(Hc::new(param_ty.clone()), Row::dyn_(), Hc::new(ret_ty.clone()));
+                    // D2 (spec 3.1): the call performs whatever the callback does, a fresh row.
+                    let row = Row::var(infer.fresh_row(RowRank::Fresh, "e", Some(ctx.level)));
+                    let fun_shape = Type::Fun(Hc::new(param_ty.clone()), row.clone(), Hc::new(ret_ty.clone()));
                     unify(&f_ty, &fun_shape, infer, spans[f])?;
                     unify(&param_ty, &a_ty, infer, spans[a])?;
                     let ret_ty2 = infer.resolve_deep(&ret_ty);
-                    (Row::dyn_(), ret_ty2, arena.push(Expr::App(f2, a2)))
+                    (row, ret_ty2, arena.push(Expr::App(f2, a2)))
                 }
                 Type::Dyn => {
                     // Unknown callee: still route "is this even callable"

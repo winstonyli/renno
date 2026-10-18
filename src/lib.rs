@@ -3028,12 +3028,15 @@ g(len)").unwrap_err();
 
     #[test]
     fn dyn_sourced_call_falls_back_permissively() {
-        // `f` is an unannotated (Dyn) lambda parameter, so calling it can't
-        // be proven to perform any particular set of effects -- the whole
-        // expression's row degrades to Dyn rather than a known-unhandled
-        // set. Static check can't reject it, but the real unhandled effect
-        // still panics at runtime exactly as before this feature existed.
-        let src = "(fun f -> f(0))(fun x -> perform mystery(x))";
+        // D2 (spec 3.1): an unannotated parameter's call now has a fresh row, so the callback's
+        // effect is a static rejection (it used to degrade to Dyn and panic at run time).
+        assert!(static_error("(fun f -> f(0))(fun x -> perform mystery(x))")
+            .is_some_and(|e| e.contains("unhandled effect: mystery")));
+        // `f` is a `Dyn` parameter, so calling it can't be proven to perform any particular set
+        // of effects -- the whole expression's row degrades to Dyn rather than a known-unhandled
+        // set. Static check can't reject it, but the real unhandled effect still panics at
+        // runtime exactly as before this feature existed.
+        let src = "(fun f: Dyn -> f(0))(fun x -> perform mystery(x))";
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated =
             typecheck::check(&mut arena, root, &spans).expect("Dyn-sourced call should not be statically rejected");
@@ -11897,6 +11900,24 @@ g(len)").unwrap_err();
         runs_to(h2, "0");
         let h3 = "let k = fun f: (Int ->{e} Int) -> handle (perform b(0) + f(1)) with handler a(p, resume) -> resume(p) in k(fun x -> x)";
         assert!(static_error(h3).is_some_and(|e| e.contains("unhandled effect: b")), "{:?}", static_error(h3));
+    }
+
+    #[test]
+    fn calls_through_unannotated_parameters_are_effect_polymorphic() {
+        // D2 (spec 3.1): `fun f -> f(1)` is `(Int ->{ρ} r) ->{ρ} r`.
+        let err = run_source("let ap = fun f -> f(1) in let z: Int = ap in z").unwrap_err();
+        assert!(err.contains("found ((Int ->{e} Dyn) ->{e} Dyn)"), "{err}");
+        // The handled unannotated `apply` (spec 3.1 Handle ruling): `{ρ}` with `ρ := {a}` stays
+        // after the handler, so it is a static rejection (prints 5 before stage 1).
+        let apply = "let apply = fun f -> handle f(1) with handler a(p, resume) -> resume(5) in apply(fun x -> perform a(x))";
+        assert!(static_error(apply).is_some_and(|e| e.contains("unhandled effect: a")), "{:?}", static_error(apply));
+        let apply_b = "let apply = fun f -> handle f(1) with handler a(p, resume) -> resume(5) in apply(fun x -> perform b(x))";
+        assert!(static_error(apply_b).is_some_and(|e| e.contains("unhandled effect: b")), "{:?}", static_error(apply_b));
+        // Self-recursion through an unannotated `let rec` (spec section 4, rec3): now static.
+        let rec3 = "let rec loop = fun n -> if n == 0 then 0 else perform a(n) + loop(n - 1) in loop(2)";
+        assert!(static_error(rec3).is_some_and(|e| e.contains("unhandled effect: a")), "{:?}", static_error(rec3));
+        // Higher-order code that handles what it is given keeps running.
+        runs_to("let both = fun f -> fun g -> (f(1), g(2)) in handle both(fun x -> x)(fun y -> perform a(y)) with handler a(p, resume) -> resume(p + 10)", "[1, 12]");
     }
 
     #[test]
