@@ -593,7 +593,7 @@ impl<'a> Parser<'a> {
     // polymorphism (typecheck::extend_generalized generalizes it at a
     // `let`, typecheck::lookup instantiates a fresh copy at each use). No
     // `{name}` -- the default, and the only option before this existed --
-    // means EffectRow::Dyn (unknown effects, gradual default), consistent
+    // means Tail::Dyn (unknown effects, gradual default), consistent
     // with every other unannotated position. A "{" that ISN'T a row
     // variable (peek_is_row_var says no) falls through to Dyn here and
     // gets parsed as an ordinary return-type atom instead, by the

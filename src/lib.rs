@@ -1613,7 +1613,7 @@ mod tests {
     fn a_still_open_enclosing_type_variable_is_not_wrongly_re_generalized() {
         // The exact bug class the passthrough feature's own final review
         // found and fixed (in its design spec's review) and the concurrent
-        // row-variable fix found again for EffectRow::Var: a nested
+        // row-variable fix found again for Tail::Var: a nested
         // let-alias inside a still-open function body must NOT
         // re-generalize the outer, still-open type variable it merely
         // touches.
@@ -4082,17 +4082,17 @@ g(len)").unwrap_err();
     fn equal_structure_is_one_node() {
         use crate::index_expr::IndexExpr;
         use std::rc::Rc;
-        use types::{EffectRow, Type};
+        use types::{Row, Type};
         let pair = || Type::Tuple(Hc::new(vec![Type::Int, Type::Int]));
         let (Type::Tuple(a), Type::Tuple(b)) = (pair(), pair()) else { unreachable!() };
         assert!(Hc::ptr_eq(&a, &b));
-        let fun = |row: EffectRow| Type::Fun(Hc::new(Type::Int), row, Hc::new(Type::Int));
+        let fun = |row: Row| Type::Fun(Hc::new(Type::Int), row, Hc::new(Type::Int));
         let node = |t: &Type| match t {
             Type::Fun(a, _, _) => a.clone(),
             _ => unreachable!(),
         };
-        assert!(Hc::ptr_eq(&node(&fun(EffectRow::Dyn)), &node(&fun(EffectRow::Var("e".into())))), "the parameter is one node");
-        let (f1, f2) = (Type::List(Hc::new(fun(EffectRow::Dyn))), Type::List(Hc::new(fun(EffectRow::pure()))));
+        assert!(Hc::ptr_eq(&node(&fun(Row::dyn_())), &node(&fun(Row::var("e")))), "the parameter is one node");
+        let (f1, f2) = (Type::List(Hc::new(fun(Row::dyn_()))), Type::List(Hc::new(fun(Row::pure()))));
         let (Type::List(x), Type::List(y)) = (&f1, &f2) else { unreachable!() };
         assert!(!Hc::ptr_eq(x, y), "an effect row is part of a node's identity");
         let tup = |t: Type| Type::Tuple(Hc::new(vec![t]));
@@ -4120,12 +4120,12 @@ g(len)").unwrap_err();
     // `plain` and `escape` come from the bodies' summary.
     #[test]
     fn rec_group_plain_and_escape_come_from_the_summary() {
-        use types::{EffectRow, Type};
+        use types::{Row, Type};
         let list = rec_list();
         assert!(list.0.plain && list.0.escape == 0);
         let var = rec_group(&["V"], vec![rec_tup(vec![Type::Var("a".into()), rec_bound(0, 0)])]);
         assert!(!var.0.plain && var.0.escape == 0);
-        let row = rec_group(&["R"], vec![Type::Fun(Hc::new(rec_bound(0, 0)), EffectRow::Var("e".into()), Hc::new(Type::Int))]);
+        let row = rec_group(&["R"], vec![Type::Fun(Hc::new(rec_bound(0, 0)), Row::var("e"), Hc::new(Type::Int))]);
         assert!(!row.0.plain);
         let free = rec_group(&["F"], vec![rec_tup(vec![rec_free(1, "X"), rec_bound(0, 0)])]);
         assert!(!free.0.plain);
@@ -6208,7 +6208,7 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::typecheck::{extend_generalized, lookup, Ctx, InferCtx};
         use std::rc::Rc;
-        use types::{EffectRow, Type};
+        use types::{Row, Type};
 
         fn vec_of(index: IndexExpr) -> Type {
             Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(index))
@@ -6218,8 +6218,8 @@ g(len)").unwrap_err();
         let n = IndexExpr::Var("n".to_string());
         let identity_vec_ty = Type::Fun(
             Hc::new(Type::Int),
-            EffectRow::Dyn,
-            Hc::new(Type::Fun(Hc::new(vec_of(n.clone())), EffectRow::Dyn, Hc::new(vec_of(n)))),
+            Row::dyn_(),
+            Hc::new(Type::Fun(Hc::new(vec_of(n.clone())), Row::dyn_(), Hc::new(vec_of(n)))),
         );
 
         let mut infer = InferCtx::new();
@@ -6258,13 +6258,13 @@ g(len)").unwrap_err();
     #[test]
     fn polymorphic_let_chain_leaves_no_levelled_variable() {
         use crate::typecheck::{extend, extend_generalized, lookup, Ctx, InferCtx, TyVar};
-        use types::{EffectRow, Type};
+        use types::{Row, Type};
 
         let mut infer = InferCtx::new();
         let mut ctx = Ctx::empty();
         for i in 0..3 {
             let a = Hc::new(Type::Var(format!("a{i}")));
-            ctx = extend_generalized(&ctx, &format!("id{i}"), Type::Fun(a.clone(), EffectRow::Dyn, a), &mut infer, None);
+            ctx = extend_generalized(&ctx, &format!("id{i}"), Type::Fun(a.clone(), Row::dyn_(), a), &mut infer, None);
             assert_eq!(infer.levels.get(&TyVar::Type(format!("a{i}"))), None);
         }
         let ctx = extend(&ctx, "x", Type::Var("b".to_string()), &mut infer);
@@ -6287,7 +6287,7 @@ g(len)").unwrap_err();
         use crate::typecheck::{extend, unify_trial, Ctx, InferCtx};
         use crate::typecheck::TyVar;
         use std::rc::Rc;
-        use types::{EffectRow, Type};
+        use types::{Row, Type};
         let var = |n: &str| Type::Var(n.to_string());
         let span = Span { start: 0, end: 0 };
         let mut infer = InferCtx::new();
@@ -6298,7 +6298,7 @@ g(len)").unwrap_err();
 
         // x := List(y -> z): y, z and the row r drop to x's level; the index n of an Indexed
         // component does too.
-        let fun = Type::Fun(Hc::new(var("y")), EffectRow::Var("r".into()), Hc::new(var("z")));
+        let fun = Type::Fun(Hc::new(var("y")), Row::var("r"), Hc::new(var("z")));
         let idx = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Int))), Rc::new(IndexExpr::Var("n".into())));
         let sol = Type::List(Hc::new(Type::Tuple(Hc::new(vec![fun, idx]))));
         assert!(unify_trial(&var("x"), &sol, &mut infer, span).is_ok());
@@ -6537,14 +6537,14 @@ g(len)").unwrap_err();
         use crate::typecheck::{check_against, Ctx, InferCtx};
         use crate::span::Span;
         use crate::expr::{Arena, Expr, SpanMap};
-        use crate::types::{Type, EffectRow};
+        use crate::types::{Type, Row};
         let mut arena = Arena::new();
         let mut spans = SpanMap::new();
         let e = arena.push(Expr::Int(5));
         spans.push(Span { start: 0, end: 0 });
         let mut infer = InferCtx::new();
         let (row, _) = check_against(&mut arena, e, &Type::Int, &Ctx::empty(), &spans, &mut infer).unwrap();
-        assert_eq!(row, EffectRow::pure());
+        assert_eq!(row, Row::pure());
     }
 
     #[test]
@@ -9128,9 +9128,9 @@ g(len)").unwrap_err();
     fn a_recursive_rec_function_type_lowers_to_one_shared_cyclic_graph() {
         // F = Dyn -> F, built as a closed group: the result of F's contract is F's own Lazy, at every
         // depth, so a call chain allocates nothing per call.
-        use crate::types::{EffectRow, Type};
+        use crate::types::{Row, Type};
         use std::rc::Rc;
-        let g = rec_group(&["F"], vec![Type::Fun(Hc::new(Type::Dyn), EffectRow::Dyn, Hc::new(rec_bound(0, 0)))]);
+        let g = rec_group(&["F"], vec![Type::Fun(Hc::new(Type::Dyn), Row::dyn_(), Hc::new(rec_bound(0, 0)))]);
         let f = Type::Rec(g, 0);
         let root = expr::Lazy::new(Rc::new(f));
         let mut level = root.clone();
@@ -10261,16 +10261,16 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::typecheck::{open_annotation, Ctx, InferCtx, TyVar};
         use std::rc::Rc;
-        use types::{EffectRow, Type};
+        use types::{Row, Tail, Type};
 
         // (Vec(n) ->{n} Dyn): an index variable and a row variable that share the spelling `n`.
         let ann = Type::Fun(
             Hc::new(Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".into())))),
-            EffectRow::Var("n".into()),
+            Row::var("n"),
             Hc::new(Type::Dyn),
         );
         let names = |t: &Type| match t {
-            Type::Fun(p, EffectRow::Var(r), _) => match p.as_ref() {
+            Type::Fun(p, Row { tail: Tail::Var(r), .. }, _) => match p.as_ref() {
                 Type::Indexed(_, i) => match i.as_ref() {
                     IndexExpr::Var(i) => (i.clone(), r.clone()),
                     other => panic!("{other:?}"),
@@ -11723,10 +11723,10 @@ g(len)").unwrap_err();
     // A type nested a million deep (a `fun` chain's type) drops on the test thread's small stack.
     #[test]
     fn a_deeply_nested_type_drops_on_a_small_stack() {
-        use types::{EffectRow, Type};
+        use types::{Row, Type};
         let mut t = Type::Int;
         for _ in 0..CHAIN_LINKS {
-            t = Type::Fun(Hc::new(Type::Int), EffectRow::pure(), Hc::new(t));
+            t = Type::Fun(Hc::new(Type::Int), Row::pure(), Hc::new(t));
         }
         drop(t);
     }
