@@ -12167,4 +12167,73 @@ g(len)").unwrap_err();
             assert!(shown.contains("{x, y | e}"), "{what}: {shown}");
         }
     }
+
+    // ---- wrong-value fixes (docs/superpowers/specs/2026-10-17-wrong-value-fixes-design.md) ----
+
+    // `src` typechecks and then stops with a run-time error containing `want`.
+    fn fails_at_run_time(src: &str, want: &str) {
+        assert_eq!(static_error(src), None, "{src}: expected no static error");
+        let err = run_source(src).expect_err(src);
+        assert!(err.contains(want), "{src}: expected `{want}` in `{err}`");
+    }
+
+    // `src` is rejected by the checker with a message containing `want`.
+    fn fails_statically(src: &str, want: &str) {
+        let err = static_error(src).unwrap_or_else(|| panic!("{src}: expected a static error"));
+        assert!(err.contains(want), "{src}: expected `{want}` in `{err}`");
+    }
+
+    // Section 1: a tuple at an Indexed(T, k) site whose elements are Unknown against the
+    // alternative is kept and checked at run time; it no longer slips past as Dyn.
+    #[test]
+    fn indexed_site_checks_unknown_tuple_elements_at_run_time() {
+        fails_at_run_time("let rec T = Union(Tuple(Str, Int), Tuple(Int, T)) in let d: Dyn = 5 in let p = (d, 1) in let x: Indexed(T, 0) = p in match x | (s, n) -> (let z: Str = s in z) | _ -> \"other\"", "expected (Str, Int), found Int at element 0");
+        fails_at_run_time("let rec L = Union(Int, Tuple(Int, L)) in let d: Dyn = \"s\" in let p = (1, d) in let v: Indexed(L, 1) = p in v", "expected (Int, L), found Str at element 1");
+        fails_at_run_time("let rec T = Union(Int, Tuple(Int, T)) in let f = fun t -> (let p = (1, t) in let w: Indexed(T, 1) = p in w) in f(\"s\")", "expected (Int, T), found Str at element 1");
+        fails_at_run_time("let rec L = Union(Int, Tuple(Int, L)) in let d: Dyn = \"s\" in let p = (d, 2) in let v: Indexed(L, 1) = p in v", "expected (Int, L), found Str at element 0");
+        fails_at_run_time("let rec L = Union(Int, Tuple(Int, L)) in let d: Dyn = \"s\" in let p = (1, (d, 3)) in let v: Indexed(L, 2) = p in v", "expected (Int, L), found Str at element 1, element 0");
+        fails_at_run_time("let rec L = Union(Int, Tuple(Int, L)) in let f = fun q -> (let p = (1, q) in let v: Indexed(L, 1) = p in v) in f(\"s\")", "expected (Int, L), found Str at element 1");
+    }
+
+    // A tuple the alternative refutes is a static error, not a value of the wrong shape.
+    #[test]
+    fn indexed_site_rejects_refuted_tuples_statically() {
+        fails_statically("let rec T = Union(Tuple(Record({x: Int, y: Str}), Int), Tuple(Int, Int, T)) in let g = fun r -> (let t: Indexed(T, 0) = (r, 1) in match t | (u, n) -> (let z: Str = u.y in z) | _ -> \"o\") in g({x: 1, y: 5})", "expected {x: Int, y: Str}, found {x: Int, y: Int}");
+        fails_statically("let rec T = Union(Str, Tuple(Int, T)) in let f = fun n -> (let p = (n, \"s\") in let v: Indexed(T, 1) = p in match v | (m, _) -> (let z: Int = m in z) | _ -> 0) in f(\"x\")", "expected Int, found Str");
+        fails_statically("let rec L = Union(Int, Tuple(Int, L)) in let f = fun q -> (let p = (q, 5) in let v: Indexed(L, 1) = p in v) in f(\"s\")", "expected Int, found Str");
+        fails_statically("let rec T = Union(Vec(3), Tuple(Int, T)) in let f = fun v: Vec(n) -> (let t: Indexed(T, 0) = v in t) in f([1, 2])", "expected [Dyn](3), found [Int](2)");
+        fails_statically("let rec L = Union(Int, Tuple(Int, L)) in let f = fun q -> (let p = (q, (q, 5)) in let v: Indexed(L, 2) = p in v) in f(\"s\")", "expected Int, found Str");
+        // The closed-record control: rejected before and after.
+        fails_statically("let rec T = Union(Tuple(Record({x: Int, y: Str}), Int), Tuple(Int, Int, T)) in let g = fun r: {x: Int, y: Int} -> (let t: Indexed(T, 0) = (r, 1) in match t | (u, n) -> (let z: Str = u.y in z) | _ -> \"o\") in g({x: 1, y: 5})", "expected T(0), found ({x: Int, y: Int}, Int)");
+    }
+
+    // Values that fit the alternative keep running; a wider record now fits the base end.
+    #[test]
+    fn indexed_site_keeps_fitting_tuples() {
+        runs_to("let rec L = Union(Int, Tuple(Int, L)) in let mk = fun h -> (let p = (h, 0) in let v: Indexed(L, 1) = p in v) in mk(5)", "[5, 0]");
+        runs_to("let rec T = Union(Tuple(Record({x: Int, y: Str}), Int), Tuple(Int, Int, T)) in let g = fun r -> (let t: Indexed(T, 0) = (r, 1) in match t | (u, n) -> (let z: Str = u.y in z) | _ -> \"o\") in g({x: 1, y: \"a\"})", "a");
+        runs_to("let rec T = Union(Tuple(Record({x: Int, y: Str}), Int), Tuple(Int, Int, T)) in let g = fun r -> (let t: Indexed(T, 0) = (r, 1) in r.z) in g({x: 1, y: \"a\", z: 7})", "7");
+        runs_to("let rec L = Union(Int, Tuple(Int, L)) in let p = (1, (2, 3)) in let v: Indexed(L, 2) = p in v", "[1, [2, 3]]");
+        runs_to("let rec L = Union(Int, Tuple(Int, L)) in let p = (1, 2) in let v: Indexed(L, 1) = p in v", "[1, 2]");
+        runs_to("let rec L = Union(Int, Tuple(Int, L)) in let mk = fun h -> (let p = (1, (h, 3)) in let v: Indexed(L, 2) = p in v) in mk(5)", "[1, [5, 3]]");
+        runs_to("let rec T = Union(Vec(3), Tuple(Int, T)) in let f = fun v: Vec(n) -> (let t: Indexed(T, 0) = v in t) in f([1, 2, 3])", "[1, 2, 3]");
+        runs_to("let rec T = Union(Tuple(Record({x: Int, y: Str}), Int), Tuple(Int, Int, T)) in let g = fun r -> (r.z, let t: Indexed(T, 0) = (r, 1) in 0) in g({x: 1, y: \"a\", z: 7})", "[7, 0]");
+        // A right `Dyn` payload or parameter still runs (D1 option b: Unknown is kept and checked).
+        runs_to("let rec T = Union(Tuple(Str, Int), Tuple(Int, T)) in let d: Dyn = \"a\" in let p = (d, 1) in let x: Indexed(T, 0) = p in match x | (s, n) -> (let z: Str = s in z) | _ -> \"other\"", "a");
+        runs_to("let rec T = Union(Tuple(Str, Int), Tuple(Int, T)) in let f = fun d -> (let p = (d, 1) in let x: Indexed(T, 0) = p in match x | (s, n) -> (let z: Str = s in z) | _ -> \"other\") in f(\"a\")", "a");
+        runs_to("let rec L = Union(Int, Tuple(Int, L)) in let d: Dyn = 2 in let p = (1, d) in let v: Indexed(L, 1) = p in v", "[1, 2]");
+        runs_to("let rec L = Union(Int, Tuple(Int, L)) in let d: Dyn = 1 in let p = (d, 2) in let v: Indexed(L, 1) = p in v", "[1, 2]");
+        runs_to("let rec T = Union(Record({x: Int}), Tuple(Int, T)) in let r = {x: 1, y: 2} in let t: Indexed(T, 0) = r in t", "{x: 1, y: 2}");
+    }
+
+    // Review focus: a function element at an Indexed site; its effect row must not make the
+    // fit test refute it, pure or performing.
+    #[test]
+    fn indexed_site_keeps_function_elements() {
+        runs_to("let rec T = Union(Tuple(Fun((Int, Int)), Int), Tuple(Int, Int, T)) in let f = fun x: Int -> x + 1 in let p = (f, 1) in let t: Indexed(T, 0) = p in match t | (g, n) -> g(n) | _ -> 0", "2");
+        runs_to("let rec T = Union(Tuple(Fun((Int, Int)), Int), Tuple(Int, Int, T)) in let f = fun x -> perform a(x) in let p = (f, 1) in let t: Indexed(T, 0) = p in handle (match t | (g, n) -> g(n) | _ -> 0) with handler a(q, k) -> k(q + 10)", "11");
+        // Unhandled, the performing element still stops the program, before and after.
+        fails_at_run_time("let rec T = Union(Tuple(Fun((Int, Int)), Int), Tuple(Int, Int, T)) in let f = fun x -> perform a(x) in let p = (f, 1) in let t: Indexed(T, 0) = p in match t | (g, n) -> g(n) | _ -> 0", "unhandled effect: a");
+        fails_at_run_time("let rec T = Union(Tuple(Fun((Int, \"e\", Int)), Int), Tuple(Int, Int, T)) in let k = fun f -> (let p = (f, 1) in let t: Indexed(T, 0) = p in match t | (g, n) -> g(n) | _ -> 0) in k(fun x -> perform a(x))", "unhandled effect: a");
+    }
 }

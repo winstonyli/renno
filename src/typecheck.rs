@@ -3544,26 +3544,54 @@ fn const_index(e: &IndexExpr) -> Option<i64> {
 // `rec(idx)` step value? Only decided when `idx` is a known
 // positive constant -- a symbolic or zero index keeps the base-case
 // treatment, since a Dyn base alternative would also accept the tuple
-// there. Non-recursive positions must be consistent with the step
-// alternative's; the recursive position is checked against `idx - 1`,
+// there. Non-recursive positions must pass `fits_not_refuted` against the
+// step alternative's; the recursive position is checked against `idx - 1`,
 // recursing while it is itself a tuple and ending at a base value (or
-// Dyn/Var, which carries no information to contradict).
-fn is_step_shaped_tuple(actual: &Type, base_alt: &Type, step_alt: &Type, self_ref: SelfRef, idx: &IndexExpr, infer: &InferCtx) -> bool {
+// Dyn/Var, which carries no information to contradict; the caller's coerce
+// to the step alternative checks its values at run time). A rejected
+// candidate keeps none of the bindings its earlier positions made: one
+// snapshot at the outermost call, since the base-case fallback runs next.
+fn is_step_shaped_tuple(actual: &Type, base_alt: &Type, step_alt: &Type, self_ref: SelfRef, idx: &IndexExpr, infer: &mut InferCtx, span: Span) -> bool {
+    let snapshot = infer.snapshot();
+    let ok = step_shaped_in(actual, base_alt, step_alt, self_ref, idx, infer, span);
+    if !ok {
+        infer.restore(snapshot);
+    }
+    ok
+}
+
+fn step_shaped_in(actual: &Type, base_alt: &Type, step_alt: &Type, self_ref: SelfRef, idx: &IndexExpr, infer: &mut InferCtx, span: Span) -> bool {
     let (Type::Tuple(items), Type::Tuple(step_items)) = (actual, step_alt) else { return false };
     let Some(k) = const_index(&infer.resolve_index_deep(idx)).filter(|k| *k > 0) else { return false };
     let Some(rec_pos) = self_ref_position(step_alt, self_ref) else { return false };
     if items.len() != step_items.len() {
         return false;
     }
-    if !(0..items.len()).all(|i| i == rec_pos || consistent(&items[i], &step_items[i])) {
+    if !(0..items.len()).all(|i| i == rec_pos || fits_not_refuted(&step_items[i], &items[i], infer, span)) {
         return false;
     }
     let tail = infer.resolve_deep(&items[rec_pos]);
     match &tail {
         Type::Dyn | Type::Var(_) => true,
-        Type::Tuple(_) if k > 1 => is_step_shaped_tuple(&tail, base_alt, step_alt, self_ref, &IndexExpr::Lit(k - 1), infer),
-        _ => k == 1 && !matches!(tail, Type::Indexed(..)) && consistent(&tail, base_alt),
+        Type::Tuple(_) if k > 1 => step_shaped_in(&tail, base_alt, step_alt, self_ref, &IndexExpr::Lit(k - 1), infer, span),
+        _ => k == 1 && !matches!(tail, Type::Indexed(..)) && fits_not_refuted(base_alt, &tail, infer, span),
     }
+}
+
+// Can a value of type `actual` be one of `required` (a Case B alternative)? Unify first, then ask
+// (wrong-value fixes spec, section 1): `unify_fits` binds what the two share (its error is
+// ignored: the call is made for the bindings it leaves, and its directional width rule applies),
+// then `relate` judges the resolved pair. Only a `Refuted` verdict rejects, and it undoes the
+// bindings; `Proven` and `Unknown` keep them, and the caller coerces the value to `required`, so
+// what `relate` could not decide is checked at run time.
+fn fits_not_refuted(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) -> bool {
+    let snapshot = infer.snapshot();
+    let _ = unify_fits(required, actual, infer, span);
+    if matches!(relate(actual, required, infer), Rel::Refuted(_)) {
+        infer.restore(snapshot);
+        return false;
+    }
+    true
 }
 
 // Shared "nothing real to correlate against" fallback: bind each of a
@@ -4862,8 +4890,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     // give the tail one extra dispatch option alongside plain
     // elaborate_node, the same tail-dispatch point Phase 3 built for
     // If/Match's own Check-mode treatment. When it doesn't qualify (or
-    // qualifies but the actual type isn't consistent with the base
-    // alternative), this falls through to elaborate_node's own Synth
+    // qualifies but `fits_not_refuted` refutes the actual type against the
+    // base alternative), this falls through to elaborate_node's own Synth
     // result, and the UNCHANGED trailing coerce/unify_fits check right
     // below does today's ordinary generic fallback -- correctly
     // rejecting a value that's neither shape.
@@ -4871,6 +4899,12 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         Mode::Check(expected) => match case_b_base_candidate(arena, cur_expr, expected, infer) {
             Some((base_alt, step_alt, self_ref, idx)) => {
                 let (actual_ty, row, expr2) = elaborate(arena, cur_expr, &cur_ctx, spans, infer)?;
+                // The base-case test below was `consistent(&actual_ty,
+                // &base_alt)`; it is now `fits_not_refuted` (wrong-value
+                // fixes spec, section 1), which is as permissive as
+                // `consistent` on a Dyn/Var side, so the history below
+                // still explains the two guards in front of it.
+                //
                 // DEVIATION from the task-6 brief's literal text: the
                 // brief's own condition was bare `consistent(&actual_ty,
                 // &base_alt)`. `consistent` treats Dyn/Var as
@@ -4955,15 +4989,21 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // Dyn/Var) still unifies index 0 correctly.
                 let actual_is_indexed = matches!(actual_ty, Type::Indexed(..));
                 let base_is_dyn_or_var = matches!(base_alt, Type::Dyn | Type::Var(_));
-                if is_step_shaped_tuple(&actual_ty, &base_alt, &step_alt, self_ref, &idx, infer) {
-                    // Already-synthesized step-shaped Tuple (see the helper).
-                    (expected.clone(), row, expr2)
+                if is_step_shaped_tuple(&actual_ty, &base_alt, &step_alt, self_ref, &idx, infer, spans[cur_expr]) {
+                    // Already-synthesized step-shaped Tuple (see the helper). Coerced to the
+                    // step alternative, not to `expected` (that rejects correct step values
+                    // statically), because the tail's coerce below is then the identity: this
+                    // is where a `Dyn` or unknown payload gets its run-time check.
+                    let checked = coerce(arena, expr2, &actual_ty, &step_alt, spans[cur_expr], &CheckEnv::new(infer))?;
+                    (expected.clone(), row, checked)
                 } else if !matches!(actual_ty, Type::Dyn | Type::Var(_))
                     && !(actual_is_indexed && base_is_dyn_or_var)
-                    && consistent(&actual_ty, &base_alt)
+                    && fits_not_refuted(&base_alt, &actual_ty, infer, spans[cur_expr])
                 {
                     unify_index(&idx, &IndexExpr::Lit(0), infer, spans[cur_expr])?;
-                    (expected.clone(), row, expr2)
+                    // As in the step arm: the base value's run-time check, if relate left one.
+                    let checked = coerce(arena, expr2, &actual_ty, &base_alt, spans[cur_expr], &CheckEnv::new(infer))?;
+                    (expected.clone(), row, checked)
                 } else {
                     (actual_ty, row, expr2)
                 }
