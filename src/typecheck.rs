@@ -1344,10 +1344,11 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
     fits_in(required, actual, infer, span, &mut FxSet::default())
 }
 
-// `done` holds the big pairs this call has already accepted, relate rescue included. That is
-// safe: a remembered acceptance cannot add strictness (rows it bound stay equal, a rescue is
-// only for pairs outside a Fun's row), and every caller propagates an error with `?`, so a
-// failure ends the call.
+// `done` holds the big pairs this call has already accepted, relate rescue included.
+// Remembering an acceptance cannot add strictness: the only place `unify_fits` is stricter than
+// `coerce_check` is a `Fun`'s effect row (spec 2.3, stage 1 (iv)), and a repeat meeting of the
+// same pair finds its rows already equal, so `unify_rows` binds nothing new. Every caller
+// propagates an error with `?`, so a failure ends the call.
 fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
     let required = infer.resolve(required);
     let actual = infer.resolve(actual);

@@ -11974,6 +11974,15 @@ g(len)").unwrap_err();
         // Review Focus 5: a types-as-values signature row is rigid too. Guard after Task 4.
         let tav = "let F = Fun((Int, \"e\", Int)) in let k: (F -> F) = fun f -> fun x -> perform a(x) + f(x) in 0";
         assert!(static_error(tav).is_some(), "types-as-values signature row should be rigid");
+        // Two distinct types-as-values row variables are rigid too (guard; printed 6 on baseline).
+        let tavr = "let F1 = Fun((Int, \"e1\", Int)) in let F2 = Fun((Int, \"e2\", Int)) in let h: (F1 -> F2 -> Int) = fun f -> fun g -> f(1) + g(1) in h(fun x -> x + 1)(fun x -> x + 3)";
+        assert!(static_error(tavr).is_some_and(|e| e.contains("effect row variables e1 and e2 are fixed by the signature")), "{:?}", static_error(tavr));
+        // Rigidity ends with the signature (guard): a later call of the let-bound `k` is checked
+        // against its instantiated type, so the performing callback typechecks and fails only at
+        // run time as an unhandled effect, not as a "fixed by the signature" error.
+        let released = "let k: ((Int ->{e} Int) -> Int) = fun f -> f(1) in k(fun x -> perform a(x))";
+        let err = run_source(released).unwrap_err();
+        assert!(err.contains("unhandled effect: a") && !err.contains("fixed by the signature"), "{err:?}");
         // Pure and declared-polymorphic implementations still fit (guard; a1 to a3 stay in Task 4's test).
         runs_to("let k: (Int -> (Int ->{e} Int)) = fun n -> fun x -> n in k(1)(2)", "1");
     }

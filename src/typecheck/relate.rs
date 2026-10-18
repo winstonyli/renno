@@ -1,8 +1,8 @@
 //! Directional, infer-aware type relation (design 2026-10-08, section 3.1). Pure and read-only.
 //! S2 T1 added `Why`/`Undecided`/`relate_cast`; consumers: coerce_check and the unify_fits rescue (T3), coerce_cast (T4).
-use super::{free_index_vars, unify_index_expr, InferCtx};
+use super::{free_index_vars, row_compatible, unify_index_expr, InferCtx};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
-use crate::types::{is_big, row_consistent, unfold, ById, FxMap, RecRef, Type};
+use crate::types::{is_big, unfold, ById, FxMap, RecRef, Type};
 use crate::util::find_field;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -287,7 +287,7 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
     let Type::Fun(a, r, b) = from else { return Rel::refuted("not a function") };
     let (a2, b2) = match to {
         Type::Fun(a2, r2, b2) => {
-            if !fuel.ignore_rows && !row_consistent(r, r2) {
+            if !fuel.ignore_rows && !row_compatible(r, r2, infer) {
                 return Rel::opaque("effect row");
             }
             ((**a2).clone(), (**b2).clone())
@@ -502,6 +502,25 @@ mod tests {
         let fx = |row: Row| Type::Fun(Hc::new(i.clone()), row, Hc::new(i.clone()));
         assert!(matches!(relate(&fx(Row::single("a")), &fx(Row::pure()), &infer), Rel::Refuted(_)));
         assert_eq!(relate_cast(&fx(Row::single("a")), &fx(Row::pure()), &infer), Rel::Proven);
+    }
+
+    #[test]
+    fn effect_rows_relate_by_row_compatibility_and_casts_ignore_them() {
+        use crate::typecheck::RowRank;
+        use crate::types::{Row, Tail};
+        let mut infer = InferCtx::new();
+        let i = Type::Int;
+        let fx = |row: Row| Type::Fun(Hc::new(i.clone()), row, Hc::new(i.clone()));
+        let e = infer.fresh_row(RowRank::User, "e", None);
+        let open = infer.fresh_row(RowRank::Opened, crate::types::OPENED_ROW, None);
+        infer.rigid_row.insert(e.clone());
+        let labelled = Row::new(vec!["a".into()], Tail::Var(open.clone()));
+        // A rigid tail cannot absorb `a`: refuted, as unify_fits would fail.
+        assert!(matches!(relate(&fx(labelled.clone()), &fx(Row::var(e.clone())), &infer), Rel::Refuted(_)));
+        // A flexible tail can: compatible (Proven: effect-row relate is boolean).
+        assert_eq!(relate(&fx(Row::var(open.clone())), &fx(Row::single("a")), &infer), Rel::Proven);
+        // relate_cast ignores rows (relate.rs:174).
+        assert_eq!(relate_cast(&fx(labelled), &fx(Row::var(e)), &infer), Rel::Proven);
     }
 
     // 2^50 leaves, 50 nodes: the pair memo makes each distinct pair cost one decision, so this
