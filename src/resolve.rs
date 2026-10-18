@@ -98,6 +98,9 @@ enum Work {
     // Enter / leave one runtime frame with these binder names.
     Push(Vec<String>),
     Pop,
+    // Add / remove one binder at the end of the innermost frame (a group member's parameter).
+    Extend(String),
+    Unextend,
 }
 
 // Iterative on purpose: parser and typecheck flatten Let/Fun chains to keep
@@ -147,6 +150,8 @@ fn walk(arena: &Arena, root: ExprRef, outer: &[String]) -> Vec<(ExprRef, VarRef)
         match item {
             Work::Push(names) => scopes.push(names),
             Work::Pop => scopes.pop(),
+            Work::Extend(name) => scopes.extend(name),
+            Work::Unextend => scopes.unextend(),
             Work::Visit(id) => visit(arena, id, &scopes, &mut found, &mut work),
         }
     }
@@ -201,6 +206,23 @@ impl Scopes {
             self.index.entry(n.clone()).or_default().push((frame, slot as u32));
         }
         self.frames.push(names);
+    }
+
+    // One more slot in the innermost frame: O(1), where a frame rebuilt per member is O(names).
+    fn extend(&mut self, name: String) {
+        let frame = self.frames.len() - 1;
+        let slot = self.frames[frame].len() as u32;
+        self.index.entry(name.clone()).or_default().push((frame, slot));
+        self.frames[frame].push(name);
+    }
+
+    fn unextend(&mut self) {
+        let name = self.frames.last_mut().and_then(Vec::pop).expect("unextend of an empty frame");
+        let stack = self.index.get_mut(&name).expect("binder indexed at extend");
+        stack.pop();
+        if stack.is_empty() {
+            self.index.remove(&name);
+        }
     }
 
     fn pop(&mut self) {
@@ -308,22 +330,28 @@ fn visit(
                 work.push(Work::Push(names));
                 return;
             }
-            // Reverse processing order: the body's frame [names…] comes last…
-            scoped(work, names.clone(), *body);
-            for (_, _, v) in bindings.iter().rev() {
-                if kind == GroupKind::Functions {
-                    // Direct-Lambda group: each function body runs in one
-                    // frame [names…, param] (the Lambda node itself is never
-                    // evaluated in the runtime's group form).
+            if kind == GroupKind::Functions {
+                // Direct-Lambda group: each function body runs in one frame
+                // [names…, param] (the Lambda node itself is never evaluated in
+                // the runtime's group form), at the same depth as the body's frame
+                // [names…]. One frame serves them all: each member extends it by
+                // its parameter (a frame per member would cost O(names) each,
+                // quadratic in the group's size).
+                work.push(Work::Pop);
+                work.push(Work::Visit(*body));
+                for (_, _, v) in bindings.iter().rev() {
                     let Expr::Lambda(param, _, lbody) = &arena[*v] else { unreachable!("group checked above") };
-                    let mut frame = names.clone();
-                    frame.push(param.clone());
-                    scoped(work, frame, *lbody);
-                } else {
-                    // Fallback: values evaluate in the OUTER scope; the names
-                    // are bound only for `body`.
-                    work.push(Work::Visit(*v));
+                    work.push(Work::Unextend);
+                    work.push(Work::Visit(*lbody));
+                    work.push(Work::Extend(param.clone()));
                 }
+                work.push(Work::Push(names));
+                return;
+            }
+            // Fallback: values evaluate in the OUTER scope; the names are bound only for `body`.
+            scoped(work, names, *body);
+            for (_, _, v) in bindings.iter().rev() {
+                work.push(Work::Visit(*v));
             }
         }
         Expr::BinOp(_, l, r) => {
@@ -537,6 +565,13 @@ mod tests {
         assert_eq!(refs_of(src, "od"), vec![local(0, 1)]);
         assert_eq!(refs_of(src, "ev"), vec![local(0, 0), local(0, 0)]);
         assert_eq!(refs_of(src, "n"), vec![local(0, 2), local(0, 2)]);
+    }
+
+    #[test]
+    fn let_rec_member_parameter_shadows_a_group_name_only_in_its_own_body() {
+        // `f`'s parameter is also `g`: slot 2 inside f's body, but the group's `g` (slot 1) in g's own body.
+        let src = "let rec f = fun g -> g and g = fun x -> g in f";
+        assert_eq!(refs_of(src, "g"), vec![local(0, 1), local(0, 2)]); // sorted
     }
 
     #[test]
