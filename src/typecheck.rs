@@ -1574,6 +1574,49 @@ fn forget_index(ty: &Type) -> Type {
     }
 }
 
+// The result type of `l ++ r` (wrong-value fixes spec, section 2a), judged on resolved types. A
+// top-level `Dyn` operand unifies nothing: the result is the other operand's type, or `Dyn` when
+// that is `Dyn` or an unbound variable. Otherwise the right operand must fit the left
+// (`unify_fits`, which keeps its width rule and union rescue), else the left the right; the side
+// that was `required` in the accepting call is the result. The result must be a string, a list,
+// `Dyn` or an unbound variable (two unbound operands give their unified variable). An error
+// leaves nothing bound: the whole operation is one snapshot. pub(crate) for the tests in lib.rs.
+pub(crate) fn concat_type(l_ty: &Type, r_ty: &Type, infer: &mut InferCtx, span: Span) -> Result<Type, String> {
+    let snapshot = infer.snapshot();
+    let result = concat_type_in(l_ty, r_ty, infer, span);
+    if result.is_err() {
+        infer.restore(snapshot);
+    }
+    result
+}
+
+fn concat_type_in(l_ty: &Type, r_ty: &Type, infer: &mut InferCtx, span: Span) -> Result<Type, String> {
+    let operands = |infer: &InferCtx| format!("{} with {}", infer.resolve_deep(l_ty).brief(), infer.resolve_deep(r_ty).brief());
+    let result = match (infer.resolve(l_ty), infer.resolve(r_ty)) {
+        (Type::Dyn, Type::Dyn | Type::Var(_)) | (Type::Var(_), Type::Dyn) => Type::Dyn,
+        (Type::Dyn, _) => infer.resolve_deep(r_ty),
+        (_, Type::Dyn) => infer.resolve_deep(l_ty),
+        _ => {
+            let snapshot = infer.snapshot();
+            if unify_fits(l_ty, r_ty, infer, span).is_ok() {
+                infer.resolve_deep(l_ty)
+            } else {
+                infer.restore(snapshot);
+                let snapshot = infer.snapshot();
+                if unify_fits(r_ty, l_ty, infer, span).is_err() {
+                    infer.restore(snapshot);
+                    return Err(format!("type mismatch: cannot concat {}", operands(infer)));
+                }
+                infer.resolve_deep(r_ty)
+            }
+        }
+    };
+    if !matches!(result, Type::Str | Type::List(_) | Type::Dyn | Type::Var(_)) {
+        return Err(format!("type mismatch: cannot concat {} (expected two strings or two lists)", operands(infer)));
+    }
+    Ok(result)
+}
+
 pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
     // Unbound at typecheck time: don't error here, machine::run's own
     // `unbound variable` panic at runtime is the right place for that.
@@ -5627,11 +5670,9 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     };
                     Ok((Type::Bool, row, arena.push(Expr::BinOp(op, l3, r3))))
                 }
-                // Concat: like Eq, operands just need to be consistent with
-                // each other -- but ALSO must actually be Str or List, not
-                // e.g. Int (unlike Eq, which is happy to compare any two
-                // consistent types). Result type: whichever side is
-                // concretely known; Dyn if neither is.
+                // Concat: the result type comes from `concat_type` (one
+                // operand must fit the other, and the result must be a
+                // string or a list), and each operand is coerced to it.
                 BinOp::Concat => {
                     // "Forget" either side's own tracked index for the
                     // purposes of this operator -- Concat only cares
@@ -5644,38 +5685,14 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // type entirely rather than half-tracking it.
                     let l_ty = forget_index(&l_ty);
                     let r_ty = forget_index(&r_ty);
-                    if !consistent(&l_ty, &r_ty) {
-                        return Err(TypeError(
-                            format!("type mismatch: cannot concat {} with {}", l_ty.brief(), r_ty.brief()),
-                            spans[expr],
-                        ));
-                    }
-                    let result_ty = match (&l_ty, &r_ty) {
-                        (Type::Dyn | Type::Var(_), Type::Dyn | Type::Var(_)) => Type::Dyn,
-                        (Type::Dyn | Type::Var(_), t) | (t, Type::Dyn | Type::Var(_)) => t.clone(),
-                        (Type::Str, Type::Str) => Type::Str,
-                        (Type::List(_), Type::List(_)) => l_ty.clone(),
-                        _ => {
-                            return Err(TypeError(
-                                format!(
-                                    "type mismatch: cannot concat {} with {} (expected two strings or two lists)",
-                                    l_ty.brief(),
-                                    r_ty.brief()
-                                ),
-                                spans[expr],
-                            ))
-                        }
-                    };
-                    let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
-                        coerce(arena, l2, &l_ty, &r_ty, spans[l], &CheckEnv::new(infer))?
-                    } else {
-                        l2
-                    };
-                    let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
-                        coerce(arena, r2, &r_ty, &l_ty, spans[r], &CheckEnv::new(infer))?
-                    } else {
-                        r2
-                    };
+                    let result_ty = concat_type(&l_ty, &r_ty, infer, spans[expr]).map_err(|msg| TypeError(msg, spans[expr]))?;
+                    let l_ty = infer.resolve_deep(&l_ty);
+                    let r_ty = infer.resolve_deep(&r_ty);
+                    // One rule for every operand (it subsumes the old top-level
+                    // `Dyn` special case): coerce it to the result type where it
+                    // differs, so `[1] ++ [d]` checks `d`'s elements.
+                    let l3 = if l_ty != result_ty { coerce(arena, l2, &l_ty, &result_ty, spans[l], &CheckEnv::new(infer))? } else { l2 };
+                    let r3 = if r_ty != result_ty { coerce(arena, r2, &r_ty, &result_ty, spans[r], &CheckEnv::new(infer))? } else { r2 };
                     Ok((result_ty, row, arena.push(Expr::BinOp(op, l3, r3))))
                 }
                 // `h :: t`: `t` must be List-shaped (or Dyn -- checked no
