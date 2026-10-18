@@ -359,6 +359,11 @@ impl Ctx {
 
     fn bind(&self, name: &str, scheme: Scheme, infer: &mut InferCtx) -> Ctx {
         Lowerer::new(infer, self.level, &scheme.quantified).ty(&scheme.ty);
+        self.bind_lowered(name, scheme)
+    }
+
+    // `bind` for a scheme whose free variables the caller has already lowered to this level.
+    fn bind_lowered(&self, name: &str, scheme: Scheme) -> Ctx {
         Ctx { binds: self.binds.insert(name.to_string(), Rc::new(scheme)), annot: self.annot.clone(), level: self.level }
     }
 }
@@ -1395,7 +1400,7 @@ pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type, infer: &mut InferCtx) -> C
 pub(crate) fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &mut InferCtx, def: Option<Rc<CheckDef>>) -> Ctx {
     let ty = infer.resolve_deep(&ty);
     let quantified = generalizable(ctx, &ty, infer);
-    ctx.bind(name, Scheme { quantified, ty, def }, infer)
+    ctx.bind_lowered(name, Scheme { quantified, ty, def })
 }
 
 // The variables of `ty` (already resolve_deep'ed) that this `let` may
@@ -1404,20 +1409,27 @@ pub(crate) fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &mut In
 // function containing the crossing; generalizing it would give each use a
 // fresh copy and leave the obligation unresolvable (spec
 // 2026-10-07-dyn-crossing-deferred-length-checks, polymorphism rule).
-fn generalizable(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<TyVar> {
+fn generalizable(ctx: &Ctx, ty: &Type, infer: &mut InferCtx) -> Vec<TyVar> {
     let candidates = vars_in(ty);
     if candidates.is_empty() {
         return Vec::new();
     }
     let pending = if candidates.iter().any(|v| matches!(v, TyVar::Index(_))) { pending_obligation_vars(infer) } else { BTreeSet::new() };
-    candidates
-        .into_iter()
-        .filter(|v| {
-            level_work();
-            infer.levels.get(v).is_none_or(|l| l > ctx.level)
-        })
-        .filter(|v| !matches!(v, TyVar::Index(n) if pending.contains(n)))
-        .collect()
+    let mut quantified = Vec::new();
+    for v in candidates {
+        level_work();
+        if infer.levels.get(&v).is_some_and(|l| l <= ctx.level) {
+            continue;
+        }
+        match &v {
+            // Held after all: the scheme's free variables must sit at this level (`bind`).
+            TyVar::Index(n) if pending.contains(n) => {
+                Lowerer::new(infer, ctx.level, &[]).index(&IndexExpr::Var(n.clone()));
+            }
+            _ => quantified.push(v),
+        }
+    }
+    quantified
 }
 
 // Every index-variable name free anywhere inside `e` -- IndexExpr has
