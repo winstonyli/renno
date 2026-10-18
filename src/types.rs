@@ -3,7 +3,6 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -490,11 +489,9 @@ pub enum Tail {
     Dyn,
 }
 
-// Cached constant rows. ManuallyDrop: a cached row dropped during thread teardown would touch
-// the (possibly already destroyed) intern tables.
 thread_local! {
-    static PURE_ROW: ManuallyDrop<Row> = ManuallyDrop::new(Row::new(Vec::new(), Tail::Closed));
-    static DYN_ROW: ManuallyDrop<Row> = ManuallyDrop::new(Row::new(Vec::new(), Tail::Dyn));
+    static PURE_ROW: Row = Row::new(Vec::new(), Tail::Closed);
+    static DYN_ROW: Row = Row::new(Vec::new(), Tail::Dyn);
 }
 
 impl Row {
@@ -509,7 +506,7 @@ impl Row {
     }
 
     pub fn pure() -> Row {
-        PURE_ROW.with(|r| Row::clone(r))
+        PURE_ROW.with(Row::clone)
     }
 
     pub fn single(effect: &str) -> Row {
@@ -521,7 +518,7 @@ impl Row {
     }
 
     pub fn dyn_() -> Row {
-        DYN_ROW.with(|r| Row::clone(r))
+        DYN_ROW.with(Row::clone)
     }
 
     pub fn labels(&self) -> impl Iterator<Item = &str> + '_ {
@@ -570,7 +567,7 @@ impl Row {
 pub struct RecGroup {
     pub names: Vec<Rc<str>>,
     pub bodies: Hc<Vec<Type>>,
-    // No body mentions (at any depth, nested groups included) a Type::Var, an Indexed, an
+    // No body mentions (at any depth, nested groups included) a Type::Var, an Indexed,
     // a `Tail::Var` or a RecVar::Free: a walker that renames variables may return it as is.
     pub plain: bool,
     // How many enclosing groups the bodies reach through a Bound (0: closed). Lets `unfold`

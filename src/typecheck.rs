@@ -1459,7 +1459,7 @@ fn fresh_row_name(base: &str) -> String {
 }
 
 // Same idea as fresh_row_name, its own separate counter -- a Type::Var's
-// namespace is unrelated to an Tail::Var's, so there's no reason to
+// namespace is unrelated to a Tail::Var's, so there's no reason to
 // share one (and every reason not to, in case they're ever compared or
 // logged together during debugging).
 fn fresh_type_name(base: &str) -> String {

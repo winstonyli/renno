@@ -41,7 +41,7 @@ pub fn bounded_drop<T: 'static>(value: T) {
         drop(value);
     }
     if nest == 0 {
-        while let Some(item) = DROP_QUEUE.with(|q| q.borrow_mut().pop()) {
+        while let Some(item) = DROP_QUEUE.try_with(|q| q.borrow_mut().pop()).ok().flatten() {
             let _restore = Nested::enter(0);
             drop(item);
         }
