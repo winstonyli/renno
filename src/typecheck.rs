@@ -10,6 +10,12 @@ use crate::resolve::{group_kind, GroupKind, Resolved};
 use crate::span::Span;
 use crate::value::Value;
 use rpds::{HashTrieMap, HashTrieSet};
+
+// The scope and substitution maps, hashed with the crate's cheap hasher (their keys are short
+// names, hashed on every lookup; the default SipHash was ~11% of a generalized-let chain).
+type FxBuild = std::hash::BuildHasherDefault<crate::types::FxHasher>;
+type TrieMap<K, V> = HashTrieMap<K, V, archery::RcK, FxBuild>;
+type TrieSet<T> = HashTrieSet<T, archery::RcK, FxBuild>;
 use crate::types::{consistent, each_child, is_big, row_consistent, unfold, ById, EffectRow, Hc, Interned, NodeMemo, RecGroup, RecRef, RecVar, Rebuild, Summary, Type, Visited, FxMap, FxSet};
 use crate::util::find_field;
 mod relate;
@@ -72,11 +78,12 @@ impl From<Mismatch> for TypeError {
 //
 // THE RULE, one place for all three sorts (and any future one):
 // generalize(ctx, ty) = freevars(ty) MINUS freevars(ctx) -- never quantify
-// over a name that's still free somewhere still open in the enclosing
-// scope. The mechanism is the `open` set every Ctx carries (see Ctx):
-// `freevars(ctx)` is read from it, not by walking the bindings, so a `let`
-// costs the size of its own type plus the number of variables currently
-// open, however many bindings precede it. Index variables a pending
+// over a name that's still free somewhere in the enclosing scope. The
+// mechanism is a level per variable (InferCtx::levels) and a level per scope
+// (Ctx::level): a scope holding a variable, or unification binding a
+// variable it holds, lowers the variable to the scope's level, and a `let`
+// at level `d` quantifies the variables above `d`. A `let` costs the size of
+// its own type, however many bindings precede it. Index variables a pending
 // obligation still needs are excluded on top (see `generalizable`).
 pub(crate) struct Scheme {
     // The variables generalized over this binding, of all three sorts,
@@ -118,7 +125,7 @@ pub(crate) enum TyVar {
 }
 
 // Every variable of every sort `ty` mentions, as written: no substitution
-// is consulted (callers resolve first, or reopen the names later).
+// is consulted (callers resolve first, or follow the names later).
 pub(crate) fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
     fn go(ty: &Type, out: &mut BTreeSet<TyVar>, seen: &mut Visited) {
         if !ty.summary().any(Summary::VAR | Summary::ROWVAR | Summary::INDEXED) || !seen.first(ty) {
@@ -156,27 +163,12 @@ fn index_names(vars: BTreeSet<TyVar>) -> BTreeSet<String> {
     vars.into_iter().filter_map(|v| if let TyVar::Index(name) = v { Some(name) } else { None }).collect()
 }
 
-// The variables a stored name stands for now: a Type or Index variable that
-// unification has since bound stands for the variables of what it was bound
-// to; a Row variable is never bound.
-fn reopen(var: &TyVar, infer: &InferCtx) -> BTreeSet<TyVar> {
-    match var {
-        TyVar::Row(_) => BTreeSet::from([var.clone()]),
-        TyVar::Type(name) => {
-            vars_in(&infer.resolve_deep(&Type::Var(name.clone())))
-        }
-        TyVar::Index(name) => {
-            free_index_vars(&infer.resolve_index_deep(&IndexExpr::Var(name.clone()))).into_iter().map(TyVar::Index).collect()
-        }
-    }
-}
-
-// A scope: the visible bindings, the variables still open in it (i.e. free in
-// some binding's type and not quantified by that binding), and the annotation
-// variables its binders introduced. All three are persistent, so extending a
-// scope is cheap and an enclosing scope is untouched: a `let` may quantify
-// only a variable no enclosing scope has open, and an annotation variable is
-// visible exactly in the scope that introduced it.
+// A scope: the visible bindings, the annotation variables its binders
+// introduced, and its level (how many `let` right-hand sides enclose it).
+// All are persistent, so extending a scope is cheap and an enclosing scope
+// is untouched: a `let` may quantify only a variable above its own level
+// (no enclosing scope holds it), and an annotation variable is visible
+// exactly in the scope that introduced it.
 //
 // Constructing and dropping a 50k-binding chain on the default stack is
 // pinned by let_chain_is_o1_stack_construction_and_teardown. A `CheckDef`
@@ -185,19 +177,136 @@ fn reopen(var: &TyVar, infer: &InferCtx) -> BTreeSet<TyVar> {
 #[derive(Clone)]
 pub(crate) struct Ctx {
     // Innermost binding of each name; a shadowed one is no longer reachable.
-    binds: HashTrieMap<String, Rc<Scheme>>,
-    // As written when each binding was added, union-only: a shadowed
-    // binding keeps its variables open (its type may still mention them
-    // through values already built from it). A binding's own quantified
-    // names are not added: the scheme is sealed, since lookup renames them
-    // before any later read. open_vars reads the names
-    // through the substitution as it stands, so a rollback in `unify_trial`
-    // or a match arm's hypotheses cannot leave it stale.
-    open: HashTrieSet<TyVar>,
+    binds: TrieMap<String, Rc<Scheme>>,
     // The annotation variables in scope, keyed by the row or index name as the user wrote it
-    // (never a `TyVar::Type`): the fresh variable each denotes here (open_annotation). A scoped
-    // annotation variable is also in `open`: it is free in the context.
-    annot: HashTrieMap<TyVar, AnnotVar>,
+    // (never a `TyVar::Type`): the fresh variable each denotes here (open_annotation).
+    annot: TrieMap<TyVar, AnnotVar>,
+    // How many `let` right-hand sides enclose this scope (U8b); `Ctx::empty()` is 0. A `let`
+    // at level `d` quantifies the variables whose level is above `d` (InferCtx::levels).
+    level: u32,
+}
+
+// The level of every variable that some scope has held, one persistent map per sort (a Type
+// variable, an effect-row variable and an index variable are separate namespaces, as `subst`
+// and `index_subst` are). A variable absent from its map has never been held by a scope: its
+// level is infinity. Persistent, so `unify_trial` snapshots it in O(1) like the substitution.
+#[derive(Clone, Default)]
+pub(crate) struct Levels {
+    ty: TrieMap<String, u32>,
+    row: TrieMap<String, u32>,
+    index: TrieMap<String, u32>,
+}
+
+impl Levels {
+    pub(crate) fn get(&self, v: &TyVar) -> Option<u32> {
+        match v {
+            TyVar::Type(n) => self.ty.get(n),
+            TyVar::Row(n) => self.row.get(n),
+            TyVar::Index(n) => self.index.get(n),
+        }
+        .copied()
+    }
+
+    // Lowers `map[name]` to `to`; true when it changed (absent counts as infinity).
+    fn lower(map: &mut TrieMap<String, u32>, name: &str, to: u32) -> bool {
+        if map.get(name).is_some_and(|l| *l <= to) {
+            return false;
+        }
+        map.insert_mut(name.to_string(), to);
+        true
+    }
+}
+
+// Lowers every variable reachable from what it is given, through the substitution, to at most
+// `to` (U8b): the one mechanism behind both ways a variable gets a level (a scope holds it, or
+// unification binds a levelled variable to a type mentioning it). `skip` names variables left
+// alone (a scheme's own quantified ones, sealed).
+struct Lowerer<'a> {
+    subst: &'a TrieMap<String, Type>,
+    index_subst: &'a TrieMap<String, IndexExpr>,
+    levels: &'a mut Levels,
+    to: u32,
+    skip: &'a [TyVar],
+    seen: Visited,
+}
+
+impl<'a> Lowerer<'a> {
+    fn new(infer: &'a mut InferCtx, to: u32, skip: &'a [TyVar]) -> Lowerer<'a> {
+        Lowerer { subst: &infer.subst, index_subst: &infer.index_subst, levels: &mut infer.levels, to, skip, seen: Visited::new() }
+    }
+
+    fn skipped(&self, sort: fn(&TyVar) -> Option<&String>, name: &str) -> bool {
+        self.skip.iter().any(|s| sort(s).is_some_and(|n| n == name))
+    }
+
+    // Mirrors `vars_in` node for node, but follows a bound variable to its solution.
+    fn ty(&mut self, t: &Type) {
+        level_work();
+        if !t.summary().any(Summary::VAR | Summary::ROWVAR | Summary::INDEXED) || !self.seen.first(t) {
+            return;
+        }
+        match t {
+            Type::Var(name) => {
+                if self.skipped(|v| if let TyVar::Type(n) = v { Some(n) } else { None }, name) {
+                    return;
+                }
+                // Already low enough: by the invariant (a levelled variable's solution is no
+                // higher than it) nothing below it needs lowering either.
+                if Levels::lower(&mut self.levels.ty, name, self.to) {
+                    let subst = self.subst;
+                    if let Some(bound) = subst.get(name) {
+                        self.ty(bound);
+                    }
+                }
+            }
+            Type::Fun(param, row, ret) => {
+                if let EffectRow::Var(name) = row {
+                    self.row(name);
+                }
+                self.ty(param);
+                self.ty(ret);
+            }
+            Type::List(elem) => self.ty(elem),
+            Type::Tuple(items) | Type::Union(items) => items.iter().for_each(|t| self.ty(t)),
+            Type::Record(fields) => fields.iter().for_each(|(_, t)| self.ty(t)),
+            Type::Indexed(wrapped, index) => {
+                self.ty(wrapped);
+                self.index(index);
+            }
+            Type::Rec(g, _) => g.0.bodies.iter().for_each(|b| self.ty(b)),
+            Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::RecVar(_) => {}
+        }
+    }
+
+    // Rows are never bound, so there is no solution to follow.
+    fn row(&mut self, name: &str) {
+        level_work();
+        if !self.skipped(|v| if let TyVar::Row(n) = v { Some(n) } else { None }, name) {
+            Levels::lower(&mut self.levels.row, name, self.to);
+        }
+    }
+
+    fn index(&mut self, e: &IndexExpr) {
+        level_work();
+        match e {
+            IndexExpr::Var(name) => {
+                if self.skipped(|v| if let TyVar::Index(n) = v { Some(n) } else { None }, name) {
+                    return;
+                }
+                if Levels::lower(&mut self.levels.index, name, self.to) {
+                    let index_subst = self.index_subst;
+                    if let Some(bound) = index_subst.get(name) {
+                        self.index(bound);
+                    }
+                }
+            }
+            IndexExpr::Lit(_) => {}
+            IndexExpr::Add(a, b) | IndexExpr::Sub(a, b) | IndexExpr::Mul(a, b) => {
+                self.index(a);
+                self.index(b);
+            }
+        }
+    }
 }
 
 // What a written annotation variable stands for in a scope. `universal`: a function
@@ -215,15 +324,26 @@ pub(crate) struct AnnotVar {
 
 impl Ctx {
     pub(crate) fn empty() -> Ctx {
-        Ctx { binds: HashTrieMap::new(), open: HashTrieSet::new(), annot: HashTrieMap::new() }
+        Ctx { binds: TrieMap::default(), annot: TrieMap::default(), level: 0 }
     }
 
-    // This scope with `entries` (as open_annotation introduced them) in scope and open.
-    pub(crate) fn with_annot(&self, entries: &[(TyVar, AnnotVar)]) -> Ctx {
+    // This scope one `let` right-hand side deeper.
+    pub(crate) fn deeper(&self) -> Ctx {
+        Ctx { level: self.level + 1, ..self.clone() }
+    }
+
+    // This scope with `entries` (as open_annotation introduced them) in scope and open; each
+    // entry's variable is lowered to this scope's level.
+    pub(crate) fn with_annot(&self, entries: &[(TyVar, AnnotVar)], infer: &mut InferCtx) -> Ctx {
         let mut ctx = self.clone();
         for (written, entry) in entries {
-            ctx.open = ctx.open.insert(entry.var.clone());
             ctx.annot = ctx.annot.insert(written.clone(), entry.clone());
+            let mut lowerer = Lowerer::new(infer, self.level, &[]);
+            match &entry.var {
+                TyVar::Row(n) => lowerer.row(n),
+                TyVar::Index(n) => lowerer.index(&IndexExpr::Var(n.clone())),
+                TyVar::Type(n) => lowerer.ty(&Type::Var(n.clone())),
+            }
         }
         ctx
     }
@@ -237,38 +357,14 @@ impl Ctx {
         self.binds.get(name).cloned()
     }
 
-    fn bind(&self, name: &str, scheme: Scheme) -> Ctx {
-        let mut open = self.open.clone();
-        for var in vars_in(&scheme.ty) {
-            if !scheme.quantified.contains(&var) && !open.contains(&var) {
-                open = open.insert(var);
-            }
-        }
-        Ctx { binds: self.binds.insert(name.to_string(), Rc::new(scheme)), open, annot: self.annot.clone() }
+    fn bind(&self, name: &str, scheme: Scheme, infer: &mut InferCtx) -> Ctx {
+        Lowerer::new(infer, self.level, &scheme.quantified).ty(&scheme.ty);
+        self.bind_lowered(name, scheme)
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_vars(&self, infer: &InferCtx) -> BTreeSet<TyVar> {
-        self.open.iter().flat_map(|v| reopen(v, infer)).collect()
-    }
-
-    // The members of `candidates` that are open: open_vars(infer) restricted to them, without
-    // building the whole set (a context with many open variables is walked once per `let`).
-    fn open_among(&self, candidates: &BTreeSet<TyVar>, infer: &InferCtx) -> BTreeSet<TyVar> {
-        let mut found = BTreeSet::new();
-        for v in self.open.iter() {
-            if let TyVar::Type(name) = v
-                && let Type::Var(n) = infer.resolve_deep(&Type::Var(name.clone()))
-            {
-                let r = TyVar::Type(n);
-                if candidates.contains(&r) {
-                    found.insert(r);
-                }
-                continue;
-            }
-            found.extend(reopen(v, infer).into_iter().filter(|r| candidates.contains(r)));
-        }
-        found
+    // `bind` for a scheme whose free variables the caller has already lowered to this level.
+    fn bind_lowered(&self, name: &str, scheme: Scheme) -> Ctx {
+        Ctx { binds: self.binds.insert(name.to_string(), Rc::new(scheme)), annot: self.annot.clone(), level: self.level }
     }
 }
 
@@ -485,9 +581,9 @@ fn fallible_check(arena: &Arena, root: ExprRef, spans: &SpanMap, infer: &InferCt
 // through every elaborate()/elaborate_node() call as `&mut InferCtx` --
 // see the design spec's own "Data model" section for the full rationale
 // (functional substitution over union-find). Generalization does NOT
-// live here -- no level counter, no birth-level tracking -- it reads the
-// per-scope open-variable set Ctx carries (THE RULE at Scheme); this
-// struct is just a substitution.
+// live here, only the levels it reads: `levels` (THE RULE at Scheme) is
+// the level of every variable some scope holds, lowered together with the
+// substitution; the rest of this struct is the substitution.
 //
 // `unify` is now called unconditionally from Expr::App/BinOp::Cons/If/
 // Match/ListLit (Tasks 4-6), so `subst` and every method below are live
@@ -496,7 +592,7 @@ pub(crate) struct InferCtx {
     // Grows monotonically as unify() binds variables; never shrinks --
     // no backtracking, matching this checker's existing single-pass
     // character everywhere else.
-    subst: HashTrieMap<String, Type>,
+    subst: TrieMap<String, Type>,
     // Grows monotonically exactly like `subst`, for the same reason --
     // no backtracking anywhere in this checker. A SEPARATE map from
     // `subst`: an index variable (IndexExpr::Var) and a type variable
@@ -504,7 +600,11 @@ pub(crate) struct InferCtx {
     // plain Strings -- conflating them would let an ordinary generic
     // function's own type-var name collide with an unrelated Vec's
     // own index-var name.
-    pub(crate) index_subst: HashTrieMap<String, IndexExpr>,
+    pub(crate) index_subst: TrieMap<String, IndexExpr>,
+    // The level of every variable a scope has held (U8b), rolled back with the substitution by
+    // unify_trial. Invariant: if a levelled variable is bound, everything its solution mentions
+    // has a level at most its own (the match-arm hypotheses are the one exception).
+    pub(crate) levels: Levels,
     // Index variables that unify_index_expr must NOT bind: the free index
     // variables of an annotated binding's signature (the fresh ones its
     // binder introduced, not the user's spelling) while its value is
@@ -541,7 +641,7 @@ pub(crate) struct InferCtx {
     // variable. Grows like `subst` and is snapshotted/restored with it by
     // unify_trial (a failed trial must not leak flags); propagated by
     // `lookup` and `unify`.
-    dyn_sunk: HashTrieSet<String>,
+    dyn_sunk: TrieSet<String>,
     // Every name some binder in the arena binds (check). A
     // name in an annotation that no binder has can only be a prelude name or
     // unbound, so annotation_type skips the scope walk for it: without this,
@@ -576,15 +676,16 @@ pub(crate) struct InferCtx {
 impl InferCtx {
     pub(crate) fn new() -> InferCtx {
         InferCtx {
-            subst: HashTrieMap::new(),
-            index_subst: HashTrieMap::new(),
+            subst: TrieMap::default(),
+            index_subst: TrieMap::default(),
+            levels: Levels::default(),
             rigid_index: HashSet::new(),
             index_witness: Vec::new(),
             obligations: RefCell::new(Vec::new()),
             pendings: RefCell::new(Vec::new()),
             resume_row: None,
             repeatable_depth: 0,
-            dyn_sunk: HashTrieSet::new(),
+            dyn_sunk: TrieSet::default(),
             bound_names: HashSet::new(),
             defs: Vec::new(),
             resolved: Resolved::default(),
@@ -823,6 +924,9 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
         _ if a == b => Rel::Proven,
         // A flexible variable yields to a rigid one: bind the flexible side, never the rigid one.
         (IndexExpr::Var(rigid), IndexExpr::Var(flex)) if infer.rigid_index.contains(rigid) && !infer.rigid_index.contains(flex) => {
+            if let Some(l) = infer.levels.index.get(flex).copied() {
+                Lowerer::new(infer, l, &[]).index(&IndexExpr::Var(rigid.clone()));
+            }
             infer.index_subst.insert_mut(flex.clone(), IndexExpr::Var(rigid.clone()));
             Rel::Proven
         }
@@ -842,6 +946,9 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
                     None => undecided(),
                     Some(_) => refuted(format!("infinite index expression: {} occurs in {other}", IndexExpr::Var(name.clone()))),
                 };
+            }
+            if let Some(l) = infer.levels.index.get(name).copied() {
+                Lowerer::new(infer, l, &[]).index(other);
             }
             infer.index_subst.insert_mut(name.clone(), other.clone());
             Rel::Proven
@@ -931,6 +1038,9 @@ fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: 
                 infer.dyn_sunk.insert_mut(name.clone());
                 infer.dyn_sunk.insert_mut(o.clone());
             }
+            if let Some(l) = infer.levels.ty.get(name).copied() {
+                Lowerer::new(infer, l, &[]).ty(other);
+            }
             infer.subst.insert_mut(name.clone(), other.clone());
             Ok(())
         }
@@ -1010,6 +1120,18 @@ fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, don
     fits_resolved(&required, &actual, infer, span, done)?;
     done.extend(key);
     Ok(())
+}
+
+// Per-let generalization work (U8b): candidate level lookups and `Lowerer` visits. Test-only.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LEVEL_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn level_work() {
+    #[cfg(test)]
+    LEVEL_WORK.with(|c| c.set(c.get() + 1));
 }
 
 #[cfg(test)]
@@ -1150,11 +1272,14 @@ pub(crate) fn unify_trial(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span
     // The Dyn-sink flags travel with variable aliasing in unify(), so a
     // failed trial must drop the flags it spread as well.
     let sunk_snapshot = infer.dyn_sunk.clone();
+    // Lowering walks all three sorts, so the level maps are rolled back as one.
+    let levels_snapshot = infer.levels.clone();
     let result = unify(t1, t2, infer, span);
     if result.is_err() {
         infer.subst = snapshot;
         infer.index_subst = index_snapshot;
         infer.dyn_sunk = sunk_snapshot;
+        infer.levels = levels_snapshot;
     }
     result
 }
@@ -1226,13 +1351,13 @@ pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
 // test's identical precedent for exercising typecheck's own internals
 // below the parser's reach. Same progressive, only-as-far-as-needed
 // visibility widening this project already uses repeatedly.
-pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
-    ctx.bind(name, Scheme::mono(ty))
+pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type, infer: &mut InferCtx) -> Ctx {
+    ctx.bind(name, Scheme::mono(ty), infer)
 }
 
 // `let`-binding: generalizes over row, type and index variables alike,
 // by THE RULE stated at Scheme -- the variables of `ty` that no enclosing
-// scope has open (`generalizable`).
+// scope holds (`generalizable`).
 //
 // Why the exclusion matters, e.g. for row variables (confirmed reachable:
 // `let f = fun cb: (Dyn ->{e} Dyn) -> let g = cb in g in f(fun y -> perform
@@ -1272,28 +1397,39 @@ pub(crate) fn extend(ctx: &Ctx, name: &str, ty: Type) -> Ctx {
 // own unit test exercises directly, bypassing the separate Expr::App
 // coerce() gap a source-level `identity_vec(3)(va)` call would hit.
 // `def` is the binder's definition, which an annotation naming it evaluates.
-pub(crate) fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &InferCtx, def: Option<Rc<CheckDef>>) -> Ctx {
+pub(crate) fn extend_generalized(ctx: &Ctx, name: &str, ty: Type, infer: &mut InferCtx, def: Option<Rc<CheckDef>>) -> Ctx {
     let ty = infer.resolve_deep(&ty);
     let quantified = generalizable(ctx, &ty, infer);
-    ctx.bind(name, Scheme { quantified, ty, def })
+    ctx.bind_lowered(name, Scheme { quantified, ty, def })
 }
 
 // The variables of `ty` (already resolve_deep'ed) that this `let` may
-// quantify: those no enclosing scope has open. An index variable a pending
+// quantify: those no enclosing scope holds (level above the `let`'s). An index variable a pending
 // obligation still needs is decided by whoever binds it later, inside the
 // function containing the crossing; generalizing it would give each use a
 // fresh copy and leave the obligation unresolvable (spec
 // 2026-10-07-dyn-crossing-deferred-length-checks, polymorphism rule).
-fn generalizable(ctx: &Ctx, ty: &Type, infer: &InferCtx) -> Vec<TyVar> {
+fn generalizable(ctx: &Ctx, ty: &Type, infer: &mut InferCtx) -> Vec<TyVar> {
     let candidates = vars_in(ty);
     if candidates.is_empty() {
         return Vec::new();
     }
-    let mut open = ctx.open_among(&candidates, infer);
-    if candidates.iter().any(|v| matches!(v, TyVar::Index(_))) {
-        open.extend(pending_obligation_vars(infer).into_iter().map(TyVar::Index));
+    let pending = if candidates.iter().any(|v| matches!(v, TyVar::Index(_))) { pending_obligation_vars(infer) } else { BTreeSet::new() };
+    let mut quantified = Vec::new();
+    for v in candidates {
+        level_work();
+        if infer.levels.get(&v).is_some_and(|l| l <= ctx.level) {
+            continue;
+        }
+        match &v {
+            // Held after all: the scheme's free variables must sit at this level (`bind`).
+            TyVar::Index(n) if pending.contains(n) => {
+                Lowerer::new(infer, ctx.level, &[]).index(&IndexExpr::Var(n.clone()));
+            }
+            _ => quantified.push(v),
+        }
     }
-    candidates.difference(&open).cloned().collect()
+    quantified
 }
 
 // Every index-variable name free anywhere inside `e` -- IndexExpr has
@@ -3284,7 +3420,10 @@ fn bind_pattern_vars(
         // unannotated xs -- nothing to resolve yet) and only ever changes
         // the stored type when something upstream has ALREADY pinned it
         // down.
-        Pattern::Var(name) => Ok(extend(ctx, name, infer.resolve_deep(scrutinee_ty))),
+        Pattern::Var(name) => {
+            let ty = infer.resolve_deep(scrutinee_ty);
+            Ok(extend(ctx, name, ty, infer))
+        }
         Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => Ok(ctx.clone()),
         // A fixed-length List pattern is really a Tuple-shaped correlation
         // (each position its own type), not a single shared element type
@@ -4215,20 +4354,20 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         let universal = is_signature(&annotation.ty);
                         let mut introduced = Vec::new();
                         let t = open_annotation(&annotation.ty, &cur_ctx, universal, &mut introduced);
-                        let (val_row, val4) = check_against_rigid(arena, val, &t, &cur_ctx.with_annot(&introduced), spans, infer)?;
+                        let (val_row, val4) = check_against_rigid(arena, val, &t, &cur_ctx.deeper().with_annot(&introduced, infer), spans, infer)?;
                         if !universal {
                             existentials = introduced;
                         }
                         (t, val_row, bind_site(arena, infer, &annotation.site, val4))
                     }
                     None => {
-                        let (val_ty, val_row, val2) = elaborate(arena, val, &cur_ctx, spans, infer)?;
+                        let (val_ty, val_row, val2) = elaborate(arena, val, &cur_ctx.deeper(), spans, infer)?;
                         (val_ty, val_row, val2)
                     }
                 };
                 let def = infer.new_def(DefNode::Let(val), vec![val3], &cur_ctx);
                 infer.note_value_of(val, def.idx, 0);
-                cur_ctx = extend_generalized(&cur_ctx.with_annot(&existentials), &var, bound_ty.clone(), infer, Some(def.clone()));
+                cur_ctx = extend_generalized(&cur_ctx.with_annot(&existentials, infer), &var, bound_ty.clone(), infer, Some(def.clone()));
                 pending.push(PendingElab::Let { var, bound_ty, val_row, val: val3, def });
                 cur_expr = body;
             }
@@ -4264,7 +4403,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     let _ = def.fallible.set(true);
                     def
                 });
-                let mut val_ctx = cur_ctx.clone();
+                let mut val_ctx = cur_ctx.deeper();
                 // Each annotation opened once, against the outer scope and
                 // into one `introduced` vector (a name two members write is
                 // one variable, unless an outer existential of that name is in
@@ -4298,7 +4437,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // A type group has no annotations: its names are Dyn, and stuck
                     // (no definition) for an annotation inside a value.
                     let Some(group) = &group else {
-                        val_ctx = val_ctx.bind(name, Scheme::mono(Type::Dyn));
+                        val_ctx = val_ctx.bind(name, Scheme::mono(Type::Dyn), infer);
                         continue;
                     };
                     val_ctx = match ann {
@@ -4311,13 +4450,16 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         // inference, so this is deliberately narrower
                         // than general HM polymorphic recursion.
                         Some(ty) => extend_generalized(&val_ctx, name, ty.clone(), infer, Some(group.clone())),
-                        None => val_ctx.bind(name, Scheme { quantified: Vec::new(), ty: infer.fresh_var(name), def: Some(group.clone()) }),
+                        None => {
+                            let ty = infer.fresh_var(name);
+                            val_ctx.bind(name, Scheme { quantified: Vec::new(), ty, def: Some(group.clone()) }, infer)
+                        }
                     };
                 }
                 // The pre-bindings above are built first: the group's own universals are
                 // not yet open there, so they are quantified and a recursive reference
                 // instantiates them afresh (polymorphic recursion).
-                val_ctx = val_ctx.with_annot(&introduced);
+                val_ctx = val_ctx.with_annot(&introduced, infer);
                 let mut elaborated = Vec::with_capacity(bindings.len());
                 for ((name, _, val), ann) in bindings.iter().zip(opened) {
                     // Same check_against restructuring as Expr::Let just
@@ -4348,7 +4490,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 }
                 // The group's existential variables stay in scope, and open, after it.
                 introduced.retain(|(_, entry)| !entry.universal);
-                cur_ctx = cur_ctx.with_annot(&introduced);
+                cur_ctx = cur_ctx.with_annot(&introduced, infer);
                 for (name, bound_ty, _, _) in elaborated.iter() {
                     cur_ctx = extend_generalized(&cur_ctx, name, bound_ty.clone(), infer, Some(def.clone()));
                 }
@@ -4409,7 +4551,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     }
                     _ => (ann.unwrap_or_else(|| infer.fresh_var(&param)), Mode::Synth),
                 };
-                cur_ctx = extend(&cur_ctx.with_annot(&introduced), &param, param_ty.clone());
+                cur_ctx = extend(&cur_ctx.with_annot(&introduced, infer), &param, param_ty.clone(), infer);
                 let witness = list_length_var(&param_ty, infer).map(|var| IndexWitness::new(var, &param));
                 let has_witness = witness.is_some();
                 infer.index_witness.extend(witness);
@@ -5431,14 +5573,11 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // whole-map assignment.
             fn restore_index_key(infer: &mut InferCtx, index_key: &Option<String>, prior_index_value: &Option<Option<IndexExpr>>) {
                 if let (Some(k), Some(prior)) = (index_key, prior_index_value) {
-                    match prior {
-                        Some(v) => {
-                            infer.index_subst.insert_mut(k.clone(), v.clone());
-                        }
-                        None => {
-                            infer.index_subst.remove_mut(k);
-                        }
-                    }
+                    // The refinement target is the resolved scrutinee index, so it is unbound on
+                    // entry. Re-inserting a prior binding would also need its variables lowered to
+                    // the key's level (U8b); nothing needs it, so it is asserted away.
+                    debug_assert!(prior.is_none(), "match refinement target {k} was already bound");
+                    infer.index_subst.remove_mut(k);
                 }
             }
             // The fresh cons-arm length variable m is made rigid and stays so: it is
@@ -5526,7 +5665,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                                     infer.index_subst.insert_mut(n_name.clone(), hypothesis);
                                     infer.rigid_index.insert(m.clone());
                                     let refined_tail_ty = Type::Indexed(Hc::new(Type::List(elem_ty.clone())), Rc::new(IndexExpr::Var(m)));
-                                    arm_ctx = extend(&arm_ctx, tail_name, refined_tail_ty);
+                                    arm_ctx = extend(&arm_ctx, tail_name, refined_tail_ty, infer);
                                 }
                                 // A compound/nested tail pattern: no override,
                                 // no hypothesis -- v1 scope boundary, see this
@@ -5562,7 +5701,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                                     infer.index_subst.insert_mut(n_name.clone(), hypothesis);
                                     infer.rigid_index.insert(m.clone());
                                     let refined_ty = Type::Indexed(Hc::new(rec.clone()), Rc::new(IndexExpr::Var(m)));
-                                    arm_ctx = extend(&arm_ctx, self_ref_name, refined_ty);
+                                    arm_ctx = extend(&arm_ctx, self_ref_name, refined_ty, infer);
                                 }
                                 // The self-referential position is bound
                                 // by something other than a bare Var (or
@@ -5673,7 +5812,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 Some(row) => Type::Fun(Hc::new(Type::Dyn), row.clone(), Hc::new(Type::Dyn)),
                 None => Type::Dyn,
             };
-            let inner_ctx = extend(&extend(ctx, &payload_var, Type::Dyn), &resume_var, resume_ty);
+            let inner_ctx = extend(&extend(ctx, &payload_var, Type::Dyn, infer), &resume_var, resume_ty, infer);
             infer.repeatable_depth += 1;
             let body_result = elaborate(arena, body, &inner_ctx, spans, infer);
             infer.repeatable_depth -= 1;

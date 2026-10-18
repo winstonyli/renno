@@ -18,6 +18,7 @@ cranelift-entity = "0.135.2"
 logos = "0.16.1"
 mimalloc = "0.1.52"
 rpds = "1.2.1"
+archery = "1"
 
 [dev-dependencies]
 criterion = "0.5"
