@@ -1185,12 +1185,24 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), M
     unify_in(t1, t2, infer, span, &mut FxSet::default())
 }
 
+// The same interned node on both sides, with nothing in it to bind or rescue (no type, row or
+// index variable, free name or recursive group): it unifies with and fits itself, and walking it
+// would cost its depth. Shared by `unify_in` and `fits_in`.
+fn same_ground_type(a: &Type, b: &Type) -> bool {
+    !a.summary().any(Summary::VAR | Summary::ROWVAR | Summary::INDEXED | Summary::FREE | Summary::REC) && a.exact_eq(b)
+}
+
 // `done` holds the big pairs this call has already unified (after resolution). Within one call
 // the substitution only grows, so a pair unified once stays unified; a failure ends the call,
 // so no failed pair is ever recorded. Each call (and each unify_trial) has its own set.
 fn unify_in(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
     let t1 = infer.resolve(t1);
     let t2 = infer.resolve(t2);
+    // Reflexivity, as `fits_in` and `relate` already have it: `unify_resolved` has no `Union`
+    // arm, so without this `u :: [v]` over one union type failed (wrong-value fixes D4).
+    if same_ground_type(&t1, &t2) {
+        return Ok(());
+    }
     let key = (is_big(&t1) || is_big(&t2)).then(|| (ById(t1.clone()), ById(t2.clone())));
     if key.as_ref().is_some_and(|k| done.contains(k)) {
         return Ok(());
@@ -1405,9 +1417,7 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
 fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
     let required = infer.resolve(required);
     let actual = infer.resolve(actual);
-    // The same interned node on both sides, with nothing in it to bind or rescue: it fits
-    // itself, and walking it would cost its depth.
-    if !required.summary().any(Summary::VAR | Summary::ROWVAR | Summary::INDEXED | Summary::FREE | Summary::REC) && required.exact_eq(&actual) {
+    if same_ground_type(&required, &actual) {
         return Ok(());
     }
     let key = (is_big(&required) || is_big(&actual)).then(|| (ById(required.clone()), ById(actual.clone())));
@@ -1571,6 +1581,86 @@ fn forget_index(ty: &Type) -> Type {
     match ty {
         Type::Indexed(wrapped, _) => (**wrapped).clone(),
         _ => ty.clone(),
+    }
+}
+
+// The result type of `l ++ r` (wrong-value fixes spec, section 2a), judged on resolved types. A
+// top-level `Dyn` operand unifies nothing: the result is the other operand's type, or `Dyn` when
+// that is `Dyn` or an unbound variable. Otherwise the right operand must fit the left
+// (`unify_fits`, which keeps its width rule and union rescue), else the left the right; the side
+// that was `required` in the accepting call is the result. The result must be a string, a list,
+// `Dyn` or an unbound variable (two unbound operands give their unified variable). An error
+// leaves nothing bound: the whole operation is one snapshot. pub(crate) for the tests in lib.rs.
+pub(crate) fn concat_type(l_ty: &Type, r_ty: &Type, infer: &mut InferCtx, span: Span) -> Result<Type, String> {
+    let snapshot = infer.snapshot();
+    let result = concat_type_in(l_ty, r_ty, infer, span);
+    if result.is_err() {
+        infer.restore(snapshot);
+    }
+    result
+}
+
+fn concat_type_in(l_ty: &Type, r_ty: &Type, infer: &mut InferCtx, span: Span) -> Result<Type, String> {
+    let operands = |infer: &InferCtx| format!("{} with {}", infer.resolve_deep(l_ty).brief(), infer.resolve_deep(r_ty).brief());
+    dyn_walk(l_ty, r_ty, infer, span, &mut FxSet::default());
+    let result = match (infer.resolve(l_ty), infer.resolve(r_ty)) {
+        (Type::Dyn, Type::Dyn | Type::Var(_)) | (Type::Var(_), Type::Dyn) => Type::Dyn,
+        (Type::Dyn, _) => infer.resolve_deep(r_ty),
+        (_, Type::Dyn) => infer.resolve_deep(l_ty),
+        _ => {
+            let snapshot = infer.snapshot();
+            if unify_fits(l_ty, r_ty, infer, span).is_ok() {
+                infer.resolve_deep(l_ty)
+            } else {
+                infer.restore(snapshot);
+                let snapshot = infer.snapshot();
+                if unify_fits(r_ty, l_ty, infer, span).is_err() {
+                    infer.restore(snapshot);
+                    return Err(format!("type mismatch: cannot concat {}", operands(infer)));
+                }
+                infer.resolve_deep(r_ty)
+            }
+        }
+    };
+    if !matches!(result, Type::Str | Type::List(_) | Type::Dyn | Type::Var(_)) {
+        return Err(format!("type mismatch: cannot concat {} (expected two strings or two lists)", operands(infer)));
+    }
+    Ok(result)
+}
+
+// The Dyn rule (wrong-value fixes spec, section 2b), written for any join site; only `++` calls
+// it. Walks `a` and `b` in parallel, resolving each node first, through lists, tuples of equal
+// length and the fields two records share. Where a `Dyn` meets a subterm that is neither `Dyn`
+// nor a variable, that subterm's unbound type variables are bound to `Dyn`, so a value the `Dyn`
+// side supplies is not typed by a constraint it never met (`fun p -> [p] ++ d` is
+// `Dyn -> [Dyn]`). A `Dyn` meeting a bare variable is left to the caller's unify, which binds it.
+// Row and index variables are not bound. The caller owns the snapshot. `done` remembers the big
+// pairs already walked (binding to `Dyn` is idempotent), so a shared type DAG costs its distinct
+// pairs, not its expansion.
+fn dyn_walk(a: &Type, b: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) {
+    let (a, b) = (infer.resolve(a), infer.resolve(b));
+    if (is_big(&a) || is_big(&b)) && !done.insert((ById(a.clone()), ById(b.clone()))) {
+        return;
+    }
+    match (&a, &b) {
+        (Type::Dyn, Type::Dyn | Type::Var(_)) | (Type::Var(_), Type::Dyn) => {}
+        (Type::Dyn, t) | (t, Type::Dyn) => {
+            for v in vars_in(&infer.resolve_deep(t)) {
+                if let TyVar::Type(name) = v {
+                    let _ = unify(&Type::Var(name), &Type::Dyn, infer, span);
+                }
+            }
+        }
+        (Type::List(x), Type::List(y)) => dyn_walk(x, y, infer, span, done),
+        (Type::Tuple(xs), Type::Tuple(ys)) if xs.len() == ys.len() => xs.iter().zip(ys.iter()).for_each(|(x, y)| dyn_walk(x, y, infer, span, done)),
+        (Type::Record(xs), Type::Record(ys)) => {
+            for (name, x) in xs.iter() {
+                if let Some(y) = find_field(ys, name) {
+                    dyn_walk(x, y, infer, span, done);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3544,26 +3634,54 @@ fn const_index(e: &IndexExpr) -> Option<i64> {
 // `rec(idx)` step value? Only decided when `idx` is a known
 // positive constant -- a symbolic or zero index keeps the base-case
 // treatment, since a Dyn base alternative would also accept the tuple
-// there. Non-recursive positions must be consistent with the step
-// alternative's; the recursive position is checked against `idx - 1`,
+// there. Non-recursive positions must pass `fits_not_refuted` against the
+// step alternative's; the recursive position is checked against `idx - 1`,
 // recursing while it is itself a tuple and ending at a base value (or
-// Dyn/Var, which carries no information to contradict).
-fn is_step_shaped_tuple(actual: &Type, base_alt: &Type, step_alt: &Type, self_ref: SelfRef, idx: &IndexExpr, infer: &InferCtx) -> bool {
+// Dyn/Var, which carries no information to contradict; the caller's coerce
+// to the step alternative checks its values at run time). A rejected
+// candidate keeps none of the bindings its earlier positions made: one
+// snapshot at the outermost call, since the base-case fallback runs next.
+fn is_step_shaped_tuple(actual: &Type, base_alt: &Type, step_alt: &Type, self_ref: SelfRef, idx: &IndexExpr, infer: &mut InferCtx, span: Span) -> bool {
+    let snapshot = infer.snapshot();
+    let ok = step_shaped_in(actual, base_alt, step_alt, self_ref, idx, infer, span);
+    if !ok {
+        infer.restore(snapshot);
+    }
+    ok
+}
+
+fn step_shaped_in(actual: &Type, base_alt: &Type, step_alt: &Type, self_ref: SelfRef, idx: &IndexExpr, infer: &mut InferCtx, span: Span) -> bool {
     let (Type::Tuple(items), Type::Tuple(step_items)) = (actual, step_alt) else { return false };
     let Some(k) = const_index(&infer.resolve_index_deep(idx)).filter(|k| *k > 0) else { return false };
     let Some(rec_pos) = self_ref_position(step_alt, self_ref) else { return false };
     if items.len() != step_items.len() {
         return false;
     }
-    if !(0..items.len()).all(|i| i == rec_pos || consistent(&items[i], &step_items[i])) {
+    if !(0..items.len()).all(|i| i == rec_pos || fits_not_refuted(&step_items[i], &items[i], infer, span)) {
         return false;
     }
     let tail = infer.resolve_deep(&items[rec_pos]);
     match &tail {
         Type::Dyn | Type::Var(_) => true,
-        Type::Tuple(_) if k > 1 => is_step_shaped_tuple(&tail, base_alt, step_alt, self_ref, &IndexExpr::Lit(k - 1), infer),
-        _ => k == 1 && !matches!(tail, Type::Indexed(..)) && consistent(&tail, base_alt),
+        Type::Tuple(_) if k > 1 => step_shaped_in(&tail, base_alt, step_alt, self_ref, &IndexExpr::Lit(k - 1), infer, span),
+        _ => k == 1 && !matches!(tail, Type::Indexed(..)) && fits_not_refuted(base_alt, &tail, infer, span),
     }
+}
+
+// Can a value of type `actual` be one of `required` (a Case B alternative)? Unify first, then ask
+// (wrong-value fixes spec, section 1): `unify_fits` binds what the two share (its error is
+// ignored: the call is made for the bindings it leaves, and its directional width rule applies),
+// then `relate` judges the resolved pair. Only a `Refuted` verdict rejects, and it undoes the
+// bindings; `Proven` and `Unknown` keep them, and the caller coerces the value to `required`, so
+// what `relate` could not decide is checked at run time.
+fn fits_not_refuted(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) -> bool {
+    let snapshot = infer.snapshot();
+    let _ = unify_fits(required, actual, infer, span);
+    if matches!(relate(actual, required, infer), Rel::Refuted(_)) {
+        infer.restore(snapshot);
+        return false;
+    }
+    true
 }
 
 // Shared "nothing real to correlate against" fallback: bind each of a
@@ -4862,8 +4980,8 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     // give the tail one extra dispatch option alongside plain
     // elaborate_node, the same tail-dispatch point Phase 3 built for
     // If/Match's own Check-mode treatment. When it doesn't qualify (or
-    // qualifies but the actual type isn't consistent with the base
-    // alternative), this falls through to elaborate_node's own Synth
+    // qualifies but `fits_not_refuted` refutes the actual type against the
+    // base alternative), this falls through to elaborate_node's own Synth
     // result, and the UNCHANGED trailing coerce/unify_fits check right
     // below does today's ordinary generic fallback -- correctly
     // rejecting a value that's neither shape.
@@ -4871,6 +4989,12 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         Mode::Check(expected) => match case_b_base_candidate(arena, cur_expr, expected, infer) {
             Some((base_alt, step_alt, self_ref, idx)) => {
                 let (actual_ty, row, expr2) = elaborate(arena, cur_expr, &cur_ctx, spans, infer)?;
+                // The base-case test below was `consistent(&actual_ty,
+                // &base_alt)`; it is now `fits_not_refuted` (wrong-value
+                // fixes spec, section 1), which is as permissive as
+                // `consistent` on a Dyn/Var side, so the history below
+                // still explains the two guards in front of it.
+                //
                 // DEVIATION from the task-6 brief's literal text: the
                 // brief's own condition was bare `consistent(&actual_ty,
                 // &base_alt)`. `consistent` treats Dyn/Var as
@@ -4955,15 +5079,21 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // Dyn/Var) still unifies index 0 correctly.
                 let actual_is_indexed = matches!(actual_ty, Type::Indexed(..));
                 let base_is_dyn_or_var = matches!(base_alt, Type::Dyn | Type::Var(_));
-                if is_step_shaped_tuple(&actual_ty, &base_alt, &step_alt, self_ref, &idx, infer) {
-                    // Already-synthesized step-shaped Tuple (see the helper).
-                    (expected.clone(), row, expr2)
+                if is_step_shaped_tuple(&actual_ty, &base_alt, &step_alt, self_ref, &idx, infer, spans[cur_expr]) {
+                    // Already-synthesized step-shaped Tuple (see the helper). Coerced to the
+                    // step alternative, not to `expected` (that rejects correct step values
+                    // statically), because the tail's coerce below is then the identity: this
+                    // is where a `Dyn` or unknown payload gets its run-time check.
+                    let checked = coerce(arena, expr2, &actual_ty, &step_alt, spans[cur_expr], &CheckEnv::new(infer))?;
+                    (expected.clone(), row, checked)
                 } else if !matches!(actual_ty, Type::Dyn | Type::Var(_))
                     && !(actual_is_indexed && base_is_dyn_or_var)
-                    && consistent(&actual_ty, &base_alt)
+                    && fits_not_refuted(&base_alt, &actual_ty, infer, spans[cur_expr])
                 {
                     unify_index(&idx, &IndexExpr::Lit(0), infer, spans[cur_expr])?;
-                    (expected.clone(), row, expr2)
+                    // As in the step arm: the base value's run-time check, if relate left one.
+                    let checked = coerce(arena, expr2, &actual_ty, &base_alt, spans[cur_expr], &CheckEnv::new(infer))?;
+                    (expected.clone(), row, checked)
                 } else {
                     (actual_ty, row, expr2)
                 }
@@ -5587,11 +5717,9 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     };
                     Ok((Type::Bool, row, arena.push(Expr::BinOp(op, l3, r3))))
                 }
-                // Concat: like Eq, operands just need to be consistent with
-                // each other -- but ALSO must actually be Str or List, not
-                // e.g. Int (unlike Eq, which is happy to compare any two
-                // consistent types). Result type: whichever side is
-                // concretely known; Dyn if neither is.
+                // Concat: the result type comes from `concat_type` (one
+                // operand must fit the other, and the result must be a
+                // string or a list), and each operand is coerced to it.
                 BinOp::Concat => {
                     // "Forget" either side's own tracked index for the
                     // purposes of this operator -- Concat only cares
@@ -5604,38 +5732,14 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // type entirely rather than half-tracking it.
                     let l_ty = forget_index(&l_ty);
                     let r_ty = forget_index(&r_ty);
-                    if !consistent(&l_ty, &r_ty) {
-                        return Err(TypeError(
-                            format!("type mismatch: cannot concat {} with {}", l_ty.brief(), r_ty.brief()),
-                            spans[expr],
-                        ));
-                    }
-                    let result_ty = match (&l_ty, &r_ty) {
-                        (Type::Dyn | Type::Var(_), Type::Dyn | Type::Var(_)) => Type::Dyn,
-                        (Type::Dyn | Type::Var(_), t) | (t, Type::Dyn | Type::Var(_)) => t.clone(),
-                        (Type::Str, Type::Str) => Type::Str,
-                        (Type::List(_), Type::List(_)) => l_ty.clone(),
-                        _ => {
-                            return Err(TypeError(
-                                format!(
-                                    "type mismatch: cannot concat {} with {} (expected two strings or two lists)",
-                                    l_ty.brief(),
-                                    r_ty.brief()
-                                ),
-                                spans[expr],
-                            ))
-                        }
-                    };
-                    let l3 = if l_ty == Type::Dyn && r_ty != Type::Dyn {
-                        coerce(arena, l2, &l_ty, &r_ty, spans[l], &CheckEnv::new(infer))?
-                    } else {
-                        l2
-                    };
-                    let r3 = if r_ty == Type::Dyn && l_ty != Type::Dyn {
-                        coerce(arena, r2, &r_ty, &l_ty, spans[r], &CheckEnv::new(infer))?
-                    } else {
-                        r2
-                    };
+                    let result_ty = concat_type(&l_ty, &r_ty, infer, spans[expr]).map_err(|msg| TypeError(msg, spans[expr]))?;
+                    let l_ty = infer.resolve_deep(&l_ty);
+                    let r_ty = infer.resolve_deep(&r_ty);
+                    // One rule for every operand (it subsumes the old top-level
+                    // `Dyn` special case): coerce it to the result type where it
+                    // differs, so `[1] ++ [d]` checks `d`'s elements.
+                    let l3 = if l_ty != result_ty { coerce(arena, l2, &l_ty, &result_ty, spans[l], &CheckEnv::new(infer))? } else { l2 };
+                    let r3 = if r_ty != result_ty { coerce(arena, r2, &r_ty, &result_ty, spans[r], &CheckEnv::new(infer))? } else { r2 };
                     Ok((result_ty, row, arena.push(Expr::BinOp(op, l3, r3))))
                 }
                 // `h :: t`: `t` must be List-shaped (or Dyn -- checked no

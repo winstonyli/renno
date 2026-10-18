@@ -12167,4 +12167,247 @@ g(len)").unwrap_err();
             assert!(shown.contains("{x, y | e}"), "{what}: {shown}");
         }
     }
+
+    // ---- wrong-value fixes (docs/superpowers/specs/2026-10-17-wrong-value-fixes-design.md) ----
+
+    // `src` typechecks and then stops with a run-time error containing `want`.
+    fn fails_at_run_time(src: &str, want: &str) {
+        assert_eq!(static_error(src), None, "{src}: expected no static error");
+        let err = run_source(src).expect_err(src);
+        assert!(err.contains(want), "{src}: expected `{want}` in `{err}`");
+    }
+
+    // `src` is rejected by the checker with a message containing `want`.
+    fn fails_statically(src: &str, want: &str) {
+        let err = static_error(src).unwrap_or_else(|| panic!("{src}: expected a static error"));
+        assert!(err.contains(want), "{src}: expected `{want}` in `{err}`");
+    }
+
+    // Section 1: a tuple at an Indexed(T, k) site whose elements are Unknown against the
+    // alternative is kept and checked at run time; it no longer slips past as Dyn.
+    #[test]
+    fn indexed_site_checks_unknown_tuple_elements_at_run_time() {
+        fails_at_run_time("let rec T = Union(Tuple(Str, Int), Tuple(Int, T)) in let d: Dyn = 5 in let p = (d, 1) in let x: Indexed(T, 0) = p in match x | (s, n) -> (let z: Str = s in z) | _ -> \"other\"", "expected (Str, Int), found Int at element 0");
+        fails_at_run_time("let rec L = Union(Int, Tuple(Int, L)) in let d: Dyn = \"s\" in let p = (1, d) in let v: Indexed(L, 1) = p in v", "expected (Int, L), found Str at element 1");
+        fails_at_run_time("let rec T = Union(Int, Tuple(Int, T)) in let f = fun t -> (let p = (1, t) in let w: Indexed(T, 1) = p in w) in f(\"s\")", "expected (Int, T), found Str at element 1");
+        fails_at_run_time("let rec L = Union(Int, Tuple(Int, L)) in let d: Dyn = \"s\" in let p = (d, 2) in let v: Indexed(L, 1) = p in v", "expected (Int, L), found Str at element 0");
+        fails_at_run_time("let rec L = Union(Int, Tuple(Int, L)) in let d: Dyn = \"s\" in let p = (1, (d, 3)) in let v: Indexed(L, 2) = p in v", "expected (Int, L), found Str at element 1, element 0");
+        fails_at_run_time("let rec L = Union(Int, Tuple(Int, L)) in let f = fun q -> (let p = (1, q) in let v: Indexed(L, 1) = p in v) in f(\"s\")", "expected (Int, L), found Str at element 1");
+    }
+
+    // A tuple the alternative refutes is a static error, not a value of the wrong shape.
+    #[test]
+    fn indexed_site_rejects_refuted_tuples_statically() {
+        fails_statically("let rec T = Union(Tuple(Record({x: Int, y: Str}), Int), Tuple(Int, Int, T)) in let g = fun r -> (let t: Indexed(T, 0) = (r, 1) in match t | (u, n) -> (let z: Str = u.y in z) | _ -> \"o\") in g({x: 1, y: 5})", "expected {x: Int, y: Str}, found {x: Int, y: Int}");
+        fails_statically("let rec T = Union(Str, Tuple(Int, T)) in let f = fun n -> (let p = (n, \"s\") in let v: Indexed(T, 1) = p in match v | (m, _) -> (let z: Int = m in z) | _ -> 0) in f(\"x\")", "expected Int, found Str");
+        fails_statically("let rec L = Union(Int, Tuple(Int, L)) in let f = fun q -> (let p = (q, 5) in let v: Indexed(L, 1) = p in v) in f(\"s\")", "expected Int, found Str");
+        fails_statically("let rec T = Union(Vec(3), Tuple(Int, T)) in let f = fun v: Vec(n) -> (let t: Indexed(T, 0) = v in t) in f([1, 2])", "expected [Dyn](3), found [Int](2)");
+        fails_statically("let rec L = Union(Int, Tuple(Int, L)) in let f = fun q -> (let p = (q, (q, 5)) in let v: Indexed(L, 2) = p in v) in f(\"s\")", "expected Int, found Str");
+        // The closed-record control: rejected before and after.
+        fails_statically("let rec T = Union(Tuple(Record({x: Int, y: Str}), Int), Tuple(Int, Int, T)) in let g = fun r: {x: Int, y: Int} -> (let t: Indexed(T, 0) = (r, 1) in match t | (u, n) -> (let z: Str = u.y in z) | _ -> \"o\") in g({x: 1, y: 5})", "expected T(0), found ({x: Int, y: Int}, Int)");
+    }
+
+    // Values that fit the alternative keep running; a wider record now fits the base end.
+    #[test]
+    fn indexed_site_keeps_fitting_tuples() {
+        runs_to("let rec L = Union(Int, Tuple(Int, L)) in let mk = fun h -> (let p = (h, 0) in let v: Indexed(L, 1) = p in v) in mk(5)", "[5, 0]");
+        runs_to("let rec T = Union(Tuple(Record({x: Int, y: Str}), Int), Tuple(Int, Int, T)) in let g = fun r -> (let t: Indexed(T, 0) = (r, 1) in match t | (u, n) -> (let z: Str = u.y in z) | _ -> \"o\") in g({x: 1, y: \"a\"})", "a");
+        runs_to("let rec T = Union(Tuple(Record({x: Int, y: Str}), Int), Tuple(Int, Int, T)) in let g = fun r -> (let t: Indexed(T, 0) = (r, 1) in r.z) in g({x: 1, y: \"a\", z: 7})", "7");
+        runs_to("let rec L = Union(Int, Tuple(Int, L)) in let p = (1, (2, 3)) in let v: Indexed(L, 2) = p in v", "[1, [2, 3]]");
+        runs_to("let rec L = Union(Int, Tuple(Int, L)) in let p = (1, 2) in let v: Indexed(L, 1) = p in v", "[1, 2]");
+        runs_to("let rec L = Union(Int, Tuple(Int, L)) in let mk = fun h -> (let p = (1, (h, 3)) in let v: Indexed(L, 2) = p in v) in mk(5)", "[1, [5, 3]]");
+        runs_to("let rec T = Union(Vec(3), Tuple(Int, T)) in let f = fun v: Vec(n) -> (let t: Indexed(T, 0) = v in t) in f([1, 2, 3])", "[1, 2, 3]");
+        runs_to("let rec T = Union(Tuple(Record({x: Int, y: Str}), Int), Tuple(Int, Int, T)) in let g = fun r -> (r.z, let t: Indexed(T, 0) = (r, 1) in 0) in g({x: 1, y: \"a\", z: 7})", "[7, 0]");
+        // A right `Dyn` payload or parameter still runs (D1 option b: Unknown is kept and checked).
+        runs_to("let rec T = Union(Tuple(Str, Int), Tuple(Int, T)) in let d: Dyn = \"a\" in let p = (d, 1) in let x: Indexed(T, 0) = p in match x | (s, n) -> (let z: Str = s in z) | _ -> \"other\"", "a");
+        runs_to("let rec T = Union(Tuple(Str, Int), Tuple(Int, T)) in let f = fun d -> (let p = (d, 1) in let x: Indexed(T, 0) = p in match x | (s, n) -> (let z: Str = s in z) | _ -> \"other\") in f(\"a\")", "a");
+        runs_to("let rec L = Union(Int, Tuple(Int, L)) in let d: Dyn = 2 in let p = (1, d) in let v: Indexed(L, 1) = p in v", "[1, 2]");
+        runs_to("let rec L = Union(Int, Tuple(Int, L)) in let d: Dyn = 1 in let p = (d, 2) in let v: Indexed(L, 1) = p in v", "[1, 2]");
+        runs_to("let rec T = Union(Record({x: Int}), Tuple(Int, T)) in let r = {x: 1, y: 2} in let t: Indexed(T, 0) = r in t", "{x: 1, y: 2}");
+    }
+
+    // Review focus: a function element at an Indexed site; its effect row must not make the
+    // fit test refute it, pure or performing.
+    #[test]
+    fn indexed_site_keeps_function_elements() {
+        runs_to("let rec T = Union(Tuple(Fun((Int, Int)), Int), Tuple(Int, Int, T)) in let f = fun x: Int -> x + 1 in let p = (f, 1) in let t: Indexed(T, 0) = p in match t | (g, n) -> g(n) | _ -> 0", "2");
+        runs_to("let rec T = Union(Tuple(Fun((Int, Int)), Int), Tuple(Int, Int, T)) in let f = fun x -> perform a(x) in let p = (f, 1) in let t: Indexed(T, 0) = p in handle (match t | (g, n) -> g(n) | _ -> 0) with handler a(q, k) -> k(q + 10)", "11");
+        // Unhandled, the performing element still stops the program, before and after.
+        fails_at_run_time("let rec T = Union(Tuple(Fun((Int, Int)), Int), Tuple(Int, Int, T)) in let f = fun x -> perform a(x) in let p = (f, 1) in let t: Indexed(T, 0) = p in match t | (g, n) -> g(n) | _ -> 0", "unhandled effect: a");
+        fails_at_run_time("let rec T = Union(Tuple(Fun((Int, \"e\", Int)), Int), Tuple(Int, Int, T)) in let k = fun f -> (let p = (f, 1) in let t: Indexed(T, 0) = p in match t | (g, n) -> g(n) | _ -> 0) in k(fun x -> perform a(x))", "unhandled effect: a");
+    }
+
+    // Section 2a: `++` relates its operands by unify_fits both ways and demands strings or lists.
+    #[test]
+    fn concat_rejects_operands_that_are_not_strings_or_lists() {
+        fails_statically("let f = fun x -> x ++ 1 in f", "cannot concat Int with Int (expected two strings or two lists)");
+        fails_statically("let f = fun x -> x ++ (1, 2) in f", "(expected two strings or two lists)");
+        fails_statically("let f = fun x -> (1, 2) ++ x in f((3,4))", "cannot concat (Int, Int) with (Int, Int) (expected two strings or two lists)");
+        fails_statically("let d: Dyn = \"a\" in d ++ 1", "cannot concat Dyn with Int (expected two strings or two lists)");
+        // Unchanged static rejections next to a `Dyn` operand.
+        fails_statically("let d: Dyn = \"a\" in let n: Int = d ++ \"s\" in n", "expected Int, found Str");
+        fails_statically("let d: Dyn = \"a\" in (d ++ \"s\") ++ 1", "cannot concat Str with Int");
+        // D3's cost: `f(1)(2)` is typed `Int` and still fails at run time, as before.
+        fails_at_run_time("let f = fun x -> fun y -> x ++ y in f(1)(2)", "++ expects two strings or two lists");
+    }
+
+    #[test]
+    fn concat_binds_element_types_across_operands() {
+        fails_statically("let f = fun xs -> xs ++ [\"s\"] in match f([1]) | h :: _ -> (let w: Str = h in w) | _ -> \"o\"", "expected [Str], found [Int]");
+        fails_statically("let f = fun p -> [p] ++ [\"s\"] in match f(1) | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0", "expected Str, found Int");
+        fails_statically("let f = fun p -> (let z: Int = p.x in [p] ++ [{x: \"s\"}]) in match f({x: 1}) | _ :: t -> (match t | h :: _ -> (let w: Int = h.x in w) | _ -> 0) | _ -> 0", "expected {x: Str}, found {x: Int}");
+        fails_statically("let f = fun x -> x ++ \"s\" in f(1)", "expected Str, found Int");
+        fails_statically("let f = fun x -> fun y -> [x] ++ [y] in f(1)(\"a\")", "expected Int, found Str");
+        fails_statically("let f = fun x -> fun y -> x ++ y in f(\"a\")([1])", "expected Str, found [Int]");
+        // D3: two unbound operands share one type variable, so the result is that type, not Dyn.
+        fails_statically("let f = fun x -> fun y -> x ++ y in let z: Int = f(\"a\")(\"b\") in z", "expected Int, found Str");
+    }
+
+    #[test]
+    fn concat_checks_a_dyn_element_against_the_other_operand() {
+        fails_at_run_time("let d: Dyn = \"s\" in match [1] ++ [d] | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0", "expected [Int], found Str at element 0");
+        fails_at_run_time("let xs: [Dyn] = [\"s\"] in match [1] ++ xs | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0", "expected [Int], found Str at element 0");
+        // `p` is already `Int` when the `++` is checked, so `d` is coerced to `[Int]` (spec 2b, ord3).
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> (let q: Int = p in (q, [p] ++ d)) in match f(1) | (n, xs) -> (match xs | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0)", "expected [Int], found Str at element 0");
+        // Review focus: a chain checks the Dyn operand against the joined left side.
+        fails_at_run_time("let d: Dyn = \"s\" in let xs = [1] ++ [2] ++ [d] in match xs | _ :: _ :: h :: _ -> h + 1 | _ -> 0", "expected [Int], found Str at element 0");
+    }
+
+    #[test]
+    fn concat_keeps_wider_records_unions_and_polymorphic_uses() {
+        runs_to("let f = fun p: {x: Int} -> [p] ++ [{x: 1, y: 2}] in f({x: 3})", "[{x: 3}, {x: 1, y: 2}]");
+        runs_to("[{x: 1, y: 2}] ++ [{x: 1}]", "[{x: 1, y: 2}, {x: 1}]");
+        runs_to("[{x: 1}] ++ [{x: 1, y: 2}]", "[{x: 1}, {x: 1, y: 2}]");
+        runs_to("let u: (Int | Str) = 1 in [1] ++ [u]", "[1, 1]");
+        runs_to("let u: ({x: Int} | {y: Str}) = {x: 1} in [u] ++ [{x: 2}]", "[{x: 1}, {x: 2}]");
+        runs_to("let u: ({x: Int} | {y: Str}) = {x: 1} in [u] ++ [u]", "[{x: 1}, {x: 1}]");
+        runs_to("let u: (Int | Str) = 1 in let f = fun x: (Int | Str) -> [x] ++ [u] in f(2)", "[2, 1]");
+        runs_to("let u: (Int | Str) = 1 in let v: (Int | Str) = \"a\" in [u] ++ [v]", "[1, a]");
+        runs_to("let f = fun a -> [a] ++ [[a]] in 1", "1");
+        // Pre-existing and unchanged: `++` joins without cast_join_arms (PARKED).
+        runs_to("let d: Dyn = fun y -> y in let f = fun x: Int -> x == 5 in match [d] ++ [f] | _ :: t -> (match t | g :: _ -> g(\"s\") | _ -> false) | _ -> false", "false");
+        runs_to("let r: {x: Int} = {x: 1} in let s = {x: 2, y: 3} in [r] ++ [s]", "[{x: 1}, {x: 2, y: 3}]");
+        runs_to("let u: (Int | Str) = 1 in [u] ++ [1]", "[1, 1]");
+        runs_to("let u: (Int | Str) = 1 in let w: (Str | Int) = \"a\" in [u] ++ [w]", "[1, a]");
+        runs_to("let f = fun x -> fun y -> x ++ y in [f(\"a\")(\"b\"), f([1])([2])]", "[ab, [1, 2]]");
+        runs_to("let d: Dyn = [1] in d ++ [1]", "[1, 1]");
+    }
+
+    // Review focus: an empty list and Dyn operands beside an unbound or string operand.
+    #[test]
+    fn concat_with_empty_and_dyn_operands_keeps_running() {
+        runs_to("let f = fun xs -> [] ++ xs in f([\"a\"])", "[a]");
+        runs_to("let d: Dyn = \"a\" in let f = fun x -> x ++ d in f(\"b\")", "ba");
+        runs_to("let d: Dyn = [1] in let f = fun x -> x ++ d in f([2])", "[2, 1]");
+        runs_to("let d: Dyn = [1] in let f = fun x -> d ++ x in f([2])", "[1, 2]");
+    }
+
+    // Function elements: different rigid rows are a static mismatch; inferred rows join, so
+    // the performing callback's effect reaches the handler-less program (a static error;
+    // it printed `1` before, hiding the effect behind the left operand's row).
+    #[test]
+    fn concat_relates_function_element_rows() {
+        fails_statically("let h: ((Int ->{e1} Int) -> (Int ->{e2} Int) -> Int) = fun f -> fun g -> (match [f] ++ [g] | k :: _ -> k(1) | _ -> 0) in h(fun x -> x)(fun x -> x)", "cannot concat [(Int ->{e1} Int)] with [(Int ->{e2} Int)]");
+        fails_statically("let h = fun f -> fun g -> (match [f] ++ [g] | k :: _ -> k(1) | _ -> 0) in h(fun x -> x)(fun x -> perform a(x))", "unhandled effect: a");
+        fails_statically("let f = fun x -> x in let g = fun x -> perform a(x) in match ([f] ++ [g]) | h :: _ -> h(1) | _ -> 0", "unhandled effect: a");
+        runs_to("let h: ((Int ->{e1} Int) -> (Int ->{e1} Int) -> Int) = fun f -> fun g -> (match [f] ++ [g] | k :: _ -> k(1) | _ -> 0) in h(fun x -> x)(fun x -> x)", "1");
+    }
+
+    // Review focus: a long `++` chain (the parser caps nesting at 2000) still checks quickly,
+    // with a `Dyn` operand coerced at the end.
+    #[test]
+    fn long_concat_chain_checks_in_bounded_time() {
+        let src = format!("let d: Dyn = [7] in let xs = {}d in match xs | h :: _ -> h | _ -> 0", "[1] ++ ".repeat(1500));
+        assert_eq!(finishes_within(20, &src).expect("runs").as_int(), 1);
+    }
+
+    // A failed `++` leaves no partial binding behind (spec 2a, the snapshot).
+    #[test]
+    fn concat_type_rolls_back_bindings_on_failure() {
+        use crate::span::Span;
+        use crate::typecheck::{concat_type, InferCtx};
+        use types::Type;
+        let span = Span { start: 0, end: 0 };
+        let mut infer = InferCtx::new();
+        let a = Type::Var("a".into());
+        let l = Type::List(Hc::new(Type::Tuple(Hc::new(vec![a.clone(), Type::Int]))));
+        let r = Type::List(Hc::new(Type::Tuple(Hc::new(vec![Type::Str, Type::Bool]))));
+        // Both directions bind `a := Str` and then fail on `Int` against `Bool`.
+        assert!(concat_type(&l, &r, &mut infer, span).is_err());
+        assert_eq!(infer.resolve_deep(&a), a);
+        // The fit succeeds (`a := Int`) and the shape check then fails: only the outer
+        // snapshot undoes that binding.
+        let err = concat_type(&a, &Type::Int, &mut infer, span).expect_err("Int is not concatenable");
+        assert!(err.contains("(expected two strings or two lists)"), "{err}");
+        assert_eq!(infer.resolve_deep(&a), a);
+    }
+
+    // Section 2b: a type variable that meets Dyn inside `++` is sunk to Dyn, so the element
+    // the Dyn side supplies is checked where it is used.
+    #[test]
+    fn concat_sinks_variables_that_meet_dyn() {
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> [p] ++ d in match f(1) | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0", "expected Int, found Str");
+        fails_at_run_time("let d: Dyn = [[\"s\"]] in let f = fun p -> [[p]] ++ d in match f(1) | _ :: t -> (match t | h :: _ -> (match h | k :: _ -> (let w: Int = k in w) | _ -> 0) | _ -> 0) | _ -> 0", "expected Int, found Str");
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> [[p]] ++ [d] in match f(1) | _ :: x :: _ -> (match x | y :: _ -> (let w: Int = y in w) | _ -> 0) | _ -> 0", "expected Int, found Str");
+        fails_at_run_time("let d: Dyn = [{x: \"s\"}] in let f = fun p -> [{x: p}] ++ d in match f(1) | _ :: t -> (match t | h :: _ -> (let w: Int = h.x in w) | _ -> 0) | _ -> 0", "expected Int, found Str");
+        // Order (spec 2b): `p + 1` does not fix `p`, so both orders sink it; with `let q: Int = p`
+        // after the `++` (ord4) `p` is still unbound at the `++` and is sunk too.
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> (p + 1, [p] ++ d) in match f(1) | (n, xs) -> (match xs | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0)", "expected Int, found Str");
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> ([p] ++ d, p + 1) in match f(1) | (xs, n) -> (match xs | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0)", "expected Int, found Str");
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> ([p] ++ d, let q: Int = p in q) in match f(1) | (xs, n) -> (match xs | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0)", "expected Int, found Str");
+    }
+
+    // The walk goes through equal-length tuples and shared record fields too.
+    #[test]
+    fn concat_sinks_variables_inside_tuples_and_records() {
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> [([p], 2)] ++ [(d, 3)] in match f(1) | _ :: x :: _ -> (match x | (ys, _) -> (match ys | y :: _ -> (let w: Int = y in w) | _ -> 0) | _ -> 0) | _ -> 0", "expected Int, found Str");
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> [{a: [p]}] ++ [{a: d}] in match f(1) | _ :: x :: _ -> (match x.a | y :: _ -> (let w: Int = y in w) | _ -> 0) | _ -> 0", "expected Int, found Str");
+    }
+
+    // Controls: a fitting Dyn still runs, and a variable that never meets Dyn inside `++`
+    // stays polymorphic.
+    #[test]
+    fn concat_sinking_leaves_fitting_and_unrelated_values_alone() {
+        runs_to("let d: Dyn = [2] in let h = fun p -> [p] ++ d in match h(1) | _ :: x :: _ -> (let w: Int = x in w) | _ -> 0", "2");
+        runs_to("let d: Dyn = [\"s\"] in let f = fun p -> (p + 1, [p] ++ d) in f(1)", "[2, [1, s]]");
+        fails_statically("let d: Dyn = \"s\" in let h = fun p -> ([p], d) in match h(1) | (xs, _) -> (match xs | x :: _ -> (let w: Str = x in w) | _ -> \"o\")", "expected Str, found Int");
+    }
+
+    // Review focus: a variable already sunk by an annotation is walked again without harm.
+    #[test]
+    fn concat_sinking_an_already_sunk_variable_is_harmless() {
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> (let e: Dyn = p in [p] ++ d) in match f(1) | _ :: x :: _ -> (let w: Int = x in w) | _ -> 0", "expected Int, found Str");
+    }
+
+    // D4: two exactly equal ground types unify, unions included (unify has no Union arm).
+    #[test]
+    fn equal_ground_unions_unify() {
+        runs_to("let u: (Int | Str) = 1 in let v: (Int | Str) = \"a\" in u :: [v]", "[1, a]");
+        runs_to("let u: (Int | Str) = 1 in u :: [u]", "[1, 1]");
+        runs_to("let u: (Int | Str) = 1 in let v: (Int | Str) = 2 in match [u, v] | h :: _ -> (let w: Int = h in w) | _ -> 0", "1");
+    }
+
+    #[test]
+    fn unify_accepts_identical_ground_unions_and_still_rejects_different_ones() {
+        use crate::span::Span;
+        use crate::typecheck::{unify_trial, InferCtx};
+        use types::Type;
+        let span = Span { start: 0, end: 0 };
+        let mut infer = InferCtx::new();
+        let u = |ts: Vec<Type>| Type::Union(Hc::new(ts));
+        assert!(unify_trial(&u(vec![Type::Int, Type::Str]), &u(vec![Type::Int, Type::Str]), &mut infer, span).is_ok());
+        assert!(unify_trial(&u(vec![Type::Int, Type::Str]), &u(vec![Type::Int, Type::Bool]), &mut infer, span).is_err());
+    }
+
+    // Review finding: `dyn_walk` must cost the distinct pairs of a shared type DAG, not its
+    // expansion (a doubling tuple type, 28 deep, took 18 s before the memo).
+    #[test]
+    fn concat_over_a_shared_type_dag_checks_in_bounded_time() {
+        let mut src = String::from("let t0 = (1, 2) in ");
+        for i in 1..=28 {
+            src.push_str(&format!("let t{i} = (t{}, t{}) in ", i - 1, i - 1));
+        }
+        src.push_str("match [t28] ++ [t28] | _ :: _ -> 1 | _ -> 0");
+        assert_eq!(finishes_within(20, &src).expect("runs").as_int(), 1);
+    }
 }
