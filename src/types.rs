@@ -492,6 +492,8 @@ pub enum Tail {
 thread_local! {
     static PURE_ROW: Row = Row::new(Vec::new(), Tail::Closed);
     static DYN_ROW: Row = Row::new(Vec::new(), Tail::Dyn);
+    // The entries of a row with no labels (every row variable's own row), shared.
+    static NO_LABELS: Hc<Vec<(String, Type)>> = Hc::new(Vec::new());
 }
 
 impl Row {
@@ -499,6 +501,9 @@ impl Row {
     pub fn new(mut labels: Vec<String>, tail: Tail) -> Row {
         if tail == Tail::Dyn {
             labels.clear();
+        }
+        if labels.is_empty() {
+            return Row { entries: NO_LABELS.with(Hc::clone), tail };
         }
         labels.sort();
         labels.dedup();

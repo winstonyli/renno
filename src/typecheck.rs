@@ -1,5 +1,6 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -642,6 +643,9 @@ pub(crate) struct InferCtx {
     row_subst: TrieMap<String, Row>,
     // Path-compression cache of `flatten_row` (see there); cleared when `row_subst` is rolled back.
     flat_rows: RefCell<FxMap<String, Row>>,
+    // `resolve_deep`'s memo, emptied and kept between calls so its table is not regrown from
+    // nothing every time (resolve_deep runs once per application).
+    resolve_memo: RefCell<NodeMemo<Option<Type>>>,
     // Row variables `unify_rows` must not bind: a let-annotated signature's while its value is
     // checked (D6), as `rigid_index` is for index variables.
     pub(crate) rigid_row: HashSet<String>,
@@ -725,6 +729,7 @@ impl InferCtx {
             index_subst: TrieMap::default(),
             row_subst: TrieMap::default(),
             flat_rows: RefCell::new(FxMap::default()),
+            resolve_memo: RefCell::new(NodeMemo::default()),
             rigid_row: HashSet::new(),
             levels: Levels::default(),
             rigid_index: HashSet::new(),
@@ -835,7 +840,17 @@ impl InferCtx {
         let relevant = (if self.subst.is_empty() { 0 } else { Summary::VAR })
             | (if self.index_subst.is_empty() { 0 } else { Summary::INDEXED })
             | (if self.row_subst.is_empty() { 0 } else { Summary::ROWVAR });
-        ResolveDeep { infer: self, relevant, memo: NodeMemo::default() }.walk(ty).unwrap_or_else(|| ty.clone())
+        let memo = std::mem::take(&mut *self.resolve_memo.borrow_mut());
+        let mut walk = ResolveDeep { infer: self, relevant, memo };
+        let result = walk.walk(ty).unwrap_or_else(|| ty.clone());
+        let mut memo = walk.memo;
+        memo.clear();
+        // One huge call must not leave every later small one clearing its table.
+        if memo.capacity() > MEMO_KEEP {
+            memo = NodeMemo::default();
+        }
+        *self.resolve_memo.borrow_mut() = memo;
+        result
     }
 
     // IndexExpr's own analog of resolve() -- follows a bound index
@@ -884,20 +899,26 @@ impl InferCtx {
     // from its end. Without it a chain of n fresh row variables (one per lambda in a list) is
     // re-walked on every resolve, quadratic. `restore` clears it: a rollback unbinds variables.
     pub(crate) fn flatten_row(&self, row: &Row) -> Row {
-        let Tail::Var(first) = &row.tail else { return row.clone() };
+        self.flattened(row).unwrap_or_else(|| row.clone())
+    }
+
+    // `flatten_row`, or None when `row` is already flat (no allocation on the common unchanged case).
+    pub(crate) fn flattened(&self, row: &Row) -> Option<Row> {
+        let Tail::Var(first) = &row.tail else { return None };
         // The variables walked (not already compressed to their end) with their own labels.
         let mut path: Vec<(String, usize)> = Vec::new();
         let mut cache = self.flat_rows.borrow_mut();
         let mut labels: Vec<String> = Vec::new();
         let mut tail = Tail::Var(first.clone());
         while let Tail::Var(name) = &tail {
+            // Only a bound variable has a cache entry, so an unbound one costs a single lookup.
+            let Some(bound) = self.row_subst.get(name) else { break };
             if let Some(done) = cache.get(name.as_str()) {
                 // Entries are prefixes: the cached end may have been bound since, so go on.
                 labels.extend(done.labels().map(String::from));
                 tail = done.tail.clone();
                 continue;
             }
-            let Some(bound) = self.row_subst.get(name) else { break };
             path.push((name.clone(), labels.len()));
             labels.extend(bound.labels().map(String::from));
             tail = bound.tail.clone();
@@ -909,9 +930,9 @@ impl InferCtx {
             }
         }
         if labels.is_empty() && tail == row.tail {
-            return row.clone();
+            return None;
         }
-        Row::new(row.labels().map(String::from).chain(labels).collect(), tail)
+        Some(Row::new(row.labels().map(String::from).chain(labels).collect(), tail))
     }
 
     // A fresh instance of quantified row variable `v` (lookup): same base and rank, no level.
@@ -967,6 +988,9 @@ struct ResolveDeep<'a> {
     memo: NodeMemo<Option<Type>>,
 }
 
+// The most table slots `InferCtx::resolve_memo` keeps between calls.
+const MEMO_KEEP: usize = 1 << 13;
+
 impl Rebuild for ResolveDeep<'_> {
     fn skip(&self, s: Summary) -> bool {
         !s.any(self.relevant)
@@ -991,12 +1015,12 @@ impl Rebuild for ResolveDeep<'_> {
                 Some(Some(Type::Indexed(wrapped2.map_or_else(|| wrapped.clone(), Hc::new), Rc::new(index2))))
             }
             Type::Fun(param, row, ret) if matches!(row.tail, Tail::Var(_)) => {
-                let row2 = self.infer.flatten_row(row);
+                let row2 = self.infer.flattened(row);
                 let (param2, ret2) = (self.walk(param), self.walk(ret));
-                if param2.is_none() && ret2.is_none() && row2 == *row {
+                if param2.is_none() && ret2.is_none() && row2.is_none() {
                     return Some(None);
                 }
-                Some(Some(Type::Fun(param2.map_or_else(|| param.clone(), Hc::new), row2, ret2.map_or_else(|| ret.clone(), Hc::new))))
+                Some(Some(Type::Fun(param2.map_or_else(|| param.clone(), Hc::new), row2.unwrap_or_else(|| row.clone()), ret2.map_or_else(|| ret.clone(), Hc::new))))
             }
             _ => None,
         }
@@ -1565,8 +1589,8 @@ pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
             let row_vars = names(|v| if let TyVar::Row(n) = v { Some(n) } else { None });
             let type_vars = names(|v| if let TyVar::Type(n) = v { Some(n) } else { None });
             let index_vars = names(|v| if let TyVar::Index(n) = v { Some(n) } else { None });
-            let row_subst: HashMap<String, Row> = row_vars.iter().map(|v| (v.clone(), infer.instance_row(v))).collect();
-            let type_subst: HashMap<String, Type> =
+            let row_subst: FxMap<String, Row> = row_vars.iter().map(|v| (v.clone(), infer.instance_row(v))).collect();
+            let type_subst: FxMap<String, Type> =
                 type_vars.iter().map(|v| (v.clone(), infer.fresh_var(v))).collect();
             // An instance of a quantified variable that reaches a Dyn sink
             // reaches it too.
@@ -1577,7 +1601,7 @@ pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
                     }
                 }
             }
-            let index_subst: HashMap<String, IndexExpr> =
+            let index_subst: FxMap<String, IndexExpr> =
                 index_vars.iter().map(|v| (v.clone(), IndexExpr::Var(fresh_index_name(v)))).collect();
             subst_type(&scheme.ty, &row_subst, &type_subst, &index_subst)
         }
@@ -1732,7 +1756,7 @@ fn fresh_index_name(base: &str) -> String {
 // entry per generalized index variable), leaving Lit and any variable not
 // in the map untouched, and recursing into Add/Sub/Mul the same way
 // subst_type recurses into Fun/List/Tuple/Union/Record.
-fn subst_index_expr(e: &IndexExpr, index_subst: &HashMap<String, IndexExpr>) -> IndexExpr {
+fn subst_index_expr<S: BuildHasher>(e: &IndexExpr, index_subst: &HashMap<String, IndexExpr, S>) -> IndexExpr {
     match e {
         IndexExpr::Var(name) => index_subst.get(name).cloned().unwrap_or_else(|| e.clone()),
         IndexExpr::Lit(_) => e.clone(),
@@ -1742,7 +1766,7 @@ fn subst_index_expr(e: &IndexExpr, index_subst: &HashMap<String, IndexExpr>) -> 
     }
 }
 
-pub(crate) fn subst_type(ty: &Type, row_subst: &HashMap<String, Row>, type_subst: &HashMap<String, Type>, index_subst: &HashMap<String, IndexExpr>) -> Type {
+pub(crate) fn subst_type<S: BuildHasher>(ty: &Type, row_subst: &HashMap<String, Row, S>, type_subst: &HashMap<String, Type, S>, index_subst: &HashMap<String, IndexExpr, S>) -> Type {
     // Only a variable some map names can change anything.
     let relevant = (if type_subst.is_empty() { 0 } else { Summary::VAR })
         | (if row_subst.is_empty() { 0 } else { Summary::ROWVAR })
@@ -1750,15 +1774,15 @@ pub(crate) fn subst_type(ty: &Type, row_subst: &HashMap<String, Row>, type_subst
     SubstType { row_subst, type_subst, index_subst, relevant, memo: NodeMemo::default() }.walk(ty).unwrap_or_else(|| ty.clone())
 }
 
-struct SubstType<'a> {
-    row_subst: &'a HashMap<String, Row>,
-    type_subst: &'a HashMap<String, Type>,
-    index_subst: &'a HashMap<String, IndexExpr>,
+struct SubstType<'a, S> {
+    row_subst: &'a HashMap<String, Row, S>,
+    type_subst: &'a HashMap<String, Type, S>,
+    index_subst: &'a HashMap<String, IndexExpr, S>,
     relevant: u8,
     memo: NodeMemo<Option<Type>>,
 }
 
-impl Rebuild for SubstType<'_> {
+impl<S: BuildHasher> Rebuild for SubstType<'_, S> {
     fn skip(&self, s: Summary) -> bool {
         !s.any(self.relevant)
     }
@@ -1788,7 +1812,7 @@ impl Rebuild for SubstType<'_> {
 }
 
 // `row` with its variable tail replaced per `map` (the replacement's labels join `row`'s).
-fn rename_row(row: &Row, map: &HashMap<String, Row>) -> Row {
+fn rename_row<S: BuildHasher>(row: &Row, map: &HashMap<String, Row, S>) -> Row {
     match &row.tail {
         Tail::Var(name) => match map.get(name) {
             Some(r) => Row::new(row.labels().chain(r.labels()).map(String::from).collect(), r.tail.clone()),

@@ -12056,6 +12056,29 @@ g(len)").unwrap_err();
         assert_eq!(infer.flatten_row(&Row::var(head)), first);
     }
 
+    // The shared scratch of resolve_deep (its memo, kept between calls) must not carry one call's
+    // answers into the next, and rows with no labels share one entries node.
+    #[test]
+    fn resolve_deep_reuses_its_memo_without_going_stale() {
+        use crate::typecheck::{unify_rows, InferCtx, RowRank};
+        use types::{Row, Tail, Type};
+        assert!(Hc::ptr_eq(&Row::var("a#1").entries, &Row::pure().entries) && Hc::ptr_eq(&Row::dyn_().entries, &Row::pure().entries));
+        let mut infer = InferCtx::new();
+        let a = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        let mut ty = Type::Int;
+        for _ in 0..40 {
+            ty = Type::Fun(Hc::new(ty), Row::var(a.clone()), Hc::new(Type::Int));
+        }
+        assert!(infer.flattened(&Row::var(a.clone())).is_none(), "an unbound tail is already flat");
+        let before = infer.resolve_deep(&ty);
+        assert_eq!(before, ty);
+        let b = infer.fresh_row(RowRank::User, "e", None);
+        assert!(unify_rows(&Row::var(a.clone()), &row_of(&["x"], Tail::Var(b)), &mut infer));
+        let after = infer.resolve_deep(&ty);
+        assert_ne!(after, ty, "the memo of the first call must not answer the second");
+        assert!(after.to_string().contains("{x | e}"), "{after}");
+    }
+
     #[test]
     fn resolve_deep_flattens_bound_row_tails_in_every_position() {
         use crate::typecheck::{unify_rows, InferCtx, RowRank};
