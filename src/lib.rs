@@ -12378,4 +12378,24 @@ g(len)").unwrap_err();
     fn concat_sinking_an_already_sunk_variable_is_harmless() {
         fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> (let e: Dyn = p in [p] ++ d) in match f(1) | _ :: x :: _ -> (let w: Int = x in w) | _ -> 0", "expected Int, found Str");
     }
+
+    // D4: two exactly equal ground types unify, unions included (unify has no Union arm).
+    #[test]
+    fn equal_ground_unions_unify() {
+        runs_to("let u: (Int | Str) = 1 in let v: (Int | Str) = \"a\" in u :: [v]", "[1, a]");
+        runs_to("let u: (Int | Str) = 1 in u :: [u]", "[1, 1]");
+        runs_to("let u: (Int | Str) = 1 in let v: (Int | Str) = 2 in match [u, v] | h :: _ -> (let w: Int = h in w) | _ -> 0", "1");
+    }
+
+    #[test]
+    fn unify_accepts_identical_ground_unions_and_still_rejects_different_ones() {
+        use crate::span::Span;
+        use crate::typecheck::{unify_trial, InferCtx};
+        use types::Type;
+        let span = Span { start: 0, end: 0 };
+        let mut infer = InferCtx::new();
+        let u = |ts: Vec<Type>| Type::Union(Hc::new(ts));
+        assert!(unify_trial(&u(vec![Type::Int, Type::Str]), &u(vec![Type::Int, Type::Str]), &mut infer, span).is_ok());
+        assert!(unify_trial(&u(vec![Type::Int, Type::Str]), &u(vec![Type::Int, Type::Bool]), &mut infer, span).is_err());
+    }
 }

@@ -1185,12 +1185,24 @@ fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), M
     unify_in(t1, t2, infer, span, &mut FxSet::default())
 }
 
+// The same interned node on both sides, with nothing in it to bind or rescue (no type, row or
+// index variable, free name or recursive group): it unifies with and fits itself, and walking it
+// would cost its depth. Shared by `unify_in` and `fits_in`.
+fn same_ground_type(a: &Type, b: &Type) -> bool {
+    !a.summary().any(Summary::VAR | Summary::ROWVAR | Summary::INDEXED | Summary::FREE | Summary::REC) && a.exact_eq(b)
+}
+
 // `done` holds the big pairs this call has already unified (after resolution). Within one call
 // the substitution only grows, so a pair unified once stays unified; a failure ends the call,
 // so no failed pair is ever recorded. Each call (and each unify_trial) has its own set.
 fn unify_in(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
     let t1 = infer.resolve(t1);
     let t2 = infer.resolve(t2);
+    // Reflexivity, as `fits_in` and `relate` already have it: `unify_resolved` has no `Union`
+    // arm, so without this `u :: [v]` over one union type failed (wrong-value fixes D4).
+    if same_ground_type(&t1, &t2) {
+        return Ok(());
+    }
     let key = (is_big(&t1) || is_big(&t2)).then(|| (ById(t1.clone()), ById(t2.clone())));
     if key.as_ref().is_some_and(|k| done.contains(k)) {
         return Ok(());
@@ -1405,9 +1417,7 @@ fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) 
 fn fits_in(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
     let required = infer.resolve(required);
     let actual = infer.resolve(actual);
-    // The same interned node on both sides, with nothing in it to bind or rescue: it fits
-    // itself, and walking it would cost its depth.
-    if !required.summary().any(Summary::VAR | Summary::ROWVAR | Summary::INDEXED | Summary::FREE | Summary::REC) && required.exact_eq(&actual) {
+    if same_ground_type(&required, &actual) {
         return Ok(());
     }
     let key = (is_big(&required) || is_big(&actual)).then(|| (ById(required.clone()), ById(actual.clone())));
