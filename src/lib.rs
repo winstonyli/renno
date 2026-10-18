@@ -11866,23 +11866,18 @@ g(len)").unwrap_err();
         use types::{Row, Type};
         let mut infer = InferCtx::new();
         let fun = |r: &str| Type::Fun(Hc::new(Type::Int), Row::var(r.to_string()), Hc::new(Type::Int));
-        let (free, held, via) = (
-            infer.fresh_row(RowRank::Opened, types::OPENED_ROW),
-            infer.fresh_row(RowRank::Opened, types::OPENED_ROW),
-            infer.fresh_row(RowRank::Opened, types::OPENED_ROW),
-        );
+        let (free, via) = (infer.fresh_row(RowRank::Opened, types::OPENED_ROW), infer.fresh_row(RowRank::Opened, types::OPENED_ROW));
         let held_by = infer.fresh_row(RowRank::User, "e");
         let ctx = extend(&Ctx::empty(), "p", fun(&held_by), &mut infer);
-        // `via` is unified into a held tail, so it is held too; `free` and `held` start alike.
+        // `via` is unified into a held tail, so it is held too; `free` is held by nothing.
         assert!(unify_rows(&Row::var(held_by.clone()), &Row::var(via.clone()), &mut infer));
         let mut ctx = ctx;
-        for (name, row) in [("free", &free), ("held", &held), ("via", &via)] {
+        for (name, row) in [("free", &free), ("via", &via)] {
             ctx = extend_generalized(&ctx, name, fun(row), &mut infer, None);
         }
         assert_ne!(lookup(&ctx, "free", &mut infer), fun(&free), "an unheld fresh row is quantified");
-        assert_ne!(lookup(&ctx, "held", &mut infer), fun(&held), "a row no scope holds is quantified");
         let got = lookup(&ctx, "via", &mut infer);
-        assert!(got == fun(&via) || got == fun(&held_by), "a row bound into a held tail is not quantified: {got:?}");
+        assert_eq!(got, fun(&held_by), "a row bound into a held tail is not quantified");
     }
     // An instance of an instance keeps a short name: a chain of n `let`s each instantiating the
     // one before must not make the names (copied into every type, map and hash) n links long.
@@ -12105,7 +12100,21 @@ g(len)").unwrap_err();
         assert!(extended.labels().any(|l| l == "z"));
         // Rolled back: the binding, and what was compressed through it, is gone.
         infer.restore(snap);
-        assert_eq!(infer.flatten_row(&Row::var(head)), first);
+        assert_eq!(infer.flatten_row(&Row::var(head.clone())), first);
+        // A chain bound and flattened after a snapshot caches entries; a rollback must drop them,
+        // or a head rebound differently afterwards keeps the stale compressed prefix.
+        let snap = infer.snapshot();
+        let chain: Vec<String> = (0..4).map(|_| infer.fresh_row(RowRank::Opened, types::OPENED_ROW)).collect();
+        for (w, l) in chain.windows(2).zip(["p", "q", "r"]) {
+            assert!(unify_rows(&Row::var(w[0].clone()), &row_of(&[l], Tail::Var(w[1].clone())), &mut infer));
+        }
+        let stale = infer.flatten_row(&Row::var(chain[0].clone()));
+        assert!(stale.labels().eq(["p", "q", "r"]), "{stale:?}");
+        let end = stale.tail.clone();
+        infer.restore(snap);
+        assert!(unify_rows(&Row::var(chain[0].clone()), &row_of(&["y"], end.clone()), &mut infer));
+        let fresh = infer.flatten_row(&Row::var(chain[0].clone()));
+        assert!(fresh.labels().eq(["y"]), "stale compressed prefix survived the rollback: {fresh:?}");
     }
 
     // The shared scratch of resolve_deep (its memo, kept between calls) must not carry one call's

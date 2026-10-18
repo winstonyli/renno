@@ -900,9 +900,12 @@ impl InferCtx {
         self.flattened(row).unwrap_or_else(|| row.clone())
     }
 
-    // `flatten_row`, or None when `row` is already flat (no allocation on the common unchanged case).
+    // `flatten_row`, or None when `row` is already flat (no allocation when the tail is unbound, the common case).
     pub(crate) fn flattened(&self, row: &Row) -> Option<Row> {
         let Tail::Var(first) = &row.tail else { return None };
+        if !self.row_subst.contains_key(first) {
+            return None;
+        }
         // The variables walked (not already compressed to their end) with their own labels.
         let mut path: Vec<(String, usize)> = Vec::new();
         let mut cache = self.flat_rows.borrow_mut();
