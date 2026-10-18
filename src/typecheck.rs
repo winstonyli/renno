@@ -1602,7 +1602,7 @@ pub(crate) fn concat_type(l_ty: &Type, r_ty: &Type, infer: &mut InferCtx, span: 
 
 fn concat_type_in(l_ty: &Type, r_ty: &Type, infer: &mut InferCtx, span: Span) -> Result<Type, String> {
     let operands = |infer: &InferCtx| format!("{} with {}", infer.resolve_deep(l_ty).brief(), infer.resolve_deep(r_ty).brief());
-    dyn_walk(l_ty, r_ty, infer, span);
+    dyn_walk(l_ty, r_ty, infer, span, &mut FxSet::default());
     let result = match (infer.resolve(l_ty), infer.resolve(r_ty)) {
         (Type::Dyn, Type::Dyn | Type::Var(_)) | (Type::Var(_), Type::Dyn) => Type::Dyn,
         (Type::Dyn, _) => infer.resolve_deep(r_ty),
@@ -1634,9 +1634,14 @@ fn concat_type_in(l_ty: &Type, r_ty: &Type, infer: &mut InferCtx, span: Span) ->
 // nor a variable, that subterm's unbound type variables are bound to `Dyn`, so a value the `Dyn`
 // side supplies is not typed by a constraint it never met (`fun p -> [p] ++ d` is
 // `Dyn -> [Dyn]`). A `Dyn` meeting a bare variable is left to the caller's unify, which binds it.
-// Row and index variables are not bound. The caller owns the snapshot.
-fn dyn_walk(a: &Type, b: &Type, infer: &mut InferCtx, span: Span) {
+// Row and index variables are not bound. The caller owns the snapshot. `done` remembers the big
+// pairs already walked (binding to `Dyn` is idempotent), so a shared type DAG costs its distinct
+// pairs, not its expansion.
+fn dyn_walk(a: &Type, b: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) {
     let (a, b) = (infer.resolve(a), infer.resolve(b));
+    if (is_big(&a) || is_big(&b)) && !done.insert((ById(a.clone()), ById(b.clone()))) {
+        return;
+    }
     match (&a, &b) {
         (Type::Dyn, Type::Dyn | Type::Var(_)) | (Type::Var(_), Type::Dyn) => {}
         (Type::Dyn, t) | (t, Type::Dyn) => {
@@ -1646,12 +1651,12 @@ fn dyn_walk(a: &Type, b: &Type, infer: &mut InferCtx, span: Span) {
                 }
             }
         }
-        (Type::List(x), Type::List(y)) => dyn_walk(x, y, infer, span),
-        (Type::Tuple(xs), Type::Tuple(ys)) if xs.len() == ys.len() => xs.iter().zip(ys.iter()).for_each(|(x, y)| dyn_walk(x, y, infer, span)),
+        (Type::List(x), Type::List(y)) => dyn_walk(x, y, infer, span, done),
+        (Type::Tuple(xs), Type::Tuple(ys)) if xs.len() == ys.len() => xs.iter().zip(ys.iter()).for_each(|(x, y)| dyn_walk(x, y, infer, span, done)),
         (Type::Record(xs), Type::Record(ys)) => {
             for (name, x) in xs.iter() {
                 if let Some(y) = find_field(ys, name) {
-                    dyn_walk(x, y, infer, span);
+                    dyn_walk(x, y, infer, span, done);
                 }
             }
         }

@@ -12398,4 +12398,16 @@ g(len)").unwrap_err();
         assert!(unify_trial(&u(vec![Type::Int, Type::Str]), &u(vec![Type::Int, Type::Str]), &mut infer, span).is_ok());
         assert!(unify_trial(&u(vec![Type::Int, Type::Str]), &u(vec![Type::Int, Type::Bool]), &mut infer, span).is_err());
     }
+
+    // Review finding: `dyn_walk` must cost the distinct pairs of a shared type DAG, not its
+    // expansion (a doubling tuple type, 28 deep, took 18 s before the memo).
+    #[test]
+    fn concat_over_a_shared_type_dag_checks_in_bounded_time() {
+        let mut src = String::from("let t0 = (1, 2) in ");
+        for i in 1..=28 {
+            src.push_str(&format!("let t{i} = (t{}, t{}) in ", i - 1, i - 1));
+        }
+        src.push_str("match [t28] ++ [t28] | _ :: _ -> 1 | _ -> 0");
+        assert_eq!(finishes_within(20, &src).expect("runs").as_int(), 1);
+    }
 }
