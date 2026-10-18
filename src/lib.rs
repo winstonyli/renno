@@ -12341,4 +12341,41 @@ g(len)").unwrap_err();
         assert!(err.contains("(expected two strings or two lists)"), "{err}");
         assert_eq!(infer.resolve_deep(&a), a);
     }
+
+    // Section 2b: a type variable that meets Dyn inside `++` is sunk to Dyn, so the element
+    // the Dyn side supplies is checked where it is used.
+    #[test]
+    fn concat_sinks_variables_that_meet_dyn() {
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> [p] ++ d in match f(1) | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0", "expected Int, found Str");
+        fails_at_run_time("let d: Dyn = [[\"s\"]] in let f = fun p -> [[p]] ++ d in match f(1) | _ :: t -> (match t | h :: _ -> (match h | k :: _ -> (let w: Int = k in w) | _ -> 0) | _ -> 0) | _ -> 0", "expected Int, found Str");
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> [[p]] ++ [d] in match f(1) | _ :: x :: _ -> (match x | y :: _ -> (let w: Int = y in w) | _ -> 0) | _ -> 0", "expected Int, found Str");
+        fails_at_run_time("let d: Dyn = [{x: \"s\"}] in let f = fun p -> [{x: p}] ++ d in match f(1) | _ :: t -> (match t | h :: _ -> (let w: Int = h.x in w) | _ -> 0) | _ -> 0", "expected Int, found Str");
+        // Order (spec 2b): `p + 1` does not fix `p`, so both orders sink it; with `let q: Int = p`
+        // after the `++` (ord4) `p` is still unbound at the `++` and is sunk too.
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> (p + 1, [p] ++ d) in match f(1) | (n, xs) -> (match xs | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0)", "expected Int, found Str");
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> ([p] ++ d, p + 1) in match f(1) | (xs, n) -> (match xs | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0)", "expected Int, found Str");
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> ([p] ++ d, let q: Int = p in q) in match f(1) | (xs, n) -> (match xs | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0)", "expected Int, found Str");
+    }
+
+    // The walk goes through equal-length tuples and shared record fields too.
+    #[test]
+    fn concat_sinks_variables_inside_tuples_and_records() {
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> [([p], 2)] ++ [(d, 3)] in match f(1) | _ :: x :: _ -> (match x | (ys, _) -> (match ys | y :: _ -> (let w: Int = y in w) | _ -> 0) | _ -> 0) | _ -> 0", "expected Int, found Str");
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> [{a: [p]}] ++ [{a: d}] in match f(1) | _ :: x :: _ -> (match x.a | y :: _ -> (let w: Int = y in w) | _ -> 0) | _ -> 0", "expected Int, found Str");
+    }
+
+    // Controls: a fitting Dyn still runs, and a variable that never meets Dyn inside `++`
+    // stays polymorphic.
+    #[test]
+    fn concat_sinking_leaves_fitting_and_unrelated_values_alone() {
+        runs_to("let d: Dyn = [2] in let h = fun p -> [p] ++ d in match h(1) | _ :: x :: _ -> (let w: Int = x in w) | _ -> 0", "2");
+        runs_to("let d: Dyn = [\"s\"] in let f = fun p -> (p + 1, [p] ++ d) in f(1)", "[2, [1, s]]");
+        fails_statically("let d: Dyn = \"s\" in let h = fun p -> ([p], d) in match h(1) | (xs, _) -> (match xs | x :: _ -> (let w: Str = x in w) | _ -> \"o\")", "expected Str, found Int");
+    }
+
+    // Review focus: a variable already sunk by an annotation is walked again without harm.
+    #[test]
+    fn concat_sinking_an_already_sunk_variable_is_harmless() {
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> (let e: Dyn = p in [p] ++ d) in match f(1) | _ :: x :: _ -> (let w: Int = x in w) | _ -> 0", "expected Int, found Str");
+    }
 }

@@ -1592,6 +1592,7 @@ pub(crate) fn concat_type(l_ty: &Type, r_ty: &Type, infer: &mut InferCtx, span: 
 
 fn concat_type_in(l_ty: &Type, r_ty: &Type, infer: &mut InferCtx, span: Span) -> Result<Type, String> {
     let operands = |infer: &InferCtx| format!("{} with {}", infer.resolve_deep(l_ty).brief(), infer.resolve_deep(r_ty).brief());
+    dyn_walk(l_ty, r_ty, infer, span);
     let result = match (infer.resolve(l_ty), infer.resolve(r_ty)) {
         (Type::Dyn, Type::Dyn | Type::Var(_)) | (Type::Var(_), Type::Dyn) => Type::Dyn,
         (Type::Dyn, _) => infer.resolve_deep(r_ty),
@@ -1615,6 +1616,37 @@ fn concat_type_in(l_ty: &Type, r_ty: &Type, infer: &mut InferCtx, span: Span) ->
         return Err(format!("type mismatch: cannot concat {} (expected two strings or two lists)", operands(infer)));
     }
     Ok(result)
+}
+
+// The Dyn rule (wrong-value fixes spec, section 2b), written for any join site; only `++` calls
+// it. Walks `a` and `b` in parallel, resolving each node first, through lists, tuples of equal
+// length and the fields two records share. Where a `Dyn` meets a subterm that is neither `Dyn`
+// nor a variable, that subterm's unbound type variables are bound to `Dyn`, so a value the `Dyn`
+// side supplies is not typed by a constraint it never met (`fun p -> [p] ++ d` is
+// `Dyn -> [Dyn]`). A `Dyn` meeting a bare variable is left to the caller's unify, which binds it.
+// Row and index variables are not bound. The caller owns the snapshot.
+fn dyn_walk(a: &Type, b: &Type, infer: &mut InferCtx, span: Span) {
+    let (a, b) = (infer.resolve(a), infer.resolve(b));
+    match (&a, &b) {
+        (Type::Dyn, Type::Dyn | Type::Var(_)) | (Type::Var(_), Type::Dyn) => {}
+        (Type::Dyn, t) | (t, Type::Dyn) => {
+            for v in vars_in(&infer.resolve_deep(t)) {
+                if let TyVar::Type(name) = v {
+                    let _ = unify(&Type::Var(name), &Type::Dyn, infer, span);
+                }
+            }
+        }
+        (Type::List(x), Type::List(y)) => dyn_walk(x, y, infer, span),
+        (Type::Tuple(xs), Type::Tuple(ys)) if xs.len() == ys.len() => xs.iter().zip(ys.iter()).for_each(|(x, y)| dyn_walk(x, y, infer, span)),
+        (Type::Record(xs), Type::Record(ys)) => {
+            for (name, x) in xs.iter() {
+                if let Some(y) = find_field(ys, name) {
+                    dyn_walk(x, y, infer, span);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn lookup(ctx: &Ctx, name: &str, infer: &mut InferCtx) -> Type {
