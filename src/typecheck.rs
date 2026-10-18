@@ -163,6 +163,11 @@ fn index_names(vars: BTreeSet<TyVar>) -> BTreeSet<String> {
     vars.into_iter().filter_map(|v| if let TyVar::Index(name) = v { Some(name) } else { None }).collect()
 }
 
+// The row-variable names among `vars`.
+fn row_names(vars: &BTreeSet<TyVar>) -> BTreeSet<String> {
+    vars.iter().filter_map(|v| if let TyVar::Row(name) = v { Some(name.clone()) } else { None }).collect()
+}
+
 // A scope: the visible bindings, the annotation variables its binders
 // introduced, and its level (how many `let` right-hand sides enclose it).
 // All are persistent, so extending a scope is cheap and an enclosing scope
@@ -5029,19 +5034,25 @@ fn elaborate(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, infer
 }
 
 // check_against for an annotated binding's value: a FUNCTION signature's
-// index variables (already the fresh ones open_annotation minted at the
-// binder) are rigid for the duration, so the body cannot pin them (e.g.
-// `n := 3`) by unification. Only variables THIS call newly marked are
+// index and row variables (D6; already the fresh ones open_annotation minted
+// at the binder) are rigid for the duration, so the body cannot pin them (e.g.
+// `n := 3`) by unification. Row variables: `unify_rows` and `union_rows`
+// refuse to extend or merge them. Only variables THIS call newly marked are
 // released afterwards, so nested annotated bindings compose. Non-function
 // annotations (`let x: Vec(n) = [1, 2]`) keep their flexible, binding-style
 // variables: there `n` is an existential to be inferred from the value, not
 // a signature parameter. See spec 2026-10-07.
 fn check_against_rigid(arena: &mut Arena, val: ExprRef, ann: &Type, ctx: &Ctx, spans: &SpanMap, infer: &mut InferCtx) -> Result<(Row, ExprRef), TypeError> {
-    let signature_vars = if is_signature(ann) { index_names(vars_in(&infer.resolve_deep(ann))) } else { BTreeSet::new() };
-    let added: Vec<String> = signature_vars.into_iter().filter(|v| infer.rigid_index.insert(v.clone())).collect();
+    let vars = if is_signature(ann) { vars_in(&infer.resolve_deep(ann)) } else { BTreeSet::new() };
+    let rows = row_names(&vars);
+    let added: Vec<String> = index_names(vars).into_iter().filter(|v| infer.rigid_index.insert(v.clone())).collect();
+    let added_rows: Vec<String> = rows.into_iter().filter(|v| infer.rigid_row.insert(v.clone())).collect();
     let result = check_against(arena, val, ann, ctx, spans, infer);
     for v in &added {
         infer.rigid_index.remove(v);
+    }
+    for v in &added_rows {
+        infer.rigid_row.remove(v);
     }
     result
 }

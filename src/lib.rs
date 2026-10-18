@@ -11959,6 +11959,26 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn a_declared_row_variable_is_rigid_in_the_body() {
+        // D6: a concrete effect under a declared `->{e}` (prints 0 before stage 1). Guard after
+        // Task 4: already rejected (flexible e against {a | e}); the message may change.
+        let d6 = "let k: ((Int ->{e} Int) -> (Int ->{e} Int)) = fun f -> fun x -> perform a(x) + f(x) in 0";
+        assert!(static_error(d6).is_some_and(|e| e.contains("{a | e}")), "{:?}", static_error(d6));
+        // D1 (rigid): union of two distinct declared variables (prints 6 before stage 1).
+        let twor = "let h: ((Int ->{e1} Int) -> (Int ->{e2} Int) -> Int) = fun f -> fun g -> f(1) + g(1) in h(fun x -> x + 1)(fun x -> x + 3)";
+        assert!(static_error(twor).is_some_and(|e| e.contains("effect row variables e1 and e2 are fixed by the signature")), "{:?}", static_error(twor));
+        // Review 19 M7 (spec section 5): one variable twice in a parameter, a rigid callback and a
+        // performing one. relate passes each position alone; unify_fits fails.
+        let m7 = "let g = fun p: ((Int ->{e} Int), (Int ->{e} Int)) -> 0 in let f: ((Int ->{e1} Int) -> Int) = fun c1 -> g((c1, fun x -> perform a(x))) in 0";
+        assert!(static_error(m7).is_some_and(|e| e.contains("expected (Int ->{e1} Int)")), "{:?}", static_error(m7));
+        // Review Focus 5: a types-as-values signature row is rigid too. Guard after Task 4.
+        let tav = "let F = Fun((Int, \"e\", Int)) in let k: (F -> F) = fun f -> fun x -> perform a(x) + f(x) in 0";
+        assert!(static_error(tav).is_some(), "types-as-values signature row should be rigid");
+        // Pure and declared-polymorphic implementations still fit (guard; a1 to a3 stay in Task 4's test).
+        runs_to("let k: (Int -> (Int ->{e} Int)) = fun n -> fun x -> n in k(1)(2)", "1");
+    }
+
+    #[test]
     fn row_plan_cells_the_other_tests_do_not_reach() {
         use crate::typecheck::{row_compatible, unify_rows, InferCtx, RowRank};
         use types::{surface_name, Row, Tail};
