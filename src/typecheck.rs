@@ -652,7 +652,8 @@ pub(crate) struct InferCtx {
     // The level of every variable a scope has held (U8b), rolled back with the substitution by
     // unify_trial. Invariant: if a levelled variable (of any sort) is bound, everything its
     // solution mentions has a level at most its own (the match-arm hypotheses are the one
-    // exception).
+    // exception). Row bindings made inside a match arm are not undone per arm: arm hypotheses
+    // write only `index_subst`, and nothing writes rows through a hypothesis (spec 2.2).
     pub(crate) levels: Levels,
     // Index variables that unify_index_expr must NOT bind: the free index
     // variables of an annotated binding's signature (the fresh ones its
@@ -4002,8 +4003,8 @@ fn missing_case(patterns: &[&Pattern], scrut_ty: &Type) -> Option<String> {
 }
 
 // Bidirectional-lite synthesis: walks the tree once, producing the
-// inferred Type, the inferred Row (closed, no polymorphism -- just
-// the union of effect names this expression's evaluation might perform),
+// inferred Type, the inferred Row (the effect labels this expression's
+// evaluation might perform, with a variable, closed or Dyn tail),
 // and an elaborated Expr (same shape, with boundary checks -- or, at Fun
 // boundaries, full contracts -- spliced into the arena at Dyn-to-concrete
 // crossings; unchanged leaves are returned by their original ExprRef,
