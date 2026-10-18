@@ -11772,8 +11772,8 @@ g(len)").unwrap_err();
         use crate::typecheck::{row_compatible, unify_rows, InferCtx, RowRank};
         use types::{surface_name, Row, Tail};
         let mut infer = InferCtx::new();
-        let a = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
-        let b = infer.fresh_row(RowRank::User, "e", None);
+        let a = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
+        let b = infer.fresh_row(RowRank::User, "e");
         // {x | a} ~ {y | b}: both flexible with extras: one fresh tail takes both, named after
         // the higher-ranked side (User beats Opened).
         assert!(unify_rows(&row_of(&["x"], Tail::Var(a.clone())), &row_of(&["y"], Tail::Var(b.clone())), &mut infer));
@@ -11787,23 +11787,23 @@ g(len)").unwrap_err();
         assert!(unify_rows(&Row::single("a"), &Row::single("a"), &mut infer));
         assert!(!unify_rows(&Row::single("a"), &Row::pure(), &mut infer));
         // A flexible tail against a closed row absorbs the other side's extras, not its own.
-        let c = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        let c = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
         assert!(!unify_rows(&row_of(&["z"], Tail::Var(c.clone())), &Row::single("a"), &mut infer));
         assert!(unify_rows(&Row::var(c.clone()), &Row::single("a"), &mut infer));
         assert_eq!(infer.flatten_row(&Row::var(c)).to_string(), "{a}");
         // Rigid tails: never extended, never meet another rigid tail; a flexible one binds to them.
-        let e1 = infer.fresh_row(RowRank::User, "e1", None);
-        let e2 = infer.fresh_row(RowRank::User, "e2", None);
+        let e1 = infer.fresh_row(RowRank::User, "e1");
+        let e2 = infer.fresh_row(RowRank::User, "e2");
         infer.rigid_row.insert(e1.clone());
         infer.rigid_row.insert(e2.clone());
-        let d = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        let d = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
         assert!(!row_compatible(&Row::var(e1.clone()), &row_of(&["a"], Tail::Var(d.clone())), &infer));
         assert!(!row_compatible(&Row::var(e1.clone()), &Row::var(e2.clone()), &infer));
         assert!(row_compatible(&Row::var(e1.clone()), &Row::var(d.clone()), &infer));
         assert!(unify_rows(&Row::var(d.clone()), &Row::var(e1.clone()), &mut infer));
         assert_eq!(infer.flatten_row(&Row::var(d)).tail, Tail::Var(e1));
         // A Dyn tail is compatible with anything and binds nothing.
-        let g = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        let g = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
         assert!(unify_rows(&Row::dyn_(), &row_of(&["q"], Tail::Var(g.clone())), &mut infer));
         assert_eq!(infer.flatten_row(&Row::var(g.clone())), Row::var(g));
     }
@@ -11815,8 +11815,8 @@ g(len)").unwrap_err();
         use types::{Row, Tail};
         let sp = Span { start: 0, end: 0 };
         let mut infer = InferCtx::new();
-        let a = infer.fresh_row(RowRank::User, "a", None);
-        let b = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        let a = infer.fresh_row(RowRank::User, "a");
+        let b = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
         assert_eq!(union_rows(&Row::single("x"), &Row::var(a.clone()), &mut infer, sp).unwrap().to_string(), "{x | a}");
         // Var b ∪ Var a unifies the two tails (b, the opened one, binds to a) and is that tail.
         let u = union_rows(&Row::var(b.clone()), &row_of(&["y"], Tail::Var(a.clone())), &mut infer, sp).unwrap();
@@ -11824,8 +11824,8 @@ g(len)").unwrap_err();
         assert_eq!(infer.flatten_row(&Row::var(b)).tail, Tail::Var(a));
         assert_eq!(union_rows(&Row::single("x"), &Row::single("y"), &mut infer, sp).unwrap().to_string(), "{x, y}");
         assert!(union_rows(&Row::dyn_(), &Row::single("y"), &mut infer, sp).unwrap().is_dyn());
-        let e1 = infer.fresh_row(RowRank::User, "e1", None);
-        let e2 = infer.fresh_row(RowRank::User, "e2", None);
+        let e1 = infer.fresh_row(RowRank::User, "e1");
+        let e2 = infer.fresh_row(RowRank::User, "e2");
         infer.rigid_row.insert(e1.clone());
         infer.rigid_row.insert(e2.clone());
         let err = union_rows(&Row::var(e1), &Row::var(e2), &mut infer, sp).unwrap_err();
@@ -11837,9 +11837,14 @@ g(len)").unwrap_err();
         use crate::typecheck::{unify_rows, InferCtx, RowRank, TyVar};
         use types::{Row, Tail, Type};
         let mut infer = InferCtx::new();
-        let a = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, Some(1));
-        let b = infer.fresh_row(RowRank::User, "e", None);
+        let a = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
+        let b = infer.fresh_row(RowRank::User, "e");
         let fun = Type::Fun(Hc::new(Type::Int), Row::var(a.clone()), Hc::new(Type::Int));
+        // A fresh row has no level until a scope holds it (invariant I); a scope at level 1 does.
+        assert_eq!(infer.levels.get(&TyVar::Row(a.clone())), None);
+        let ctx = crate::typecheck::Ctx::empty().deeper();
+        crate::typecheck::extend(&ctx, "h", fun.clone(), &mut infer);
+        assert_eq!(infer.levels.get(&TyVar::Row(a.clone())), Some(1));
         let snap = infer.snapshot();
         assert!(unify_rows(&Row::var(a.clone()), &row_of(&["x"], Tail::Var(b.clone())), &mut infer));
         assert_eq!(infer.resolve_deep(&fun).to_string(), "(Int ->{x | e} Int)");
@@ -11852,6 +11857,53 @@ g(len)").unwrap_err();
         assert_eq!(infer.levels.get(&TyVar::Row(b)), None);
     }
 
+    // A lambda's opened row is minted with no level (invariant I), and that is the same as
+    // minting it at the scope's level: a `let` quantifies it unless a scope holds it, and
+    // holding it (a binder, or unification into a held variable) gives it the holder's level.
+    #[test]
+    fn a_fresh_row_is_generalized_unless_a_scope_holds_it() {
+        use crate::typecheck::{extend, extend_generalized, lookup, unify_rows, Ctx, InferCtx, RowRank};
+        use types::{Row, Type};
+        let mut infer = InferCtx::new();
+        let fun = |r: &str| Type::Fun(Hc::new(Type::Int), Row::var(r.to_string()), Hc::new(Type::Int));
+        let (free, held, via) = (
+            infer.fresh_row(RowRank::Opened, types::OPENED_ROW),
+            infer.fresh_row(RowRank::Opened, types::OPENED_ROW),
+            infer.fresh_row(RowRank::Opened, types::OPENED_ROW),
+        );
+        let held_by = infer.fresh_row(RowRank::User, "e");
+        let ctx = extend(&Ctx::empty(), "p", fun(&held_by), &mut infer);
+        // `via` is unified into a held tail, so it is held too; `free` and `held` start alike.
+        assert!(unify_rows(&Row::var(held_by.clone()), &Row::var(via.clone()), &mut infer));
+        let mut ctx = ctx;
+        for (name, row) in [("free", &free), ("held", &held), ("via", &via)] {
+            ctx = extend_generalized(&ctx, name, fun(row), &mut infer, None);
+        }
+        assert_ne!(lookup(&ctx, "free", &mut infer), fun(&free), "an unheld fresh row is quantified");
+        assert_ne!(lookup(&ctx, "held", &mut infer), fun(&held), "a row no scope holds is quantified");
+        let got = lookup(&ctx, "via", &mut infer);
+        assert!(got == fun(&via) || got == fun(&held_by), "a row bound into a held tail is not quantified: {got:?}");
+    }
+    // An instance of an instance keeps a short name: a chain of n `let`s each instantiating the
+    // one before must not make the names (copied into every type, map and hash) n links long.
+    #[test]
+    fn instance_names_do_not_grow_with_the_generation() {
+        use crate::typecheck::{extend_generalized, lookup, Ctx, InferCtx, RowRank};
+        use types::{Row, Tail, Type};
+        let mut infer = InferCtx::new();
+        let tail = infer.fresh_row(RowRank::User, "e");
+        let mut ctx = Ctx::empty();
+        let a = Hc::new(Type::Var("a".to_string()));
+        ctx = extend_generalized(&ctx, "f0", Type::Fun(a.clone(), Row::var(tail), a), &mut infer, None);
+        for i in 1..300 {
+            let ty = lookup(&ctx, &format!("f{}", i - 1), &mut infer);
+            ctx = extend_generalized(&ctx, &format!("f{i}"), ty, &mut infer, None);
+        }
+        let Type::Fun(p, row, _) = lookup(&ctx, "f299", &mut infer) else { panic!("fun") };
+        let Tail::Var(r) = &row.tail else { panic!("row var") };
+        let Type::Var(v) = &*p else { panic!("type var") };
+        assert!(r.len() < 16 && v.len() < 16, "names grew with the generation: {r} {v}");
+    }
     // ---- one row sort, stage 1: wiring (D10, precise union, exact Fun rows) ----
 
     // The type error `check` reports for `src`, or None when it typechecks: separates a static
@@ -11994,25 +12046,25 @@ g(len)").unwrap_err();
         let mut infer = InferCtx::new();
         // Flexible/flexible, equal label sets: no split, the loser binds to the winner. Equal
         // rank ties go to the second argument; a higher rank wins whatever the order.
-        let (a, b) = (infer.fresh_row(RowRank::User, "e1", None), infer.fresh_row(RowRank::User, "e2", None));
+        let (a, b) = (infer.fresh_row(RowRank::User, "e1"), infer.fresh_row(RowRank::User, "e2"));
         assert!(unify_rows(&row_of(&["x"], Tail::Var(a.clone())), &row_of(&["x"], Tail::Var(b.clone())), &mut infer));
         assert_eq!(infer.flatten_row(&Row::var(a.clone())).tail, Tail::Var(b.clone()), "tie: the second survives");
         assert_eq!(infer.flatten_row(&Row::var(b.clone())), Row::var(b.clone()));
-        let (c, d) = (infer.fresh_row(RowRank::User, "e3", None), infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None));
+        let (c, d) = (infer.fresh_row(RowRank::User, "e3"), infer.fresh_row(RowRank::Opened, types::OPENED_ROW));
         assert!(unify_rows(&Row::var(c.clone()), &Row::var(d.clone()), &mut infer));
         assert_eq!(infer.flatten_row(&Row::var(d.clone())).tail, Tail::Var(c.clone()), "User beats Opened though it is first");
         // Split where the first argument wins (higher rank): sigma is named after it.
-        let (f, g) = (infer.fresh_row(RowRank::User, "ef", None), infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None));
+        let (f, g) = (infer.fresh_row(RowRank::User, "ef"), infer.fresh_row(RowRank::Opened, types::OPENED_ROW));
         assert!(unify_rows(&row_of(&["x"], Tail::Var(f.clone())), &row_of(&["y"], Tail::Var(g.clone())), &mut infer));
         let Tail::Var(sigma) = infer.flatten_row(&Row::var(f)).tail else { panic!("tail") };
         assert_eq!(surface_name(&sigma), "ef");
         // The same tail with different labels cannot unify, flexible or not; with equal labels it is a no-op.
-        let h = infer.fresh_row(RowRank::User, "eh", None);
+        let h = infer.fresh_row(RowRank::User, "eh");
         assert!(!row_compatible(&row_of(&["x"], Tail::Var(h.clone())), &row_of(&["y"], Tail::Var(h.clone())), &infer));
         assert!(!unify_rows(&row_of(&["x"], Tail::Var(h.clone())), &row_of(&["y"], Tail::Var(h.clone())), &mut infer));
         assert!(unify_rows(&row_of(&["x"], Tail::Var(h.clone())), &row_of(&["x"], Tail::Var(h.clone())), &mut infer));
         // Closed against rigid: nowhere for the rest to go, in either order, even when empty.
-        let r = infer.fresh_row(RowRank::User, "er", None);
+        let r = infer.fresh_row(RowRank::User, "er");
         infer.rigid_row.insert(r.clone());
         for (x, y) in [(Row::pure(), Row::var(r.clone())), (Row::var(r.clone()), Row::pure()), (Row::single("a"), row_of(&["a"], Tail::Var(r.clone())))] {
             assert!(!row_compatible(&x, &y, &infer), "{x} vs {y}");
@@ -12020,7 +12072,7 @@ g(len)").unwrap_err();
         }
         // Rigid against flexible: the flexible one binds to the rigid one, in either order.
         for flexible_first in [true, false] {
-            let flex = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+            let flex = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
             let (x, y) = if flexible_first { (Row::var(flex.clone()), Row::var(r.clone())) } else { (Row::var(r.clone()), Row::var(flex.clone())) };
             assert!(unify_rows(&x, &y, &mut infer));
             assert_eq!(infer.flatten_row(&Row::var(flex)).tail, Tail::Var(r.clone()));
@@ -12035,7 +12087,7 @@ g(len)").unwrap_err();
         use crate::typecheck::{unify_rows, InferCtx, RowRank};
         use types::{Row, Tail};
         let mut infer = InferCtx::new();
-        let vars: Vec<String> = (0..2000).map(|_| infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None)).collect();
+        let vars: Vec<String> = (0..2000).map(|_| infer.fresh_row(RowRank::Opened, types::OPENED_ROW)).collect();
         for w in vars.windows(2) {
             assert!(unify_rows(&Row::var(w[0].clone()), &row_of(&["x"], Tail::Var(w[1].clone())), &mut infer));
         }
@@ -12045,7 +12097,7 @@ g(len)").unwrap_err();
         assert_eq!(infer.flatten_row(&Row::var(head.clone())), first, "a second walk starts from the compressed form");
         // The end gets bound later: the compressed prefix continues through it.
         let snap = infer.snapshot();
-        let end = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        let end = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
         assert!(unify_rows(&Row::var(last.clone()), &row_of(&["z"], Tail::Var(end.clone())), &mut infer));
         let extended = infer.flatten_row(&Row::var(head.clone()));
         assert_eq!(extended.tail, infer.flatten_row(&Row::var(last.clone())).tail);
@@ -12064,7 +12116,7 @@ g(len)").unwrap_err();
         use types::{Row, Tail, Type};
         assert!(Hc::ptr_eq(&Row::var("a#1").entries, &Row::pure().entries) && Hc::ptr_eq(&Row::dyn_().entries, &Row::pure().entries));
         let mut infer = InferCtx::new();
-        let a = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        let a = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
         let mut ty = Type::Int;
         for _ in 0..40 {
             ty = Type::Fun(Hc::new(ty), Row::var(a.clone()), Hc::new(Type::Int));
@@ -12072,7 +12124,7 @@ g(len)").unwrap_err();
         assert!(infer.flattened(&Row::var(a.clone())).is_none(), "an unbound tail is already flat");
         let before = infer.resolve_deep(&ty);
         assert_eq!(before, ty);
-        let b = infer.fresh_row(RowRank::User, "e", None);
+        let b = infer.fresh_row(RowRank::User, "e");
         assert!(unify_rows(&Row::var(a.clone()), &row_of(&["x"], Tail::Var(b)), &mut infer));
         let after = infer.resolve_deep(&ty);
         assert_ne!(after, ty, "the memo of the first call must not answer the second");
@@ -12084,10 +12136,10 @@ g(len)").unwrap_err();
         use crate::typecheck::{unify_rows, InferCtx, RowRank};
         use types::{Row, Tail, Type};
         let mut infer = InferCtx::new();
-        let (a, b) = (infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None), infer.fresh_row(RowRank::User, "e", None));
+        let (a, b) = (infer.fresh_row(RowRank::Opened, types::OPENED_ROW), infer.fresh_row(RowRank::User, "e"));
         let fun = |name: &str| Type::Fun(Hc::new(Type::Int), Row::var(name), Hc::new(Type::Int));
         // a := {x | b}, so `{a}` is `{x | b}`: a chain of two bindings.
-        let c = infer.fresh_row(RowRank::Opened, types::OPENED_ROW, None);
+        let c = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
         assert!(unify_rows(&Row::var(a.clone()), &row_of(&["x"], Tail::Var(b.clone())), &mut infer));
         assert!(unify_rows(&Row::var(b.clone()), &row_of(&["y"], Tail::Var(c.clone())), &mut infer));
         let flat = infer.flatten_row(&Row::var(a.clone())).to_string();

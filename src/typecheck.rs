@@ -879,12 +879,10 @@ impl InferCtx {
         }
     }
 
-    // Mints a row variable `base#k` of `rank`, held at `level` if given.
-    pub(crate) fn fresh_row(&mut self, rank: RowRank, base: &str, level: Option<u32>) -> String {
+    // Mints a row variable `base#k` of `rank`. Like every fresh variable it has no level (U8b
+    // invariant I: a variable no scope holds has none; it gets one when a holder lowers it).
+    pub(crate) fn fresh_row(&mut self, rank: RowRank, base: &str) -> String {
         let name = fresh_row_name(base);
-        if let Some(level) = level {
-            Levels::lower(&mut self.levels.row, &name, level);
-        }
         if rank == RowRank::Fresh {
             self.levels.rank.insert_mut(name.clone(), rank);
         }
@@ -935,10 +933,10 @@ impl InferCtx {
         Some(Row::new(row.labels().map(String::from).chain(labels).collect(), tail))
     }
 
-    // A fresh instance of quantified row variable `v` (lookup): same base and rank, no level.
+    // A fresh instance of quantified row variable `v` (lookup): same base and rank.
     fn instance_row(&mut self, v: &str) -> Row {
         let rank = self.levels.rank(v);
-        Row::var(self.fresh_row(rank, v, None))
+        Row::var(self.fresh_row(rank, v))
     }
 
     // Binds row variable `name` (unbound) to `row`, lowering what `row` mentions to `name`'s level.
@@ -1256,7 +1254,7 @@ pub(crate) fn unify_rows(r1: &Row, r2: &Row, infer: &mut InferCtx) -> bool {
         }
         Some(RowPlan::Split { a, b, only_a, only_b, winner }) => {
             let rank = infer.levels.rank(&winner);
-            let sigma = infer.fresh_row(rank, surface_name(&winner), None);
+            let sigma = infer.fresh_row(rank, &winner);
             infer.bind_row(&a, Row::new(only_b, Tail::Var(sigma.clone())));
             infer.bind_row(&b, Row::new(only_a, Tail::Var(sigma)));
             true
@@ -1726,10 +1724,17 @@ fn pending_obligation_vars(infer: &InferCtx) -> BTreeSet<String> {
     infer.obligations.borrow().iter().flat_map(|ob| ob.unresolved_vars(infer)).collect()
 }
 
+// `base#k` with a counter that makes it unique. An instance of an instance keeps the surface
+// name, not the whole `x#3#17#..` chain, so a name stays short however many generations of
+// instantiation (one per `let`-bound call in a chain) lie between it and the written variable.
+fn fresh_name(counter: &AtomicU32, base: &str) -> String {
+    let n = counter.fetch_add(1, Ordering::Relaxed);
+    format!("{}#{n}", surface_name(base))
+}
+
 fn fresh_row_name(base: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{base}#{n}")
+    fresh_name(&COUNTER, base)
 }
 
 // Same idea as fresh_row_name, its own separate counter -- a Type::Var's
@@ -1738,8 +1743,7 @@ fn fresh_row_name(base: &str) -> String {
 // logged together during debugging).
 fn fresh_type_name(base: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{base}#{n}")
+    fresh_name(&COUNTER, base)
 }
 
 // Same idea as fresh_type_name, its own separate counter/namespace --
@@ -1747,8 +1751,7 @@ fn fresh_type_name(base: &str) -> String {
 // Tail::Var's, for the same reason index_subst is its own map.
 fn fresh_index_name(base: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{base}#{n}")
+    fresh_name(&COUNTER, base)
 }
 
 // Index-expression analog of subst_type's own Type::Var arm -- renames a
@@ -4537,7 +4540,7 @@ fn type_lit(arena: &mut Arena, ty: Type) -> ExprRef {
 }
 
 // D10 (spec 3.1): the row of a function type the checker builds from an expression row. A
-// closed row (a pure or concretely-performing body) gets a fresh opened tail held at `level`:
+// closed row (a pure or concretely-performing body) gets a fresh opened tail:
 // an arrow row is an upper bound, so `A ->{R} B` is usable where `A ->{R, X} B` is expected.
 // Every Type::Fun built from an expression row goes through here (the only two such sites are
 // the Fun frame and MakeHandler's `resume`), so no checker-built arrow row is ever closed.
@@ -4545,11 +4548,11 @@ fn type_lit(arena: &mut Arena, ty: Type) -> ExprRef {
 // (machine.rs:1714-1719; `->{}` does not parse, parser.rs:600-609), and `any_fun` and D2's shape
 // are `Dyn`/`Var`. So no `Type::Fun` in a context type or the root type has a closed row, which
 // the debug assertion below checks.
-fn arrow_row(row: Row, level: u32, infer: &mut InferCtx) -> Row {
+fn arrow_row(row: Row, infer: &mut InferCtx) -> Row {
     if row.tail != Tail::Closed {
         return row;
     }
-    let tail = infer.fresh_row(RowRank::Opened, OPENED_ROW, Some(level));
+    let tail = infer.fresh_row(RowRank::Opened, OPENED_ROW);
     Row::new(row.labels().map(String::from).collect(), Tail::Var(tail))
 }
 
@@ -5018,7 +5021,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // Matches the original Lambda arm: the body's row is
                 // embedded in the Fun type, not propagated -- evaluating
                 // the Lambda expression itself is always pure.
-                let row = arrow_row(result_row, ctx.level, infer);
+                let row = arrow_row(result_row, infer);
                 result_ty = Type::Fun(Hc::new(param_ty.clone()), row, Hc::new(result_ty));
                 result_row = Row::pure();
                 if witness {
@@ -5472,7 +5475,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     let param_ty = infer.fresh_var("param");
                     let ret_ty = infer.fresh_var("ret");
                     // D2 (spec 3.1): the call performs whatever the callback does, a fresh row.
-                    let row = Row::var(infer.fresh_row(RowRank::Fresh, "e", Some(ctx.level)));
+                    let row = Row::var(infer.fresh_row(RowRank::Fresh, "e"));
                     let fun_shape = Type::Fun(Hc::new(param_ty.clone()), row.clone(), Hc::new(ret_ty.clone()));
                     unify(&f_ty, &fun_shape, infer, spans[f])?;
                     unify(&param_ty, &a_ty, infer, spans[a])?;
@@ -6053,7 +6056,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let resume_row = infer.resume_row.take();
             let resume_ty = match &resume_row {
                 Some(row) => {
-                    let row = arrow_row(row.clone(), ctx.level, infer);
+                    let row = arrow_row(row.clone(), infer);
                     Type::Fun(Hc::new(Type::Dyn), row, Hc::new(Type::Dyn))
                 }
                 None => Type::Dyn,

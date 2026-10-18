@@ -511,8 +511,8 @@ mod tests {
         let mut infer = InferCtx::new();
         let i = Type::Int;
         let fx = |row: Row| Type::Fun(Hc::new(i.clone()), row, Hc::new(i.clone()));
-        let e = infer.fresh_row(RowRank::User, "e", None);
-        let open = infer.fresh_row(RowRank::Opened, crate::types::OPENED_ROW, None);
+        let e = infer.fresh_row(RowRank::User, "e");
+        let open = infer.fresh_row(RowRank::Opened, crate::types::OPENED_ROW);
         infer.rigid_row.insert(e.clone());
         let labelled = Row::new(vec!["a".into()], Tail::Var(open.clone()));
         // A rigid tail cannot absorb `a`: refuted, as unify_fits would fail.
