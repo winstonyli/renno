@@ -1613,7 +1613,7 @@ mod tests {
     fn a_still_open_enclosing_type_variable_is_not_wrongly_re_generalized() {
         // The exact bug class the passthrough feature's own final review
         // found and fixed (in its design spec's review) and the concurrent
-        // row-variable fix found again for EffectRow::Var: a nested
+        // row-variable fix found again for Tail::Var: a nested
         // let-alias inside a still-open function body must NOT
         // re-generalize the outer, still-open type variable it merely
         // touches.
@@ -3028,12 +3028,15 @@ g(len)").unwrap_err();
 
     #[test]
     fn dyn_sourced_call_falls_back_permissively() {
-        // `f` is an unannotated (Dyn) lambda parameter, so calling it can't
-        // be proven to perform any particular set of effects -- the whole
-        // expression's row degrades to Dyn rather than a known-unhandled
-        // set. Static check can't reject it, but the real unhandled effect
-        // still panics at runtime exactly as before this feature existed.
-        let src = "(fun f -> f(0))(fun x -> perform mystery(x))";
+        // D2 (spec 3.1): an unannotated parameter's call now has a fresh row, so the callback's
+        // effect is a static rejection (it used to degrade to Dyn and panic at run time).
+        assert!(static_error("(fun f -> f(0))(fun x -> perform mystery(x))")
+            .is_some_and(|e| e.contains("unhandled effect: mystery")));
+        // `f` is a `Dyn` parameter, so calling it can't be proven to perform any particular set
+        // of effects -- the whole expression's row degrades to Dyn rather than a known-unhandled
+        // set. Static check can't reject it, but the real unhandled effect still panics at
+        // runtime exactly as before this feature existed.
+        let src = "(fun f: Dyn -> f(0))(fun x -> perform mystery(x))";
         let (mut arena, spans, root) = parser::parse(src).unwrap();
         let elaborated =
             typecheck::check(&mut arena, root, &spans).expect("Dyn-sourced call should not be statically rejected");
@@ -4082,17 +4085,17 @@ g(len)").unwrap_err();
     fn equal_structure_is_one_node() {
         use crate::index_expr::IndexExpr;
         use std::rc::Rc;
-        use types::{EffectRow, Type};
+        use types::{Row, Type};
         let pair = || Type::Tuple(Hc::new(vec![Type::Int, Type::Int]));
         let (Type::Tuple(a), Type::Tuple(b)) = (pair(), pair()) else { unreachable!() };
         assert!(Hc::ptr_eq(&a, &b));
-        let fun = |row: EffectRow| Type::Fun(Hc::new(Type::Int), row, Hc::new(Type::Int));
+        let fun = |row: Row| Type::Fun(Hc::new(Type::Int), row, Hc::new(Type::Int));
         let node = |t: &Type| match t {
             Type::Fun(a, _, _) => a.clone(),
             _ => unreachable!(),
         };
-        assert!(Hc::ptr_eq(&node(&fun(EffectRow::Dyn)), &node(&fun(EffectRow::Var("e".into())))), "the parameter is one node");
-        let (f1, f2) = (Type::List(Hc::new(fun(EffectRow::Dyn))), Type::List(Hc::new(fun(EffectRow::pure()))));
+        assert!(Hc::ptr_eq(&node(&fun(Row::dyn_())), &node(&fun(Row::var("e")))), "the parameter is one node");
+        let (f1, f2) = (Type::List(Hc::new(fun(Row::dyn_()))), Type::List(Hc::new(fun(Row::pure()))));
         let (Type::List(x), Type::List(y)) = (&f1, &f2) else { unreachable!() };
         assert!(!Hc::ptr_eq(x, y), "an effect row is part of a node's identity");
         let tup = |t: Type| Type::Tuple(Hc::new(vec![t]));
@@ -4120,12 +4123,12 @@ g(len)").unwrap_err();
     // `plain` and `escape` come from the bodies' summary.
     #[test]
     fn rec_group_plain_and_escape_come_from_the_summary() {
-        use types::{EffectRow, Type};
+        use types::{Row, Type};
         let list = rec_list();
         assert!(list.0.plain && list.0.escape == 0);
         let var = rec_group(&["V"], vec![rec_tup(vec![Type::Var("a".into()), rec_bound(0, 0)])]);
         assert!(!var.0.plain && var.0.escape == 0);
-        let row = rec_group(&["R"], vec![Type::Fun(Hc::new(rec_bound(0, 0)), EffectRow::Var("e".into()), Hc::new(Type::Int))]);
+        let row = rec_group(&["R"], vec![Type::Fun(Hc::new(rec_bound(0, 0)), Row::var("e"), Hc::new(Type::Int))]);
         assert!(!row.0.plain);
         let free = rec_group(&["F"], vec![rec_tup(vec![rec_free(1, "X"), rec_bound(0, 0)])]);
         assert!(!free.0.plain);
@@ -6208,7 +6211,7 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::typecheck::{extend_generalized, lookup, Ctx, InferCtx};
         use std::rc::Rc;
-        use types::{EffectRow, Type};
+        use types::{Row, Type};
 
         fn vec_of(index: IndexExpr) -> Type {
             Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(index))
@@ -6218,8 +6221,8 @@ g(len)").unwrap_err();
         let n = IndexExpr::Var("n".to_string());
         let identity_vec_ty = Type::Fun(
             Hc::new(Type::Int),
-            EffectRow::Dyn,
-            Hc::new(Type::Fun(Hc::new(vec_of(n.clone())), EffectRow::Dyn, Hc::new(vec_of(n)))),
+            Row::dyn_(),
+            Hc::new(Type::Fun(Hc::new(vec_of(n.clone())), Row::dyn_(), Hc::new(vec_of(n)))),
         );
 
         let mut infer = InferCtx::new();
@@ -6258,13 +6261,13 @@ g(len)").unwrap_err();
     #[test]
     fn polymorphic_let_chain_leaves_no_levelled_variable() {
         use crate::typecheck::{extend, extend_generalized, lookup, Ctx, InferCtx, TyVar};
-        use types::{EffectRow, Type};
+        use types::{Row, Type};
 
         let mut infer = InferCtx::new();
         let mut ctx = Ctx::empty();
         for i in 0..3 {
             let a = Hc::new(Type::Var(format!("a{i}")));
-            ctx = extend_generalized(&ctx, &format!("id{i}"), Type::Fun(a.clone(), EffectRow::Dyn, a), &mut infer, None);
+            ctx = extend_generalized(&ctx, &format!("id{i}"), Type::Fun(a.clone(), Row::dyn_(), a), &mut infer, None);
             assert_eq!(infer.levels.get(&TyVar::Type(format!("a{i}"))), None);
         }
         let ctx = extend(&ctx, "x", Type::Var("b".to_string()), &mut infer);
@@ -6287,7 +6290,7 @@ g(len)").unwrap_err();
         use crate::typecheck::{extend, unify_trial, Ctx, InferCtx};
         use crate::typecheck::TyVar;
         use std::rc::Rc;
-        use types::{EffectRow, Type};
+        use types::{Row, Type};
         let var = |n: &str| Type::Var(n.to_string());
         let span = Span { start: 0, end: 0 };
         let mut infer = InferCtx::new();
@@ -6298,7 +6301,7 @@ g(len)").unwrap_err();
 
         // x := List(y -> z): y, z and the row r drop to x's level; the index n of an Indexed
         // component does too.
-        let fun = Type::Fun(Hc::new(var("y")), EffectRow::Var("r".into()), Hc::new(var("z")));
+        let fun = Type::Fun(Hc::new(var("y")), Row::var("r"), Hc::new(var("z")));
         let idx = Type::Indexed(Hc::new(Type::List(Hc::new(Type::Int))), Rc::new(IndexExpr::Var("n".into())));
         let sol = Type::List(Hc::new(Type::Tuple(Hc::new(vec![fun, idx]))));
         assert!(unify_trial(&var("x"), &sol, &mut infer, span).is_ok());
@@ -6537,14 +6540,14 @@ g(len)").unwrap_err();
         use crate::typecheck::{check_against, Ctx, InferCtx};
         use crate::span::Span;
         use crate::expr::{Arena, Expr, SpanMap};
-        use crate::types::{Type, EffectRow};
+        use crate::types::{Type, Row};
         let mut arena = Arena::new();
         let mut spans = SpanMap::new();
         let e = arena.push(Expr::Int(5));
         spans.push(Span { start: 0, end: 0 });
         let mut infer = InferCtx::new();
         let (row, _) = check_against(&mut arena, e, &Type::Int, &Ctx::empty(), &spans, &mut infer).unwrap();
-        assert_eq!(row, EffectRow::pure());
+        assert_eq!(row, Row::pure());
     }
 
     #[test]
@@ -9128,9 +9131,9 @@ g(len)").unwrap_err();
     fn a_recursive_rec_function_type_lowers_to_one_shared_cyclic_graph() {
         // F = Dyn -> F, built as a closed group: the result of F's contract is F's own Lazy, at every
         // depth, so a call chain allocates nothing per call.
-        use crate::types::{EffectRow, Type};
+        use crate::types::{Row, Type};
         use std::rc::Rc;
-        let g = rec_group(&["F"], vec![Type::Fun(Hc::new(Type::Dyn), EffectRow::Dyn, Hc::new(rec_bound(0, 0)))]);
+        let g = rec_group(&["F"], vec![Type::Fun(Hc::new(Type::Dyn), Row::dyn_(), Hc::new(rec_bound(0, 0)))]);
         let f = Type::Rec(g, 0);
         let root = expr::Lazy::new(Rc::new(f));
         let mut level = root.clone();
@@ -10261,16 +10264,16 @@ g(len)").unwrap_err();
         use crate::index_expr::IndexExpr;
         use crate::typecheck::{open_annotation, Ctx, InferCtx, TyVar};
         use std::rc::Rc;
-        use types::{EffectRow, Type};
+        use types::{Row, Tail, Type};
 
         // (Vec(n) ->{n} Dyn): an index variable and a row variable that share the spelling `n`.
         let ann = Type::Fun(
             Hc::new(Type::Indexed(Hc::new(Type::List(Hc::new(Type::Dyn))), Rc::new(IndexExpr::Var("n".into())))),
-            EffectRow::Var("n".into()),
+            Row::var("n"),
             Hc::new(Type::Dyn),
         );
         let names = |t: &Type| match t {
-            Type::Fun(p, EffectRow::Var(r), _) => match p.as_ref() {
+            Type::Fun(p, Row { tail: Tail::Var(r), .. }, _) => match p.as_ref() {
                 Type::Indexed(_, i) => match i.as_ref() {
                     IndexExpr::Var(i) => (i.clone(), r.clone()),
                     other => panic!("{other:?}"),
@@ -10374,9 +10377,14 @@ g(len)").unwrap_err();
 
     #[test]
     fn effect_row_variables_are_shared_when_nested_and_independent_when_siblings() {
-        // Nested: the inner `e` is the outer parameter's, so the row is not re-generalized.
+        // Nested: the inner `e` is the outer parameter's. Under D10 the pure `h` fits `{choose}`
+        // (its row is opened), so the call runs (it was a rejection before stage 1)...
         let src = "let k = fun cb: (Dyn ->{e} Dyn) -> fun h: (Dyn ->{e} Dyn) -> h in handle k(fun y -> perform choose(y))(fun z -> z)(1) with handler choose(p, resume) -> resume(p)";
-        rejects(src, "type mismatch: expected (Dyn ->{choose} Dyn), found (Dyn ->{} Dyn)");
+        assert_eq!(run_source(src).unwrap().to_string(), "1");
+        // ...and sharing shows: `h` returned under `e := {choose | ..}` carries `choose`, so the
+        // same call under a handler for another effect is a static unhandled `choose`.
+        let src = "let k = fun cb: (Dyn ->{e} Dyn) -> fun h: (Dyn ->{e} Dyn) -> h in handle k(fun y -> perform choose(y))(fun z -> z)(1) with handler other(p, resume) -> resume(p)";
+        assert!(static_error(src).is_some_and(|e| e.contains("unhandled effect: choose")), "{:?}", static_error(src));
         // Siblings: two lets each quantify their own `e`.
         let src = "let k = fun cb: (Dyn ->{e} Dyn) -> cb in let m = fun cb: (Dyn ->{e} Dyn) -> cb in handle m(k(fun y -> perform choose(y)))(1) with handler choose(p, resume) -> resume(p)";
         assert_eq!(run_source(src).unwrap().to_string(), "1");
@@ -11723,10 +11731,10 @@ g(len)").unwrap_err();
     // A type nested a million deep (a `fun` chain's type) drops on the test thread's small stack.
     #[test]
     fn a_deeply_nested_type_drops_on_a_small_stack() {
-        use types::{EffectRow, Type};
+        use types::{Row, Type};
         let mut t = Type::Int;
         for _ in 0..CHAIN_LINKS {
-            t = Type::Fun(Hc::new(Type::Int), EffectRow::pure(), Hc::new(t));
+            t = Type::Fun(Hc::new(Type::Int), Row::pure(), Hc::new(t));
         }
         drop(t);
     }
@@ -11740,5 +11748,423 @@ g(len)").unwrap_err();
         let outcome = run_source(&src).expect("runs");
         let text = std::thread::Builder::new().stack_size(WORKER_STACK_SIZE).spawn(move || outcome.to_string()).unwrap().join().unwrap();
         assert_eq!(text, format!("{}1{}", "[".repeat(depth), "]".repeat(depth)));
+    }
+
+    // ---- one row sort, stage 1 (docs/superpowers/plans/2026-10-18-one-row-sort-stage1.md) ----
+
+    fn row_of(labels: &[&str], tail: types::Tail) -> types::Row {
+        types::Row::new(labels.iter().map(|s| s.to_string()).collect(), tail)
+    }
+
+    #[test]
+    fn rows_print_labels_then_a_named_tail_and_hide_an_opened_one() {
+        use types::Tail;
+        assert_eq!(row_of(&["b", "a"], Tail::Closed).to_string(), "{a, b}");
+        assert_eq!(row_of(&["a"], Tail::Var("e#3".into())).to_string(), "{a | e}");
+        assert_eq!(row_of(&[], Tail::Var("e#3".into())).to_string(), "{e}");
+        assert_eq!(row_of(&[], Tail::Var("'#7".into())).to_string(), "{}");
+        assert_eq!(row_of(&["a"], Tail::Var("'#7#9".into())).to_string(), "{a}");
+        assert_eq!(row_of(&["a"], Tail::Dyn).to_string(), "Dyn");
+    }
+
+    #[test]
+    fn row_unification_extends_flexible_tails_and_refuses_rigid_ones() {
+        use crate::typecheck::{row_compatible, unify_rows, InferCtx, RowRank};
+        use types::{surface_name, Row, Tail};
+        let mut infer = InferCtx::new();
+        let a = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
+        let b = infer.fresh_row(RowRank::User, "e");
+        // {x | a} ~ {y | b}: both flexible with extras: one fresh tail takes both, named after
+        // the higher-ranked side (User beats Opened).
+        assert!(unify_rows(&row_of(&["x"], Tail::Var(a.clone())), &row_of(&["y"], Tail::Var(b.clone())), &mut infer));
+        let (fa, fb) = (infer.flatten_row(&Row::var(a.clone())), infer.flatten_row(&Row::var(b.clone())));
+        assert_eq!(fa.labels().collect::<Vec<_>>(), ["y"]);
+        assert_eq!(fb.labels().collect::<Vec<_>>(), ["x"]);
+        assert_eq!(fa.tail, fb.tail);
+        let Tail::Var(sigma) = &fa.tail else { panic!("{fa:?}") };
+        assert_eq!(surface_name(sigma), "e");
+        // Closed against closed: equal label sets only.
+        assert!(unify_rows(&Row::single("a"), &Row::single("a"), &mut infer));
+        assert!(!unify_rows(&Row::single("a"), &Row::pure(), &mut infer));
+        // A flexible tail against a closed row absorbs the other side's extras, not its own.
+        let c = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
+        assert!(!unify_rows(&row_of(&["z"], Tail::Var(c.clone())), &Row::single("a"), &mut infer));
+        assert!(unify_rows(&Row::var(c.clone()), &Row::single("a"), &mut infer));
+        assert_eq!(infer.flatten_row(&Row::var(c)).to_string(), "{a}");
+        // Rigid tails: never extended, never meet another rigid tail; a flexible one binds to them.
+        let e1 = infer.fresh_row(RowRank::User, "e1");
+        let e2 = infer.fresh_row(RowRank::User, "e2");
+        infer.rigid_row.insert(e1.clone());
+        infer.rigid_row.insert(e2.clone());
+        let d = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
+        assert!(!row_compatible(&Row::var(e1.clone()), &row_of(&["a"], Tail::Var(d.clone())), &infer));
+        assert!(!row_compatible(&Row::var(e1.clone()), &Row::var(e2.clone()), &infer));
+        assert!(row_compatible(&Row::var(e1.clone()), &Row::var(d.clone()), &infer));
+        assert!(unify_rows(&Row::var(d.clone()), &Row::var(e1.clone()), &mut infer));
+        assert_eq!(infer.flatten_row(&Row::var(d)).tail, Tail::Var(e1));
+        // A Dyn tail is compatible with anything and binds nothing.
+        let g = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
+        assert!(unify_rows(&Row::dyn_(), &row_of(&["q"], Tail::Var(g.clone())), &mut infer));
+        assert_eq!(infer.flatten_row(&Row::var(g.clone())), Row::var(g));
+    }
+
+    #[test]
+    fn row_union_is_precise_and_identifies_tails() {
+        use crate::span::Span;
+        use crate::typecheck::{union_rows, InferCtx, RowRank};
+        use types::{Row, Tail};
+        let sp = Span { start: 0, end: 0 };
+        let mut infer = InferCtx::new();
+        let a = infer.fresh_row(RowRank::User, "a");
+        let b = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
+        assert_eq!(union_rows(&Row::single("x"), &Row::var(a.clone()), &mut infer, sp).unwrap().to_string(), "{x | a}");
+        // Var b ∪ Var a unifies the two tails (b, the opened one, binds to a) and is that tail.
+        let u = union_rows(&Row::var(b.clone()), &row_of(&["y"], Tail::Var(a.clone())), &mut infer, sp).unwrap();
+        assert_eq!(u.to_string(), "{y | a}");
+        assert_eq!(infer.flatten_row(&Row::var(b)).tail, Tail::Var(a));
+        assert_eq!(union_rows(&Row::single("x"), &Row::single("y"), &mut infer, sp).unwrap().to_string(), "{x, y}");
+        assert!(union_rows(&Row::dyn_(), &Row::single("y"), &mut infer, sp).unwrap().is_dyn());
+        let e1 = infer.fresh_row(RowRank::User, "e1");
+        let e2 = infer.fresh_row(RowRank::User, "e2");
+        infer.rigid_row.insert(e1.clone());
+        infer.rigid_row.insert(e2.clone());
+        let err = union_rows(&Row::var(e1), &Row::var(e2), &mut infer, sp).unwrap_err();
+        assert!(err.0.contains("effect row variables e1 and e2 are fixed by the signature"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_bound_row_tail_resolves_deeply_lowers_levels_and_rolls_back() {
+        use crate::typecheck::{unify_rows, InferCtx, RowRank, TyVar};
+        use types::{Row, Tail, Type};
+        let mut infer = InferCtx::new();
+        let a = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
+        let b = infer.fresh_row(RowRank::User, "e");
+        let fun = Type::Fun(Hc::new(Type::Int), Row::var(a.clone()), Hc::new(Type::Int));
+        // A fresh row has no level until a scope holds it (invariant I); a scope at level 1 does.
+        assert_eq!(infer.levels.get(&TyVar::Row(a.clone())), None);
+        let ctx = crate::typecheck::Ctx::empty().deeper();
+        crate::typecheck::extend(&ctx, "h", fun.clone(), &mut infer);
+        assert_eq!(infer.levels.get(&TyVar::Row(a.clone())), Some(1));
+        let snap = infer.snapshot();
+        assert!(unify_rows(&Row::var(a.clone()), &row_of(&["x"], Tail::Var(b.clone())), &mut infer));
+        assert_eq!(infer.resolve_deep(&fun).to_string(), "(Int ->{x | e} Int)");
+        // {a} ~ {x | b} splits (both tails flexible, b's side has x): a := {x | σ}, b := {σ}.
+        // σ is what a's solution mentions, so it is lowered to a's level.
+        let Tail::Var(sigma) = infer.flatten_row(&Row::var(a.clone())).tail else { panic!("tail") };
+        assert_eq!(infer.levels.get(&TyVar::Row(sigma)), Some(1), "a solution's tail is lowered to the bound variable's level");
+        infer.restore(snap);
+        assert_eq!(infer.resolve_deep(&fun).to_string(), "(Int ->{} Int)");
+        assert_eq!(infer.levels.get(&TyVar::Row(b)), None);
+    }
+
+    // A lambda's opened row is minted with no level (invariant I), and that is the same as
+    // minting it at the scope's level: a `let` quantifies it unless a scope holds it, and
+    // holding it (a binder, or unification into a held variable) gives it the holder's level.
+    #[test]
+    fn a_fresh_row_is_generalized_unless_a_scope_holds_it() {
+        use crate::typecheck::{extend, extend_generalized, lookup, unify_rows, Ctx, InferCtx, RowRank};
+        use types::{Row, Type};
+        let mut infer = InferCtx::new();
+        let fun = |r: &str| Type::Fun(Hc::new(Type::Int), Row::var(r.to_string()), Hc::new(Type::Int));
+        let (free, via) = (infer.fresh_row(RowRank::Opened, types::OPENED_ROW), infer.fresh_row(RowRank::Opened, types::OPENED_ROW));
+        let held_by = infer.fresh_row(RowRank::User, "e");
+        let ctx = extend(&Ctx::empty(), "p", fun(&held_by), &mut infer);
+        // `via` is unified into a held tail, so it is held too; `free` is held by nothing.
+        assert!(unify_rows(&Row::var(held_by.clone()), &Row::var(via.clone()), &mut infer));
+        let mut ctx = ctx;
+        for (name, row) in [("free", &free), ("via", &via)] {
+            ctx = extend_generalized(&ctx, name, fun(row), &mut infer, None);
+        }
+        assert_ne!(lookup(&ctx, "free", &mut infer), fun(&free), "an unheld fresh row is quantified");
+        let got = lookup(&ctx, "via", &mut infer);
+        assert_eq!(got, fun(&held_by), "a row bound into a held tail is not quantified");
+    }
+    // An instance of an instance keeps a short name: a chain of n `let`s each instantiating the
+    // one before must not make the names (copied into every type, map and hash) n links long.
+    #[test]
+    fn instance_names_do_not_grow_with_the_generation() {
+        use crate::typecheck::{extend_generalized, lookup, Ctx, InferCtx, RowRank};
+        use types::{Row, Tail, Type};
+        let mut infer = InferCtx::new();
+        let tail = infer.fresh_row(RowRank::User, "e");
+        let mut ctx = Ctx::empty();
+        let a = Hc::new(Type::Var("a".to_string()));
+        ctx = extend_generalized(&ctx, "f0", Type::Fun(a.clone(), Row::var(tail), a), &mut infer, None);
+        for i in 1..300 {
+            let ty = lookup(&ctx, &format!("f{}", i - 1), &mut infer);
+            ctx = extend_generalized(&ctx, &format!("f{i}"), ty, &mut infer, None);
+        }
+        let Type::Fun(p, row, _) = lookup(&ctx, "f299", &mut infer) else { panic!("fun") };
+        let Tail::Var(r) = &row.tail else { panic!("row var") };
+        let Type::Var(v) = &*p else { panic!("type var") };
+        assert!(r.len() < 16 && v.len() < 16, "names grew with the generation: {r} {v}");
+    }
+    // ---- one row sort, stage 1: wiring (D10, precise union, exact Fun rows) ----
+
+    // The type error `check` reports for `src`, or None when it typechecks: separates a static
+    // rejection from a run-time one.
+    fn static_error(src: &str) -> Option<String> {
+        let (mut arena, spans, root) = parser::parse(src).unwrap();
+        typecheck::check(&mut arena, root, &spans).err().map(|e| e.0)
+    }
+
+    fn runs_to(src: &str, want: &str) {
+        assert_eq!(run_source(src).map(|o| o.to_string()), Ok(want.to_string()), "{src}");
+    }
+
+    #[test]
+    fn pure_implementations_fit_declared_effect_polymorphic_types() {
+        // D10 (spec 3.1): a lambda's closed row is opened, so a1 to a3 keep running.
+        runs_to("let k: (Int -> (Int ->{e} Int)) = fun n -> fun x -> n in k(1)(2)", "1");
+        runs_to("let g: ((Int ->{e} Int) -> (Int ->{e} Int)) = fun f -> fun x -> x + 1 in g(fun y -> y)(3)", "4");
+        runs_to("let g: ((Int ->{e} Int) -> (Int ->{e} Int)) = fun f -> fun x -> x + 1 in handle g(fun y -> perform a(y))(3) with handler a(p, resume) -> resume(p)", "4");
+    }
+
+    #[test]
+    fn pure_and_performing_callbacks_share_a_row_and_still_run() {
+        runs_to("let both = fun f -> fun g -> (f(1), g(2)) in handle both(fun x -> x)(fun y -> perform a(y)) with handler a(p, resume) -> resume(p + 10)", "[1, 12]");
+        runs_to("let compose = fun f -> fun g -> fun x -> f(g(x)) in handle compose(fun x -> x + 1)(fun y -> perform a(y))(1) with handler a(p, resume) -> resume(p * 10)", "11");
+        // Review 8 M7 / probe m1: no extra generalization condition.
+        runs_to("let both = fun f -> fun g -> (f(1), g(2)) in let y = (fun f -> (f(1), f))(fun x -> x) in match y | (n, h) -> handle both(h)(fun z -> perform a(z)) with handler a(p, k) -> k(10)", "[1, 10]");
+        // `resume` is opened like a lambda (MakeHandler): r1 and rv.
+        runs_to("let both = fun f -> fun g -> (f(1), g(2)) in handle handle perform a(0) + 1 with handler a(p, k) -> both(k)(fun y -> perform b(y)) with handler b(p, k) -> k(7)", "[2, 7]");
+        runs_to("let both = fun f -> fun g -> (f(1), g(2)) in handle handle perform a(0) + 1 with handler a(p, k) -> both(fun y -> perform b(y))(k) with handler b(p, k) -> k(7)", "[7, 3]");
+    }
+
+    #[test]
+    fn recursion_with_a_row_variable_parameter_still_runs() {
+        // i1: annotated `let rec` is instantiated fresh at its recursive call.
+        runs_to("let rec f: ((Dyn ->{e} Dyn) -> Int -> Int) = fun g -> fun n -> if n == 0 then g(0) else f(fun x -> perform a(x))(n - 1) in handle f(fun x -> x)(2) with handler a(p, resume) -> resume(5)", "5");
+        // i2: unannotated, monomorphic `e`; the outer call still fits (its row is opened).
+        runs_to("let rec f = fun g: (Dyn ->{e} Dyn) -> fun n -> if n == 0 then g(0) else f(fun x -> perform a(x))(n - 1) in handle f(fun x -> x)(2) with handler a(p, resume) -> resume(5)", "5");
+    }
+
+    #[test]
+    fn a_precise_row_escaping_a_handler_is_unhandled_only_when_called() {
+        // h2/h3 (spec 3.1 Handle): `{b | e}` survives the handler for `a`.
+        let h2 = "let k = fun f: (Int ->{e} Int) -> handle (perform b(0) + f(1)) with handler a(p, resume) -> resume(p) in 0";
+        assert_eq!(static_error(h2), None);
+        runs_to(h2, "0");
+        let h3 = "let k = fun f: (Int ->{e} Int) -> handle (perform b(0) + f(1)) with handler a(p, resume) -> resume(p) in k(fun x -> x)";
+        assert!(static_error(h3).is_some_and(|e| e.contains("unhandled effect: b")), "{:?}", static_error(h3));
+    }
+
+    #[test]
+    fn calls_through_unannotated_parameters_are_effect_polymorphic() {
+        // D2 (spec 3.1): `fun f -> f(1)` is `(Int ->{ρ} r) ->{ρ} r`.
+        let err = run_source("let ap = fun f -> f(1) in let z: Int = ap in z").unwrap_err();
+        assert!(err.contains("found ((Int ->{e} Dyn) ->{e} Dyn)"), "{err}");
+        // The handled unannotated `apply` (spec 3.1 Handle ruling): `{ρ}` with `ρ := {a}` stays
+        // after the handler, so it is a static rejection (prints 5 before stage 1).
+        let apply = "let apply = fun f -> handle f(1) with handler a(p, resume) -> resume(5) in apply(fun x -> perform a(x))";
+        assert!(static_error(apply).is_some_and(|e| e.contains("unhandled effect: a")), "{:?}", static_error(apply));
+        let apply_b = "let apply = fun f -> handle f(1) with handler a(p, resume) -> resume(5) in apply(fun x -> perform b(x))";
+        assert!(static_error(apply_b).is_some_and(|e| e.contains("unhandled effect: b")), "{:?}", static_error(apply_b));
+        // Self-recursion through an unannotated `let rec` (spec section 4, rec3): now static.
+        let rec3 = "let rec loop = fun n -> if n == 0 then 0 else perform a(n) + loop(n - 1) in loop(2)";
+        assert!(static_error(rec3).is_some_and(|e| e.contains("unhandled effect: a")), "{:?}", static_error(rec3));
+        // Higher-order code that handles what it is given keeps running.
+        runs_to("let both = fun f -> fun g -> (f(1), g(2)) in handle both(fun x -> x)(fun y -> perform a(y)) with handler a(p, resume) -> resume(p + 10)", "[1, 12]");
+    }
+
+    #[test]
+    fn union_of_two_row_variables_unifies_them() {
+        // Spec stage 1 gate: precise union binds `Var a ∪ Var b`. Two flexible user tails tie,
+        // so the second (e2) survives and e1 is bound to it.
+        let err = run_source("let both = fun f: (Int ->{e1} Int) -> fun g: (Int ->{e2} Int) -> f(1) + g(1) in let z: Int = both in z").unwrap_err();
+        assert!(err.contains("found ((Int ->{e2} Int) ->{} ((Int ->{e2} Int) ->{e2} Int))"), "{err}");
+    }
+
+    #[test]
+    fn a_function_join_keeps_both_branches_effects() {
+        // Probe e1 and its swap (spec 3.1 Function join): neither branch's effect is lost.
+        for src in [
+            "let f = if true then (fun x -> perform a(x)) else (fun x -> 1) in f(1)",
+            "let f = if true then (fun x -> 1) else (fun x -> perform a(x)) in f(1)",
+            "let l = (fun x: Int -> 1) :: [fun x: Int -> perform a(x)] in match l | h :: t -> h(1) | _ -> 0",
+            "let r = if true then {f: fun x -> perform a(x)} else {f: fun x -> 1} in r.f(1)",
+        ] {
+            assert!(static_error(src).is_some_and(|e| e.contains("unhandled effect: a")), "{src}: {:?}", static_error(src));
+        }
+    }
+
+    #[test]
+    fn list_of_lambdas_message_shows_the_joined_row() {
+        // Review Focus 1: a bound opened tail prints its labels.
+        let err = run_source("let f = fun x -> 1 in let l = [f, fun x -> perform a(x)] in let z: Int = l in z").unwrap_err();
+        assert!(err.contains("found [(Dyn ->{a} Int)]"), "{err}");
+    }
+
+    #[test]
+    fn effects_survive_aliases_records_and_unknown_handlers() {
+        // Review Focus 2 and 4: generalizing an opened tail or projecting a field keeps the effect.
+        for src in ["let g = fun x -> perform a(x) in let h = g in h(1)", "let r = {f: fun x -> perform a(x)} in r.f(1)"] {
+            assert!(static_error(src).is_some_and(|e| e.contains("unhandled effect: a")), "{src}: {:?}", static_error(src));
+        }
+        // Review Focus 3: a handler through a variable gives a Dyn row, which absorbs.
+        runs_to("let h = handler a(p, k) -> k(1) in handle perform a(0) with h", "1");
+    }
+
+    #[test]
+    fn a_declared_row_variable_is_rigid_in_the_body() {
+        // D6: a concrete effect under a declared `->{e}` (prints 0 before stage 1). Guard after
+        // Task 4: already rejected (flexible e against {a | e}); the message may change.
+        let d6 = "let k: ((Int ->{e} Int) -> (Int ->{e} Int)) = fun f -> fun x -> perform a(x) + f(x) in 0";
+        assert!(static_error(d6).is_some_and(|e| e.contains("{a | e}")), "{:?}", static_error(d6));
+        // D1 (rigid): union of two distinct declared variables (prints 6 before stage 1).
+        let twor = "let h: ((Int ->{e1} Int) -> (Int ->{e2} Int) -> Int) = fun f -> fun g -> f(1) + g(1) in h(fun x -> x + 1)(fun x -> x + 3)";
+        assert!(static_error(twor).is_some_and(|e| e.contains("effect row variables e1 and e2 are fixed by the signature")), "{:?}", static_error(twor));
+        // Review 19 M7 (spec section 5): one variable twice in a parameter, a rigid callback and a
+        // performing one. relate passes each position alone; unify_fits fails.
+        let m7 = "let g = fun p: ((Int ->{e} Int), (Int ->{e} Int)) -> 0 in let f: ((Int ->{e1} Int) -> Int) = fun c1 -> g((c1, fun x -> perform a(x))) in 0";
+        assert!(static_error(m7).is_some_and(|e| e.contains("expected (Int ->{e1} Int)")), "{:?}", static_error(m7));
+        // Review Focus 5: a types-as-values signature row is rigid too. Guard after Task 4.
+        let tav = "let F = Fun((Int, \"e\", Int)) in let k: (F -> F) = fun f -> fun x -> perform a(x) + f(x) in 0";
+        assert!(static_error(tav).is_some(), "types-as-values signature row should be rigid");
+        // Two distinct types-as-values row variables are rigid too (guard; printed 6 on baseline).
+        let tavr = "let F1 = Fun((Int, \"e1\", Int)) in let F2 = Fun((Int, \"e2\", Int)) in let h: (F1 -> F2 -> Int) = fun f -> fun g -> f(1) + g(1) in h(fun x -> x + 1)(fun x -> x + 3)";
+        assert!(static_error(tavr).is_some_and(|e| e.contains("effect row variables e1 and e2 are fixed by the signature")), "{:?}", static_error(tavr));
+        // Rigidity ends with the signature (guard): a later call of the let-bound `k` is checked
+        // against its instantiated type, so the performing callback typechecks and fails only at
+        // run time as an unhandled effect, not as a "fixed by the signature" error.
+        let released = "let k: ((Int ->{e} Int) -> Int) = fun f -> f(1) in k(fun x -> perform a(x))";
+        let err = run_source(released).unwrap_err();
+        assert!(err.contains("unhandled effect: a") && !err.contains("fixed by the signature"), "{err:?}");
+        // Pure and declared-polymorphic implementations still fit (guard; a1 to a3 stay in Task 4's test).
+        runs_to("let k: (Int -> (Int ->{e} Int)) = fun n -> fun x -> n in k(1)(2)", "1");
+    }
+
+    #[test]
+    fn row_plan_cells_the_other_tests_do_not_reach() {
+        use crate::typecheck::{row_compatible, unify_rows, InferCtx, RowRank};
+        use types::{surface_name, Row, Tail};
+        let mut infer = InferCtx::new();
+        // Flexible/flexible, equal label sets: no split, the loser binds to the winner. Equal
+        // rank ties go to the second argument; a higher rank wins whatever the order.
+        let (a, b) = (infer.fresh_row(RowRank::User, "e1"), infer.fresh_row(RowRank::User, "e2"));
+        assert!(unify_rows(&row_of(&["x"], Tail::Var(a.clone())), &row_of(&["x"], Tail::Var(b.clone())), &mut infer));
+        assert_eq!(infer.flatten_row(&Row::var(a.clone())).tail, Tail::Var(b.clone()), "tie: the second survives");
+        assert_eq!(infer.flatten_row(&Row::var(b.clone())), Row::var(b.clone()));
+        let (c, d) = (infer.fresh_row(RowRank::User, "e3"), infer.fresh_row(RowRank::Opened, types::OPENED_ROW));
+        assert!(unify_rows(&Row::var(c.clone()), &Row::var(d.clone()), &mut infer));
+        assert_eq!(infer.flatten_row(&Row::var(d.clone())).tail, Tail::Var(c.clone()), "User beats Opened though it is first");
+        // Split where the first argument wins (higher rank): sigma is named after it.
+        let (f, g) = (infer.fresh_row(RowRank::User, "ef"), infer.fresh_row(RowRank::Opened, types::OPENED_ROW));
+        assert!(unify_rows(&row_of(&["x"], Tail::Var(f.clone())), &row_of(&["y"], Tail::Var(g.clone())), &mut infer));
+        let Tail::Var(sigma) = infer.flatten_row(&Row::var(f)).tail else { panic!("tail") };
+        assert_eq!(surface_name(&sigma), "ef");
+        // The same tail with different labels cannot unify, flexible or not; with equal labels it is a no-op.
+        let h = infer.fresh_row(RowRank::User, "eh");
+        assert!(!row_compatible(&row_of(&["x"], Tail::Var(h.clone())), &row_of(&["y"], Tail::Var(h.clone())), &infer));
+        assert!(!unify_rows(&row_of(&["x"], Tail::Var(h.clone())), &row_of(&["y"], Tail::Var(h.clone())), &mut infer));
+        assert!(unify_rows(&row_of(&["x"], Tail::Var(h.clone())), &row_of(&["x"], Tail::Var(h.clone())), &mut infer));
+        // Closed against rigid: nowhere for the rest to go, in either order, even when empty.
+        let r = infer.fresh_row(RowRank::User, "er");
+        infer.rigid_row.insert(r.clone());
+        for (x, y) in [(Row::pure(), Row::var(r.clone())), (Row::var(r.clone()), Row::pure()), (Row::single("a"), row_of(&["a"], Tail::Var(r.clone())))] {
+            assert!(!row_compatible(&x, &y, &infer), "{x} vs {y}");
+            assert!(!unify_rows(&x, &y, &mut infer), "{x} vs {y}");
+        }
+        // Rigid against flexible: the flexible one binds to the rigid one, in either order.
+        for flexible_first in [true, false] {
+            let flex = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
+            let (x, y) = if flexible_first { (Row::var(flex.clone()), Row::var(r.clone())) } else { (Row::var(r.clone()), Row::var(flex.clone())) };
+            assert!(unify_rows(&x, &y, &mut infer));
+            assert_eq!(infer.flatten_row(&Row::var(flex)).tail, Tail::Var(r.clone()));
+            assert_eq!(infer.flatten_row(&Row::var(r.clone())), Row::var(r.clone()), "the rigid tail stays unbound");
+        }
+    }
+
+    // flatten_row path-compresses long chains of bound row variables (a list of n lambdas makes n
+    // of them); the compressed form must follow later bindings and vanish on rollback.
+    #[test]
+    fn flatten_row_compression_follows_later_bindings_and_rolls_back() {
+        use crate::typecheck::{unify_rows, InferCtx, RowRank};
+        use types::{Row, Tail};
+        let mut infer = InferCtx::new();
+        let vars: Vec<String> = (0..2000).map(|_| infer.fresh_row(RowRank::Opened, types::OPENED_ROW)).collect();
+        for w in vars.windows(2) {
+            assert!(unify_rows(&Row::var(w[0].clone()), &row_of(&["x"], Tail::Var(w[1].clone())), &mut infer));
+        }
+        let head = vars[0].clone();
+        let first = infer.flatten_row(&Row::var(head.clone()));
+        let Tail::Var(last) = first.tail.clone() else { panic!("{first:?}") };
+        assert_eq!(infer.flatten_row(&Row::var(head.clone())), first, "a second walk starts from the compressed form");
+        // The end gets bound later: the compressed prefix continues through it.
+        let snap = infer.snapshot();
+        let end = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
+        assert!(unify_rows(&Row::var(last.clone()), &row_of(&["z"], Tail::Var(end.clone())), &mut infer));
+        let extended = infer.flatten_row(&Row::var(head.clone()));
+        assert_eq!(extended.tail, infer.flatten_row(&Row::var(last.clone())).tail);
+        assert_ne!(extended.tail, first.tail);
+        assert!(extended.labels().any(|l| l == "z"));
+        // Rolled back: the binding, and what was compressed through it, is gone.
+        infer.restore(snap);
+        assert_eq!(infer.flatten_row(&Row::var(head.clone())), first);
+        // A chain bound and flattened after a snapshot caches entries; a rollback must drop them,
+        // or a head rebound differently afterwards keeps the stale compressed prefix.
+        let snap = infer.snapshot();
+        let chain: Vec<String> = (0..4).map(|_| infer.fresh_row(RowRank::Opened, types::OPENED_ROW)).collect();
+        for (w, l) in chain.windows(2).zip(["p", "q", "r"]) {
+            assert!(unify_rows(&Row::var(w[0].clone()), &row_of(&[l], Tail::Var(w[1].clone())), &mut infer));
+        }
+        let stale = infer.flatten_row(&Row::var(chain[0].clone()));
+        assert!(stale.labels().eq(["p", "q", "r"]), "{stale:?}");
+        let end = stale.tail.clone();
+        infer.restore(snap);
+        assert!(unify_rows(&Row::var(chain[0].clone()), &row_of(&["y"], end.clone()), &mut infer));
+        let fresh = infer.flatten_row(&Row::var(chain[0].clone()));
+        assert!(fresh.labels().eq(["y"]), "stale compressed prefix survived the rollback: {fresh:?}");
+    }
+
+    // The shared scratch of resolve_deep (its memo, kept between calls) must not carry one call's
+    // answers into the next, and rows with no labels share one entries node.
+    #[test]
+    fn resolve_deep_reuses_its_memo_without_going_stale() {
+        use crate::typecheck::{unify_rows, InferCtx, RowRank};
+        use types::{Row, Tail, Type};
+        assert!(Hc::ptr_eq(&Row::var("a#1").entries, &Row::pure().entries) && Hc::ptr_eq(&Row::dyn_().entries, &Row::pure().entries));
+        let mut infer = InferCtx::new();
+        let a = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
+        let mut ty = Type::Int;
+        for _ in 0..40 {
+            ty = Type::Fun(Hc::new(ty), Row::var(a.clone()), Hc::new(Type::Int));
+        }
+        assert!(infer.flattened(&Row::var(a.clone())).is_none(), "an unbound tail is already flat");
+        let before = infer.resolve_deep(&ty);
+        assert_eq!(before, ty);
+        let b = infer.fresh_row(RowRank::User, "e");
+        assert!(unify_rows(&Row::var(a.clone()), &row_of(&["x"], Tail::Var(b)), &mut infer));
+        let after = infer.resolve_deep(&ty);
+        assert_ne!(after, ty, "the memo of the first call must not answer the second");
+        assert!(after.to_string().contains("{x | e}"), "{after}");
+    }
+
+    #[test]
+    fn resolve_deep_flattens_bound_row_tails_in_every_position() {
+        use crate::typecheck::{unify_rows, InferCtx, RowRank};
+        use types::{Row, Tail, Type};
+        let mut infer = InferCtx::new();
+        let (a, b) = (infer.fresh_row(RowRank::Opened, types::OPENED_ROW), infer.fresh_row(RowRank::User, "e"));
+        let fun = |name: &str| Type::Fun(Hc::new(Type::Int), Row::var(name), Hc::new(Type::Int));
+        // a := {x | b}, so `{a}` is `{x | b}`: a chain of two bindings.
+        let c = infer.fresh_row(RowRank::Opened, types::OPENED_ROW);
+        assert!(unify_rows(&Row::var(a.clone()), &row_of(&["x"], Tail::Var(b.clone())), &mut infer));
+        assert!(unify_rows(&Row::var(b.clone()), &row_of(&["y"], Tail::Var(c.clone())), &mut infer));
+        let flat = infer.flatten_row(&Row::var(a.clone())).to_string();
+        assert_eq!(flat, "{x, y | e}");
+        let shapes = [
+            ("list", Type::List(Hc::new(fun(&a)))),
+            ("tuple", Type::Tuple(Hc::new(vec![Type::Int, fun(&a)]))),
+            ("record", Type::Record(Hc::new(vec![("f".to_string(), fun(&a))]))),
+            ("union", Type::Union(Hc::new(vec![Type::Int, fun(&a)]))),
+            ("nested fun", Type::Fun(Hc::new(fun(&a)), Row::pure(), Hc::new(Type::Int))),
+            ("under rec", Type::Rec(rec_group(&["L"], vec![Type::Union(Hc::new(vec![Type::Int, Type::Fun(Hc::new(rec_bound(0, 0)), Row::var(a.clone()), Hc::new(Type::Int))]))]), 0)),
+        ];
+        for (what, ty) in shapes {
+            let resolved = infer.resolve_deep(&ty);
+            let shown = if let Type::Rec(g, i) = &resolved { types::unfold(g, *i).to_string() } else { resolved.to_string() };
+            assert!(shown.contains("{x, y | e}"), "{what}: {shown}");
+        }
     }
 }

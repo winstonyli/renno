@@ -12,7 +12,7 @@ use crate::list::{List, SealId};
 use crate::resolve::{group_kind, resolve, GroupKind, Resolved, VarRef};
 use crate::span::Span;
 use crate::text::Text;
-use crate::types::{first_free, fresh_rec_id, EffectRow, Hc, RecVar, Type};
+use crate::types::{first_free, fresh_rec_id, Hc, RecVar, Row, Type};
 use crate::util::find_field;
 use crate::value::{Builtin, Contract, HandlerData, SiteCtx, TypeCtor, Value};
 
@@ -1713,9 +1713,9 @@ fn construct_type(ctor: TypeCtor, arg: Value) -> Type {
         }
         // (A, B) is `A -> B`; (A, "e", B) is `A ->{e} B`.
         (TypeCtor::Fun, Value::List(items)) => match &items.to_vec()[..] {
-            [Value::Type(a), Value::Type(b)] => Type::Fun(Hc::new((**a).clone()), EffectRow::Dyn, Hc::new((**b).clone())),
+            [Value::Type(a), Value::Type(b)] => Type::Fun(Hc::new((**a).clone()), Row::dyn_(), Hc::new((**b).clone())),
             [Value::Type(a), Value::Str(row), Value::Type(b)] => {
-                Type::Fun(Hc::new((**a).clone()), EffectRow::Var(row.to_string()), Hc::new((**b).clone()))
+                Type::Fun(Hc::new((**a).clone()), Row::var(row.to_string()), Hc::new((**b).clone()))
             }
             _ => crate::run_error!("Fun expects (param, result) or (param, \"row\", result) types"),
         },

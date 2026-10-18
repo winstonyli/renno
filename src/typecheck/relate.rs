@@ -1,8 +1,8 @@
 //! Directional, infer-aware type relation (design 2026-10-08, section 3.1). Pure and read-only.
 //! S2 T1 added `Why`/`Undecided`/`relate_cast`; consumers: coerce_check and the unify_fits rescue (T3), coerce_cast (T4).
-use super::{free_index_vars, unify_index_expr, InferCtx};
+use super::{free_index_vars, row_compatible, unify_index_expr, InferCtx};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
-use crate::types::{is_big, row_consistent, unfold, ById, FxMap, RecRef, Type};
+use crate::types::{is_big, unfold, ById, FxMap, RecRef, Type};
 use crate::util::find_field;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -287,7 +287,7 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
     let Type::Fun(a, r, b) = from else { return Rel::refuted("not a function") };
     let (a2, b2) = match to {
         Type::Fun(a2, r2, b2) => {
-            if !fuel.ignore_rows && !row_consistent(r, r2) {
+            if !fuel.ignore_rows && !row_compatible(r, r2, infer) {
                 return Rel::opaque("effect row");
             }
             ((**a2).clone(), (**b2).clone())
@@ -339,7 +339,7 @@ fn index_refuted(a: &IndexExpr, b: &IndexExpr, infer: &InferCtx) -> Rel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{EffectRow, Hc};
+    use crate::types::{Row, Hc};
     use std::rc::Rc;
     fn list(t: Type) -> Type {
         Type::List(Hc::new(t))
@@ -354,7 +354,7 @@ mod tests {
         Type::Record(Hc::new(fs.iter().map(|(n, t)| (n.to_string(), t.clone())).collect()))
     }
     fn fun(a: Type, b: Type) -> Type {
-        Type::Fun(Hc::new(a), EffectRow::Dyn, Hc::new(b))
+        Type::Fun(Hc::new(a), Row::dyn_(), Hc::new(b))
     }
     fn var(n: &str) -> Type {
         Type::Var(n.to_string())
@@ -407,7 +407,7 @@ mod tests {
         let (i, s, d, b) = (Type::Int, Type::Str, Type::Dyn, Type::Bool);
         let is = uni(&[i.clone(), s.clone()]);
         let ii = tup(&[i.clone(), i.clone()]);
-        let fx = |p: Type, r: Type, row: EffectRow| Type::Fun(Hc::new(p), row, Hc::new(r));
+        let fx = |p: Type, r: Type, row: Row| Type::Fun(Hc::new(p), row, Hc::new(r));
         let cases: Vec<(&str, Type, Type, Exp)> = vec![
             ("int-int", i.clone(), i.clone(), P),
             ("int-str", i.clone(), s.clone(), R),
@@ -445,7 +445,7 @@ mod tests {
             ("fun result dyn (h02)", fun(i.clone(), d.clone()), fun(i.clone(), i.clone()), U(&["Fun"], Imp)),
             ("fun wider param ok", fun(is.clone(), i.clone()), fun(i.clone(), i.clone()), P),
             ("fun narrower param", fun(i.clone(), i.clone()), fun(is.clone(), i.clone()), U(&["Fun"], Imp)),
-            ("fun rows differ", fx(i.clone(), i.clone(), EffectRow::single("a")), fx(i.clone(), i.clone(), EffectRow::pure()), R),
+            ("fun rows differ", fx(i.clone(), i.clone(), Row::single("a")), fx(i.clone(), i.clone(), Row::pure()), R),
             ("rec same", l_ty(), l_ty(), P),
             ("rec into int", l_ty(), i.clone(), R),
             ("literal one level into L", tup(&[i.clone(), b.clone()]), l_ty(), P),
@@ -499,9 +499,28 @@ mod tests {
         let lits = Why::Index { msg: "type mismatch: index 4 does not unify with index 3".into(), bare: false };
         assert_eq!(relate(&vec_n(lit(3)), &vec_n(lit(4)), &infer), Rel::Refuted(lits));
         // Rows have no runtime representation: a cast ignores them.
-        let fx = |row: EffectRow| Type::Fun(Hc::new(i.clone()), row, Hc::new(i.clone()));
-        assert!(matches!(relate(&fx(EffectRow::single("a")), &fx(EffectRow::pure()), &infer), Rel::Refuted(_)));
-        assert_eq!(relate_cast(&fx(EffectRow::single("a")), &fx(EffectRow::pure()), &infer), Rel::Proven);
+        let fx = |row: Row| Type::Fun(Hc::new(i.clone()), row, Hc::new(i.clone()));
+        assert!(matches!(relate(&fx(Row::single("a")), &fx(Row::pure()), &infer), Rel::Refuted(_)));
+        assert_eq!(relate_cast(&fx(Row::single("a")), &fx(Row::pure()), &infer), Rel::Proven);
+    }
+
+    #[test]
+    fn effect_rows_relate_by_row_compatibility_and_casts_ignore_them() {
+        use crate::typecheck::RowRank;
+        use crate::types::{Row, Tail};
+        let mut infer = InferCtx::new();
+        let i = Type::Int;
+        let fx = |row: Row| Type::Fun(Hc::new(i.clone()), row, Hc::new(i.clone()));
+        let e = infer.fresh_row(RowRank::User, "e");
+        let open = infer.fresh_row(RowRank::Opened, crate::types::OPENED_ROW);
+        infer.rigid_row.insert(e.clone());
+        let labelled = Row::new(vec!["a".into()], Tail::Var(open.clone()));
+        // A rigid tail cannot absorb `a`: refuted, as unify_fits would fail.
+        assert!(matches!(relate(&fx(labelled.clone()), &fx(Row::var(e.clone())), &infer), Rel::Refuted(_)));
+        // A flexible tail can: compatible (Proven: effect-row relate is boolean).
+        assert_eq!(relate(&fx(Row::var(open.clone())), &fx(Row::single("a")), &infer), Rel::Proven);
+        // relate_cast ignores rows (relate.rs:174).
+        assert_eq!(relate_cast(&fx(labelled), &fx(Row::var(e)), &infer), Rel::Proven);
     }
 
     // 2^50 leaves, 50 nodes: the pair memo makes each distinct pair cost one decision, so this
