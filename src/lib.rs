@@ -11643,12 +11643,28 @@ g(len)").unwrap_err();
         assert_eq!(run_source(ok).unwrap().as_int(), 2);
         let int = "let u: Union(Int, (Int -> Int)) = 3 in let d: Dyn = u in match d | 3 -> 1 | _ -> 0";
         assert_eq!(run_source(int).unwrap().as_int(), 1);
-        // The argument's type is checked, but an outer index variable inside a Union alternative is not
-        // tied to the outer length (`checked_index_vars` treats a spine function's own parameter variable
-        // as its own binder), unlike the closure form; a container leaf behaves the same. Open pin: remove when fixed.
+        // An outer index variable inside a Union alternative is tied to the outer length, as in the closure form.
         let len = |arg: &str| format!("let f = fun v: Vec(n) -> (let u: Union(Int, (Vec(n) -> Int)) = fun w: Vec(n) -> len(w) in let d: Dyn = u in d) in f([1,2])({arg})");
         assert!(run_err(&len("\"s\"")).contains("found Str"));
-        assert_eq!(run_source(&len("[3]")).unwrap().as_int(), 1, "now rejected: remove this pin");
+        assert!(run_err(&len("[3]")).contains("expected"));
+        assert_eq!(run_source(&len("[3, 4]")).unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_function_leaf_compares_its_argument_length_with_an_enclosing_vec_n() {
+        let list = "let f = fun v: Vec(n) -> (let l: [Vec(n) -> Int] = [fun w: Vec(n) -> len(w)] in let d: Dyn = l in d) in match f([1,2]) | g :: _ -> g(ARG) | _ -> 0";
+        let tuple = "let f = fun v: Vec(n) -> (let l: ((Vec(n) -> Int), Int) = (fun w: Vec(n) -> len(w), 0) in let d: Dyn = l in d) in match f([1,2]) | (g, _) -> g(ARG) | _ -> 0";
+        let record = "let f = fun v: Vec(n) -> (let l: {g: (Vec(n) -> Int)} = {g: fun w: Vec(n) -> len(w)} in let d: Dyn = l in d) in match f([1,2]) | {g: h} -> h(ARG) | _ -> 0";
+        for src in [list, tuple, record] {
+            let err = run_err(&src.replace("ARG", "[3]"));
+            assert!(err.contains("expected [Dyn](n), found List"), "{src}: {err}");
+            assert_eq!(run_source(&src.replace("ARG", "[3, 4]")).unwrap().as_int(), 2, "{src}");
+        }
+        // Only the leaf's own binder (no enclosing length), and an unrelated variable, accept any length.
+        let own = "let l: [Vec(n) -> Int] = [fun w: Vec(n) -> len(w)] in let d: Dyn = l in match d | g :: _ -> g([3]) | _ -> 0";
+        assert_eq!(run_source(own).unwrap().as_int(), 1);
+        let other = "let f = fun v: Vec(n) -> (let l: [Vec(m) -> Int] = [fun w: Vec(m) -> len(w)] in let d: Dyn = l in d) in match f([1,2]) | g :: _ -> g([3]) | _ -> 0";
+        assert_eq!(run_source(other).unwrap().as_int(), 1);
     }
 
     #[test]
