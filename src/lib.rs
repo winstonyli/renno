@@ -7674,7 +7674,7 @@ g(len)").unwrap_err();
     fn bind_pattern_vars_falls_back_to_fresh_vars_at_a_cycle_detected_nested_position() {
         // Finding 6 (Task 4 brief): the cycle-detected fallback branch in
         // bind_pattern_vars's own Type::Rec arm (`if visiting.contains(id)
-        // { return bind_fresh_positions(...) }`, added by Task 3's own
+        // { return bind_dyn_positions(...) }`, added by Task 3's own
         // fix-round-1) is correct by inspection and was re-verified there,
         // but wasn't exercised by any existing test -- every existing
         // Case B test puts a bare Var at the self-referential position
@@ -7694,7 +7694,7 @@ g(len)").unwrap_err();
         // with pat=(h2, t2) (a nested Pattern::List) against
         // ty=List -- this time "List" is ALREADY in visiting, so
         // the cycle guard fires and h2/t2 both get fresh, uncorrelated
-        // types via bind_fresh_positions, rather than h2:Int/t2:List
+        // types via bind_dyn_positions, rather than h2:Int/t2:List
         // the way a genuinely one-more-level unfold would give them. This
         // is a real, deliberate conservative approximation (mirroring
         // pattern_could_match's own identical stance) -- it fires here
@@ -11768,6 +11768,26 @@ g(len)").unwrap_err();
         assert_eq!(run_source("match [5, 6] | (a, b) -> a + b | _ -> 0").unwrap().as_int(), 11);
         assert_eq!(run_source("match (5, 6) | [a, b] -> a + b | _ -> 0").unwrap().as_int(), 11);
         assert_eq!(run_source("match (5, 6) | (a, b) -> a + b | _ -> 0").unwrap().as_int(), 11);
+    }
+
+    #[test]
+    fn a_binder_under_a_dyn_scrutinee_is_dyn_and_checked_at_use() {
+        // Each prints a string typed Int without the check; now each is a run-time or static type error.
+        let bad = [
+            r#"let g = fun d: Dyn -> match d | (a, b) -> a | _ -> 1 in let z: Int = g(("s", 2)) in z"#,
+            r#"let g = fun d: Dyn -> match d | [a, b] -> a | _ -> 1 in let z: Int = g(["s", "t"]) in z"#,
+            r#"let g = fun d: Dyn -> match d | {x: a} -> a | _ -> 1 in let z: Int = g({x: "s"}) in z"#,
+            r#"let g = fun d: Dyn -> match d | a :: _ -> a | _ -> 1 in let z: Int = g(["s"]) in z"#,
+            r#"let g = fun d: Dyn -> match d | (a, (b, c)) -> b | _ -> 1 in let z: Int = g(("s", ("t", 2))) in z"#,
+        ];
+        for src in bad {
+            assert!(run_source(src).is_err(), "should reject: {src}");
+        }
+        // The right values still run, and a Dyn tail stays a list.
+        let ok = r#"let g = fun d: Dyn -> match d | (a, b) -> a | _ -> 1 in let z: Int = g((7, "t")) in z"#;
+        assert_eq!(run_source(ok).unwrap().as_int(), 7);
+        let tail = r#"let g = fun d: Dyn -> match d | _ :: t -> len(t) | _ -> 0 in g([1, 2, 3])"#;
+        assert_eq!(run_source(tail).unwrap().as_int(), 2);
     }
 
     fn run_err(src: &str) -> String {

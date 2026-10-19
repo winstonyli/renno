@@ -3980,13 +3980,11 @@ fn fits_not_refuted(required: &Type, actual: &Type, infer: &mut InferCtx, span: 
 }
 
 // Shared "nothing real to correlate against" fallback: bind each of a
-// Pattern::List's own positions to its own independent fresh var.
-// Factored out of what used to be three separate, identically-bodied
-// arms in bind_pattern_vars's own Pattern::List match (Type::Var, the
-// final catch-all, and now the Type::Rec/Type::Union arms'
-// own "no matching alternative found" cases below) -- same fallback,
-// same reasoning, one copy.
-fn bind_fresh_positions(
+// Pattern::List's own positions to `Dyn`. A fresh variable here would be
+// fixed by whatever its use demands, with nothing checking the value;
+// `Dyn` makes the use check it. One copy for the final catch-all and the
+// Type::Rec/Type::Union arms' own "no matching alternative found" cases.
+fn bind_dyn_positions(
     ctx: &Ctx,
     pats: &[Pattern],
     infer: &mut InferCtx,
@@ -3995,21 +3993,18 @@ fn bind_fresh_positions(
 ) -> Result<Ctx, TypeError> {
     let mut c = ctx.clone();
     for p in pats {
-        let elem_ty = infer.fresh_var("elem");
-        c = bind_pattern_vars(&c, p, &elem_ty, infer, span, visiting)?;
+        c = bind_pattern_vars(&c, p, &Type::Dyn, infer, span, visiting)?;
     }
     Ok(c)
 }
 
-// `bind_fresh_positions`'s own Record analog: bind each of a
-// Pattern::Record's own named fields to its own independent fresh var,
-// keyed by that field's own name (matching this function's own existing
-// per-field fallback). Same "nothing real to correlate against"
-// fallback, factored out for the same reason -- Finding 6's new
-// Type::Indexed/Rec/Union delegation arms below need this same
-// fallback for their own "no matching alternative found" cases, not
-// just the catch-all.
-fn bind_fresh_record_fields(
+// `bind_dyn_positions`'s own Record analog: bind each of a
+// Pattern::Record's own named fields to `Dyn`. Same "nothing real to
+// correlate against" fallback for the Type::Indexed/Rec/Union delegation
+// arms' "no matching alternative found" cases and the catch-all. An
+// unsolved Type::Var scrutinee does NOT come here: its payloads stay
+// fresh, because the D7 pin after the arm loop connects them.
+fn bind_dyn_record_fields(
     ctx: &Ctx,
     fields: &[(String, Pattern)],
     infer: &mut InferCtx,
@@ -4017,9 +4012,8 @@ fn bind_fresh_record_fields(
     visiting: &Visiting,
 ) -> Result<Ctx, TypeError> {
     let mut c = ctx.clone();
-    for (name, p) in fields {
-        let field_ty = infer.fresh_var(name);
-        c = bind_pattern_vars(&c, p, &field_ty, infer, span, visiting)?;
+    for (_, p) in fields {
+        c = bind_pattern_vars(&c, p, &Type::Dyn, infer, span, visiting)?;
     }
     Ok(c)
 }
@@ -4124,7 +4118,7 @@ fn bind_pattern_vars(
             // correlation via Cons's own arm, which is where my_map's
             // own precision genuinely comes from -- this arm never
             // forcing List costs nothing there.
-            Type::Var(_) => bind_fresh_positions(ctx, pats, infer, span, visiting),
+            Type::Var(_) => bind_dyn_positions(ctx, pats, infer, span, visiting),
             // A Type::Indexed-wrapped scrutinee (Vec(n)-style, or Case
             // B's own recursive-type analog per §2's generalization) --
             // correlate against the WRAPPED type directly, "forgetting"
@@ -4155,7 +4149,7 @@ fn bind_pattern_vars(
             // otherwise recurse with it added to the accumulated set.
             Type::Rec(g, i) => {
                 if visiting.has_rec(g, *i) {
-                    return bind_fresh_positions(ctx, pats, infer, span, visiting);
+                    return bind_dyn_positions(ctx, pats, infer, span, visiting);
                 }
                 bind_pattern_vars(ctx, pat, &unfold(g, *i), infer, span, &visiting.with_rec(g, *i))
             }
@@ -4191,7 +4185,7 @@ fn bind_pattern_vars(
             // reachable again and again forever.
             Type::Union(alts) => match alts.iter().find(|alt| pattern_could_match(pat, alt, visiting)) {
                 Some(matching_alt) => bind_pattern_vars(ctx, pat, matching_alt, infer, span, visiting),
-                None => bind_fresh_positions(ctx, pats, infer, span, visiting),
+                None => bind_dyn_positions(ctx, pats, infer, span, visiting),
             },
             // A concrete, non-Tuple, non-List, non-Indexed/Rec/Union
             // scrutinee against a List pattern: pattern_could_match's
@@ -4200,10 +4194,11 @@ fn bind_pattern_vars(
             // -- bind each position to its own independent fresh var
             // (nothing real to correlate against) so nested sub-bindings
             // still work.
-            _ => bind_fresh_positions(ctx, pats, infer, span, visiting),
+            _ => bind_dyn_positions(ctx, pats, infer, span, visiting),
         },
         Pattern::Cons(head, tail) => {
-            let elem_ty = infer.fresh_var("elem");
+            // Over a Dyn scrutinee the elements are Dyn, not a fresh variable a use could fix to anything.
+            let elem_ty = if matches!(infer.resolve_deep(scrutinee_ty), Type::Dyn) { Type::Dyn } else { infer.fresh_var("elem") };
             let list_shape = Type::List(Hc::new(elem_ty.clone()));
             // "Forget" an Indexed scrutinee's own tracked index before
             // correlating its shape -- same widening as BinOp::Cons's own
@@ -4235,15 +4230,23 @@ fn bind_pattern_vars(
             Type::Indexed(wrapped, _) => bind_pattern_vars(ctx, pat, wrapped, infer, span, visiting),
             Type::Rec(g, i) => {
                 if visiting.has_rec(g, *i) {
-                    return bind_fresh_record_fields(ctx, fields, infer, span, visiting);
+                    return bind_dyn_record_fields(ctx, fields, infer, span, visiting);
                 }
                 bind_pattern_vars(ctx, pat, &unfold(g, *i), infer, span, &visiting.with_rec(g, *i))
             }
             Type::Union(alts) => match alts.iter().find(|alt| pattern_could_match(pat, alt, visiting)) {
                 Some(matching_alt) => bind_pattern_vars(ctx, pat, matching_alt, infer, span, visiting),
-                None => bind_fresh_record_fields(ctx, fields, infer, span, visiting),
+                None => bind_dyn_record_fields(ctx, fields, infer, span, visiting),
             },
-            _ => bind_fresh_record_fields(ctx, fields, infer, span, visiting),
+            Type::Var(_) => {
+                let mut c = ctx.clone();
+                for (name, p) in fields {
+                    let field_ty = infer.fresh_var(name);
+                    c = bind_pattern_vars(&c, p, &field_ty, infer, span, visiting)?;
+                }
+                Ok(c)
+            }
+            _ => bind_dyn_record_fields(ctx, fields, infer, span, visiting),
         },
     }
 }
