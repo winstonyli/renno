@@ -11652,6 +11652,33 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn a_union_or_rec_function_in_a_container_keeps_its_parameter_check() {
+        let union = "let l: [Union(Int, (Int -> Int))] = [fun x: Int -> x] in let d: Dyn = l in match d | g :: _ -> g(\"s\") | _ -> 0";
+        let rec = "let rec R = Union(Int, Fun((Int, Int))) in let l: [R] = [fun x: Int -> x] in let d: Dyn = l in match d | g :: _ -> g(\"s\") | _ -> 0";
+        let tuple = "let t: (Union(Int, (Int -> Int)), Int) = (fun x: Int -> x, 2) in let d: Dyn = t in match d | (g, _) -> g(\"s\") | _ -> 0";
+        for src in [union, rec, tuple] {
+            let err = run_err(src);
+            assert!(err.contains("expected Int, found Str"), "{src}: {err}");
+        }
+        let ok = "let l: [Union(Int, (Int -> Int))] = [fun x: Int -> x + 1] in let d: Dyn = l in match d | g :: _ -> g(1) | _ -> 0";
+        assert_eq!(run_source(ok).unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_union_leaf_without_a_function_is_not_rebuilt_and_a_round_trip_collapses() {
+        machine::MAP_REBUILDS.with(|c| c.set(0));
+        run_source_on_this_thread("let l: [Union(Int, Str)] = [1, 2] in let d: Dyn = l in 1").expect("runs");
+        assert_eq!(machine::MAP_REBUILDS.with(|c| c.get()), 0);
+        machine::CONTRACT_COLLAPSES.with(|c| c.set(0));
+        let same = "let l: [Union(Int, (Int -> Int))] = [fun x: Int -> x + 1] in let d: Dyn = l in let m: [Union(Int, (Int -> Int))] = d in let e: Dyn = m in match e | g :: _ -> g(1) | _ -> 0";
+        assert_eq!(run_source_on_this_thread(same).expect("runs").as_int(), 2);
+        assert!(machine::CONTRACT_COLLAPSES.with(|c| c.get()) >= 1);
+        let diff = "let l: [Union(Int, (Int -> Int))] = [fun x: Int -> x + 1] in let d: Dyn = l in let m: [Union(Int, (Str -> Int))] = d in let e: Dyn = m in match e | g :: _ -> g(\"s\") | _ -> 0";
+        let err = run_err(diff);
+        assert!(err.contains("found Str") || err.contains("expected"), "{diff}: {err}");
+    }
+
+    #[test]
     fn a_function_free_container_to_dyn_is_not_rebuilt() {
         machine::MAP_REBUILDS.with(|c| c.set(0));
         run_source_on_this_thread("let xs = [1, 2, 3] in let d: Dyn = xs in 1").expect("runs");
