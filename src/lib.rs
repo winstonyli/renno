@@ -8494,7 +8494,7 @@ g(len)").unwrap_err();
     // witness and checks list shape only, returning 1, while the direct call `f([1])` fails at
     // run time. The two forms should agree.
     #[test]
-    fn a_monomorphic_vec_n_witness_checks_list_shape_only_in_the_closure_form_known_limitation() {
+    fn a_monomorphic_vec_n_witness_checks_list_shape_only_through_dyn_known_limitation() {
         let prefix = "let x: Dyn = [1, 2] in let y: Vec(n) = x in let p: ((Vec(n) -> Int), Int) = (fun w -> len(w), 0) in match p | (f, _) -> ";
         assert_eq!(run_source(&format!("{prefix}let d: Dyn = f in d([1])")).unwrap().as_int(), 1);
         let err = run_source(&format!("{prefix}f([1])")).unwrap_err();
@@ -8594,7 +8594,7 @@ g(len)").unwrap_err();
         // site reads the witness length and used to panic inside `len`.
         let src = "let f = fun v: Vec(n) -> (let r: Dyn = [1,2,3] in let q: Vec(n) = r in 0) in let d: Dyn = f in d(5)";
         let err = run_source(src).unwrap_err();
-        assert!(err.contains("type error: expected [Dyn], found Int"), "unexpected message: {err}");
+        assert!(err.contains("type error: expected [Dyn](n), found Int"), "unexpected message: {err}");
         assert!(!err.contains("len expects"), "unexpected message: {err}");
         // A real list witness still works.
         let src = "let f = fun v: Vec(n) -> (let r: Dyn = [1,2,3] in let q: Vec(n) = r in 0) in let d: Dyn = f in d([4,5,6])";
@@ -8964,7 +8964,6 @@ g(len)").unwrap_err();
     fn a_literal_is_rebuilt_in_place_not_wrapped_in_a_closure() {
         // Literal form: no `let __cf = ... in fun __ca` outer closure.
         assert!(!elaborated_has_wrapper("let d: Dyn = fun a: Int -> fun b: Int -> a + b in d(1)(2)"));
-        assert!(elaborated_has_wrapper("let f = fun a: Int -> a + 1 in let d: Dyn = f in d(2)"));
     }
 
     #[test]
@@ -9069,7 +9068,6 @@ g(len)").unwrap_err();
         ] {
             assert!(!elaborated_has_wrapper(src), "{src}");
         }
-        assert!(elaborated_has_wrapper("let f = fun a: Int -> a + 1 in let d: Dyn = f in d(2)"));
     }
 
     #[test]
@@ -9292,9 +9290,10 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn a_closure_form_cast_check_is_native() {
+    fn a_bare_function_at_dyn_is_one_native_contract_node() {
         let src = "let f = fun x: Int -> x + 1 in let d: Dyn = f in d(1)";
-        assert!(has_assert_check(src, expr::Test::Int));
+        let (arena, root) = elaborated_tree(src);
+        assert!(tree_any(&arena, root, &|n| matches!(n, expr::Expr::Conform(..))));
         assert!(!calls_a_check_predicate(src));
         assert_clean_rejection("let f = fun x: Int -> x + 1 in let d: Dyn = f in d(true)", BAD_INT);
     }
@@ -9419,8 +9418,6 @@ g(len)").unwrap_err();
             within("[Vec(n)]", "[[1, 2]]"),
             within("Vec(n) | (Int -> Int)", "[1, 2]"),
             format!("let T = fun v -> Union(Tuple(v, Bool), Bool) in {}", within("T(Vec(n))", "true")),
-            // a closure-form cast to Dyn: the inner wrapper checks ys against the witness of xs
-            "let f = fun xs: Vec(n) -> fun ys: Vec(n) -> len(ys) in let d: Dyn = f in d([1, 2])([3, 4])".to_string(),
             // a pending (sink-then-call) cast next to a slot
             "let ap = fun g -> let d: Dyn = g in let r = g([1, 2]) in d in let h = ap(fun xs: Vec(n) -> fun ys: [Vec(n)] -> len(ys)) in let e: Dyn = [[1]] in let zs: [Vec(m)] = e in h([1, 2])([[3, 4]])".to_string(),
             "let d: Dyn = [[1, 2]] in let ys: [Vec(n)] = d in let g = fun zs: [Vec(2)] -> len(zs) in g(ys)".to_string(),
@@ -9433,6 +9430,13 @@ g(len)").unwrap_err();
             assert!(out.values().all(|&n| n == 1), "{src}: a slot with several owners {out:?}");
             assert!(!run_source(src).is_err_and(|e| e.contains("internal error")), "{src}");
         }
+    }
+
+    #[test]
+    fn a_bare_vec_n_function_through_dyn_checks_the_second_argument_against_the_first() {
+        let src = "let f = fun xs: Vec(n) -> fun ys: Vec(n) -> len(ys) in let d: Dyn = f in d([1, 2])([3, 4])";
+        assert_eq!(run_source(src).unwrap().as_int(), 2);
+        assert_clean_rejection(&src.replace("[3, 4]", "[3, 4, 5]"), "type error: expected [Dyn](n), found List");
     }
 
     #[test]
@@ -9790,9 +9794,8 @@ g(len)").unwrap_err();
 
     #[test]
     fn a_vec_n_function_through_an_untyped_dyn_sink_parameter_is_checked_for_list_shape() {
-        // `map(g)` applies g to each ELEMENT. The wrapper's DOWN is `is_list`
-        // only (the witness is the wrapper's own, no length check), so a list
-        // element still returns [0]...
+        // `map(g)` applies g to each ELEMENT. The contract's parameter check is the
+        // list shape plus the length slot, so a list element still returns [0]...
         let f = "let f = fun v: Vec(n) -> if true then 0 else (let r: Dyn = [1] in let q: Vec(n) = r in 0) in";
         let ok = format!("{f} let ap = fun g -> map(g)([[5]]) in ap(f)");
         assert_eq!(run_source(&ok).unwrap(), Outcome::List(vec![Outcome::Int(0)]));
@@ -9800,7 +9803,7 @@ g(len)").unwrap_err();
         // unchecked (`map(g)([5])` returned [0]), is now rejected cleanly.
         for el in ["5", "true"] {
             let bad = format!("{f} let ap = fun g -> map(g)([{el}]) in ap(f)");
-            assert_clean_rejection(&bad, "type error: expected [Dyn], found");
+            assert_clean_rejection(&bad, "type error: expected [Dyn](n), found");
         }
     }
 
