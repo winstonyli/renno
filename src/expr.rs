@@ -68,6 +68,16 @@ pub enum Pattern {
     Record(Vec<(String, Pattern)>),
 }
 
+impl Pattern {
+    // The items of a fixed-length positional pattern, tuple or list form.
+    pub fn positional(&self) -> Option<&[Pattern]> {
+        match self {
+            Pattern::List(ps) | Pattern::Tuple(ps) => Some(ps),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOp {
     Add,
@@ -1098,15 +1108,5 @@ mod seal_tests {
         impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
         <Test as AmbiguousIfSend<_>>::probe();
         <Seal as AmbiguousIfSend<_>>::probe();
-    }
-}
-
-impl Pattern {
-    // The items of a fixed-length positional pattern, tuple or list form.
-    pub fn positional(&self) -> Option<&[Pattern]> {
-        match self {
-            Pattern::List(ps) | Pattern::Tuple(ps) => Some(ps),
-            _ => None,
-        }
     }
 }
