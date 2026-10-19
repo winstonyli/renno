@@ -668,9 +668,8 @@ impl<'a> Parser<'a> {
             Some(Token::Str(s)) => Ok(Pattern::Str(s)),
             // `(p)` stays ordinary grouping (unchanged); `(p, p, ...)` (a
             // comma present) destructures a tuple -- tuples are plain
-            // Value::List at runtime (see Expr::Tuple's own doc comment),
-            // so this is just sugar for the same Pattern::List `[p, p,
-            // ...]` already matches lists with.
+            // Value::List at runtime (see Expr::Tuple's own doc comment), so this is a
+            // Pattern::Tuple, matched like the list pattern `[p, p, ...]`.
             Some(Token::LParen) => {
                 let first = self.pattern()?;
                 if matches!(self.peek(), Some(Token::Comma)) {
@@ -685,7 +684,7 @@ impl<'a> Parser<'a> {
                         items.push(self.pattern()?);
                     }
                     self.expect(&Token::RParen)?;
-                    Ok(Pattern::List(items))
+                    Ok(Pattern::Tuple(items))
                 } else {
                     self.expect(&Token::RParen)?;
                     Ok(first)

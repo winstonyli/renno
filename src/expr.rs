@@ -41,9 +41,8 @@ pub type SpanMap = PrimaryMap<ExprRef, Span>;
 // (matched by equality), List's two structural forms (fixed-length and
 // cons), Record (name-keyed, width-tolerant), and Var, which matches
 // anything and binds it -- "_" is just an ordinary (unused) Var name, not
-// a special token. A tuple pattern (`(p, q)`) is sugar over List -- see
-// parser::pattern_atom's LParen arm -- so there's no separate variant for
-// it either.
+// a special token. A tuple pattern (`(p, q)`) is Tuple, matched like List -- see
+// parser::pattern_atom's LParen arm.
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Var(String),
@@ -52,6 +51,9 @@ pub enum Pattern {
     Str(String),
     // [], [p1, p2, ...] -- matches only a list of exactly this length.
     List(Vec<Pattern>),
+    // `(p, p, ...)` -- the same match as List at run time (a tuple is a Value::List) and in every
+    // check except one: over an unsolved variable it pins a Tuple, where `[p, ...]` pins a List.
+    Tuple(Vec<Pattern>),
     // `head :: tail` -- matches a non-empty list of any length.
     Cons(Box<Pattern>, Box<Pattern>),
     // `{x: p, y: p, ...}` -- matches a Value::Record that has AT LEAST
@@ -1096,5 +1098,15 @@ mod seal_tests {
         impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
         <Test as AmbiguousIfSend<_>>::probe();
         <Seal as AmbiguousIfSend<_>>::probe();
+    }
+}
+
+impl Pattern {
+    // The items of a fixed-length positional pattern, tuple or list form.
+    pub fn positional(&self) -> Option<&[Pattern]> {
+        match self {
+            Pattern::List(ps) | Pattern::Tuple(ps) => Some(ps),
+            _ => None,
+        }
     }
 }

@@ -1924,7 +1924,7 @@ fn match_pattern(pat: &Pattern, value: &Value, out: &mut Bindings) -> bool {
         Pattern::Int(n) => matches!(value, Value::Int(v) if v == n),
         Pattern::Bool(b) => matches!(value, Value::Bool(v) if v == b),
         Pattern::Str(s) => matches!(value, Value::Str(v) if &**v == s.as_str()),
-        Pattern::List(pats) => match value {
+        Pattern::List(pats) | Pattern::Tuple(pats) => match value {
             Value::List(items) if items.len() == pats.len() => {
                 pats.iter().zip(items.iter()).all(|(p, v)| match_pattern(p, v, out))
             }

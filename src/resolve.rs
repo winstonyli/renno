@@ -84,7 +84,7 @@ fn collect_pattern_vars(p: &Pattern, out: &mut Vec<String>) {
     match p {
         Pattern::Var(n) => out.push(n.clone()),
         Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => {}
-        Pattern::List(ps) => ps.iter().for_each(|p| collect_pattern_vars(p, out)),
+        Pattern::List(ps) | Pattern::Tuple(ps) => ps.iter().for_each(|p| collect_pattern_vars(p, out)),
         Pattern::Cons(h, t) => {
             collect_pattern_vars(h, out);
             collect_pattern_vars(t, out);

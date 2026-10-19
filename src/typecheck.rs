@@ -3479,7 +3479,7 @@ fn pattern_type(pat: &Pattern) -> Type {
         Pattern::Int(_) => Type::Int,
         Pattern::Bool(_) => Type::Bool,
         Pattern::Str(_) => Type::Str,
-        Pattern::List(_) | Pattern::Cons(..) => Type::List(Hc::new(Type::Dyn)),
+        Pattern::List(_) | Pattern::Tuple(_) | Pattern::Cons(..) => Type::List(Hc::new(Type::Dyn)),
         // Dyn -- but unlike every other arm above, this is NOT what
         // decides whether a Record pattern can match a given scrutinee
         // (Dyn is trivially consistent with anything, which would make
@@ -3663,9 +3663,9 @@ fn could_match(pat: &Pattern, ty: &Type, visiting: &Visiting, memo: &mut StackMe
         // runs. Type::List scrutinees still fall through to the generic
         // consistent()-based catch-all below, correctly: an actual List
         // type has no fixed arity to check a pattern's length against.
-        (Pattern::List(subpats), Type::Tuple(items)) => subpats.len() == items.len(),
-        (Pattern::List(_), Type::Union(alts)) => alts.iter().any(|alt| could_match(pat, alt, visiting, memo)),
-        (Pattern::List(_), Type::Dyn | Type::Var(_)) => true,
+        (Pattern::List(subpats) | Pattern::Tuple(subpats), Type::Tuple(items)) => subpats.len() == items.len(),
+        (Pattern::List(_) | Pattern::Tuple(_), Type::Union(alts)) => alts.iter().any(|alt| could_match(pat, alt, visiting, memo)),
+        (Pattern::List(_) | Pattern::Tuple(_), Type::Dyn | Type::Var(_)) => true,
         // One level only, matching every other consumer of Type::Rec in this
         // file: unfold what this member stands for and ask the SAME question
         // about that shape instead.
@@ -3822,7 +3822,7 @@ fn count_bound(t: &Type, nest: u32, member: usize) -> usize {
 fn self_ref_pattern<'a>(pat: &'a Pattern, step_alt: &Type, self_ref: SelfRef) -> Option<&'a Pattern> {
     match (self_ref, step_alt, pat) {
         (SelfRef::Whole, _, _) => Some(pat),
-        (SelfRef::Item(k), Type::Tuple(items), Pattern::List(pats)) if pats.len() == items.len() => pats.get(k),
+        (SelfRef::Item(k), Type::Tuple(items), Pattern::List(pats) | Pattern::Tuple(pats)) if pats.len() == items.len() => pats.get(k),
         _ => None,
     }
 }
@@ -4095,7 +4095,7 @@ fn bind_pattern_vars(
         // this design is supposed to handle. Determining the real
         // per-position type before recursing avoids the fresh var ever
         // being eagerly bound to the wrong shape.
-        Pattern::List(pats) => match scrutinee_ty {
+        Pattern::List(pats) | Pattern::Tuple(pats) => match scrutinee_ty {
             Type::Tuple(items) if items.len() == pats.len() => {
                 let mut c = ctx.clone();
                 for (p, item_ty) in pats.iter().zip(items.iter()) {
@@ -4323,7 +4323,7 @@ fn first_unreachable(patterns: &[&Pattern], has_guard: &[bool]) -> Option<usize>
 fn covers_tuple_position(pat: &Pattern, ty: &Type) -> bool {
     match (pat, ty) {
         (Pattern::Var(_), _) => true,
-        (Pattern::List(subpats), Type::Tuple(items)) if subpats.len() == items.len() => {
+        (Pattern::List(subpats) | Pattern::Tuple(subpats), Type::Tuple(items)) if subpats.len() == items.len() => {
             subpats.iter().zip(items.iter()).all(|(sp, t)| covers_tuple_position(sp, t))
         }
         (Pattern::Record(pat_fields), Type::Record(Row { entries: type_fields, .. })) => pat_fields

@@ -11760,6 +11760,16 @@ g(len)").unwrap_err();
         assert_eq!(run_source(src).unwrap().as_int(), 2);
     }
 
+    #[test]
+    fn a_tuple_pattern_parses_to_tuple_and_matches_like_a_list_pattern() {
+        // That the parser emits Tuple for `(..)` and List for `[..]` is pinned by the tuple-versus-list pin test.
+        assert_eq!(expr::Pattern::Tuple(vec![expr::Pattern::Var("a".into())]).positional().map(<[_]>::len), Some(1));
+        // Runtime and type behaviour are unchanged: a tuple pattern still matches a list value and a Tuple type.
+        assert_eq!(run_source("match [5, 6] | (a, b) -> a + b | _ -> 0").unwrap().as_int(), 11);
+        assert_eq!(run_source("match (5, 6) | [a, b] -> a + b | _ -> 0").unwrap().as_int(), 11);
+        assert_eq!(run_source("match (5, 6) | (a, b) -> a + b | _ -> 0").unwrap().as_int(), 11);
+    }
+
     fn run_err(src: &str) -> String {
         run_source(src).expect_err("a run-time type error")
     }
