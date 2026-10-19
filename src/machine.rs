@@ -983,8 +983,38 @@ fn conform_then(then: &Then, check: &CheckSpec, lens: &[Len], value: Value, ctx:
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    // How many wrappers a crossing merged into an existing contract (wrap_function).
+    pub(crate) static CONTRACT_COLLAPSES: Cell<usize> = const { Cell::new(0) };
+}
+
+// Would wrapping `c` again at `ctx` only repeat checks `c` already makes? Equal parameter and result
+// types, no index-variable table or witness anywhere (a `Vec(n)` type can check differently under a
+// different table), and both sites agree on `trusted` (a trusted outer site skips the argument check an
+// untrusted inner one makes).
+fn collapsible(c: &Contract, param: &Rc<Lazy>, ret: &Rc<Lazy>, ctx: &SiteCtx) -> bool {
+    let plain = |s: &SiteCtx| s.table.is_empty() && s.witness.is_none();
+    (Rc::ptr_eq(&c.param, param) || *c.param.ty == *param.ty)
+        && (Rc::ptr_eq(&c.ret, ret) || *c.ret.ty == *ret.ty)
+        && plain(&c.ctx)
+        && plain(&c.ret_ctx)
+        && plain(ctx)
+        && c.ctx.spec.trusted == ctx.spec.trusted
+        && c.ret_ctx.spec.trusted == ctx.spec.trusted
+}
+
 // `f` as a contract of this parameter and result at `ctx`.
 fn wrap_function(param: &Rc<Lazy>, ret: &Rc<Lazy>, f: Value, ctx: Rc<SiteCtx>) -> Value {
+    // One wrapper for equal targets: arguments blamed at the new (outer) site, results at the old (inner)
+    // one, which is where a stack of two would blame them.
+    if let Value::Contract(c) = &f
+        && collapsible(c, param, ret, &ctx)
+    {
+        #[cfg(test)]
+        CONTRACT_COLLAPSES.with(|n| n.set(n.get() + 1));
+        return Value::Contract(Rc::new(Contract { f: c.f.clone(), param: param.clone(), ret: ret.clone(), ret_ctx: c.ret_ctx.clone(), ctx }));
+    }
     Value::Contract(Rc::new(Contract { f, param: param.clone(), ret: ret.clone(), ret_ctx: ctx.clone(), ctx }))
 }
 

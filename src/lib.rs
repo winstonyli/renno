@@ -11570,6 +11570,33 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn a_result_failure_after_two_crossings_blames_the_first_site() {
+        // Column 52 is the first `d`: the inner contract's result check runs first, before any outer one.
+        let src = "let d: Dyn = fun x -> \"s\" in let g: (Int -> Int) = d in let d2: Dyn = g in let h: (Int -> Int) = d2 in h(1)";
+        let err = run_err(src);
+        assert!(err.contains("column 52") && err.contains("expected Int, found Str"), "{err}");
+    }
+
+    #[test]
+    fn repeated_crossings_of_a_container_function_collapse_too() {
+        let src = "let rec loop = fun n -> fun xs -> if n == 0 then (match xs | g :: _ -> g(1) | _ -> 0) else (let d: Dyn = xs in let ys: [Int -> Int] = d in loop(n - 1)(ys)) in loop(200)([fun x -> x + 1])";
+        machine::CONTRACT_COLLAPSES.with(|c| c.set(0));
+        assert_eq!(run_source_on_this_thread(src).expect("runs").as_int(), 2);
+        assert_eq!(machine::CONTRACT_COLLAPSES.with(|c| c.get()), 199);
+    }
+
+    #[test]
+    fn a_function_whose_site_has_an_index_table_never_collapses() {
+        // `n` is the parameter's own index variable, so each site carries a table and its wrappers are not interchangeable.
+        let src = "let rec loop = fun i -> fun v: Vec(n) -> fun p -> if i == 0 then (match p | (u, g) -> g(u) | _ -> 0) else (let d: Dyn = p in let q: (Vec(n), (Vec(n) -> Int)) = d in loop(i - 1)(v)(q)) in loop(5)([1, 2])(([3, 4], fun w -> len(w)))";
+        machine::CONTRACT_COLLAPSES.with(|c| c.set(0));
+        machine::MAP_REBUILDS.with(|c| c.set(0));
+        assert_eq!(run_source_on_this_thread(src).expect("runs").as_int(), 2);
+        assert_eq!(machine::MAP_REBUILDS.with(|c| c.get()), 5, "every crossing wraps");
+        assert_eq!(machine::CONTRACT_COLLAPSES.with(|c| c.get()), 0);
+    }
+
+    #[test]
     fn a_path_prints_root_first() {
         use crate::value::{PathStep, Step};
         use std::rc::Rc;
