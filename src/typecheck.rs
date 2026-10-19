@@ -2283,7 +2283,7 @@ fn cast_now(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEn
     let (from, to) = (from.clone(), to.clone());
     // Only a function value relate cannot prove is wrapped. Refuted never reaches here from
     // coerce (coerce_check reported it); joins and Dyn sinks cannot refute a Fun.
-    if !matches!(from, Type::Fun(..)) || !matches!(relate_cast(&from, &to, env.infer), Rel::Unknown(..)) {
+    if !matches!(from, Type::Fun(..)) || !matches!(relate_cast(&from, &to, env.infer), Rel::Unknown(res, _) if !res.row_only()) {
         return e;
     }
     if matches!(arena[e], Expr::Lambda(..)) {
@@ -5214,8 +5214,10 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         Mode::Synth => elaborate_node(arena, cur_expr, &cur_ctx, spans, infer, cur_mode)?,
     };
     if let Mode::Check(expected) = cur_mode {
-        result_expr = coerce(arena, result_expr, &result_ty, expected, spans[cur_expr], &CheckEnv::new(infer))?;
+        // The cast is built after the unifier has bound the tails (spec 2.3, D9).
+        let checked = coerce_check(arena, result_expr, &result_ty, expected, spans[cur_expr], &CheckEnv::new(infer))?;
         unify_fits(expected, &result_ty, infer, spans[cur_expr])?;
+        result_expr = coerce_cast(arena, checked, &result_ty, expected, &CheckEnv::new(infer).with_span(spans[cur_expr]));
         result_ty = expected.clone();
     }
 
@@ -5317,10 +5319,10 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
     // see this file's own regression history for why skipping this step
     // silently accepted `let f: Int = fun x -> x in ...`).
     if let Mode::Check(expected) = mode {
-        let checked = coerce(arena, result_expr, &result_ty, expected, spans[expr], &CheckEnv::new(infer))?;
+        let checked = coerce_check(arena, result_expr, &result_ty, expected, spans[expr], &CheckEnv::new(infer))?;
         unify_fits(expected, &result_ty, infer, spans[expr])?;
+        result_expr = coerce_cast(arena, checked, &result_ty, expected, &CheckEnv::new(infer).with_span(spans[expr]));
         result_ty = expected.clone();
-        result_expr = checked;
     }
 
     Ok((result_ty, result_row, result_expr))

@@ -2,7 +2,7 @@
 //! S2 T1 added `Why`/`Undecided`/`relate_cast`; consumers: coerce_check and the unify_fits rescue (T3), coerce_cast (T4).
 use super::{free_index_vars, row_compatible, unify_index_expr, InferCtx};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
-use crate::types::{is_big, unfold, ById, FxMap, RecRef, Row, Type};
+use crate::types::{is_big, unfold, ById, FxMap, RecRef, Row, Tail, Type};
 use crate::util::find_field;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -35,9 +35,11 @@ impl Residual {
     pub(crate) const LAZY: Residual = Residual(16);
     /// No value test, wrapper or unifier step decides it: a static error.
     pub(crate) const UNDECIDED: Residual = Residual(32);
+    /// A record's tails decide it: `unify_fits` binds them, no value test or wrapper is needed.
+    pub(crate) const ROW: Residual = Residual(64);
     #[cfg(test)]
     fn collect(self, out: &mut BTreeSet<&'static str>) {
-        let names = [(Self::TEST, "Test"), (Self::FUN, "Fun"), (Self::LEN, "Len"), (Self::INDEX_EQ, "IndexEq"), (Self::LAZY, "Lazy"), (Self::UNDECIDED, "Undecided")];
+        let names = [(Self::TEST, "Test"), (Self::FUN, "Fun"), (Self::LEN, "Len"), (Self::INDEX_EQ, "IndexEq"), (Self::LAZY, "Lazy"), (Self::UNDECIDED, "Undecided"), (Self::ROW, "Row")];
         out.extend(names.iter().filter(|(bit, _)| self.0 & bit.0 != 0).map(|(_, name)| *name));
     }
     /// Some part is decided by a value test (lowered by `build_boundary_check`).
@@ -46,6 +48,10 @@ impl Residual {
     }
     pub(crate) fn undecided(self) -> bool {
         self.0 & Self::UNDECIDED.0 != 0
+    }
+    /// Nothing but record tails is open (no wrapper, no test).
+    pub(crate) fn row_only(self) -> bool {
+        self == Self::ROW
     }
 }
 impl std::ops::BitOr for Residual {
@@ -220,7 +226,7 @@ fn decide(from: Type, to: Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Re
                 Rel::Refuted(w) => !w.observable(),
                 // An Undecided nested in the alternative stays Undecided. Otherwise only an Imprecise
                 // Unknown Fun alternative is a wrapper to add; Incomplete (a cap) stays a runtime test.
-                Rel::Unknown(res, c) => res.undecided() || (*c == Cause::Imprecise && matches!(infer.resolve(a), Type::Fun(..))),
+                Rel::Unknown(res, c) => res.undecided() || (*c == Cause::Imprecise && !res.row_only() && matches!(infer.resolve(a), Type::Fun(..))),
                 Rel::Proven => false,
             }) {
                 Rel::Unknown(Residual::UNDECIDED, Cause::Incomplete)
@@ -273,10 +279,7 @@ fn decide(from: Type, to: Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Re
         (Type::Tuple(_), Type::List(e)) => {
             if loose(&infer.resolve(e)) { Rel::Proven } else { Rel::refuted("tuple into list") }
         }
-        (Type::Record(Row { entries: a, .. }), Type::Record(Row { entries: b, .. })) => and(b.iter().map(|(name, t)| match find_field(a, name) {
-            Some(ft) => go(ft, t, infer, fuel, d),
-            None => Rel::refuted("missing field"),
-        })),
+        (Type::Record(s), Type::Record(t)) => record_rel(&infer.flatten_row(s), &infer.flatten_row(t), infer, fuel, d),
         (Type::Fun(..), Type::Fun(..)) => fun_rel(&from, &to, infer, fuel, d),
         _ => Rel::refuted("shape"),
     }
@@ -295,10 +298,57 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
         _ => (Type::Dyn, Type::Dyn),
     };
     match and([go(&a2, a, infer, fuel, d), go(b, &b2, infer, fuel, d)]) {
+        // A pure ROW stays one: the unifier decides it, a wrapper would not help.
+        Rel::Unknown(res, c) if res.row_only() => Rel::Unknown(res, c),
         Rel::Unknown(res, c) if !res.undecided() => Rel::Unknown(Residual::FUN, c),
         Rel::Refuted(Why::Shape(w)) => Rel::Refuted(Why::Opaque(w)),
         other => other,
     }
+}
+/// A record against a record (spec 2.3): the tails decide where a lacking or extra field may go,
+/// the payloads of common fields are related recursively. Refuted dominates, Unknowns join.
+fn record_rel(s: &Row, t: &Row, infer: &InferCtx, fuel: &Budget, d: usize) -> Rel {
+    #[derive(PartialEq)]
+    enum Kind {
+        Closed,
+        Flexible,
+        Rigid,
+    }
+    let kind = |tail: &Tail| match tail {
+        Tail::Closed => Kind::Closed,
+        Tail::Var(v) if infer.rigid_row.contains(v) => Kind::Rigid,
+        _ => Kind::Flexible,
+    };
+    let lacking = t.entries.iter().any(|(l, _)| !s.has(l));
+    let extras = s.entries.iter().any(|(l, _)| !t.has(l));
+    let same_tail = matches!((&s.tail, &t.tail), (Tail::Var(a), Tail::Var(b)) if a == b);
+    let row = if same_tail {
+        if lacking || extras { Rel::opaque("record rows: same tail, different fields") } else { Rel::Proven }
+    } else {
+        let unknown = |r: Residual| Rel::Unknown(r, Cause::Imprecise);
+        match (kind(&s.tail), kind(&t.tail)) {
+            (Kind::Closed, Kind::Closed) | (Kind::Rigid, Kind::Closed) => {
+                if lacking { Rel::refuted("missing field") } else { Rel::Proven }
+            }
+            (Kind::Closed, Kind::Flexible) | (Kind::Rigid, Kind::Flexible) => {
+                if lacking { Rel::refuted("missing field") } else { unknown(Residual::ROW) }
+            }
+            (Kind::Closed, Kind::Rigid) => Rel::opaque("closed record into a rigid row"),
+            (Kind::Flexible, Kind::Closed) => {
+                if lacking { unknown(Residual::TEST) } else { Rel::Proven }
+            }
+            (Kind::Flexible, Kind::Flexible) => unknown(if lacking { Residual::TEST } else { Residual::ROW }),
+            (Kind::Flexible, Kind::Rigid) => {
+                if extras {
+                    Rel::opaque("record fields into a rigid row")
+                } else {
+                    unknown(if lacking { Residual::TEST } else { Residual::ROW })
+                }
+            }
+            (Kind::Rigid, Kind::Rigid) => Rel::opaque("different rigid record rows"),
+        }
+    };
+    and(std::iter::once(row).chain(t.entries.iter().filter_map(|(name, tt)| find_field(&s.entries, name).map(|st| go(st, tt, infer, fuel, d)))))
 }
 /// Read-only index half of `unify_index_expr`. Equal -> Proven; cap/overflow -> Unknown(IndexEq,
 /// Incomplete); differ by a nonzero constant -> Refuted; a bare flexible variable (bound by
@@ -666,5 +716,59 @@ mod tests {
         // Alone, at the same depth, the pair is past the cap and not proven.
         let (deep_from, deep_to) = (nest(&a), nest(&b));
         assert_ne!(relate(&deep_from, &deep_to, &infer), Rel::Proven);
+    }
+
+    #[test]
+    fn relate_records_follows_the_row_table() {
+        use crate::typecheck::RowRank;
+        use crate::types::{Hc, Tail};
+        let mut infer = InferCtx::new();
+        let (f1, f2) = (infer.fresh_row(RowRank::User, "f"), infer.fresh_row(RowRank::User, "g"));
+        let (r1, r2) = (infer.fresh_row(RowRank::User, "r"), infer.fresh_row(RowRank::User, "s"));
+        infer.rigid_row.insert(r1.clone());
+        infer.rigid_row.insert(r2.clone());
+        let rec = |fields: &[&str], tail: Tail| Type::Record(Row::from_entries(fields.iter().map(|l| (l.to_string(), Type::Int)).collect(), tail));
+        let (c, fl, fl2, ri, ri2) = (Tail::Closed, Tail::Var(f1.clone()), Tail::Var(f2), Tail::Var(r1.clone()), Tail::Var(r2));
+        let kinds = |s: Type, t: Type| -> String {
+            match relate(&s, &t, &infer) {
+                Rel::Proven => "Proven".into(),
+                Rel::Refuted(_) => "Refuted".into(),
+                Rel::Unknown(..) => format!("{:?}", relate(&s, &t, &infer).kinds()),
+            }
+        };
+        // closed / closed: width, as today
+        assert_eq!(kinds(rec(&["x", "y"], c.clone()), rec(&["x"], c.clone())), "Proven");
+        assert_eq!(kinds(rec(&["x"], c.clone()), rec(&["x", "y"], c.clone())), "Refuted");
+        // closed / flexible: lacking refuted, else the unifier decides
+        assert_eq!(kinds(rec(&["x"], c.clone()), rec(&["x", "y"], fl.clone())), "Refuted");
+        assert_eq!(kinds(rec(&["x", "y"], c.clone()), rec(&["x"], fl.clone())), "{\"Row\"}");
+        // closed / rigid: nowhere for the rest to go
+        assert_eq!(kinds(rec(&["x"], c.clone()), rec(&["x"], ri.clone())), "Refuted");
+        // flexible / closed: lacking becomes a value test, else proven
+        assert_eq!(kinds(rec(&["x"], fl.clone()), rec(&["x", "y"], c.clone())), "{\"Test\"}");
+        assert_eq!(kinds(rec(&["x", "y"], fl.clone()), rec(&["x"], c.clone())), "Proven");
+        // flexible / flexible: same variable decided by labels; distinct ones by the table
+        assert_eq!(kinds(rec(&["x"], fl.clone()), rec(&["y"], fl.clone())), "Refuted");
+        assert_eq!(kinds(rec(&["x"], fl.clone()), rec(&["x"], fl.clone())), "Proven");
+        assert_eq!(kinds(rec(&["x"], fl.clone()), rec(&["x", "y"], fl2.clone())), "{\"Test\"}");
+        assert_eq!(kinds(rec(&["x"], fl.clone()), rec(&["x"], fl2.clone())), "{\"Row\"}");
+        // flexible / rigid: extras refuted (a rigid tail cannot absorb them)
+        assert_eq!(kinds(rec(&["x", "y"], fl.clone()), rec(&["x"], ri.clone())), "Refuted");
+        assert_eq!(kinds(rec(&["x"], fl.clone()), rec(&["x"], ri.clone())), "{\"Row\"}");
+        // rigid / closed, rigid / flexible
+        assert_eq!(kinds(rec(&["x"], ri.clone()), rec(&["x", "y"], c.clone())), "Refuted");
+        assert_eq!(kinds(rec(&["x", "y"], ri.clone()), rec(&["x"], c.clone())), "Proven");
+        assert_eq!(kinds(rec(&["x", "y"], ri.clone()), rec(&["x"], fl.clone())), "{\"Row\"}");
+        // rigid / rigid: the same variable and equal labels only
+        assert_eq!(kinds(rec(&["x"], ri.clone()), rec(&["x"], ri.clone())), "Proven");
+        assert_eq!(kinds(rec(&["x"], ri.clone()), rec(&["x"], ri2.clone())), "Refuted");
+        // A pure ROW inside a function stays ROW (no wrapper), a TEST becomes a wrapper.
+        let fun = |s: Type, t: Type| (Type::Fun(Hc::new(s), Row::dyn_(), Hc::new(Type::Int)), Type::Fun(Hc::new(t), Row::dyn_(), Hc::new(Type::Int)));
+        let (a, b) = fun(rec(&["x"], fl.clone()), rec(&["x"], fl2.clone()));
+        assert_eq!(kinds(a, b), "{\"Row\"}");
+        let (a, b) = fun(rec(&["x"], fl.clone()), rec(&["x", "y"], c.clone()));
+        assert_eq!(kinds(a, b), "{\"Row\"}");
+        let (a, b) = fun(rec(&["x", "y"], c.clone()), rec(&["x"], fl.clone()));
+        assert_eq!(kinds(a, b), "{\"Fun\"}");
     }
 }
