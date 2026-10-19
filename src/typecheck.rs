@@ -2198,10 +2198,22 @@ fn cast_now(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEn
 // parameter checks. Call once, after the whole join: a later arm can still
 // change the join, and an arm that unified with an already-Dyn join needs the
 // cast too. Infallible; non-function and equal-typed arms come back unchanged.
-fn cast_join_arms(arena: &mut Arena, arms: &mut [ExprRef], tys: &[Type], join: &Type, infer: &InferCtx) {
-    for (arm, ty) in arms.iter_mut().zip(tys) {
-        *arm = coerce_cast(arena, *arm, ty, join, &CheckEnv::new(infer));
+fn cast_join_arms(arena: &mut Arena, arms: &mut [ExprRef], tys: &[Type], spans: &[Span], join: &Type, infer: &InferCtx) {
+    for ((arm, ty), span) in arms.iter_mut().zip(tys).zip(spans) {
+        *arm = join_arm(arena, *arm, ty, join, *span, infer);
     }
+}
+
+// One arm to the joined type: the boundary check a Dyn (or partly Dyn) arm needs, then the
+// function cast. The join unified the arm with its type, so the check should not refute; if it
+// does, the arm is left as the join found it.
+fn join_arm(arena: &mut Arena, e: ExprRef, from: &Type, join: &Type, span: Span, infer: &InferCtx) -> ExprRef {
+    if infer.resolve_deep(from) == infer.resolve_deep(join) {
+        return e;
+    }
+    let checked = coerce_check(arena, e, from, join, span, &CheckEnv::at(infer, span)).unwrap_or(e);
+    // The function cast keeps blaming the function's own parameter (no join span).
+    coerce_cast(arena, checked, from, join, &CheckEnv::new(infer))
 }
 
 // Binder names a cast introduces (`__cf`, `__ca`): fresh and unlexable
@@ -5475,7 +5487,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 },
                 Mode::Synth => None,
             };
-            for item in items {
+            for &item in &items {
                 let (item_ty, item_row, item2) = match &want_elem {
                     Some(want) => {
                         let (r, e) = check_against(arena, item, want, ctx, spans, infer)?;
@@ -5501,7 +5513,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // flatten the whole result.
             let elem_ty = elem_ty.unwrap_or_else(|| infer.fresh_var("elem"));
             if matches!(mode, Mode::Synth) {
-                cast_join_arms(arena, &mut refs, &item_tys, &elem_ty, infer);
+                let item_spans: Vec<Span> = items.iter().map(|i| spans[*i]).collect();
+                cast_join_arms(arena, &mut refs, &item_tys, &item_spans, &elem_ty, infer);
             }
             // Case A construction (design spec 2026-09-20 sec 1): checked
             // against an Indexed(List(_), _) expected type, synthesize the
@@ -5773,7 +5786,13 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     unify(&forget_index(&r_ty), &list_shape, infer, spans[r])?;
                     unify(&l_ty, &elem_ty, infer, spans[l])?;
                     let result_ty = Type::List(Hc::new(infer.resolve_deep(&elem_ty)));
-                    Ok((result_ty, row, arena.push(Expr::BinOp(op, l2, r2))))
+                    // Each operand meets the result at its own type (the `++` rule), so a `Dyn`
+                    // head or tail is checked against the element type the join settled on.
+                    let l3 = join_arm(arena, l2, &l_ty, &infer.resolve_deep(&elem_ty), spans[l], infer);
+                    // A bare `Dyn` tail is not: the head's type bound the element, and a mixed
+                    // dynamic list (`"s" :: d`) is a valid `Dyn` value; its shape is checked by `::`.
+                    let r3 = if infer.resolve_deep(&r_ty) == Type::Dyn { r2 } else { join_arm(arena, r2, &r_ty, &result_ty, spans[r], infer) };
+                    Ok((result_ty, row, arena.push(Expr::BinOp(op, l3, r3))))
                 }
             }
         }
@@ -5795,7 +5814,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         Err(_) => Type::Dyn,
                     };
                     let mut arms = [t2, e2];
-                    cast_join_arms(arena, &mut arms, &[t_ty, e_ty], &result_ty, infer);
+                    cast_join_arms(arena, &mut arms, &[t_ty, e_ty], &[spans[t], spans[e]], &result_ty, infer);
                     let [t2, e2] = arms;
                     (result_ty, t_row, e_row, t2, e2)
                 }
@@ -5941,6 +5960,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let mut result_ty: Option<Type> = None;
             let mut new_arms = Vec::with_capacity(arms.len());
             let mut arm_tys = Vec::with_capacity(arms.len());
+            let mut arm_spans = Vec::with_capacity(arms.len());
             for (pat, (_, guard, body)) in pats.iter().copied().zip(arms.iter()) {
                 if !pattern_could_match(pat, &scrut_ty, &Visiting::default()) {
                     return Err(TypeError(
@@ -6099,6 +6119,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     Mode::Synth => {
                         let (arm_ty, arm_row, body2) = elaborate(arena, *body, &arm_ctx, spans, infer)?;
                         arm_tys.push(arm_ty.clone());
+                        arm_spans.push(spans[*body]);
                         result_ty = Some(match result_ty {
                             None => arm_ty,
                             Some(t) => match unify_trial(&t, &arm_ty, infer, spans[expr]) {
@@ -6148,7 +6169,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             };
             if matches!(mode, Mode::Synth) {
                 let mut bodies: Vec<ExprRef> = new_arms.iter().map(|(_, _, b)| *b).collect();
-                cast_join_arms(arena, &mut bodies, &arm_tys, &final_ty, infer);
+                cast_join_arms(arena, &mut bodies, &arm_tys, &arm_spans, &final_ty, infer);
                 for (arm, body) in new_arms.iter_mut().zip(bodies) {
                     arm.2 = body;
                 }

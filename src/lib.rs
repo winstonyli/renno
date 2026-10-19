@@ -11476,10 +11476,11 @@ g(len)").unwrap_err();
     // `explain` counts the failing element from the head across a sealed 1000-element list.
     #[test]
     fn a_bad_element_above_a_sealed_list_is_named_by_its_index() {
-        let src = "let d: Dyn = range(0)(1000) in let ok: List(Int) = d in let bad: Dyn = \"bad\" in \
-                   let a: Dyn = 1 :: 2 :: 3 :: bad :: 4 :: 5 :: 6 :: 7 :: 8 :: d in let z: List(Int) = a in len(z)";
+        let src = "let d: Dyn = range(0)(1000) in let ok: List(Int) = d in \
+                   let u: Dyn = 4 :: 5 :: 6 :: 7 :: 8 :: d in let t: Dyn = \"bad\" :: u in \
+                   let a: Dyn = 1 :: 2 :: 3 :: t in let z: List(Int) = a in len(z)";
         let err = run_err(src);
-        assert!(err.starts_with("line 1, column 165: type error: expected [Int], found Str at element 3"), "{err}");
+        assert!(err.starts_with("line 1, column 179: type error: expected [Int], found Str at element 3"), "{err}");
     }
 
     // One value, two element tests: a pass for the wider test says nothing about the narrower.
@@ -12409,5 +12410,26 @@ g(len)").unwrap_err();
         }
         src.push_str("match [t28] ++ [t28] | _ :: _ -> 1 | _ -> 0");
         assert_eq!(finishes_within(20, &src).expect("runs").as_int(), 1);
+    }
+
+    // ---- join arms are checked against the joined type (survey 2026-10-18-soundness-cluster-survey.md, mechanism A) ----
+
+    // A `Dyn` arm met against a concrete one is tested where the join settles, at every join site.
+    #[test]
+    fn a_dyn_join_arm_is_checked_against_the_joined_type() {
+        let want = "expected Int, found Str";
+        fails_at_run_time("let d: Dyn = \"s\" in match [1, d] | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0", want);
+        fails_at_run_time("let d: Dyn = \"s\" in match d :: [1] | h :: _ -> (let w: Int = h in w) | _ -> 0", want);
+        fails_at_run_time("let d: Dyn = \"s\" in let b = false in match (if b then [1] else [d]) | h :: _ -> (let w: Int = h in w) | _ -> 0", "expected [Int], found Str at element 0");
+        fails_at_run_time("let d: Dyn = \"s\" in let b = false in let x = (if b then 1 else d) in let w: Int = x in w", want);
+        fails_at_run_time("let d: Dyn = \"s\" in let b = false in let x = (match b | true -> 1 | _ -> d) in let w: Int = x in w", want);
+    }
+
+    // A right `Dyn` arm, and a bare `Dyn` tail of `::`, keep running (a mixed dynamic list is a `Dyn` value).
+    #[test]
+    fn a_dyn_join_arm_that_fits_or_stays_dyn_keeps_running() {
+        runs_to("let d: Dyn = 5 in let b = false in let x = (if b then 1 else d) in let w: Int = x in w", "5");
+        runs_to("let d: Dyn = [1, 2] in let ys: Dyn = \"bad\" :: d in len(ys)", "3");
+        runs_to("let d: Dyn = 7 in match [1, d] | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0", "7");
     }
 }
