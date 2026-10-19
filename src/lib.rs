@@ -11668,6 +11668,21 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn two_instances_of_one_recursive_type_differing_only_in_rows_relate() {
+        let p1 = "let rec R = Union(Int, Fun((R,\"e\",Int))) in let f = fun g: R -> 1 in let h: R = 3 in f(h)";
+        assert_eq!(run_source(p1).unwrap().as_int(), 1);
+        // The rows stay bound: a second call and a later annotation of the same value pass too.
+        let twice = "let rec R = Union(Int, Fun((R,\"e\",Int))) in let f = fun g: R -> 1 in let h: R = 3 in f(h) + f(h)";
+        assert_eq!(run_source(twice).unwrap().as_int(), 2);
+        let later = "let rec R = Union(Int, Fun((R,\"e\",Int))) in let h: R = 3 in let k: R = h in let f = fun g: R -> 1 in f(k) + f(h)";
+        assert_eq!(run_source(later).unwrap().as_int(), 2);
+        // A difference outside a row is still two different types (q3: covariance is not added here).
+        let q3 = "let rec L = Union(Int, Fun((L,\"e\",Int))) in let rec M = Union(Int, Str, Fun((M,\"e\",Int))) in let f = fun g: M -> 1 in let h: L = 3 in f(h)";
+        let err = run_err(q3);
+        assert!(err.contains("expected M, found L"), "{err}");
+    }
+
+    #[test]
     fn a_union_or_rec_function_in_a_container_keeps_its_parameter_check() {
         let union = "let l: [Union(Int, (Int -> Int))] = [fun x: Int -> x] in let d: Dyn = l in match d | g :: _ -> g(\"s\") | _ -> 0";
         let rec = "let rec R = Union(Int, Fun((Int, Int))) in let l: [R] = [fun x: Int -> x] in let d: Dyn = l in match d | g :: _ -> g(\"s\") | _ -> 0";
