@@ -12142,6 +12142,38 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn row_unifier_binds_payloads_of_common_labels() {
+        use crate::typecheck::{unify, unify_rows_with, InferCtx, RowRank};
+        use types::{Row, Tail, Type};
+        let mut infer = InferCtx::new();
+        let a = infer.fresh_var("a");
+        let sp = crate::span::Span { start: 0, end: 1 };
+        let r1 = Row::from_entries(vec![("x".into(), a.clone())], Tail::Closed);
+        let r2 = Row::from_entries(vec![("x".into(), Type::Int)], Tail::Closed);
+        assert!(unify_rows_with(&r1, &r2, &mut infer, &mut |p, q, i| unify(p, q, i, sp).is_ok()));
+        assert_eq!(infer.resolve_deep(&a), Type::Int);
+        // A payload mismatch binds nothing.
+        let b = infer.fresh_row(RowRank::User, "e");
+        let r3 = Row::from_entries(vec![("x".into(), Type::Str)], Tail::Var(b.clone()));
+        assert!(!unify_rows_with(&r3, &r2, &mut infer, &mut |p, q, i| unify(p, q, i, sp).is_ok()));
+        assert!(infer.flattened(&Row::var(b)).is_none());
+    }
+
+    #[test]
+    fn row_unifier_split_keeps_extra_entry_types() {
+        use crate::typecheck::{unify_rows, InferCtx, RowRank};
+        use types::{Row, Tail, Type};
+        let mut infer = InferCtx::new();
+        let (a, b) = (infer.fresh_row(RowRank::User, "r"), infer.fresh_row(RowRank::User, "s"));
+        let left = Row::from_entries(vec![("x".into(), Type::Int)], Tail::Var(a.clone()));
+        let right = Row::from_entries(vec![("y".into(), Type::Str)], Tail::Var(b));
+        assert!(unify_rows(&left, &right, &mut infer));
+        let flat = infer.flatten_row(&left);
+        let shown: Vec<_> = flat.entries.iter().map(|(l, t)| format!("{l}: {t}")).collect();
+        assert_eq!(shown, ["x: Int", "y: Str"], "{flat}");
+    }
+
+    #[test]
     fn resolve_deep_flattens_bound_row_tails_in_every_position() {
         use crate::typecheck::{unify_rows, InferCtx, RowRank};
         use types::{Row, Tail, Type};

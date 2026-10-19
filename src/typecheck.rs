@@ -804,7 +804,7 @@ impl InferCtx {
     // own instantiation) rather than a second, separate one -- there's
     // no reason a fresh name minted here and one minted by instantiating
     // a generalized scheme should draw from different namespaces.
-    fn fresh_var(&mut self, base: &str) -> Type {
+    pub(crate) fn fresh_var(&mut self, base: &str) -> Type {
         Type::Var(fresh_type_name(base))
     }
 
@@ -910,31 +910,31 @@ impl InferCtx {
         // The variables walked (not already compressed to their end) with their own labels.
         let mut path: Vec<(String, usize)> = Vec::new();
         let mut cache = self.flat_rows.borrow_mut();
-        let mut labels: Vec<String> = Vec::new();
+        let mut entries: Vec<(String, Type)> = Vec::new();
         let mut tail = Tail::Var(first.clone());
         while let Tail::Var(name) = &tail {
             // Only a bound variable has a cache entry, so an unbound one costs a single lookup.
             let Some(bound) = self.row_subst.get(name) else { break };
             if let Some(done) = cache.get(name.as_str()) {
                 // Entries are prefixes: the cached end may have been bound since, so go on.
-                labels.extend(done.labels().map(String::from));
+                entries.extend(done.entries.iter().cloned());
                 tail = done.tail.clone();
                 continue;
             }
-            path.push((name.clone(), labels.len()));
-            labels.extend(bound.labels().map(String::from));
+            path.push((name.clone(), entries.len()));
+            entries.extend(bound.entries.iter().cloned());
             tail = bound.tail.clone();
         }
         if path.len() > 1 {
-            // Each walked variable flattens to the labels from its own on, and the final tail.
+            // Each walked variable flattens to the entries from its own on, and the final tail.
             for (name, from) in path {
-                cache.insert(name, Row::new(labels[from..].to_vec(), tail.clone()));
+                cache.insert(name, Row::from_entries(entries[from..].to_vec(), tail.clone()));
             }
         }
-        if labels.is_empty() && tail == row.tail {
+        if entries.is_empty() && tail == row.tail {
             return None;
         }
-        Some(Row::new(row.labels().map(String::from).chain(labels).collect(), tail))
+        Some(Row::from_entries(row.entries.iter().cloned().chain(entries).collect(), tail))
     }
 
     // A fresh instance of quantified row variable `v` (lookup): same base and rank.
@@ -1181,7 +1181,7 @@ pub(crate) fn unify_index(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCtx, sp
 // Called unconditionally from Expr::App/BinOp::Cons/If/Match/ListLit
 // (Tasks 4-6) -- a real decision point on every elaboration, not a
 // not-yet-wired-in mechanism.
-fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
+pub(crate) fn unify(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
     unify_in(t1, t2, infer, span, &mut FxSet::default())
 }
 
@@ -1220,26 +1220,36 @@ enum RowPlan {
     Bind(String, Row),
     // Two distinct flexible tails, at least one side with labels the other lacks: a fresh tail
     // named and ranked after `winner` takes both: a := {only_b | σ}, b := {only_a | σ}.
-    Split { a: String, b: String, only_a: Vec<String>, only_b: Vec<String>, winner: String },
+    Split { a: String, b: String, only_a: Vec<(String, Type)>, only_b: Vec<(String, Type)>, winner: String },
 }
 
-fn row_plan(r1: &Row, r2: &Row, infer: &InferCtx) -> Option<RowPlan> {
+// The plan, and the payload pairs of the labels both (flattened) rows have.
+fn row_plan(r1: &Row, r2: &Row, infer: &InferCtx) -> Option<(RowPlan, Vec<(Type, Type)>)> {
     let (r1, r2) = (infer.flatten_row(r1), infer.flatten_row(r2));
     if r1.is_dyn() || r2.is_dyn() {
-        return Some(RowPlan::Nothing);
+        return Some((RowPlan::Nothing, Vec::new()));
     }
-    let only1: Vec<String> = r1.labels().filter(|l| !r2.has(l)).map(String::from).collect();
-    let only2: Vec<String> = r2.labels().filter(|l| !r1.has(l)).map(String::from).collect();
+    let only1: Vec<(String, Type)> = r1.entries.iter().filter(|(l, _)| !r2.has(l)).cloned().collect();
+    let only2: Vec<(String, Type)> = r2.entries.iter().filter(|(l, _)| !r1.has(l)).cloned().collect();
+    let common: Vec<(Type, Type)> = r1
+        .entries
+        .iter()
+        .filter_map(|(l, t)| r2.entries.iter().find(|(l2, _)| l2 == l).map(|(_, t2)| (t.clone(), t2.clone())))
+        .collect();
+    row_plan_tails(&r1, &r2, only1, only2, infer).map(|p| (p, common))
+}
+
+fn row_plan_tails(r1: &Row, r2: &Row, only1: Vec<(String, Type)>, only2: Vec<(String, Type)>, infer: &InferCtx) -> Option<RowPlan> {
     let flexible = |n: &str| !infer.rigid_row.contains(n);
     match (&r1.tail, &r2.tail) {
         (Tail::Closed, Tail::Closed) => (only1.is_empty() && only2.is_empty()).then_some(RowPlan::Nothing),
-        (Tail::Var(a), Tail::Closed) => (flexible(a) && only1.is_empty()).then(|| RowPlan::Bind(a.clone(), Row::new(only2, Tail::Closed))),
-        (Tail::Closed, Tail::Var(b)) => (flexible(b) && only2.is_empty()).then(|| RowPlan::Bind(b.clone(), Row::new(only1, Tail::Closed))),
+        (Tail::Var(a), Tail::Closed) => (flexible(a) && only1.is_empty()).then(|| RowPlan::Bind(a.clone(), Row::from_entries(only2, Tail::Closed))),
+        (Tail::Closed, Tail::Var(b)) => (flexible(b) && only2.is_empty()).then(|| RowPlan::Bind(b.clone(), Row::from_entries(only1, Tail::Closed))),
         (Tail::Var(a), Tail::Var(b)) if a == b => (only1.is_empty() && only2.is_empty()).then_some(RowPlan::Nothing),
         (Tail::Var(a), Tail::Var(b)) => match (flexible(a), flexible(b)) {
             (false, false) => None,
-            (false, true) => only2.is_empty().then(|| RowPlan::Bind(b.clone(), Row::new(only1, Tail::Var(a.clone())))),
-            (true, false) => only1.is_empty().then(|| RowPlan::Bind(a.clone(), Row::new(only2, Tail::Var(b.clone())))),
+            (false, true) => only2.is_empty().then(|| RowPlan::Bind(b.clone(), Row::from_entries(only1, Tail::Var(a.clone())))),
+            (true, false) => only1.is_empty().then(|| RowPlan::Bind(a.clone(), Row::from_entries(only2, Tail::Var(b.clone())))),
             (true, true) => {
                 let (winner, loser) = row_winner(a, b, infer);
                 if only1.is_empty() && only2.is_empty() {
@@ -1261,21 +1271,30 @@ fn row_winner<'a>(a: &'a str, b: &'a str, infer: &InferCtx) -> (&'a str, &'a str
 
 // Makes two rows equal, binding flexible tails; false (nothing bound) when it cannot.
 pub(crate) fn unify_rows(r1: &Row, r2: &Row, infer: &mut InferCtx) -> bool {
-    match row_plan(r1, r2, infer) {
-        None => false,
-        Some(RowPlan::Nothing) => true,
-        Some(RowPlan::Bind(name, row)) => {
-            infer.bind_row(&name, row);
-            true
-        }
-        Some(RowPlan::Split { a, b, only_a, only_b, winner }) => {
-            let rank = infer.levels.rank(&winner);
-            let sigma = infer.fresh_row(rank, &winner);
-            infer.bind_row(&a, Row::new(only_b, Tail::Var(sigma.clone())));
-            infer.bind_row(&b, Row::new(only_a, Tail::Var(sigma)));
-            true
+    unify_rows_with(r1, r2, infer, &mut |_, _, _| true)
+}
+
+// `unify_rows` for rows with typed entries: `pair` makes the payloads of each common label
+// equal (effect payloads are all `Dyn`, so `unify_rows` passes a no-op). Payloads are unified
+// before any tail is bound; the caller's snapshot undoes a partial failure.
+pub(crate) fn unify_rows_with(r1: &Row, r2: &Row, infer: &mut InferCtx, pair: &mut dyn FnMut(&Type, &Type, &mut InferCtx) -> bool) -> bool {
+    let Some((plan, common)) = row_plan(r1, r2, infer) else { return false };
+    for (a, b) in &common {
+        if !pair(a, b, infer) {
+            return false;
         }
     }
+    match plan {
+        RowPlan::Nothing => {}
+        RowPlan::Bind(name, row) => infer.bind_row(&name, row),
+        RowPlan::Split { a, b, only_a, only_b, winner } => {
+            let rank = infer.levels.rank(&winner);
+            let sigma = infer.fresh_row(rank, &winner);
+            infer.bind_row(&a, Row::from_entries(only_b, Tail::Var(sigma.clone())));
+            infer.bind_row(&b, Row::from_entries(only_a, Tail::Var(sigma)));
+        }
+    }
+    true
 }
 
 // Could unify_rows make the two rows equal? Binds nothing (relate's effect-row test, 2.3).

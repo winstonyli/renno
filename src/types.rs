@@ -498,20 +498,24 @@ thread_local! {
 
 impl Row {
     // `labels` in any order, duplicates allowed; a `Dyn` tail drops them.
-    pub fn new(mut labels: Vec<String>, tail: Tail) -> Row {
-        if tail == Tail::Dyn {
-            labels.clear();
-        }
-        if labels.is_empty() {
-            return Row { entries: NO_LABELS.with(Hc::clone), tail };
-        }
-        labels.sort();
-        labels.dedup();
-        Row { entries: Hc::new(labels.into_iter().map(|l| (l, Type::Dyn)).collect()), tail }
+    pub fn new(labels: Vec<String>, tail: Tail) -> Row {
+        Row::from_entries(labels.into_iter().map(|l| (l, Type::Dyn)).collect(), tail)
     }
 
-    // The row of a record type: typed entries in source order (no sorting, no `Dyn` payloads),
-    // tail closed.
+    // Typed entries in any order, duplicate labels keep the first; a `Dyn` tail drops them.
+    pub fn from_entries(mut entries: Vec<(String, Type)>, tail: Tail) -> Row {
+        if tail == Tail::Dyn {
+            entries.clear();
+        }
+        if entries.is_empty() {
+            return Row { entries: NO_LABELS.with(Hc::clone), tail };
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|b, a| a.0 == b.0);
+        Row { entries: Hc::new(entries), tail }
+    }
+
+    // The row of a record type: typed entries (the caller keeps them sorted by name), tail closed.
     pub fn fields(entries: Hc<Vec<(String, Type)>>) -> Row {
         Row { entries, tail: Tail::Closed }
     }
