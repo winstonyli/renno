@@ -11631,6 +11631,27 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn a_union_or_rec_function_going_to_dyn_keeps_its_parameter_check() {
+        let union = "let u: Union(Int, (Int -> Int)) = fun x: Int -> (let y: Int = x in y) in let d: Dyn = u in d(\"s\")";
+        let rec = "let rec R = Union(Int, Fun((Int, Int))) in let u: R = fun x: Int -> x in let d: Dyn = u in d(\"s\")";
+        for src in [union, rec] {
+            let err = run_err(src);
+            assert!(err.contains("expected Int, found Str"), "{src}: {err}");
+        }
+        // The good call, and a union value that is not a function, still pass.
+        let ok = "let u: Union(Int, (Int -> Int)) = fun x: Int -> x + 1 in let d: Dyn = u in d(1)";
+        assert_eq!(run_source(ok).unwrap().as_int(), 2);
+        let int = "let u: Union(Int, (Int -> Int)) = 3 in let d: Dyn = u in match d | 3 -> 1 | _ -> 0";
+        assert_eq!(run_source(int).unwrap().as_int(), 1);
+        // The argument's type is checked, but an outer index variable inside a Union alternative is not
+        // tied to the outer length (`checked_index_vars` treats a spine function's own parameter variable
+        // as its own binder), unlike the closure form and a container leaf. Open pin: remove when fixed.
+        let len = |arg: &str| format!("let f = fun v: Vec(n) -> (let u: Union(Int, (Vec(n) -> Int)) = fun w: Vec(n) -> len(w) in let d: Dyn = u in d) in f([1,2])({arg})");
+        assert!(run_err(&len("\"s\"")).contains("found Str"));
+        assert_eq!(run_source(&len("[3]")).unwrap().as_int(), 1, "now rejected: remove this pin");
+    }
+
+    #[test]
     fn a_function_free_container_to_dyn_is_not_rebuilt() {
         machine::MAP_REBUILDS.with(|c| c.set(0));
         run_source_on_this_thread("let xs = [1, 2, 3] in let d: Dyn = xs in 1").expect("runs");

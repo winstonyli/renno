@@ -2345,7 +2345,12 @@ fn loses_function_in(from: &Type, to: &Type, infer: &InferCtx, memo: &mut FxMap<
         return *done;
     }
     let answer = match (&from, &to) {
-        (_, Type::Dyn) => map_shape(&Lazy::new(Rc::new(from.clone())), &from, &mut NodeMemo::default()).is_some(),
+        (_, Type::Dyn) => {
+            // A Union or Rec with a function alternative has no `map_shape`, but its own boundary is a
+            // contract (`Boundary::Union`/`Fun`), which a conform to its own type applies.
+            matches!(boundary(&from, &mut Visiting::default()), Boundary::Union(_) | Boundary::Fun(..))
+                || map_shape(&Lazy::new(Rc::new(from.clone())), &from, &mut NodeMemo::default()).is_some()
+        }
         (Type::List(a), Type::List(b)) => loses_function_in(a, b, infer, memo),
         (Type::Tuple(a), Type::Tuple(b)) => a.len() == b.len() && a.iter().zip(b.iter()).any(|(x, y)| loses_function_in(x, y, infer, memo)),
         (Type::Record(a), Type::Record(b)) => a.entries.iter().any(|(n, x)| b.entries.iter().any(|(m, y)| m == n && loses_function_in(x, y, infer, memo))),
