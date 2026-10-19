@@ -270,6 +270,8 @@ pub struct Contract {
     pub param: Rc<Lazy>,
     pub ret: Rc<Lazy>,
     pub ctx: Rc<SiteCtx>,
+    // The site its result is blamed at: the same Rc as `ctx` unless two wrappers collapsed.
+    pub ret_ctx: Rc<SiteCtx>,
 }
 
 // What a site's checks read the length of an index variable from: the site's
@@ -279,12 +281,47 @@ pub struct SiteCtx {
     pub spec: Rc<ConformSpec>,
     pub table: Vec<Len>,
     pub witness: Option<Rc<Witness>>,
+    // Where the function this site wraps sits inside its container, for an error's "function at" text.
+    pub path: Option<Rc<PathStep>>,
 }
 
 pub struct Witness {
     pub name: String,
     pub len: Len,
     pub parent: Option<Rc<Witness>>,
+}
+
+// One step down from a container to a function inside it.
+pub enum Step {
+    Index(usize),
+    Slot(usize),
+    Field(String),
+}
+
+pub struct PathStep {
+    pub step: Step,
+    pub parent: Option<Rc<PathStep>>,
+}
+
+impl PathStep {
+    // The steps from the container down to the function, root first; empty for no path.
+    pub fn text(path: &Option<Rc<PathStep>>) -> String {
+        let mut steps = Vec::new();
+        let mut node = path.as_deref();
+        while let Some(p) = node {
+            steps.push(&p.step);
+            node = p.parent.as_deref();
+        }
+        steps
+            .iter()
+            .rev()
+            .map(|s| match s {
+                Step::Index(i) => format!("[{i}]"),
+                Step::Slot(i) => format!(".{i}"),
+                Step::Field(f) => format!(".{f}"),
+            })
+            .collect()
+    }
 }
 
 impl SiteCtx {
@@ -300,7 +337,11 @@ impl SiteCtx {
     }
 
     pub fn with_witness(&self, name: String, len: Len) -> SiteCtx {
-        SiteCtx { spec: self.spec.clone(), table: self.table.clone(), witness: Some(Rc::new(Witness { name, len, parent: self.witness.clone() })) }
+        SiteCtx { spec: self.spec.clone(), table: self.table.clone(), witness: Some(Rc::new(Witness { name, len, parent: self.witness.clone() })), path: self.path.clone() }
+    }
+
+    pub fn with_path(&self, path: Option<Rc<PathStep>>) -> SiteCtx {
+        SiteCtx { spec: self.spec.clone(), table: self.table.clone(), witness: self.witness.clone(), path }
     }
 }
 

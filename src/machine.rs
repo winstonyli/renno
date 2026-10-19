@@ -14,7 +14,7 @@ use crate::span::Span;
 use crate::text::Text;
 use crate::types::{first_free, fresh_rec_id, open_record_tail_under, Hc, RecVar, Row, Tail, Type};
 use crate::util::find_field;
-use crate::value::{Builtin, Contract, HandlerData, SiteCtx, TypeCtor, Value};
+use crate::value::{Builtin, Contract, HandlerData, PathStep, SiteCtx, TypeCtor, Value};
 
 enum Control {
     Eval(ExprRef, Env),
@@ -411,7 +411,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                             _ => {
                                 // The slots read the env the operand is evaluated in.
                                 let table = spec.lens.iter().map(|slot| eval_slot(slot, &env, resolved)).collect();
-                                Cont::cons(Frame::Conform { lazy: lazy.clone(), ctx: Rc::new(SiteCtx { spec: spec.clone(), table, witness: None }) }, cont)
+                                Cont::cons(Frame::Conform { lazy: lazy.clone(), ctx: Rc::new(SiteCtx { spec: spec.clone(), table, witness: None, path: None }) }, cont)
                             }
                         };
                     }
@@ -738,7 +738,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                         Frame::Check { spec, lens } => {
                             if !test_holds(&spec.test, &spec.defs, lens, &value) {
                                 no_value_error(&spec.test, spec, lens, &value);
-                                check_failed(spec, lens, &value)
+                                check_failed(spec, lens, &value, &None)
                             }
                             cont = rest;
                             control = Control::Apply(value);
@@ -950,7 +950,7 @@ fn conform(lazy: &Lazy, ctx: &Rc<SiteCtx>, value: Value) -> Value {
     // A union's own test is the failure when no alternative holds.
     if !matches!(lowered.then, Then::Pick(_)) && !test_holds(&check.test, &check.defs, &lens, &value) {
         no_value_error(&check.test, check, &lens, &value);
-        check_failed(check, &lens, &value)
+        check_failed(check, &lens, &value, &ctx.path)
     }
     conform_then(&lowered.then, check, &lens, value, ctx)
 }
@@ -959,7 +959,7 @@ fn conform(lazy: &Lazy, ctx: &Rc<SiteCtx>, value: Value) -> Value {
 fn conform_then(then: &Then, check: &CheckSpec, lens: &[Len], value: Value, ctx: &Rc<SiteCtx>) -> Value {
     match then {
         Then::Done => value,
-        Then::Wrap(param, ret) => Value::Contract(Rc::new(Contract { f: value, param: param.clone(), ret: ret.clone(), ctx: ctx.clone() })),
+        Then::Wrap(param, ret) => Value::Contract(Rc::new(Contract { f: value, param: param.clone(), ret: ret.clone(), ctx: ctx.clone(), ret_ctx: ctx.clone() })),
         Then::Pick(alternatives) => {
             for (test, then) in alternatives {
                 if test_holds(test, &check.defs, lens, &value) {
@@ -967,7 +967,7 @@ fn conform_then(then: &Then, check: &CheckSpec, lens: &[Len], value: Value, ctx:
                 }
                 no_value_error(test, check, lens, &value);
             }
-            check_failed(check, lens, &value)
+            check_failed(check, lens, &value, &ctx.path)
         }
     }
 }
@@ -978,8 +978,8 @@ fn conform_then(then: &Then, check: &CheckSpec, lens: &[Len], value: Value, ctx:
 // site already holds an exact length for `n` (the scope's, as build_cast does).
 fn enter_contract(c: &Contract, arg: Value) -> (Value, Rc<SiteCtx>) {
     let ret_ctx = match param_witness(&c.param.ty, &arg) {
-        Some((n, len)) if !matches!(c.ctx.lookup(&n), Some(Len::Exact(_))) => Rc::new(c.ctx.with_witness(n, len)),
-        _ => c.ctx.clone(),
+        Some((n, len)) if !matches!(c.ret_ctx.lookup(&n), Some(Len::Exact(_))) => Rc::new(c.ret_ctx.with_witness(n, len)),
+        _ => c.ret_ctx.clone(),
     };
     let arg = if c.ctx.spec.trusted { arg } else { conform(&c.param, &c.ctx, arg) };
     (arg, ret_ctx)
@@ -996,12 +996,13 @@ fn no_value_error(test: &Test, spec: &CheckSpec, lens: &[Len], value: &Value) {
 }
 
 // A failed Assert check: the innermost offender and the way down to it.
-fn check_failed(spec: &CheckSpec, lens: &[Len], value: &Value) -> ! {
+fn check_failed(spec: &CheckSpec, lens: &[Len], value: &Value, fn_path: &Option<Rc<PathStep>>) -> ! {
     set_current_span(spec.span);
     let mut path = Vec::new();
     let found = explain(&spec.test, &spec.defs, lens, value, &mut path);
     let at = if path.is_empty() { String::new() } else { format!(" at {}", path_text(&path)) };
-    crate::run_error!("type error: expected {}, found {}{at}", spec.to.brief(), found.type_name())
+    let site = if fn_path.is_some() { format!(" (function at {})", PathStep::text(fn_path)) } else { String::new() };
+    crate::run_error!("type error: expected {}, found {}{at}{site}", spec.to.brief(), found.type_name())
 }
 
 #[cfg(test)]

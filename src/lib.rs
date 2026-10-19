@@ -11525,6 +11525,18 @@ g(len)").unwrap_err();
 
     // ---- Semantic pins: green before and after seals; the texts are the main-4c58a36 ones ----
 
+    #[test]
+    fn a_path_prints_root_first() {
+        use crate::value::{PathStep, Step};
+        use std::rc::Rc;
+        let root = Some(Rc::new(PathStep { step: Step::Index(2), parent: None }));
+        let slot = Some(Rc::new(PathStep { step: Step::Slot(0), parent: root.clone() }));
+        let field = Some(Rc::new(PathStep { step: Step::Field("f".into()), parent: slot.clone() }));
+        assert_eq!(PathStep::text(&None), "");
+        assert_eq!(PathStep::text(&root), "[2]");
+        assert_eq!(PathStep::text(&field), "[2].0.f");
+    }
+
     fn run_err(src: &str) -> String {
         run_source(src).expect_err("a run-time type error")
     }
