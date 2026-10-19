@@ -1055,7 +1055,7 @@ fn map_value(shape: &MapShape, value: Value, ctx: &Rc<SiteCtx>, path: &Option<Rc
 // A call of a contract: the argument (checked against the parameter type at
 // an untrusted site) and the site the result is checked at. A Vec(n)
 // parameter binds `n` to the argument's length for the result, unless the
-// site already holds an exact length for `n` (the scope's, as build_cast does).
+// site already holds an exact length for `n` (the scope's, as the contract's result witness does).
 fn enter_contract(c: &Contract, arg: Value) -> (Value, Rc<SiteCtx>) {
     let ret_ctx = match param_witness(&c.param.ty, &arg) {
         Some((n, len)) if !matches!(c.ret_ctx.lookup(&n), Some(Len::Exact(_))) => Rc::new(c.ret_ctx.with_witness(n, len)),

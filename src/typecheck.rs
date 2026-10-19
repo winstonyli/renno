@@ -2284,7 +2284,7 @@ impl Rebuild for StripIndexed {
 // (index_has_value) reduced to the type it wraps, so build_boundary_check never
 // needs a witness it cannot get. A non-bare index (Vec(n+1)) keeps its length
 // compare when every variable in it has a value; otherwise the check degrades
-// to is_list only (see build_cast).
+// to is_list only (see contract_type).
 fn erase_open_indexed(t: &Type, env: &CheckEnv) -> Type {
     EraseOpen { env, memo: NodeMemo::default() }.walk(t).unwrap_or_else(|| t.clone())
 }
@@ -2403,9 +2403,9 @@ fn join_arm(arena: &mut Arena, e: ExprRef, from: &Type, join: &Type, span: Span,
     coerce_cast(arena, checked, from, join, &CheckEnv::new(infer))
 }
 
-// Binder names a cast introduces (`__cf`, `__ca`): fresh and unlexable
+// Binder names a cast introduces (`__ca`): fresh and unlexable
 // (`__ca#7`), so neither a user variable nor a nested cast's own binder can
-// capture or shadow them. Shared by build_cast and build_literal_cast.
+// capture or shadow them. Used by build_literal_cast.
 fn cast_binder(base: &str) -> String {
     fresh_index_name(base)
 }
@@ -2456,13 +2456,7 @@ fn index_has_value(i: &IndexExpr, env: &CheckEnv) -> bool {
     free_index_vars(&runtime_index(i, env.infer, &vars, false)).iter().all(|v| vars.contains(&v.as_str()))
 }
 
-// Is index variable `v` already bound by a witness in scope (a local one, or
-// one the inference recorded)?
-fn index_witnessed<'a>(env: &'a CheckEnv<'a>) -> impl Fn(&str) -> bool + 'a {
-    move |v| env.local.iter().any(|w| w.var == v) || env.infer.index_witness.iter().any(|w| w.var == v)
-}
-
-// The literal form of build_cast for a Lambda `e` (spec 2026-10-08 sec 5):
+// The literal form of the cast for a Lambda `e` (spec 2026-10-08 sec 5):
 // the Lambda is rebuilt in place,
 // `fun __ca#k: A' -> let p = DOWN(__ca#k) in UP(body)`,
 // so an annotated `let rec` binding stays a direct Lambda (is_direct_group)
@@ -2475,7 +2469,7 @@ fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env
     let Expr::Lambda(param, _, body) = arena[e].clone() else { unreachable!("build_literal_cast takes a Lambda") };
     let Type::Fun(a, _, b) = from else { unreachable!("build_literal_cast takes a Fun source") };
     let (a_target, b_target) = cast_targets(to);
-    let up_body = cast_up(arena, body, b, &b_target, env, true);
+    let up_body = cast_up(arena, body, b, &b_target, env);
     if relate_cast(&a_target, a, env.infer) == Rel::Proven {
         let ann = type_lit(arena, a_target);
         return arena.push(Expr::Lambda(param, Some(ann), up_body));
@@ -2493,8 +2487,7 @@ fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env
 
 // UP for a literal's body: a Lambda body is rebuilt in turn (through a witness
 // binder `let hidden = <var> in ...`; the arm matches any `let y = a in ...`
-// too, which is harmless); any other body is wrapped in the
-// closure form.
+// too, which is harmless); any other body is conformed to its contract type (contract_type).
 fn literal_up(arena: &mut Arena, body: ExprRef, b: &Type, b_target: &Type, env: &CheckEnv) -> ExprRef {
     match arena[body].clone() {
         Expr::Lambda(..) => build_literal_cast(arena, body, b, b_target, env),
@@ -2509,13 +2502,12 @@ fn literal_up(arena: &mut Arena, body: ExprRef, b: &Type, b_target: &Type, env: 
 // UP for a result `res` of type `b` seen as `b_target`: nothing when relate proves it; a function
 // result is cast in turn; any other result is checked against what the target promises (h03).
 // Runs once per call: repeatable, records no obligations.
-fn cast_up(arena: &mut Arena, res: ExprRef, b: &Type, b_target: &Type, env: &CheckEnv, literal: bool) -> ExprRef {
+fn cast_up(arena: &mut Arena, res: ExprRef, b: &Type, b_target: &Type, env: &CheckEnv) -> ExprRef {
     if relate_cast(b, b_target, env.infer) == Rel::Proven {
         return res;
     }
     match b {
-        Type::Fun(..) if literal => literal_up(arena, res, b, b_target, env),
-        Type::Fun(..) => build_boundary_check_at(arena, res, &contract_type(b, b_target, env.infer), env, false),
+        Type::Fun(..) => literal_up(arena, res, b, b_target, env),
         _ => {
             let body_env = CheckEnv { infer: env.infer, local: env.local.clone(), defer: false, repeatable: true, span: env.span };
             let target = erase_open_indexed(b_target, &body_env);
@@ -2524,55 +2516,6 @@ fn cast_up(arena: &mut Arena, res: ExprRef, b: &Type, b_target: &Type, env: &Che
     }
 }
 
-// The closure form of coerce_cast for a Fun `from` (relate_cast is Unknown).
-// Every binder is fresh (cast_binder), so a returned function's wrapper, nested
-// inside this one's lambda, never shadows it. A Vec(n) parameter, of the source
-// or of the target, whose `n` has no witness in scope binds one from `__ca#k`
-// (one hidden alias for both): DOWN then needs only is_list (the length half
-// would be `len(__ca#k) == n`, a tautology), and UP compares a `Vec(n)` result
-// with the argument. A variable already witnessed in scope is never rebound,
-// so a nested wrapper compares against the outer value. Any other open index
-// degrades to is_list.
-// Known limitation (spec 2026-10-08 sec 7): a monomorphic `n` that no witness
-// in scope covers gets a fresh per-call witness, so DOWN checks list shape
-// only. The real case is `n` bound through a tuple-typed existential
-// (`let y: Vec(n) = x in let p: ((Vec(n) -> Int), Int) = (fun w -> len(w), 0)
-// in match p | (f, _) -> let d: Dyn = f in d([1])` returns 1), while the
-// direct call `f([1])` fails at run time. Pinned by
-// `a_monomorphic_vec_n_witness_checks_list_shape_only_in_the_closure_form_known_limitation`.
-fn build_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
-    let Type::Fun(a, _, b) = from else { unreachable!("build_cast takes a Fun source") };
-    let (a_target, b_target) = cast_targets(to);
-    let cf = cast_binder("__cf");
-    let ca = cast_binder("__ca");
-    let witnessed = index_witnessed(env);
-    let hidden = fresh_index_name(&format!("list_{ca}"));
-    let witnesses: Vec<IndexWitness> = [list_length_var(a, env.infer), list_length_var(&a_target, env.infer)]
-        .into_iter()
-        .flatten()
-        .filter(|v| !witnessed(v))
-        .map(|var| IndexWitness { var, hidden: hidden.clone(), used: Cell::new(false) })
-        .collect();
-    let mut local = env.local.clone();
-    local.extend(witnesses.iter());
-    let body_env = CheckEnv { infer: env.infer, local, defer: false, repeatable: true, span: env.span };
-    let ca_ref = arena.push(Expr::Var(ca.clone()));
-    let arg = if relate_cast(&a_target, a, env.infer) != Rel::Proven {
-        build_boundary_check(arena, ca_ref, &erase_open_indexed(a, env), &body_env)
-    } else {
-        ca_ref
-    };
-    let cf_ref = arena.push(Expr::Var(cf.clone()));
-    let call = arena.push(Expr::App(cf_ref, arg));
-    let result = cast_up(arena, call, b, &b_target, &body_env, false);
-    let body = match witnesses.iter().find(|w| w.used.get()) {
-        Some(w) => w.bind(arena, &ca, result),
-        None => result,
-    };
-    let ann = type_lit(arena, a_target);
-    let lambda = arena.push(Expr::Lambda(ca, Some(ann), body));
-    arena.push(Expr::Let(cf, None, e, lambda))
-}
 
 // Like `coerce`, but the target is "Int or Float" rather than one fixed
 // type -- Add/Sub/Mul/Div/Mod/Lt's own operand check. Kept separate from
@@ -3122,7 +3065,7 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
 // the index state (InferCtx, as of where the check is
 // spliced); `local` holds witnesses bound inside synthesized code
 // (a cast's parameter alias). `defer` is false inside a cast's synthesized body
-// (build_cast, cast_up) and in resolve_obligations, which record no obligations.
+// (build_literal_cast, cast_up) and in resolve_obligations, which record no obligations.
 struct CheckEnv<'a> {
     infer: &'a InferCtx,
     local: Vec<&'a IndexWitness>,
