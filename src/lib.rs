@@ -11588,7 +11588,7 @@ g(len)").unwrap_err();
     #[test]
     fn a_function_whose_site_has_an_index_table_never_collapses() {
         // `n` is the parameter's own index variable, so each site carries a table and its wrappers are not interchangeable.
-        let src = "let rec loop = fun i -> fun v: Vec(n) -> fun p -> if i == 0 then (match p | (u, g) -> g(u) | _ -> 0) else (let d: Dyn = p in let q: (Vec(n), (Vec(n) -> Int)) = d in loop(i - 1)(v)(q)) in loop(5)([1, 2])(([3, 4], fun w -> len(w)))";
+        let src = "let rec loop = fun i -> fun v: Vec(n) -> fun p: Dyn -> if i == 0 then (match p | (u, g) -> g(u) | _ -> 0) else (let d: Dyn = p in let q: (Vec(n), (Vec(n) -> Int)) = d in loop(i - 1)(v)(q)) in loop(5)([1, 2])(([3, 4], fun w -> len(w)))";
         machine::CONTRACT_COLLAPSES.with(|c| c.set(0));
         machine::MAP_REBUILDS.with(|c| c.set(0));
         assert_eq!(run_source_on_this_thread(src).expect("runs").as_int(), 2);
@@ -11788,6 +11788,30 @@ g(len)").unwrap_err();
         assert_eq!(run_source(ok).unwrap().as_int(), 7);
         let tail = r#"let g = fun d: Dyn -> match d | _ :: t -> len(t) | _ -> 0 in g([1, 2, 3])"#;
         assert_eq!(run_source(tail).unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_tuple_or_list_pattern_pins_an_unannotated_parameter() {
+        let bad = [
+            r#"let g = fun r -> match r | (a, b) -> a | _ -> 1 in let z: Int = g(("s", 2)) in z"#,
+            r#"let g = fun r -> match r | [a, b] -> a | _ -> 1 in let z: Int = g(["s", "t"]) in z"#,
+            // Different arity on an unannotated parameter: the first arm fixes Tuple(1), so the call with a pair is rejected.
+            r#"let g = fun r -> match r | (a,) -> a | (a, b) -> a | _ -> 0 in g((1, 2))"#,
+        ];
+        for src in bad {
+            assert!(run_source(src).is_err(), "should reject: {src}");
+        }
+        let ok = [
+            (r#"let g = fun r -> match r | (a, b) -> a + b | _ -> 0 in g((3, 4))"#, 7),
+            (r#"let g = fun r -> match r | [] -> 0 | [a] -> a | _ -> 9 in g([5])"#, 5),
+            // A variable already solved by an earlier arm is matched against that type, not re-pinned:
+            // tuple then list form, and list then tuple form, both still run.
+            (r#"let g = fun r -> match r | (a, b) -> a | [a, b] -> b | _ -> 0 in g((1, 2))"#, 1),
+            (r#"let g = fun r -> (match r | [x] -> x | _ -> 0) + (match r | (a, b) -> a | _ -> 0) in g([1])"#, 1),
+        ];
+        for (src, want) in ok {
+            assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
+        }
     }
 
     fn run_err(src: &str) -> String {

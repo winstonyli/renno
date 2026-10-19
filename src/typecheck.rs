@@ -4104,21 +4104,28 @@ fn bind_pattern_vars(
                 }
                 Ok(c)
             }
-            // A still-fully-unconstrained scrutinee (Type::Var) is
-            // handled the SAME way as a concrete, non-Tuple, non-List
-            // scrutinee just below: bind each position to its own
-            // independent fresh var, no unify against a forced List
-            // shape. Pattern::List is ALSO renno's tuple pattern
-            // (`(a, b)` desugars to this same variant) -- the two are
-            // indistinguishable at this point, so forcing scrutinee_ty
-            // into a List shape here is a guess that's WRONG whenever
-            // the pattern is actually destructuring a Tuple, and
-            // unrecoverable once made (infer.subst never shrinks). An
-            // actual List-shaped scrutinee still gets its real
-            // correlation via Cons's own arm, which is where my_map's
-            // own precision genuinely comes from -- this arm never
-            // forcing List costs nothing there.
-            Type::Var(_) => bind_dyn_positions(ctx, pats, infer, span, visiting),
+            // An unsolved variable takes its shape from the pattern: `(p, ..)` is a Tuple, `[p, ..]` a
+            // List, so each binder connects to its position instead of floating free. A variable that
+            // already resolves to a concrete type is matched against that type instead.
+            Type::Var(_) => {
+                let resolved = infer.resolve_deep(scrutinee_ty);
+                if !matches!(resolved, Type::Var(_)) {
+                    return bind_pattern_vars(ctx, pat, &resolved, infer, span, visiting);
+                }
+                let (shape, positions): (Type, Vec<Type>) = if matches!(pat, Pattern::Tuple(_)) {
+                    let items: Vec<Type> = pats.iter().map(|_| infer.fresh_var("elem")).collect();
+                    (Type::Tuple(Hc::new(items.clone())), items)
+                } else {
+                    let elem = infer.fresh_var("elem");
+                    (Type::List(Hc::new(elem.clone())), pats.iter().map(|_| elem.clone()).collect())
+                };
+                unify(scrutinee_ty, &shape, infer, span)?;
+                let mut c = ctx.clone();
+                for (p, ty) in pats.iter().zip(positions.iter()) {
+                    c = bind_pattern_vars(&c, p, ty, infer, span, visiting)?;
+                }
+                Ok(c)
+            }
             // A Type::Indexed-wrapped scrutinee (Vec(n)-style, or Case
             // B's own recursive-type analog per §2's generalization) --
             // correlate against the WRAPPED type directly, "forgetting"
