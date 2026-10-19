@@ -232,6 +232,7 @@ impl<'a> Parser<'a> {
         &mut self,
         parse_value: fn(&mut Self) -> Result<T, String>,
         default: Option<fn(&mut Self, String) -> T>,
+        tail: Option<&mut Option<String>>,
     ) -> Result<Vec<(String, T)>, String> {
         if matches!(self.peek(), Some(Token::RBrace)) {
             return Err(self.err_at(self.span_before(), "a record needs at least one field".to_string()));
@@ -266,6 +267,15 @@ impl<'a> Parser<'a> {
             if matches!(self.peek(), Some(Token::Comma)) {
                 self.bump();
                 if matches!(self.peek(), Some(Token::RBrace)) {
+                    break;
+                }
+                if matches!(self.peek(), Some(Token::DotDot)) {
+                    // `..r`: the row variable of an open record TYPE, last in the braces.
+                    let Some(slot) = tail else {
+                        return Err(self.err_at(self.span_at(), "`..r` is only allowed in a record type".to_string()));
+                    };
+                    self.bump();
+                    *slot = Some(self.ident()?);
                     break;
                 }
             } else {
@@ -436,10 +446,18 @@ impl<'a> Parser<'a> {
             // explicit ": T" here (no punning at the type level, there's
             // no value to pun with) and why the result comes back sorted.
             Some(Token::LBrace) => {
-                let fields = self.parse_record_fields(Self::parse_union_type, None)?;
+                let mut tail = None;
+                let fields = self.parse_record_fields(Self::parse_union_type, None, Some(&mut tail))?;
                 let span = Span { start, end: self.span_before().end };
                 let record = self.push_spanned(Expr::Record(Rc::new(fields)), span);
-                Ok(self.type_call("Record", record, start))
+                // `{x: T, ..r}` is `#Record(({x: T}, "r"))`.
+                match tail {
+                    Some(name) => {
+                        let row = self.push_spanned(Expr::Str(name), span);
+                        Ok(self.type_call_items("Record", vec![record, row], start))
+                    }
+                    None => Ok(self.type_call("Record", record, start)),
+                }
             }
             // `Vec(e)` and `Indexed(T, e)` (T at index e, spec section 9.1)
             // call whatever `Vec` and `Indexed` are in scope, like any name
@@ -686,7 +704,7 @@ impl<'a> Parser<'a> {
                 // only because that's parse_record_fields' shared
                 // `default` parameter shape.
                 let fields =
-                    self.parse_record_fields(Self::pattern, Some(|_: &mut Self, name| Pattern::Var(name)))?;
+                    self.parse_record_fields(Self::pattern, Some(|_: &mut Self, name| Pattern::Var(name)), None)?;
                 Ok(Pattern::Record(fields))
             }
             // No case distinction: with `data`-declared constructors gone,
@@ -1195,6 +1213,7 @@ impl<'a> Parser<'a> {
                         let span = p.span_before();
                         p.push_spanned(Expr::Var(name), span)
                     }),
+                    None,
                 )?;
                 Ok(self.push_spanned(Expr::Record(Rc::new(fields)), Span { start, end: self.span_before().end }))
             }

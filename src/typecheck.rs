@@ -164,6 +164,38 @@ pub(crate) fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
     out
 }
 
+// The row-variable names `ty` writes as a record tail (field kind) and as a `Fun` row tail
+// (effect kind). The kind is fixed by position, so a name in both sets is an annotation error.
+fn row_kinds(ty: &Type) -> (BTreeSet<String>, BTreeSet<String>) {
+    fn go(ty: &Type, fields: &mut BTreeSet<String>, effects: &mut BTreeSet<String>, seen: &mut Visited) {
+        if !ty.summary().any(Summary::ROWVAR) || !seen.first(ty) {
+            return;
+        }
+        match ty {
+            Type::Fun(param, row, ret) => {
+                if let Tail::Var(name) = &row.tail {
+                    effects.insert(name.clone());
+                }
+                go(param, fields, effects, seen);
+                go(ret, fields, effects, seen);
+            }
+            Type::List(elem) | Type::Indexed(elem, _) => go(elem, fields, effects, seen),
+            Type::Tuple(items) | Type::Union(items) => items.iter().for_each(|t| go(t, fields, effects, seen)),
+            Type::Record(row) => {
+                if let Tail::Var(name) = &row.tail {
+                    fields.insert(name.clone());
+                }
+                row.entries.iter().for_each(|(_, t)| go(t, fields, effects, seen));
+            }
+            Type::Rec(g, _) => g.0.bodies.iter().for_each(|b| go(b, fields, effects, seen)),
+            _ => {}
+        }
+    }
+    let (mut fields, mut effects) = (BTreeSet::new(), BTreeSet::new());
+    go(ty, &mut fields, &mut effects, &mut Visited::new());
+    (fields, effects)
+}
+
 // The index-variable names among `vars`.
 fn index_names(vars: BTreeSet<TyVar>) -> BTreeSet<String> {
     vars.into_iter().filter_map(|v| if let TyVar::Index(name) = v { Some(name) } else { None }).collect()
@@ -361,6 +393,8 @@ impl<'a> Lowerer<'a> {
 pub(crate) struct AnnotVar {
     pub(crate) var: TyVar,
     pub(crate) universal: bool,
+    // A row variable written as a record tail (field kind) rather than an arrow row (effect kind).
+    pub(crate) field: bool,
 }
 
 impl Ctx {
@@ -4856,7 +4890,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         let annotation = annotation_type(arena, ann, spans[val], &cur_ctx, spans, infer)?;
                         let universal = is_signature(&annotation.ty);
                         let mut introduced = Vec::new();
-                        let t = open_annotation(&annotation.ty, &cur_ctx, universal, &mut introduced);
+                        let t = open_annotation(&annotation.ty, &cur_ctx, universal, &mut introduced, spans[val])?;
                         let (val_row, val4) = check_against_rigid(arena, val, &t, &cur_ctx.deeper().with_annot(&introduced, infer), spans, infer)?;
                         if !universal {
                             existentials = introduced;
@@ -4927,7 +4961,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         Some(ann) => {
                             let annotation = annotation_type(arena, *ann, spans[*val], &cur_ctx, spans, infer)?;
                             sites.extend(annotation.site.map(|site| (name.clone(), site)));
-                            Some(open_annotation(&annotation.ty, &cur_ctx, is_signature(&annotation.ty), &mut introduced))
+                            Some(open_annotation(&annotation.ty, &cur_ctx, is_signature(&annotation.ty), &mut introduced, spans[*val])?)
                         }
                         None => None,
                     });
@@ -5011,7 +5045,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     Some(ann) => {
                         let annotation = annotation_type(arena, ann, spans[ann], &cur_ctx, spans, infer)?;
                         site = annotation.site;
-                        Some(open_annotation(&annotation.ty, &cur_ctx, true, &mut introduced))
+                        Some(open_annotation(&annotation.ty, &cur_ctx, true, &mut introduced, spans[ann])?)
                     }
                     None => None,
                 };
@@ -5373,17 +5407,31 @@ pub(crate) fn is_signature(ty: &Type) -> bool {
 //   - A name with no entry in scope (or, for a group of annotations opened against one scope,
 //     already in `introduced`) is introduced here; sharing an introduced entry through an
 //     existential binder makes it existential.
-pub(crate) fn open_annotation(ty: &Type, ctx: &Ctx, universal: bool, introduced: &mut Vec<(TyVar, AnnotVar)>) -> Type {
+pub(crate) fn open_annotation(ty: &Type, ctx: &Ctx, universal: bool, introduced: &mut Vec<(TyVar, AnnotVar)>, span: Span) -> Result<Type, TypeError> {
+    let (field_rows, effect_rows) = row_kinds(ty);
     let mut rows: HashMap<String, Row> = HashMap::new();
     let mut indices: HashMap<String, IndexExpr> = HashMap::new();
     for written in vars_in(ty) {
         if matches!(written, TyVar::Type(_)) {
             continue;
         }
+        let field = matches!(&written, TyVar::Row(name) if field_rows.contains(name));
+        let is_row = matches!(written, TyVar::Row(_));
+        if field && matches!(&written, TyVar::Row(name) if effect_rows.contains(name)) {
+            return Err(kind_clash(&written, span));
+        }
         let var = match ctx.annot_var(&written) {
-            Some(entry) if entry.universal || !universal => entry.var.clone(),
+            Some(entry) if entry.universal || !universal => {
+                if is_row && entry.field != field {
+                    return Err(kind_clash(&written, span));
+                }
+                entry.var.clone()
+            }
             _ => match introduced.iter_mut().find(|(w, _)| *w == written) {
                 Some((_, entry)) => {
+                    if is_row && entry.field != field {
+                        return Err(kind_clash(&written, span));
+                    }
                     entry.universal &= universal;
                     entry.var.clone()
                 }
@@ -5393,7 +5441,7 @@ pub(crate) fn open_annotation(ty: &Type, ctx: &Ctx, universal: bool, introduced:
                         TyVar::Index(name) => TyVar::Index(fresh_index_name(name)),
                         TyVar::Type(_) => unreachable!("type variables are skipped above"),
                     };
-                    introduced.push((written.clone(), AnnotVar { var: var.clone(), universal }));
+                    introduced.push((written.clone(), AnnotVar { var: var.clone(), universal, field }));
                     var
                 }
             },
@@ -5408,7 +5456,12 @@ pub(crate) fn open_annotation(ty: &Type, ctx: &Ctx, universal: bool, introduced:
             _ => unreachable!("an annotation variable keeps its sort"),
         }
     }
-    subst_type(ty, &rows, &HashMap::new(), &indices)
+    Ok(subst_type(ty, &rows, &HashMap::new(), &indices))
+}
+
+fn kind_clash(var: &TyVar, span: Span) -> TypeError {
+    let TyVar::Row(name) = var else { unreachable!("only row variables have kinds") };
+    TypeError(format!("row variable `{name}` is used both as a record tail (`..{name}`) and as an effect row (`->{{{name}}}`)"), span)
 }
 
 // The bidirectional-checking entry point (spec section 6): verify `expr`

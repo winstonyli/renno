@@ -12,7 +12,7 @@ use crate::env::Env;
 use crate::expr::{ExprRef, SpanMap};
 use crate::frame::Bindings;
 use crate::list::List;
-use crate::types::{close_group, Type};
+use crate::types::{close_group, open_record_tail_under, Type};
 use crate::value::Value;
 
 // What a step-driven computation asks the machine to do next.
@@ -177,6 +177,10 @@ impl Iter {
                     crate::machine::set_current_span(spans.get(bindings[i].2).copied());
                     crate::run_error!("recursive type {} is not built by a type constructor", names[i])
                 });
+                if let Some(i) = closed.iter().position(|c| c.as_ref().is_some_and(|t| open_record_tail_under(t, false))) {
+                    crate::machine::set_current_span(spans.get(bindings[i].2).copied());
+                    crate::run_error!("recursive type {} contains an open record type (`{{x: T, ..r}}`)", names[i]);
+                }
                 let mut frame = Bindings::default();
                 for (v, c) in done.into_iter().zip(closed) {
                     frame.push(c.map_or(v, |t| Value::Type(Rc::new(t))));

@@ -58,6 +58,8 @@ pub enum Token {
     RBrace,
     #[token(",")]
     Comma,
+    #[token("..")]
+    DotDot,
     #[token(".")]
     Dot,
     #[token(":")]

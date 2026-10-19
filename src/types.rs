@@ -609,6 +609,27 @@ pub fn fresh_rec_id() -> u64 {
     REC_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+// Is there a record with a row-variable tail inside `t`, under a `Union` or a `Rec` body
+// (`under`: already inside one)? Open records are not allowed there (spec 2.3).
+pub fn open_record_tail_under(t: &Type, under: bool) -> bool {
+    fn go(t: &Type, under: bool, seen: &mut [Visited; 2]) -> bool {
+        if !t.summary().any(Summary::ROWVAR) || !seen[usize::from(under)].first(t) {
+            return false;
+        }
+        match t {
+            Type::Record(row) => (under && matches!(row.tail, Tail::Var(_))) || row.entries.iter().any(|(_, x)| go(x, under, seen)),
+            Type::Union(items) => items.iter().any(|x| go(x, true, seen)),
+            Type::Rec(h, _) => h.0.bodies.iter().any(|b| go(b, true, seen)),
+            _ => {
+                let mut hit = false;
+                each_child(t, &mut |c| hit = hit || go(c, under, seen));
+                hit
+            }
+        }
+    }
+    go(t, under, &mut [Visited::new(), Visited::new()])
+}
+
 pub fn each_child(t: &Type, f: &mut dyn FnMut(&Type)) {
     match t {
         Type::List(e) => f(e),
@@ -1373,6 +1394,10 @@ fn write_type(t: &Type, f: &mut fmt::Formatter, budget: &Cell<usize>) -> fmt::Re
                 }
                 write!(f, "{name}: ")?;
                 write_type(t, f, budget)?;
+            }
+            if let Tail::Var(name) = &row.tail {
+                let sep = if row.entries.is_empty() { "" } else { ", " };
+                write!(f, "{sep}..{}", surface_name(name))?;
             }
             write!(f, "}}")
         }

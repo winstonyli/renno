@@ -12,7 +12,7 @@ use crate::list::{List, SealId};
 use crate::resolve::{group_kind, resolve, GroupKind, Resolved, VarRef};
 use crate::span::Span;
 use crate::text::Text;
-use crate::types::{first_free, fresh_rec_id, Hc, RecVar, Row, Type};
+use crate::types::{first_free, fresh_rec_id, open_record_tail_under, Hc, RecVar, Row, Tail, Type};
 use crate::util::find_field;
 use crate::value::{Builtin, Contract, HandlerData, SiteCtx, TypeCtor, Value};
 
@@ -1699,7 +1699,13 @@ fn construct_type(ctor: TypeCtor, arg: Value) -> Type {
     match (ctor, arg) {
         (TypeCtor::List, Value::Type(t)) => Type::List(Hc::new((*t).clone())),
         (TypeCtor::Tuple, Value::List(items)) if !items.is_empty() => Type::Tuple(Hc::new(types_of(&items, "Tuple"))),
-        (TypeCtor::Union, Value::List(items)) if !items.is_empty() => Type::Union(Hc::new(types_of(&items, "Union"))),
+        (TypeCtor::Union, Value::List(items)) if !items.is_empty() => {
+            let alts = types_of(&items, "Union");
+            if alts.iter().any(|t| open_record_tail_under(t, true)) {
+                crate::run_error!("a union cannot contain an open record type (`{{x: T, ..r}}`)");
+            }
+            Type::Union(Hc::new(alts))
+        }
         (TypeCtor::Record, Value::Record(fields)) => {
             let mut fields: Vec<(String, Type)> = fields
                 .iter()
@@ -1711,6 +1717,20 @@ fn construct_type(ctor: TypeCtor, arg: Value) -> Type {
             fields.sort_by(|a, b| a.0.cmp(&b.0));
             Type::record(fields)
         }
+        // ({fields}, "r") is the open record `{fields, ..r}`.
+        (TypeCtor::Record, Value::List(items)) => match &items.to_vec()[..] {
+            [Value::Record(fields), Value::Str(row)] => {
+                let entries = fields
+                    .iter()
+                    .map(|(n, v)| match v {
+                        Value::Type(t) => (n.clone(), (**t).clone()),
+                        other => crate::run_error!("Record expects a record of types, field `{n}` is a {}", other.type_name()),
+                    })
+                    .collect();
+                Type::Record(Row::from_entries(entries, Tail::Var(row.to_string())))
+            }
+            _ => crate::run_error!("Record expects a record of types, or (record of types, \"row\")"),
+        },
         // (A, B) is `A -> B`; (A, "e", B) is `A ->{e} B`.
         (TypeCtor::Fun, Value::List(items)) => match &items.to_vec()[..] {
             [Value::Type(a), Value::Type(b)] => Type::Fun(Hc::new((**a).clone()), Row::dyn_(), Hc::new((**b).clone())),

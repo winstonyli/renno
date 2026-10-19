@@ -10286,7 +10286,7 @@ g(len)").unwrap_err();
 
         // No entry: both are introduced, as two separate variables of their own sort.
         let mut intro = Vec::new();
-        let first = open_annotation(&ann, &Ctx::empty(), false, &mut intro);
+        let first = open_annotation(&ann, &Ctx::empty(), false, &mut intro, crate::span::Span { start: 0, end: 0 }).unwrap();
         assert_eq!(intro.len(), 2);
         assert!(intro.iter().any(|(w, e)| *w == TyVar::Index("n".into()) && matches!(&e.var, TyVar::Index(f) if f.starts_with("n#"))));
         assert!(intro.iter().any(|(w, e)| *w == TyVar::Row("n".into()) && matches!(&e.var, TyVar::Row(f) if f.starts_with("n#"))));
@@ -10298,28 +10298,28 @@ g(len)").unwrap_err();
         let ctx = Ctx::empty().with_annot(&intro, &mut infer);
         assert!(intro.iter().all(|(_, e)| infer.levels.get(&e.var) == Some(0)));
         let mut again = Vec::new();
-        assert_eq!(names(&open_annotation(&ann, &ctx, false, &mut again)), (i1.clone(), r1.clone()));
+        assert_eq!(names(&open_annotation(&ann, &ctx, false, &mut again, crate::span::Span { start: 0, end: 0 }).unwrap()), (i1.clone(), r1.clone()));
         assert!(again.is_empty());
 
         // A universal binder shadows an existential entry: fresh variables, universal.
         let mut shadow = Vec::new();
-        let (i2, r2) = names(&open_annotation(&ann, &ctx, true, &mut shadow));
+        let (i2, r2) = names(&open_annotation(&ann, &ctx, true, &mut shadow, crate::span::Span { start: 0, end: 0 }).unwrap());
         assert!(i2 != i1 && r2 != r1 && shadow.len() == 2 && shadow.iter().all(|(_, e)| e.universal));
 
         // ...and shares a universal one, whatever the binder kind.
         let inner = ctx.with_annot(&shadow, &mut infer);
         for universal in [true, false] {
             let mut none = Vec::new();
-            assert_eq!(names(&open_annotation(&ann, &inner, universal, &mut none)), (i2.clone(), r2.clone()));
+            assert_eq!(names(&open_annotation(&ann, &inner, universal, &mut none, crate::span::Span { start: 0, end: 0 }).unwrap()), (i2.clone(), r2.clone()));
             assert!(none.is_empty());
         }
 
         // Annotations opened into one `introduced` vector share a name, and an existential
         // binder makes the shared entry existential.
         let mut group = Vec::new();
-        let a = names(&open_annotation(&ann, &Ctx::empty(), true, &mut group));
+        let a = names(&open_annotation(&ann, &Ctx::empty(), true, &mut group, crate::span::Span { start: 0, end: 0 }).unwrap());
         assert!(group.iter().all(|(_, e)| e.universal));
-        let b = names(&open_annotation(&ann, &Ctx::empty(), false, &mut group));
+        let b = names(&open_annotation(&ann, &Ctx::empty(), false, &mut group, crate::span::Span { start: 0, end: 0 }).unwrap());
         assert_eq!(a, b);
         assert!(group.len() == 2 && group.iter().all(|(_, e)| !e.universal));
     }
@@ -10402,6 +10402,31 @@ g(len)").unwrap_err();
         let src = "let x = fun cb: (Dyn ->{e} Dyn) -> cb in let y: Int = x in y";
         let err = run_source(src).unwrap_err();
         assert!(err.contains("{e}") && !err.contains('#'), "{err}");
+    }
+
+    #[test]
+    fn open_record_annotations_parse_print_and_stay_rigid() {
+        // `..r` prints as written.
+        let err = run_source("let x: Int = fun p: {x: Int, ..r} -> p.x in x").unwrap_err();
+        assert!(err.contains("{x: Int, ..r}") && !err.contains('#'), "{err}");
+        // The tail is a type-annotation form only: a literal or a pattern cannot carry one.
+        assert!(run_source("let r = {y: 2} in {x: 1, ..r}").is_err());
+        // One name in both kinds is an annotation error, within one annotation and across two.
+        let err = run_source("let f: ({x: Int, ..r} ->{r} Int) = fun p -> 1 in 1").unwrap_err();
+        assert!(err.contains("both as a record tail"), "{err}");
+        let err = run_source("let f: (Dyn ->{r} Int) = fun p -> (let g: ({x: Int, ..r} -> Int) = fun q -> 1 in 1) in 1").unwrap_err();
+        assert!(err.contains("both as a record tail"), "{err}");
+        // A rigid tail is never extended by the body; a signature that preserves it is accepted.
+        assert!(run_source("let g: ({x: Int, ..r} -> Int) = fun p -> p.x + p.y in 1").is_err());
+        assert_eq!(run_source("let g: ({x: Int, ..r} -> {x: Int, ..r}) = fun p -> p in g({x: 1, y: 2}).x").unwrap().to_string(), "1");
+    }
+
+    #[test]
+    fn open_record_type_values_build_and_refuse_to_nest_under_unions() {
+        assert!(run_source("let T = Record(({x: Int}, \"r\")) in let f: (T -> Int) = fun p -> p.x in f({x: 1})").is_ok());
+        let err = run_source("let rec U = Union(Int, S) and S = Record(({x: Int}, \"r\")) in 1").unwrap_err();
+        assert!(err.contains("open record"), "{err}");
+        assert!(run_source("let f: ((Dyn ->{e} Dyn) -> Int) = fun cb -> 1 in let U = Union(Int, Str) in 1").is_ok());
     }
 
     #[test]
