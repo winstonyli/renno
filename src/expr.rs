@@ -599,7 +599,8 @@ pub enum Then {
 // position (None: no leaf there); `Record` lists only entries that have a leaf.
 #[derive(Debug)]
 pub enum MapShape {
-    Fun(Rc<Lazy>, Rc<Lazy>),
+    // A function, or a Union/Rec holding one: the leaf's own type, conformed at the site.
+    Leaf(Rc<Lazy>),
     List(Rc<MapShape>),
     Tuple(Vec<Option<Rc<MapShape>>>),
     Record(Vec<(String, Rc<MapShape>)>),

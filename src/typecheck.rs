@@ -2345,12 +2345,7 @@ fn loses_function_in(from: &Type, to: &Type, infer: &InferCtx, memo: &mut FxMap<
         return *done;
     }
     let answer = match (&from, &to) {
-        (_, Type::Dyn) => {
-            // A Union or Rec with a function alternative has no `map_shape`, but its own boundary is a
-            // contract (`Boundary::Union`/`Fun`), which a conform to its own type applies.
-            matches!(boundary(&from, &mut Visiting::default()), Boundary::Union(_) | Boundary::Fun(..))
-                || map_shape(&Lazy::new(Rc::new(from.clone())), &from, &mut NodeMemo::default()).is_some()
-        }
+        (_, Type::Dyn) => map_shape(&Lazy::new(Rc::new(from.clone())), &from, &mut NodeMemo::default()).is_some(),
         (Type::List(a), Type::List(b)) => loses_function_in(a, b, infer, memo),
         (Type::Tuple(a), Type::Tuple(b)) => a.len() == b.len() && a.iter().zip(b.iter()).any(|(x, y)| loses_function_in(x, y, infer, memo)),
         (Type::Record(a), Type::Record(b)) => a.entries.iter().any(|(n, x)| b.entries.iter().any(|(m, y)| m == n && loses_function_in(x, y, infer, memo))),
@@ -2705,16 +2700,19 @@ struct Seen {
 // The index variables a Map site's function leaves read per call, as `checked_index_vars` finds them for a bare function.
 fn map_leaf_vars(shape: &MapShape, infer: &InferCtx, seen: &mut Seen, out: &mut BTreeMap<String, bool>) {
     match shape {
-        MapShape::Fun(param, ret) => {
-            let mut inner = BTreeMap::new();
-            checked_index_vars(&ret.ty, infer, seen, true, true, &mut inner);
-            if let Some(own) = list_length_var(&param.ty, infer) {
-                inner.remove(&own);
+        MapShape::Leaf(lazy) => match &*lazy.ty {
+            Type::Fun(param, _, ret) => {
+                let mut inner = BTreeMap::new();
+                checked_index_vars(ret, infer, seen, true, true, &mut inner);
+                if let Some(own) = list_length_var(param, infer) {
+                    inner.remove(&own);
+                }
+                for (name, repeatable) in inner {
+                    *out.entry(name).or_insert(false) |= repeatable;
+                }
             }
-            for (name, repeatable) in inner {
-                *out.entry(name).or_insert(false) |= repeatable;
-            }
-        }
+            other => checked_index_vars(other, infer, seen, true, true, out),
+        },
         MapShape::List(inner) => map_leaf_vars(inner, infer, seen, out),
         MapShape::Tuple(slots) => slots.iter().flatten().for_each(|s| map_leaf_vars(s, infer, seen, out)),
         MapShape::Record(fields) => fields.iter().for_each(|(_, s)| map_leaf_vars(s, infer, seen, out)),
@@ -2878,31 +2876,29 @@ fn wrap(lazy: &Lazy, param: &Hc<Type>, ret: &Hc<Type>) -> Then {
 }
 
 // The function leaves of a container type, memoized by node identity (a type's shared sub-terms are
-// walked once). A leaf is a Fun that `wrap` would give a contract; Union, Rec, scalars and Dyn have
-// none (such a function stays unwrapped, as before; PARKED.md).
+// walked once). A leaf is a Fun that `wrap` would give a contract, or a Union/Rec whose boundary is a
+// contract; a Rec container element and scalars have none.
 fn map_shape(lazy: &Lazy, ty: &Type, memo: &mut NodeMemo<Option<Rc<MapShape>>>) -> Option<Rc<MapShape>> {
-    if let Type::Fun(param, _, ret) = ty {
-        return match wrap(lazy, param, ret) {
-            Then::Wrap(p, r) => Some(Rc::new(MapShape::Fun(p, r))),
-            _ => None,
-        };
-    }
     let key = (ById(ty.clone()), 0);
     if let Some(done) = memo.get(&key) {
         return done.clone();
     }
-    let shape = match ty {
-        Type::List(elem) => map_shape(lazy, elem, memo).map(|s| Rc::new(MapShape::List(s))),
-        Type::Indexed(wrapped, _) if matches!(**wrapped, Type::List(_)) => map_shape(lazy, wrapped, memo),
-        Type::Tuple(items) => {
-            let slots: Vec<Option<Rc<MapShape>>> = items.iter().map(|t| map_shape(lazy, t, memo)).collect();
-            slots.iter().any(Option::is_some).then(|| Rc::new(MapShape::Tuple(slots)))
-        }
-        Type::Record(row) => {
-            let fields: Vec<(String, Rc<MapShape>)> = row.entries.iter().filter_map(|(n, t)| Some((n.clone(), map_shape(lazy, t, memo)?))).collect();
-            (!fields.is_empty()).then(|| Rc::new(MapShape::Record(fields)))
-        }
-        _ => None,
+    let shape = match boundary(ty, &mut Visiting::default()) {
+        Boundary::Fun(fun_ty, param, ret) => matches!(wrap(lazy, &param, &ret), Then::Wrap(..)).then(|| Rc::new(MapShape::Leaf(lazy.child(Rc::new(fun_ty))))),
+        Boundary::Union(union_ty) => Some(Rc::new(MapShape::Leaf(lazy.child(Rc::new(union_ty))))),
+        _ => match ty {
+            Type::List(elem) => map_shape(lazy, elem, memo).map(|s| Rc::new(MapShape::List(s))),
+            Type::Indexed(wrapped, _) if matches!(**wrapped, Type::List(_)) => map_shape(lazy, wrapped, memo),
+            Type::Tuple(items) => {
+                let slots: Vec<Option<Rc<MapShape>>> = items.iter().map(|t| map_shape(lazy, t, memo)).collect();
+                slots.iter().any(Option::is_some).then(|| Rc::new(MapShape::Tuple(slots)))
+            }
+            Type::Record(row) => {
+                let fields: Vec<(String, Rc<MapShape>)> = row.entries.iter().filter_map(|(n, t)| Some((n.clone(), map_shape(lazy, t, memo)?))).collect();
+                (!fields.is_empty()).then(|| Rc::new(MapShape::Record(fields)))
+            }
+            _ => None,
+        },
     };
     memo.insert(key, shape.clone());
     shape

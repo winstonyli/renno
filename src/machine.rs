@@ -1025,7 +1025,7 @@ fn step(path: &Option<Rc<PathStep>>, step: PathKind) -> Option<Rc<PathStep>> {
 // A position the shape does not name is reused as is.
 fn map_value(shape: &MapShape, value: Value, ctx: &Rc<SiteCtx>, path: &Option<Rc<PathStep>>) -> Value {
     match (shape, value) {
-        (MapShape::Fun(param, ret), f) => wrap_function(param, ret, f, Rc::new(ctx.with_path(path.clone()))),
+        (MapShape::Leaf(lazy), v) => conform(lazy, &Rc::new(ctx.with_path(path.clone())), v),
         (MapShape::List(inner), Value::List(items)) => {
             Value::List(List::from_vec(items.iter().enumerate().map(|(i, x)| map_value(inner, x.clone(), ctx, &step(path, PathKind::Index(i)))).collect()))
         }
