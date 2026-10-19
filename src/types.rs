@@ -1243,6 +1243,10 @@ fn consistent_pair(a: &Type, b: &Type, memo: &mut FxMap<(ById, ById), bool>) -> 
         // every one of `a`'s (name, type) pairs found in `b` forces the
         // two name SETS to be identical, not just one contained in the
         // other.
+        // A record with a variable tail is consistent with any record, as a bare Var is with
+        // anything: this is a loose gate with no InferCtx, so it cannot tell flexible from
+        // rigid, and it never binds. Two closed records stay exact.
+        (Type::Record(a), Type::Record(b)) if matches!(a.tail, Tail::Var(_)) || matches!(b.tail, Tail::Var(_)) => true,
         (Type::Record(a), Type::Record(b)) => a.entries.len() == b.entries.len() && record_satisfies_in(&a.entries, &b.entries, memo),
         // Two unions: consistent as SETS -- every alternative on each
         // side has a match on the other (order and duplicates don't

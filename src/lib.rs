@@ -10447,6 +10447,25 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn open_records_cross_dyn_with_typed_run_time_errors() {
+        let d = "let d: Dyn = {x: 1, y: 2} in let e: Dyn = {x: 1, y: 2} in let h = fun p: {x: Int, ..r} -> p in ";
+        // The lenient `consistent` rule: a variable tail is consistent with any record.
+        runs_to(&format!("{d}h(d) == {{x: 1, y: 2}}"), "true");
+        runs_to(&format!("{d}h(d) == h(e)"), "true");
+        runs_to("let f = fun p -> fun q -> (p.x, q.y, p == q) in f({x: 1})({y: 2})", "[1, 2, false]");
+        // A Dyn argument crossing an open-record parameter tests only the listed fields; `.y`'s kept check fires.
+        fails_at_run_time("let d: Dyn = {x: 1} in let h = fun p: {x: Int, ..r} -> p in (h(d)).y", "expected {y: Dyn}, found Record");
+        fails_at_run_time("let d: Dyn = {x: 1} in let k = fun a: {y: Int} -> a.y in let h = fun p: {x: Int, ..r} -> p in k(h(d))", "expected {y: Int}, found Record");
+        runs_to(&format!("{d}(h(d)).y"), "2");
+        // A callback with an open-record parameter, static and through Dyn.
+        runs_to("let apply = fun cb: ({x: Int, ..r} -> Int) -> cb({x: 1, y: 2}) in apply(fun q -> q.x)", "1");
+        // Two joined records leave no partial binding behind.
+        runs_to("let f = fun r -> [r, {x: 1, y: 2}] in len(f({x: 3, y: 4}))", "2");
+        // A closed join narrows an open tail (D8's cost): this call is now rejected.
+        fails_statically("let g = fun r -> (r.y, [r, {y: 1, z: 2}]) in let f = fun a: {y: Int} -> a.y in f({y: 1}) + len(g({y: 1}))", "found {y: Int}");
+    }
+
+    #[test]
     fn open_record_type_values_build_and_refuse_to_nest_under_unions() {
         assert!(run_source("let T = Record(({x: Int}, \"r\")) in let f: (T -> Int) = fun p -> p.x in f({x: 1})").is_ok());
         let err = run_source("let rec U = Union(Int, S) and S = Record(({x: Int}, \"r\")) in 1").unwrap_err();
