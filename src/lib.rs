@@ -10422,6 +10422,31 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn field_access_and_record_patterns_pin_an_open_record() {
+        // D3: `.x` on an unannotated parameter reads `{x: _, ..e}`; a call that cannot satisfy it is static.
+        runs_to("let get = fun r -> r.x in get({x: 1, y: 2})", "1");
+        fails_statically("let get = fun r -> r.x in get(5)", "expected {x: Dyn, ..e}, found Int");
+        fails_statically("let get = fun r -> r.x in get({y: 1})", "expected {x: Dyn, ..e}, found {y: Int}");
+        fails_statically("let get = fun r -> r.x in if false then get({y: 1}) else 0", "found {y: Int}");
+        fails_statically("let f = fun r -> r.x + r.y in f({x: 1})", "expected {x: Dyn, y: Dyn, ..e}, found {x: Int}");
+        runs_to("let f = fun r -> r.x + r.y in f({x: 1, y: 2})", "3");
+        runs_to("let r = {x: 1, y: 2} in let q = r in q.y", "2");
+        // `==` does not resolve its operands.
+        runs_to("let f = fun r -> (r.x, r == {x: 1}) in f({x: 1})", "[1, true]");
+        // D8: a closed requirement against an unbound variable binds the open version, in either order.
+        runs_to("let h = fun a: {y: Int} -> a.y in let f = fun r -> h(r) + r.x in f({x: 1, y: 2})", "3");
+        runs_to("let h = fun a: {y: Int} -> a.y in let f = fun r -> r.x + h(r) in f({x: 1, y: 2})", "3");
+        // D7: same-label-set record arms pin; tagged dispatch and a Union scrutinee do not.
+        fails_statically("let f = fun r -> match r | {x: v} -> v | _ -> 0 in f(5)", "expected {x: Dyn, ..e}, found Int");
+        runs_to("let f = fun r -> match r | {x: a} -> a + 1 | _ -> 0 in f({x: 1})", "2");
+        runs_to(
+            "let f = fun r -> match r | {kind: \"a\", val: g} -> g(1) | {kind: \"b\", val: flag} -> if flag then 1 else 0 | _ -> 0 in [f({kind: \"a\", val: fun q -> q + 1}), f({kind: \"b\", val: true})]",
+            "[2, 1]",
+        );
+        runs_to("let f = fun u: (Int | {x: Int}) -> match u | {x: v} -> v | _ -> 0 in [f(1), f({x: 4})]", "[0, 4]");
+    }
+
+    #[test]
     fn open_record_type_values_build_and_refuse_to_nest_under_unions() {
         assert!(run_source("let T = Record(({x: Int}, \"r\")) in let f: (T -> Int) = fun p -> p.x in f({x: 1})").is_ok());
         let err = run_source("let rec U = Union(Int, S) and S = Record(({x: Int}, \"r\")) in 1").unwrap_err();
@@ -12314,7 +12339,7 @@ g(len)").unwrap_err();
     // A tuple the alternative refutes is a static error, not a value of the wrong shape.
     #[test]
     fn indexed_site_rejects_refuted_tuples_statically() {
-        fails_statically("let rec T = Union(Tuple(Record({x: Int, y: Str}), Int), Tuple(Int, Int, T)) in let g = fun r -> (let t: Indexed(T, 0) = (r, 1) in match t | (u, n) -> (let z: Str = u.y in z) | _ -> \"o\") in g({x: 1, y: 5})", "expected {x: Int, y: Str}, found {x: Int, y: Int}");
+        fails_statically("let rec T = Union(Tuple(Record({x: Int, y: Str}), Int), Tuple(Int, Int, T)) in let g = fun r -> (let t: Indexed(T, 0) = (r, 1) in match t | (u, n) -> (let z: Str = u.y in z) | _ -> \"o\") in g({x: 1, y: 5})", "expected {x: Int, y: Str, ..e}, found {x: Int, y: Int}");
         fails_statically("let rec T = Union(Str, Tuple(Int, T)) in let f = fun n -> (let p = (n, \"s\") in let v: Indexed(T, 1) = p in match v | (m, _) -> (let z: Int = m in z) | _ -> 0) in f(\"x\")", "expected Int, found Str");
         fails_statically("let rec L = Union(Int, Tuple(Int, L)) in let f = fun q -> (let p = (q, 5) in let v: Indexed(L, 1) = p in v) in f(\"s\")", "expected Int, found Str");
         fails_statically("let rec T = Union(Vec(3), Tuple(Int, T)) in let f = fun v: Vec(n) -> (let t: Indexed(T, 0) = v in t) in f([1, 2])", "expected [Dyn](3), found [Int](2)");
@@ -12371,7 +12396,7 @@ g(len)").unwrap_err();
     fn concat_binds_element_types_across_operands() {
         fails_statically("let f = fun xs -> xs ++ [\"s\"] in match f([1]) | h :: _ -> (let w: Str = h in w) | _ -> \"o\"", "expected [Str], found [Int]");
         fails_statically("let f = fun p -> [p] ++ [\"s\"] in match f(1) | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0", "expected Str, found Int");
-        fails_statically("let f = fun p -> (let z: Int = p.x in [p] ++ [{x: \"s\"}]) in match f({x: 1}) | _ :: t -> (match t | h :: _ -> (let w: Int = h.x in w) | _ -> 0) | _ -> 0", "expected {x: Str}, found {x: Int}");
+        fails_statically("let f = fun p -> (let z: Int = p.x in [p] ++ [{x: \"s\"}]) in match f({x: 1}) | _ :: t -> (match t | h :: _ -> (let w: Int = h.x in w) | _ -> 0) | _ -> 0", "cannot concat [{x: Int, ..e}] with [{x: Str}]");
         fails_statically("let f = fun x -> x ++ \"s\" in f(1)", "expected Str, found Int");
         fails_statically("let f = fun x -> fun y -> [x] ++ [y] in f(1)(\"a\")", "expected Int, found Str");
         fails_statically("let f = fun x -> fun y -> x ++ y in f(\"a\")([1])", "expected Str, found [Int]");

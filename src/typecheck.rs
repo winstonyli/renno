@@ -1582,6 +1582,18 @@ fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Spa
                 _ => Err(mismatch()),
             }
         }
+        // D8: a closed requirement against an unbound variable binds the open version, so a
+        // later use of the variable (`h(r) + r.x`) can still add fields. Closed already means
+        // "at least these fields" in a directional position.
+        (Type::Record(req_row), Type::Var(_)) => {
+            let req_row = infer.flatten_row(req_row);
+            let open = if req_row.tail == Tail::Closed {
+                Type::Record(Row::from_entries(req_row.entries.to_vec(), Tail::Var(infer.fresh_row(RowRank::Fresh, "e"))))
+            } else {
+                required.clone()
+            };
+            unify(actual, &open, infer, span)
+        }
         // Added alongside Fun/Record above: a Tuple or List annotation can
         // wrap a Vec(n) element (e.g. `(Vec(n), Int)`, `[Vec(n)]`) just
         // like a Record field can, and without an explicit recursive arm
@@ -3490,6 +3502,28 @@ impl Visiting {
 // not just a runtime concern.
 pub(crate) fn pattern_could_match(pat: &Pattern, ty: &Type, visiting: &Visiting) -> bool {
     could_match(pat, ty, visiting, &mut StackMemo::default())
+}
+
+// The label set every record arm of a match names, when there is one and all the other arms are
+// variables or wildcards (D7): the only shape one open record row can describe.
+fn shared_record_labels(pats: &[&Pattern]) -> Option<Vec<String>> {
+    let mut labels: Option<Vec<String>> = None;
+    for pat in pats {
+        match pat {
+            Pattern::Record(fields) => {
+                let mut these: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+                these.sort();
+                these.dedup();
+                if labels.as_ref().is_some_and(|l| *l != these) {
+                    return None;
+                }
+                labels = Some(these);
+            }
+            Pattern::Var(_) => {}
+            _ => return None,
+        }
+    }
+    labels
 }
 
 fn could_match(pat: &Pattern, ty: &Type, visiting: &Visiting, memo: &mut StackMemo) -> bool {
@@ -5612,13 +5646,32 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         // found Y" message.
         Expr::FieldAccess(target, name) => {
             let (target_ty, target_row, target2) = elaborate(arena, target, ctx, spans, infer)?;
-            let field_ty = match &target_ty {
-                Type::Dyn | Type::Var(_) => Type::Dyn,
-                ty if record_shaped(ty) => record_field_type(ty, &name)
-                    .ok_or_else(|| TypeError(format!("no field named `{name}`"), spans[expr]))?,
-                other => return Err(TypeError(format!("expected a record, found {}", other.brief()), spans[target])),
+            // The target resolved first (a bound variable is its record); a record's bound tail is followed.
+            let target_ty = match infer.resolve(&target_ty) {
+                Type::Record(row) => Type::Record(infer.flatten_row(&row)),
+                other => other,
             };
-            let checked_target = if matches!(target_ty, Type::Dyn | Type::Var(_)) {
+            // D3: an unbound variable, or a record whose flexible tail lacks the field, is pinned to
+            // an open record that has it. The run-time check stays: a `Dyn` caller can still lie.
+            let pinned = match &target_ty {
+                Type::Var(_) => true,
+                Type::Record(row) => matches!(&row.tail, Tail::Var(t) if !infer.rigid_row.contains(t)) && find_field(&row.entries, &name).is_none(),
+                _ => false,
+            };
+            let field_ty = if pinned {
+                let payload = infer.fresh_var("f");
+                let tail = Tail::Var(infer.fresh_row(RowRank::Fresh, "e"));
+                let open = Type::Record(Row::from_entries(vec![(name.clone(), payload.clone())], tail));
+                unify(&target_ty, &open, infer, spans[target])?;
+                payload
+            } else {
+                match &target_ty {
+                    Type::Dyn => Type::Dyn,
+                    ty if record_shaped(ty) => record_field_type(ty, &name).ok_or_else(|| TypeError(format!("no field named `{name}`"), spans[expr]))?,
+                    other => return Err(TypeError(format!("expected a record, found {}", other.brief()), spans[target])),
+                }
+            };
+            let checked_target = if pinned || matches!(target_ty, Type::Dyn) {
                 let required = Type::record(vec![(name.clone(), Type::Dyn)]);
                 build_boundary_check(arena, target2, &required, &CheckEnv::at(infer, spans[target]))
             } else {
@@ -6288,6 +6341,25 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 };
                 row = union_rows(&row, &arm_row, infer, spans[*body])?;
                 new_arms.push((pat.clone(), guard2, body2));
+            }
+            // D7: record arms that share one label set pin an unbound or flexible-tail scrutinee to
+            // an open record with those labels. After the arms, so the binders saw what earlier arms
+            // pinned; the payloads are fresh, unconnected to the binders (tagged dispatch stays free).
+            if let Some(labels) = shared_record_labels(&pats) {
+                let target = match infer.resolve(&scrut_ty) {
+                    Type::Record(row) => Type::Record(infer.flatten_row(&row)),
+                    other => other,
+                };
+                let flexible = match &target {
+                    Type::Var(_) => true,
+                    Type::Record(row) => matches!(&row.tail, Tail::Var(t) if !infer.rigid_row.contains(t)),
+                    _ => false,
+                };
+                if flexible {
+                    let entries = labels.into_iter().map(|l| (l, infer.fresh_var("f"))).collect();
+                    let open = Type::Record(Row::from_entries(entries, Tail::Var(infer.fresh_row(RowRank::Fresh, "e"))));
+                    unify(&target, &open, infer, spans[scrutinee])?;
+                }
             }
             // Final restore, after the WHOLE arm loop completes -- on top
             // of the per-arm restore each iteration now ALSO does at its
