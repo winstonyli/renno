@@ -1433,14 +1433,17 @@ fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: 
         (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
             a.iter().zip(b.iter()).try_for_each(|(x, y)| unify_in(x, y, infer, span, done))
         }
-        (Type::Record(Row { entries: a, .. }), Type::Record(Row { entries: b, .. })) if a.len() == b.len() => {
-            for (name, ty_a) in a.iter() {
-                match find_field(b, name) {
-                    Some(ty_b) => unify_in(ty_a, ty_b, infer, span, done)?,
-                    None => return Err(mismatch()),
+        // Rémy (spec 2.1): common labels unify their payloads, tails take the rest.
+        (Type::Record(r1), Type::Record(r2)) => {
+            let mut err = None;
+            let ok = unify_rows_with(r1, r2, infer, &mut |p, q, i| match unify_in(p, q, i, span, done) {
+                Ok(()) => true,
+                Err(e) => {
+                    err = Some(e);
+                    false
                 }
-            }
-            Ok(())
+            });
+            if ok { Ok(()) } else { Err(err.unwrap_or_else(mismatch)) }
         }
         _ => Err(mismatch()),
     }
@@ -1457,7 +1460,7 @@ fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: 
 // except at a Fun's effect row, which it binds exactly and does not rescue
 // (spec 2.3, stage 1 (iv)): such a failure is a real type error reported
 // after the gate. See the catch-all below.
-fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
+pub(crate) fn unify_fits(required: &Type, actual: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
     fits_in(required, actual, infer, span, &mut FxSet::default())
 }
 
@@ -1510,14 +1513,40 @@ fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Spa
             // Rows are bound, not rescued (spec 2.3): this arm may be stricter than coerce_check.
             if unify_rows(req_row, act_row, infer) { Ok(()) } else { Err(row_mismatch(required, actual, infer, span)) }
         }
-        (Type::Record(Row { entries: req_fields, .. }), Type::Record(Row { entries: act_fields, .. })) => {
-            for (name, req_ty) in req_fields.iter() {
-                match find_field(act_fields, name) {
+        (Type::Record(req_row), Type::Record(act_row)) => {
+            let (req_row, act_row) = (infer.flatten_row(req_row), infer.flatten_row(act_row));
+            if req_row.tail != Tail::Closed {
+                // An open requirement: Rémy over both rows, directional on the payloads.
+                let mut err = None;
+                let ok = unify_rows_with(&req_row, &act_row, infer, &mut |p, q, i| match fits_in(p, q, i, span, done) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        err = Some(e);
+                        false
+                    }
+                });
+                return if ok { Ok(()) } else { Err(err.unwrap_or_else(mismatch)) };
+            }
+            // A closed requirement is "at least these fields" (width): the actual's extras are ignored.
+            let mut lacking = Vec::new();
+            for (name, req_ty) in req_row.entries.iter() {
+                match find_field(&act_row.entries, name) {
                     Some(act_ty) => fits_in(req_ty, act_ty, infer, span, done)?,
-                    None => return Err(mismatch()),
+                    None => lacking.push((name.clone(), req_ty.clone())),
                 }
             }
-            Ok(())
+            if lacking.is_empty() {
+                return Ok(());
+            }
+            // An open actual gains the fields it lacks (its tail binds to them); a closed or rigid one cannot.
+            match &act_row.tail {
+                Tail::Var(a) if !infer.rigid_row.contains(a) && !row_occurs(a, &lacking, infer) => {
+                    let sigma = infer.fresh_row(infer.levels.rank(a), a);
+                    infer.bind_row(a, Row::from_entries(lacking, Tail::Var(sigma)));
+                    Ok(())
+                }
+                _ => Err(mismatch()),
+            }
         }
         // Added alongside Fun/Record above: a Tuple or List annotation can
         // wrap a Vec(n) element (e.g. `(Vec(n), Int)`, `[Vec(n)]`) just
@@ -1712,9 +1741,10 @@ fn dyn_walk(a: &Type, b: &Type, infer: &mut InferCtx, span: Span, done: &mut FxS
         }
         (Type::List(x), Type::List(y)) => dyn_walk(x, y, infer, span, done),
         (Type::Tuple(xs), Type::Tuple(ys)) if xs.len() == ys.len() => xs.iter().zip(ys.iter()).for_each(|(x, y)| dyn_walk(x, y, infer, span, done)),
-        (Type::Record(Row { entries: xs, .. }), Type::Record(Row { entries: ys, .. })) => {
-            for (name, x) in xs.iter() {
-                if let Some(y) = find_field(ys, name) {
+        (Type::Record(xs), Type::Record(ys)) => {
+            let (xs, ys) = (infer.flatten_row(xs), infer.flatten_row(ys));
+            for (name, x) in xs.entries.iter() {
+                if let Some(y) = find_field(&ys.entries, name) {
                     dyn_walk(x, y, infer, span, done);
                 }
             }

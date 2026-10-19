@@ -12177,6 +12177,47 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn record_unify_and_fits_use_the_row_unifier() {
+        use crate::typecheck::{unify, unify_fits, InferCtx, RowRank};
+        use types::{Row, Tail, Type};
+        let sp = crate::span::Span { start: 0, end: 1 };
+        let rec = |fields: &[(&str, Type)], tail: Tail| Type::Record(Row::from_entries(fields.iter().map(|(l, t)| (l.to_string(), t.clone())).collect(), tail));
+        let mut infer = InferCtx::new();
+        // Open against closed: the tail takes the rest.
+        let r = infer.fresh_row(RowRank::User, "r");
+        let open = rec(&[("x", Type::Int)], Tail::Var(r.clone()));
+        let closed = rec(&[("x", Type::Int), ("y", Type::Str)], Tail::Closed);
+        assert!(unify(&open, &closed, &mut infer, sp).is_ok());
+        assert_eq!(infer.resolve_deep(&open), closed);
+        // Same tail, different labels: fails.
+        let t = infer.fresh_row(RowRank::User, "t");
+        let p = rec(&[("x", Type::Int)], Tail::Var(t.clone()));
+        let q = rec(&[("y", Type::Int)], Tail::Var(t.clone()));
+        assert!(unify(&p, &q, &mut infer, sp).is_err());
+        // Two open records with distinct tails: both gain the other's fields.
+        let (a, b) = (infer.fresh_row(RowRank::User, "a"), infer.fresh_row(RowRank::User, "b"));
+        let left = rec(&[("x", Type::Int)], Tail::Var(a));
+        let right = rec(&[("y", Type::Str)], Tail::Var(b));
+        assert!(unify(&left, &right, &mut infer, sp).is_ok());
+        let shown = infer.resolve_deep(&left).to_string();
+        assert!(shown.contains('x') && shown.contains('y'), "{shown}");
+        // fits: a closed requirement is width-tolerant; an open actual gains the field it lacks.
+        let c = infer.fresh_row(RowRank::User, "c");
+        let actual = rec(&[("x", Type::Int)], Tail::Var(c));
+        let required = rec(&[("x", Type::Int), ("z", Type::Bool)], Tail::Closed);
+        assert!(unify_fits(&required, &actual, &mut infer, sp).is_ok());
+        assert!(infer.resolve_deep(&actual).to_string().contains('z'));
+        // A closed actual lacking the field is rejected, a wider one is fine.
+        assert!(unify_fits(&required, &rec(&[("x", Type::Int)], Tail::Closed), &mut infer, sp).is_err());
+        assert!(unify_fits(&rec(&[("x", Type::Int)], Tail::Closed), &closed, &mut infer, sp).is_ok());
+        // An open requirement against a wider closed actual (passthrough): the tail takes the extras.
+        let d = infer.fresh_row(RowRank::User, "d");
+        let req_open = rec(&[("x", Type::Int)], Tail::Var(d));
+        assert!(unify_fits(&req_open, &closed, &mut infer, sp).is_ok());
+        assert_eq!(infer.resolve_deep(&req_open), closed);
+    }
+
+    #[test]
     fn row_unifier_split_keeps_extra_entry_types() {
         use crate::typecheck::{unify_rows, InferCtx, RowRank};
         use types::{Row, Tail, Type};
