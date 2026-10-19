@@ -2377,7 +2377,7 @@ fn cast_now(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEn
     if matches!(arena[e], Expr::Lambda(..)) {
         return build_literal_cast(arena, e, &from, &to, env);
     }
-    build_cast(arena, e, &from, &to, env)
+    build_boundary_check_at(arena, e, &contract_type(&from, &to, env.infer), env, false)
 }
 
 // Casts each Synth-joined arm from its own type to the FINAL joined type, so a
@@ -2408,6 +2408,24 @@ fn join_arm(arena: &mut Arena, e: ExprRef, from: &Type, join: &Type, span: Span,
 // capture or shadow them. Shared by build_cast and build_literal_cast.
 fn cast_binder(base: &str) -> String {
     fresh_index_name(base)
+}
+
+// The type a bare function `from`, seen as `to`, is conformed to. Parameter: the target's when it fits
+// the source's (the argument then witnesses the target's index variables), else the source's own, which
+// is what the function really requires. Result: a result `relate_cast` proves is left unchecked (Dyn), a
+// function result recurses with its own target, any other result is checked as the target promises.
+fn contract_type(from: &Type, to: &Type, infer: &InferCtx) -> Type {
+    let Type::Fun(a, row, b) = from else { return from.clone() };
+    let (a_target, b_target) = cast_targets(to);
+    let param = if relate_cast(&a_target, a, infer) == Rel::Proven { a_target } else { (**a).clone() };
+    let ret = if relate_cast(b, &b_target, infer) == Rel::Proven {
+        Type::Dyn
+    } else if matches!(**b, Type::Fun(..)) {
+        contract_type(b, &b_target, infer)
+    } else {
+        b_target
+    };
+    Type::Fun(Hc::new(param), row.clone(), Hc::new(ret))
 }
 
 // The (parameter, result) types a cast aims at: those of a Fun target (a Rec one
@@ -2484,7 +2502,7 @@ fn literal_up(arena: &mut Arena, body: ExprRef, b: &Type, b_target: &Type, env: 
             let inner = literal_up(arena, inner, b, b_target, env);
             arena.push(Expr::Let(hidden, None, val, inner))
         }
-        _ => build_cast(arena, body, b, b_target, env),
+        _ => build_boundary_check_at(arena, body, &contract_type(b, b_target, env.infer), env, false),
     }
 }
 
@@ -2497,7 +2515,7 @@ fn cast_up(arena: &mut Arena, res: ExprRef, b: &Type, b_target: &Type, env: &Che
     }
     match b {
         Type::Fun(..) if literal => literal_up(arena, res, b, b_target, env),
-        Type::Fun(..) => build_cast(arena, res, b, b_target, env),
+        Type::Fun(..) => build_boundary_check_at(arena, res, &contract_type(b, b_target, env.infer), env, false),
         _ => {
             let body_env = CheckEnv { infer: env.infer, local: env.local.clone(), defer: false, repeatable: true, span: env.span };
             let target = erase_open_indexed(b_target, &body_env);

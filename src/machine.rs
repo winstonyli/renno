@@ -1012,7 +1012,7 @@ fn wrap_function(param: &Rc<Lazy>, ret: &Rc<Lazy>, f: Value, ctx: Rc<SiteCtx>) -
         #[cfg(test)]
         CONTRACT_COLLAPSES.with(|n| n.set(n.get() + 1));
         let ctx = if ctx.spec.trusted && !c.ctx.spec.trusted { c.ctx.clone() } else { ctx };
-        return Value::Contract(Rc::new(Contract { f: c.f.clone(), param: param.clone(), ret: ret.clone(), ret_ctx: c.ret_ctx.clone(), ctx }));
+        return Value::Contract(Rc::new(Contract { f: c.f.clone(), param: param.clone(), ret: c.ret.clone(), ret_ctx: c.ret_ctx.clone(), ctx }));
     }
     Value::Contract(Rc::new(Contract { f, param: param.clone(), ret: ret.clone(), ret_ctx: ctx.clone(), ctx }))
 }
