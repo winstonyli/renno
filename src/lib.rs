@@ -11676,6 +11676,10 @@ g(len)").unwrap_err();
         assert_eq!(run_source(twice).unwrap().as_int(), 2);
         let later = "let rec R = Union(Int, Fun((R,\"e\",Int))) in let h: R = 3 in let k: R = h in let f = fun g: R -> 1 in f(k) + f(h)";
         assert_eq!(run_source(later).unwrap().as_int(), 2);
+        let chain = "let rec R = Union(Int, Fun((R,\"e\",Int))) in let h: R = 3 in let k: R = h in let m: R = k in let f = fun g: R -> 1 in f(m) + f(k) + f(h)";
+        assert_eq!(run_source(chain).unwrap().as_int(), 3);
+        let concat = "let rec R = Union(Int, Fun((R,\"e\",Int))) in let h: R = 3 in let k: R = 4 in let l = [h] ++ [k] in 7";
+        assert_eq!(run_source(concat).unwrap().as_int(), 7);
         // A difference outside a row is still two different types (q3: covariance is not added here).
         let q3 = "let rec L = Union(Int, Fun((L,\"e\",Int))) in let rec M = Union(Int, Str, Fun((M,\"e\",Int))) in let f = fun g: M -> 1 in let h: L = 3 in f(h)";
         let err = run_err(q3);

@@ -1547,6 +1547,12 @@ fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Spa
             // Rows are bound, not rescued (spec 2.3): this arm may be stricter than coerce_check.
             if unify_rows(req_row, act_row, infer) { Ok(()) } else { Err(row_mismatch(required, actual, infer, span)) }
         }
+        // Two groups relate reported as differing only in rows (relate.rs): walk every pair of bodies,
+        // which reaches the `Fun` row arm and the record-tail arm and binds the variables.
+        (Type::Rec(a, i), Type::Rec(b, j)) if i == j && a.0.bodies.len() == b.0.bodies.len() => {
+            let pairs: Vec<(Type, Type)> = a.0.bodies.iter().cloned().zip(b.0.bodies.iter().cloned()).collect();
+            pairs.iter().try_for_each(|(x, y)| fits_in(x, y, infer, span, done))
+        }
         (Type::Record(req_row), Type::Record(act_row)) => {
             let (req_row, act_row) = (infer.flatten_row(req_row), infer.flatten_row(act_row));
             if req_row.tail != Tail::Closed {

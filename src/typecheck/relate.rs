@@ -2,7 +2,7 @@
 //! S2 T1 added `Why`/`Undecided`/`relate_cast`; consumers: coerce_check and the unify_fits rescue (T3), coerce_cast (T4).
 use super::{free_index_vars, row_compatible, unify_index_expr, InferCtx};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
-use crate::types::{is_big, unfold, ById, FxMap, RecRef, Row, Tail, Type};
+use crate::types::{is_big, unfold, ById, FxMap, FxSet, RecRef, Row, Tail, Type};
 use crate::util::find_field;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -249,8 +249,19 @@ fn decide(from: Type, to: Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Re
         (Type::Indexed(wf, _), _) => go(wf, &to, infer, fuel, d), // forgetting an index is sound; the reverse is not
         (_, Type::Indexed(..)) => Rel::opaque("plain type into indexed"),
         // Equal pairs were proven by `from == to` above. No directional body relating: Amber's
-        // rule without an assumption set is unsound for a contravariant occurrence.
-        (Type::Rec(..), Type::Rec(..)) => Rel::opaque("recursive: different types"),
+        // rule without an assumption set is unsound for a contravariant occurrence. Two groups that
+        // differ only in unbound row tails are one type at two annotation instances: the unifier
+        // decides (judged on the resolved groups, so a binding an earlier call made already counts).
+        (Type::Rec(..), Type::Rec(..)) => {
+            let (f, t) = (infer.resolve_deep(&from), infer.resolve_deep(&to));
+            if f == t {
+                Rel::Proven
+            } else if rows_only_differ(&f, &t, infer, &mut FxSet::default()) {
+                unknown(Residual::ROW)
+            } else {
+                Rel::opaque("recursive: different types")
+            }
+        }
         (_, Type::Rec(g, i)) => {
             let hit = |(f, h, k): &(Type, RecRef, usize)| k == i && std::rc::Rc::ptr_eq(&h.0, &g.0) && *f == from;
             if fuel.unfolding_rec.borrow().iter().any(hit) {
@@ -304,6 +315,42 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
         Rel::Refuted(Why::Shape(w)) => Rel::Refuted(Why::Opaque(w)),
         other => other,
     }
+}
+// Do `a` and `b` have the same constructors, the same bound references and the same labels everywhere,
+// differing only where a row tail is an unbound, non-rigid variable on at least one side? A pair of
+// bodies walked together, so a recursive reference (`RecVar::Bound`, compared by depth and member) is
+// never unfolded and the walk is finite. `memo` holds the node pairs already accepted (interned DAGs).
+fn rows_only_differ(a: &Type, b: &Type, infer: &InferCtx, memo: &mut FxSet<(ById, ById)>) -> bool {
+    if a == b {
+        return true;
+    }
+    let key = (ById(a.clone()), ById(b.clone()));
+    if memo.contains(&key) {
+        return true;
+    }
+    // Same labels, and tails equal or flexible on one side; payloads are walked by the caller.
+    let rows_ok = |s: &Row, t: &Row| {
+        let (s, t) = (infer.flatten_row(s), infer.flatten_row(t));
+        let flexible = |tail: &Tail| matches!(tail, Tail::Var(v) if !infer.rigid_row.contains(v));
+        s.entries.iter().map(|(n, _)| n).eq(t.entries.iter().map(|(n, _)| n)) && (s.tail == t.tail || flexible(&s.tail) || flexible(&t.tail))
+    };
+    let ok = match (a, b) {
+        (Type::List(x), Type::List(y)) => rows_only_differ(x, y, infer, memo),
+        (Type::Tuple(xs), Type::Tuple(ys)) => xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| rows_only_differ(x, y, infer, memo)),
+        (Type::Union(xs), Type::Union(ys)) => xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| rows_only_differ(x, y, infer, memo)),
+        (Type::Indexed(x, i), Type::Indexed(y, j)) => i == j && rows_only_differ(x, y, infer, memo),
+        (Type::Fun(p, r, b1), Type::Fun(q, s, b2)) => rows_ok(r, s) && rows_only_differ(p, q, infer, memo) && rows_only_differ(b1, b2, infer, memo),
+        (Type::Record(s), Type::Record(t)) => {
+            let (s, t) = (infer.flatten_row(s), infer.flatten_row(t));
+            rows_ok(&s, &t) && s.entries.iter().zip(t.entries.iter()).all(|((_, x), (_, y))| rows_only_differ(x, y, infer, memo))
+        }
+        (Type::Rec(g, i), Type::Rec(h, j)) => i == j && g.0.bodies.len() == h.0.bodies.len() && g.0.bodies.iter().zip(h.0.bodies.iter()).all(|(x, y)| rows_only_differ(x, y, infer, memo)),
+        _ => false,
+    };
+    if ok {
+        memo.insert(key);
+    }
+    ok
 }
 /// A record against a record (spec 2.3): the tails decide where a lacking or extra field may go,
 /// the payloads of common fields are related recursively. Refuted dominates, Unknowns join.
