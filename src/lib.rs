@@ -11680,6 +11680,11 @@ g(len)").unwrap_err();
         assert_eq!(run_source(chain).unwrap().as_int(), 3);
         let concat = "let rec R = Union(Int, Fun((R,\"e\",Int))) in let h: R = 3 in let k: R = 4 in let l = [h] ++ [k] in 7";
         assert_eq!(run_source(concat).unwrap().as_int(), 7);
+        // A group of several members, each with a row; and a closed (row-free) group against an open one, which binds the row.
+        let members = "let rec A = Union(Int, Fun((B,\"e\",Int))) and B = Union(Str, Fun((A,\"e\",Int))) in let f = fun g: A -> 1 in let h: A = 3 in f(h) + f(h)";
+        assert_eq!(run_source(members).unwrap().as_int(), 2);
+        let closed = "let rec R = Union(Int, Fun((R,\"e\",Int))) in let rec P = Union(Int, Fun((P,Int))) in let f = fun g: P -> 1 in let h: R = 3 in f(h)";
+        assert_eq!(run_source(closed).unwrap().as_int(), 1);
         // A difference outside a row is still two different types (q3: covariance is not added here).
         let q3 = "let rec L = Union(Int, Fun((L,\"e\",Int))) in let rec M = Union(Int, Str, Fun((M,\"e\",Int))) in let f = fun g: M -> 1 in let h: L = 3 in f(h)";
         let err = run_err(q3);
