@@ -2325,11 +2325,47 @@ fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Chec
     cast_now(arena, e, &from, &to, env)
 }
 
+// Does `from`, going to `to`, hand a function leaf to Dyn? True at a position where `from`'s subtree has
+// a function leaf (`map_shape`) and `to` is Dyn; List/Tuple(equal arity)/Record(by field name) recurse,
+// an Indexed list wrapper on either side is looked through. `relate_cast` cannot say this: a container
+// against Dyn is Proven.
+fn loses_function(from: &Type, to: &Type, infer: &InferCtx) -> bool {
+    loses_function_in(from, to, infer, &mut FxMap::default())
+}
+
+// `memo` keys a pair of shared nodes, so a DAG type is walked once per distinct pair.
+fn loses_function_in(from: &Type, to: &Type, infer: &InferCtx, memo: &mut FxMap<(ById, ById), bool>) -> bool {
+    let strip = |t: Type| match t {
+        Type::Indexed(w, _) if matches!(*w, Type::List(_)) => (*w).clone(),
+        other => other,
+    };
+    let (from, to) = (strip(infer.resolve(from)), strip(infer.resolve(to)));
+    let key = (is_big(&from) || is_big(&to)).then(|| (ById(from.clone()), ById(to.clone())));
+    if let Some(done) = key.as_ref().and_then(|k| memo.get(k)) {
+        return *done;
+    }
+    let answer = match (&from, &to) {
+        (_, Type::Dyn) => map_shape(&Lazy::new(Rc::new(from.clone())), &from, &mut NodeMemo::default()).is_some(),
+        (Type::List(a), Type::List(b)) => loses_function_in(a, b, infer, memo),
+        (Type::Tuple(a), Type::Tuple(b)) => a.len() == b.len() && a.iter().zip(b.iter()).any(|(x, y)| loses_function_in(x, y, infer, memo)),
+        (Type::Record(a), Type::Record(b)) => a.entries.iter().any(|(n, x)| b.entries.iter().any(|(m, y)| m == n && loses_function_in(x, y, infer, memo))),
+        _ => false,
+    };
+    if let Some(k) = key {
+        memo.insert(k, answer);
+    }
+    answer
+}
+
 fn cast_now(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let (from, to) = (from.clone(), to.clone());
     // Only a function value relate cannot prove is wrapped. Refuted never reaches here from
     // coerce (coerce_check reported it); joins and Dyn sinks cannot refute a Fun.
-    if !matches!(from, Type::Fun(..)) || !matches!(relate_cast(&from, &to, env.infer), Rel::Unknown(res, _) if !res.row_only()) {
+    if !matches!(from, Type::Fun(..)) {
+        // A container whose function leaf reaches Dyn: a conform to its own type wraps the leaves (U7's Map).
+        return if loses_function(&from, &to, env.infer) { build_boundary_check_at(arena, e, &from, env, false) } else { e };
+    }
+    if !matches!(relate_cast(&from, &to, env.infer), Rel::Unknown(res, _) if !res.row_only()) {
         return e;
     }
     if matches!(arena[e], Expr::Lambda(..)) {
@@ -2564,6 +2600,12 @@ fn coerce_numeric(arena: &mut Arena, e: ExprRef, ty: &Type, span: Span, env: &Ch
 // gets one slot of the node's own (read when it is entered) and one
 // obligation if nothing at run time holds it yet.
 fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv) -> ExprRef {
+    build_boundary_check_at(arena, e, to, env, true)
+}
+
+// `trusted` false is a site whose function leaves will be called by code the binder's type does not
+// cover (a container going to Dyn): each call re-checks its argument.
+fn build_boundary_check_at(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv, trusted: bool) -> ExprRef {
     let shape = match boundary(to, &mut Visiting::default()) {
         Boundary::None => return e,
         Boundary::Shape(_) => true,
@@ -2615,7 +2657,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
         index_names.push(name);
         lens.push(slot);
     }
-    let spec = ConformSpec { source: TypeSource::Static(lazy), index_names, lens, span: env.span, trusted: true };
+    let spec = ConformSpec { source: TypeSource::Static(lazy), index_names, lens, span: env.span, trusted };
     arena.push(Expr::Conform(e, Rc::new(spec)))
 }
 

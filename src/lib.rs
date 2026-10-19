@@ -9578,18 +9578,17 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn a_function_list_checked_against_a_dyn_list_is_unchecked_known_limitation() {
-        // Container casts are parked (fun-to-dyn spec 7): the list type
-        // `[Int -> Int]` coerces to `[Dyn]` with no wrapper, so the bad call
-        // is not rejected with a clean type error (pinned; flips with the fix).
-        for src in [
-            "let l: [Dyn] = [fun x: Int -> x + 1] in match l | [p] -> p(true) | _ -> 0",
-            "let l: [Dyn] = [fun x: Int -> x + 1, fun s: Str -> s] in match l | [p, q] -> p(true) | _ -> 0",
-        ] {
-            let r = std::panic::catch_unwind(|| run_source(src));
-            let clean = matches!(&r, Ok(Err(e)) if e.contains(BAD_INT));
-            assert!(!clean, "{src}: now rejected cleanly; remove the known_limitation pin");
-        }
+    fn a_function_list_checked_against_a_dyn_list_is_rejected_cleanly() {
+        // U7b: the list type `[Int -> Int]` coerces to `[Dyn]` through a wrapper, so the bad call is
+        // rejected with a clean type error (this was a pinned known limitation).
+        let src = "let l: [Dyn] = [fun x: Int -> x + 1] in match l | [p] -> p(true) | _ -> 0";
+        let r = std::panic::catch_unwind(|| run_source(src));
+        assert!(matches!(&r, Ok(Err(e)) if e.contains("expected Int, found Bool")), "{src}: {r:?}");
+        // Still open: two function types in one literal join to `[Dyn]` before any leaf is typed, so the
+        // first function's parameter is not checked (the error is the arithmetic fallback's, not the contract's).
+        let two = "let l: [Dyn] = [fun x: Int -> x + 1, fun s: Str -> s] in match l | [p, q] -> p(true) | _ -> 0";
+        let r = std::panic::catch_unwind(|| run_source(two));
+        assert!(!matches!(&r, Ok(Err(e)) if e.contains("expected Int, found Bool")), "{two}: now rejected cleanly; remove this pin");
     }
 
     #[test]
@@ -11557,7 +11556,8 @@ g(len)").unwrap_err();
         assert_eq!(machine::MAP_REBUILDS.with(|c| c.get()), 0);
         let with_fns = "let d: Dyn = [fun x -> x] in let xs: [Int -> Int] = d in len(xs)";
         run_source_on_this_thread(with_fns).expect("runs");
-        assert_eq!(machine::MAP_REBUILDS.with(|c| c.get()), 1);
+        // One rebuild at each crossing: the literal's functions to Dyn (U7b), then Dyn to the typed list.
+        assert_eq!(machine::MAP_REBUILDS.with(|c| c.get()), 2);
     }
 
     #[test]
@@ -11582,7 +11582,8 @@ g(len)").unwrap_err();
         let src = "let rec loop = fun n -> fun xs -> if n == 0 then (match xs | g :: _ -> g(1) | _ -> 0) else (let d: Dyn = xs in let ys: [Int -> Int] = d in loop(n - 1)(ys)) in loop(200)([fun x -> x + 1])";
         machine::CONTRACT_COLLAPSES.with(|c| c.set(0));
         assert_eq!(run_source_on_this_thread(src).expect("runs").as_int(), 2);
-        assert_eq!(machine::CONTRACT_COLLAPSES.with(|c| c.get()), 199);
+        // 200 iterations of two crossings each (to Dyn, back to typed), all but the first merge: 399.
+        assert_eq!(machine::CONTRACT_COLLAPSES.with(|c| c.get()), 399);
     }
 
     #[test]
@@ -11615,6 +11616,61 @@ g(len)").unwrap_err();
         assert_eq!(PathStep::text(&None), "");
         assert_eq!(PathStep::text(&root), "[2]");
         assert_eq!(PathStep::text(&field), "[2].0.f");
+    }
+
+    #[test]
+    fn a_function_in_a_typed_container_keeps_its_parameter_check_at_dyn() {
+        let t4b = "let f = fun x: Int -> x == 1 in let d: Dyn = (f, 2) in match d | (g, _) -> g(\"s\") | _ -> false";
+        let t4c = "let f = fun x: Int -> x in let p = (f, 2) in let d: Dyn = p in match d | (g, _) -> g(\"s\") | _ -> 0";
+        let k1 = "let d: Dyn = [7] in let f = fun x: Int -> x == 1 in let l = [d] ++ [f] in match l | _ :: g :: _ -> g(\"s\") | _ -> false";
+        for src in [t4b, t4c, k1] {
+            let err = run_err(src);
+            assert!(err.contains("expected Int, found Str"), "{src}: {err}");
+        }
+        let ok = "let f = fun x: Int -> x + 1 in let d: Dyn = (f, 2) in match d | (g, _) -> g(1) | _ -> 0";
+        assert_eq!(run_source(ok).unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_function_free_container_to_dyn_is_not_rebuilt() {
+        machine::MAP_REBUILDS.with(|c| c.set(0));
+        run_source_on_this_thread("let xs = [1, 2, 3] in let d: Dyn = xs in 1").expect("runs");
+        assert_eq!(machine::MAP_REBUILDS.with(|c| c.get()), 0);
+        run_source_on_this_thread("let xs = [fun x: Int -> x] in let d: Dyn = xs in 1").expect("runs");
+        assert_eq!(machine::MAP_REBUILDS.with(|c| c.get()), 1);
+    }
+
+    #[test]
+    fn typed_to_dyn_and_back_collapses_and_a_different_type_still_checks() {
+        machine::CONTRACT_COLLAPSES.with(|c| c.set(0));
+        let same = "let xs = [fun x: Int -> x + 1] in let d: Dyn = xs in let ys: [Int -> Int] = d in match ys | g :: _ -> g(1) | _ -> 0";
+        assert_eq!(run_source_on_this_thread(same).expect("runs").as_int(), 2);
+        assert_eq!(machine::CONTRACT_COLLAPSES.with(|c| c.get()), 1);
+        let diff = "let xs = [fun x: Int -> x + 1] in let d: Dyn = xs in let ys: [Str -> Int] = d in match ys | g :: _ -> g(\"s\") | _ -> 0";
+        let err = run_err(diff);
+        assert!(err.contains("expected Int, found Str"), "{err}");
+    }
+
+    #[test]
+    fn a_typed_function_in_a_container_rechecks_on_every_multi_shot_resume() {
+        let src = "let fs = [fun x: Int -> perform ask(x)] in let d: Dyn = fs in match d | g :: _ -> (handle g(0) with handler ask(p, k) -> k(1) + k(2)) | _ -> 0";
+        assert_eq!(run_source(src).unwrap().as_int(), 3);
+        let bad = "let fs = [fun x: Int -> perform ask(x)] in let d: Dyn = fs in match d | g :: _ -> (handle g(\"s\") with handler ask(p, k) -> k(1) + k(2)) | _ -> 0";
+        assert!(run_err(bad).contains("expected Int, found Str"));
+    }
+
+    #[test]
+    fn a_container_holding_a_function_still_compares_unequal_through_dyn() {
+        // Characterized on v0.5 before the cast: a function never equals another, wrapped or not.
+        let src = "let f = fun x: Int -> x in let p = (f, 1) in let d: Dyn = p in d == p";
+        assert_eq!(run_source(src).map(|v| v.to_string()), Ok("false".to_string()));
+    }
+
+    #[test]
+    fn a_leaf_function_mentioning_an_outer_index_variable_goes_to_dyn() {
+        // The leaf's result type is `Vec(n)` of the enclosing parameter: its site must read that n.
+        let src = "let f = fun v: Vec(n) -> (let fs = [fun x: Int -> v] in let d: Dyn = fs in match d | g :: _ -> len(g(0)) | _ -> 1) in f([1, 2])";
+        assert_eq!(run_source(src).unwrap().as_int(), 2);
     }
 
     fn run_err(src: &str) -> String {
@@ -12539,8 +12595,9 @@ g(len)").unwrap_err();
         runs_to("let u: (Int | Str) = 1 in let f = fun x: (Int | Str) -> [x] ++ [u] in f(2)", "[2, 1]");
         runs_to("let u: (Int | Str) = 1 in let v: (Int | Str) = \"a\" in [u] ++ [v]", "[1, a]");
         runs_to("let f = fun a -> [a] ++ [[a]] in 1", "1");
-        // Pre-existing and unchanged: `++` joins without cast_join_arms (PARKED).
-        runs_to("let d: Dyn = fun y -> y in let f = fun x: Int -> x == 5 in match [d] ++ [f] | _ :: t -> (match t | g :: _ -> g(\"s\") | _ -> false) | _ -> false", "false");
+        // U7b: a `++` join of a Dyn list with a function list wraps the function (k1), so the bad call is rejected.
+        let k1 = "let d: Dyn = fun y -> y in let f = fun x: Int -> x == 5 in match [d] ++ [f] | _ :: t -> (match t | g :: _ -> g(\"s\") | _ -> false) | _ -> false";
+        assert!(run_err(k1).contains("expected Int, found Str"), "{k1}");
         runs_to("let r: {x: Int} = {x: 1} in let s = {x: 2, y: 3} in [r] ++ [s]", "[{x: 1}, {x: 2, y: 3}]");
         runs_to("let u: (Int | Str) = 1 in [u] ++ [1]", "[1, 1]");
         runs_to("let u: (Int | Str) = 1 in let w: (Str | Int) = \"a\" in [u] ++ [w]", "[1, a]");
