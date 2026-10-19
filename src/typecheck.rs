@@ -145,7 +145,7 @@ pub(crate) fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
             }
             Type::List(elem) => go(elem, out, seen),
             Type::Tuple(items) | Type::Union(items) => items.iter().for_each(|t| go(t, out, seen)),
-            Type::Record(fields) => fields.iter().for_each(|(_, t)| go(t, out, seen)),
+            Type::Record(Row { entries: fields, .. }) => fields.iter().for_each(|(_, t)| go(t, out, seen)),
             Type::Indexed(wrapped, index) => {
                 go(wrapped, out, seen);
                 out.extend(free_index_vars(index).into_iter().map(TyVar::Index));
@@ -290,7 +290,7 @@ impl<'a> Lowerer<'a> {
             }
             Type::List(elem) => self.ty(elem),
             Type::Tuple(items) | Type::Union(items) => items.iter().for_each(|t| self.ty(t)),
-            Type::Record(fields) => fields.iter().for_each(|(_, t)| self.ty(t)),
+            Type::Record(Row { entries: fields, .. }) => fields.iter().for_each(|(_, t)| self.ty(t)),
             Type::Indexed(wrapped, index) => {
                 self.ty(wrapped);
                 self.index(index);
@@ -1050,7 +1050,7 @@ fn occurs_in(name: &str, ty: &Type, infer: &InferCtx) -> bool {
             Type::List(elem) => go(name, &elem, infer, seen),
             Type::Fun(param, _row, ret) => go(name, &param, infer, seen) || go(name, &ret, infer, seen),
             Type::Tuple(items) | Type::Union(items) => items.iter().any(|t| go(name, t, infer, seen)),
-            Type::Record(fields) => fields.iter().any(|(_, t)| go(name, t, infer, seen)),
+            Type::Record(Row { entries: fields, .. }) => fields.iter().any(|(_, t)| go(name, t, infer, seen)),
             Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::RecVar(_) => false,
             Type::Rec(g, _) => g.0.bodies.iter().any(|b| go(name, b, infer, seen)),
             // Wraps one nested Type (the index expression is never itself a
@@ -1381,7 +1381,7 @@ fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: 
         (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
             a.iter().zip(b.iter()).try_for_each(|(x, y)| unify_in(x, y, infer, span, done))
         }
-        (Type::Record(a), Type::Record(b)) if a.len() == b.len() => {
+        (Type::Record(Row { entries: a, .. }), Type::Record(Row { entries: b, .. })) if a.len() == b.len() => {
             for (name, ty_a) in a.iter() {
                 match find_field(b, name) {
                     Some(ty_b) => unify_in(ty_a, ty_b, infer, span, done)?,
@@ -1458,7 +1458,7 @@ fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Spa
             // Rows are bound, not rescued (spec 2.3): this arm may be stricter than coerce_check.
             if unify_rows(req_row, act_row, infer) { Ok(()) } else { Err(row_mismatch(required, actual, infer, span)) }
         }
-        (Type::Record(req_fields), Type::Record(act_fields)) => {
+        (Type::Record(Row { entries: req_fields, .. }), Type::Record(Row { entries: act_fields, .. })) => {
             for (name, req_ty) in req_fields.iter() {
                 match find_field(act_fields, name) {
                     Some(act_ty) => fits_in(req_ty, act_ty, infer, span, done)?,
@@ -1660,7 +1660,7 @@ fn dyn_walk(a: &Type, b: &Type, infer: &mut InferCtx, span: Span, done: &mut FxS
         }
         (Type::List(x), Type::List(y)) => dyn_walk(x, y, infer, span, done),
         (Type::Tuple(xs), Type::Tuple(ys)) if xs.len() == ys.len() => xs.iter().zip(ys.iter()).for_each(|(x, y)| dyn_walk(x, y, infer, span, done)),
-        (Type::Record(xs), Type::Record(ys)) => {
+        (Type::Record(Row { entries: xs, .. }), Type::Record(Row { entries: ys, .. })) => {
             for (name, x) in xs.iter() {
                 if let Some(y) = find_field(ys, name) {
                     dyn_walk(x, y, infer, span, done);
@@ -2567,7 +2567,7 @@ fn checked_index_vars_node(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: 
                 checked_index_vars(t, infer, seen, false, in_contract, out);
             }
         }
-        Type::Record(fields) => {
+        Type::Record(Row { entries: fields, .. }) => {
             for (_, t) in fields.iter() {
                 checked_index_vars(t, infer, seen, false, in_contract, out);
             }
@@ -3031,7 +3031,7 @@ fn shape_node(ty: &Type, env: &CheckEnv, defs: &mut Defs, unguarded: &Visiting) 
         // Width-tolerant: `v` need only HAVE (at least) every required
         // field -- extra fields are fine, see Pattern::Record's own doc
         // comment for why nothing downstream can ever observe them.
-        Type::Record(fields) => Test::RecordOf(fields.iter().map(|(name, t)| (name.clone(), element(t, defs))).collect()),
+        Type::Record(Row { entries: fields, .. }) => Test::RecordOf(fields.iter().map(|(name, t)| (name.clone(), element(t, defs))).collect()),
         Type::Union(alts) => Test::Or(alts.iter().map(|alt| shape_test(alt, env, defs, unguarded)).collect()),
         Type::Rec(g, k) if unguarded.has_rec(g, *k) => Test::Never,
         Type::Rec(g, k) if !unguarded.is_empty() => shape_test(&unfold(g, *k), env, defs, &unguarded.with_rec(g, *k)),
@@ -3272,7 +3272,7 @@ fn record_shaped(ty: &Type) -> bool {
 fn record_field_type(ty: &Type, name: &str) -> Option<Type> {
     fn go(ty: &Type, name: &str, memo: &mut FxMap<ById, Option<Type>>) -> Option<Type> {
         match ty {
-            Type::Record(fields) => find_field(fields, name).cloned(),
+            Type::Record(Row { entries: fields, .. }) => find_field(fields, name).cloned(),
             Type::Union(alts) => {
                 if is_big(ty)
                     && let Some(done) = memo.get(&ById(ty.clone()))
@@ -3372,7 +3372,7 @@ fn could_match(pat: &Pattern, ty: &Type, visiting: &Visiting, memo: &mut StackMe
         return *done;
     }
     let result = match (pat, ty) {
-        (Pattern::Record(fields), Type::Record(type_fields)) => {
+        (Pattern::Record(fields), Type::Record(Row { entries: type_fields, .. })) => {
             fields.iter().all(|(name, _)| find_field(type_fields, name).is_some())
         }
         (Pattern::Record(_), Type::Union(alts)) => alts.iter().any(|alt| could_match(pat, alt, visiting, memo)),
@@ -3627,7 +3627,7 @@ fn contains_indexed(ty: &Type) -> bool {
             Type::Indexed(..) => true,
             Type::List(t) => go(t, seen),
             Type::Tuple(ts) | Type::Union(ts) => ts.iter().any(|t| go(t, seen)),
-            Type::Record(fs) => fs.iter().any(|(_, t)| go(t, seen)),
+            Type::Record(Row { entries: fs, .. }) => fs.iter().any(|(_, t)| go(t, seen)),
             Type::Fun(p, _, r) => go(p, seen) || go(r, seen),
             _ => false,
         }
@@ -3940,7 +3940,7 @@ fn bind_pattern_vars(
             bind_pattern_vars(&c, tail, &list_shape, infer, span, visiting)
         }
         Pattern::Record(fields) => match scrutinee_ty {
-            Type::Record(type_fields) => {
+            Type::Record(Row { entries: type_fields, .. }) => {
                 let mut c = ctx.clone();
                 for (name, p) in fields {
                     let field_ty = find_field(type_fields, name).cloned().unwrap_or_else(|| infer.fresh_var(name));
@@ -4050,7 +4050,7 @@ fn covers_tuple_position(pat: &Pattern, ty: &Type) -> bool {
         (Pattern::List(subpats), Type::Tuple(items)) if subpats.len() == items.len() => {
             subpats.iter().zip(items.iter()).all(|(sp, t)| covers_tuple_position(sp, t))
         }
-        (Pattern::Record(pat_fields), Type::Record(type_fields)) => pat_fields
+        (Pattern::Record(pat_fields), Type::Record(Row { entries: type_fields, .. })) => pat_fields
             .iter()
             .all(|(name, sp)| find_field(type_fields, name).is_some_and(|t| covers_tuple_position(sp, t))),
         _ => false,
@@ -5444,7 +5444,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 field_tys.push((name.clone(), field_ty));
                 field_refs.push((name.clone(), field2));
             }
-            Ok((Type::Record(Hc::new(field_tys)), row, arena.push(Expr::Record(Rc::new(field_refs)))))
+            Ok((Type::record(field_tys), row, arena.push(Expr::Record(Rc::new(field_refs)))))
         }
 
         // `p.x` -- desugars into an ordinary get_field(target, "x") call
@@ -5472,7 +5472,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 other => return Err(TypeError(format!("expected a record, found {}", other.brief()), spans[target])),
             };
             let checked_target = if matches!(target_ty, Type::Dyn | Type::Var(_)) {
-                let required = Type::Record(Hc::new(vec![(name.clone(), Type::Dyn)]));
+                let required = Type::record(vec![(name.clone(), Type::Dyn)]);
                 build_boundary_check(arena, target2, &required, &CheckEnv::at(infer, spans[target]))
             } else {
                 target2

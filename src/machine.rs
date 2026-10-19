@@ -1709,7 +1709,7 @@ fn construct_type(ctor: TypeCtor, arg: Value) -> Type {
                 })
                 .collect();
             fields.sort_by(|a, b| a.0.cmp(&b.0));
-            Type::Record(Hc::new(fields))
+            Type::record(fields)
         }
         // (A, B) is `A -> B`; (A, "e", B) is `A ->{e} B`.
         (TypeCtor::Fun, Value::List(items)) => match &items.to_vec()[..] {

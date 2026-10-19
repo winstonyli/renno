@@ -12157,7 +12157,7 @@ g(len)").unwrap_err();
         let shapes = [
             ("list", Type::List(Hc::new(fun(&a)))),
             ("tuple", Type::Tuple(Hc::new(vec![Type::Int, fun(&a)]))),
-            ("record", Type::Record(Hc::new(vec![("f".to_string(), fun(&a))]))),
+            ("record", Type::record(vec![("f".to_string(), fun(&a))])),
             ("union", Type::Union(Hc::new(vec![Type::Int, fun(&a)]))),
             ("nested fun", Type::Fun(Hc::new(fun(&a)), Row::pure(), Hc::new(Type::Int))),
             ("under rec", Type::Rec(rec_group(&["L"], vec![Type::Union(Hc::new(vec![Type::Int, Type::Fun(Hc::new(rec_bound(0, 0)), Row::var(a.clone()), Hc::new(Type::Int))]))]), 0)),
@@ -12443,5 +12443,17 @@ g(len)").unwrap_err();
         fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> [[p], d] in match f(1) | _ :: t -> (match t | x :: _ -> (match x | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0) | _ -> 0", want);
         // The right value still runs.
         runs_to("let d: Dyn = [5] in let f = fun p -> p :: d in match f(1) | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0", "5");
+    }
+
+    // Rows stage 2: a record type is a closed Row; equal records stay one hash-consed node.
+    #[test]
+    fn equal_records_are_one_node_and_a_closed_tail_is_part_of_identity() {
+        use crate::types::Type;
+        let a = Type::record(vec![("x".into(), Type::Int)]);
+        let b = Type::record(vec![("x".into(), Type::Int)]);
+        let (Type::Record(ra), Type::Record(rb)) = (&a, &b) else { panic!("records") };
+        assert!(Hc::ptr_eq(&ra.entries, &rb.entries));
+        assert_eq!(ra.tail, crate::types::Tail::Closed);
+        assert_eq!(a.brief().to_string(), "{x: Int}");
     }
 }

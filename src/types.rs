@@ -292,7 +292,7 @@ impl Interned for Type {
                 a.summary().join(b.summary()).join(Summary::of(rows)).node()
             }
             Type::Tuple(items) | Type::Union(items) => items.summary().node(),
-            Type::Record(fields) => fields.summary().node(),
+            Type::Record(row) => row.entries.summary().join(Summary::of(if matches!(row.tail, Tail::Var(_)) { Summary::ROWVAR } else { 0 })).node(),
             Type::Indexed(w, _) => w.summary().join(Summary::of(Summary::INDEXED)).node(),
             Type::RecVar(RecVar::Free { .. }) => Summary::of(Summary::FREE).node(),
             Type::RecVar(RecVar::Bound { depth, .. }) => Summary { reach: depth + 1, ..Summary::default() }.node(),
@@ -314,7 +314,7 @@ impl Interned for Type {
             (Type::Rec(g, i), Type::Rec(h, j)) => i == j && (Rc::ptr_eq(&g.0, &h.0) || (g.0.names == h.0.names && Hc::ptr_eq(&g.0.bodies, &h.0.bodies))),
             (Type::RecVar(a), Type::RecVar(b)) => a == b,
             (Type::Tuple(a), Type::Tuple(b)) | (Type::Union(a), Type::Union(b)) => Hc::ptr_eq(a, b),
-            (Type::Record(a), Type::Record(b)) => Hc::ptr_eq(a, b),
+            (Type::Record(a), Type::Record(b)) => Hc::ptr_eq(&a.entries, &b.entries) && a.tail == b.tail,
             (Type::Indexed(a, i), Type::Indexed(b, j)) => Hc::ptr_eq(a, b) && i == j,
             _ => false,
         }
@@ -332,7 +332,7 @@ impl Interned for Type {
             Type::RecVar(RecVar::Bound { depth, member }) => (depth, member).hash(h),
             Type::RecVar(RecVar::Free { id, name }) => (id, name).hash(h),
             Type::Tuple(items) | Type::Union(items) => items.addr().hash(h),
-            Type::Record(fields) => fields.addr().hash(h),
+            Type::Record(row) => (row.entries.addr(), &row.tail).hash(h),
             Type::Indexed(w, i) => (w.addr(), i).hash(h),
         }
     }
@@ -453,7 +453,7 @@ pub enum Type {
     // to be projected away at some boundary). `coerce` uses a SEPARATE,
     // one-directional relation for that -- types::record_satisfies, not
     // this type's own (exact, symmetric) consistency.
-    Record(Hc<Vec<(String, Type)>>),
+    Record(Row),
     // "One of these" -- a self-contained sum, no registry/name lookup.
     // Typically each alternative is a Tuple whose first element is a
     // distinct Token (a hand-rolled sum: `Type::Union([Tuple([
@@ -508,6 +508,12 @@ impl Row {
         labels.sort();
         labels.dedup();
         Row { entries: Hc::new(labels.into_iter().map(|l| (l, Type::Dyn)).collect()), tail }
+    }
+
+    // The row of a record type: typed entries in source order (no sorting, no `Dyn` payloads),
+    // tail closed.
+    pub fn fields(entries: Hc<Vec<(String, Type)>>) -> Row {
+        Row { entries, tail: Tail::Closed }
     }
 
     pub fn pure() -> Row {
@@ -607,7 +613,7 @@ pub fn each_child(t: &Type, f: &mut dyn FnMut(&Type)) {
             f(b);
         }
         Type::Tuple(items) | Type::Union(items) => items.iter().for_each(f),
-        Type::Record(fields) => fields.iter().for_each(|(_, t)| f(t)),
+        Type::Record(row) => row.entries.iter().for_each(|(_, t)| f(t)),
         Type::Indexed(w, _) => f(w),
         _ => {}
     }
@@ -635,14 +641,13 @@ fn map_children(t: &Type, f: &mut dyn FnMut(&Type) -> Option<Type>) -> Option<Ty
         }
         Type::Tuple(items) => map_vec(items, f).map(|v| Type::Tuple(Hc::new(v))),
         Type::Union(items) => map_vec(items, f).map(|v| Type::Union(Hc::new(v))),
-        Type::Record(fields) => {
-            let mapped: Vec<Option<Type>> = fields.iter().map(|(_, t)| f(t)).collect();
+        Type::Record(row) => {
+            let mapped: Vec<Option<Type>> = row.entries.iter().map(|(_, t)| f(t)).collect();
             if mapped.iter().all(Option::is_none) {
                 return None;
             }
-            Some(Type::Record(Hc::new(
-                mapped.into_iter().zip(fields.iter()).map(|(m, (n, old))| (n.clone(), m.unwrap_or_else(|| old.clone()))).collect(),
-            )))
+            let entries = mapped.into_iter().zip(row.entries.iter()).map(|(m, (n, old))| (n.clone(), m.unwrap_or_else(|| old.clone()))).collect();
+            Some(Type::Record(Row { entries: Hc::new(entries), tail: row.tail.clone() }))
         }
         Type::Indexed(w, i) => f(w).map(|w| Type::Indexed(Hc::new(w), i.clone())),
         _ => None,
@@ -1067,7 +1072,7 @@ fn canonical_order(comp: &mut [usize], bodies: &HashMap<usize, Type>, index: &Ha
                 }
             }
             Type::Token(id) => (5u8, id).hash(&mut h),
-            Type::Record(fields) => (6u8, fields.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()).hash(&mut h),
+            Type::Record(row) => (6u8, row.entries.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()).hash(&mut h),
             _ => std::mem::discriminant(t).hash(&mut h),
         }
         if !matches!(t, Type::Rec(..)) {
@@ -1213,7 +1218,7 @@ fn consistent_pair(a: &Type, b: &Type, memo: &mut FxMap<(ById, ById), bool>) -> 
         // every one of `a`'s (name, type) pairs found in `b` forces the
         // two name SETS to be identical, not just one contained in the
         // other.
-        (Type::Record(a), Type::Record(b)) => a.len() == b.len() && record_satisfies_in(a, b, memo),
+        (Type::Record(a), Type::Record(b)) => a.entries.len() == b.entries.len() && record_satisfies_in(&a.entries, &b.entries, memo),
         // Two unions: consistent as SETS -- every alternative on each
         // side has a match on the other (order and duplicates don't
         // matter, only membership). Must come before the single-Union
@@ -1291,6 +1296,11 @@ impl fmt::Display for Brief<'_> {
 }
 
 impl Type {
+    // A record type: `fields` in source order, closed (stage 2 builds no other tail).
+    pub fn record(fields: Vec<(String, Type)>) -> Type {
+        Type::Record(Row::fields(Hc::new(fields)))
+    }
+
     pub fn brief(&self) -> Brief<'_> {
         Brief(self)
     }
@@ -1351,9 +1361,9 @@ fn write_type(t: &Type, f: &mut fmt::Formatter, budget: &Cell<usize>) -> fmt::Re
             }
             write!(f, ")")
         }
-        Type::Record(fields) => {
+        Type::Record(row) => {
             write!(f, "{{")?;
-            for (i, (name, t)) in fields.iter().enumerate() {
+            for (i, (name, t)) in row.entries.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }

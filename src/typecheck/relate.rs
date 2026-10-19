@@ -2,7 +2,7 @@
 //! S2 T1 added `Why`/`Undecided`/`relate_cast`; consumers: coerce_check and the unify_fits rescue (T3), coerce_cast (T4).
 use super::{free_index_vars, row_compatible, unify_index_expr, InferCtx};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
-use crate::types::{is_big, unfold, ById, FxMap, RecRef, Type};
+use crate::types::{is_big, unfold, ById, FxMap, RecRef, Row, Type};
 use crate::util::find_field;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -273,7 +273,7 @@ fn decide(from: Type, to: Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Re
         (Type::Tuple(_), Type::List(e)) => {
             if loose(&infer.resolve(e)) { Rel::Proven } else { Rel::refuted("tuple into list") }
         }
-        (Type::Record(a), Type::Record(b)) => and(b.iter().map(|(name, t)| match find_field(a, name) {
+        (Type::Record(Row { entries: a, .. }), Type::Record(Row { entries: b, .. })) => and(b.iter().map(|(name, t)| match find_field(a, name) {
             Some(ft) => go(ft, t, infer, fuel, d),
             None => Rel::refuted("missing field"),
         })),
@@ -351,7 +351,7 @@ mod tests {
         Type::Union(Hc::new(ts.to_vec()))
     }
     fn rec(fs: &[(&str, Type)]) -> Type {
-        Type::Record(Hc::new(fs.iter().map(|(n, t)| (n.to_string(), t.clone())).collect()))
+        Type::record(fs.iter().map(|(n, t)| (n.to_string(), t.clone())).collect())
     }
     fn fun(a: Type, b: Type) -> Type {
         Type::Fun(Hc::new(a), Row::dyn_(), Hc::new(b))
