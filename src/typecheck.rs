@@ -2626,6 +2626,8 @@ fn build_boundary_check_at(arena: &mut Arena, e: ExprRef, to: &Type, env: &Check
     // (inside a contract) and whether every length slot mentioning it is exactly that
     // variable (a bare one: see Obligation::bare).
     let mut read: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+    let has = |name: &str| has_len(env, name);
+    let params: Option<&dyn Fn(&str) -> bool> = (!trusted).then_some(&has);
     if matches!(lowered.then, Then::Done | Then::Map(_)) {
         for slot in &lowered.slots {
             for name in free_index_vars(slot) {
@@ -2636,14 +2638,14 @@ fn build_boundary_check_at(arena: &mut Arena, e: ExprRef, to: &Type, env: &Check
         // A function leaf inside the container reads its own variables per call.
         if let Then::Map(shape) = &lowered.then {
             let mut names = BTreeMap::new();
-            map_leaf_vars(shape, env.infer, &mut Seen::default(), &mut names);
+            map_leaf_vars(shape, env.infer, &mut Seen::default(), params, &mut names);
             for (name, repeatable) in names {
                 read.entry(name).or_insert((repeatable, true));
             }
         }
     } else {
         let mut names = BTreeMap::new();
-        checked_index_vars(&lazy.ty, env.infer, &mut Seen::default(), true, false, &mut names);
+        checked_index_vars(&lazy.ty, env.infer, &mut Seen::default(), true, false, params, &mut names);
         read.extend(names.into_iter().map(|(name, repeatable)| (name, (repeatable, true))));
     }
     let (mut index_names, mut lens) = (Vec::with_capacity(read.len()), Vec::with_capacity(read.len()));
@@ -2698,41 +2700,29 @@ struct Seen {
 }
 
 // The index variables a Map site's function leaves read per call, as `checked_index_vars` finds them for a bare function.
-fn map_leaf_vars(shape: &MapShape, infer: &InferCtx, seen: &mut Seen, out: &mut BTreeMap<String, bool>) {
+fn map_leaf_vars(shape: &MapShape, infer: &InferCtx, seen: &mut Seen, params: Option<&dyn Fn(&str) -> bool>, out: &mut BTreeMap<String, bool>) {
     match shape {
-        MapShape::Leaf(lazy) => match &*lazy.ty {
-            Type::Fun(param, _, ret) => {
-                let mut inner = BTreeMap::new();
-                checked_index_vars(ret, infer, seen, true, true, &mut inner);
-                if let Some(own) = list_length_var(param, infer) {
-                    inner.remove(&own);
-                }
-                for (name, repeatable) in inner {
-                    *out.entry(name).or_insert(false) |= repeatable;
-                }
-            }
-            other => checked_index_vars(other, infer, seen, true, true, out),
-        },
-        MapShape::List(inner) => map_leaf_vars(inner, infer, seen, out),
-        MapShape::Tuple(slots) => slots.iter().flatten().for_each(|s| map_leaf_vars(s, infer, seen, out)),
-        MapShape::Record(fields) => fields.iter().for_each(|(_, s)| map_leaf_vars(s, infer, seen, out)),
+        MapShape::Leaf(lazy) => checked_index_vars(&lazy.ty, infer, seen, true, true, params, out),
+        MapShape::List(inner) => map_leaf_vars(inner, infer, seen, params, out),
+        MapShape::Tuple(slots) => slots.iter().flatten().for_each(|s| map_leaf_vars(s, infer, seen, params, out)),
+        MapShape::Record(fields) => fields.iter().for_each(|(_, s)| map_leaf_vars(s, infer, seen, params, out)),
     }
 }
 
-fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool, in_contract: bool, out: &mut BTreeMap<String, bool>) {
+fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool, in_contract: bool, params: Option<&dyn Fn(&str) -> bool>, out: &mut BTreeMap<String, bool>) {
     // Only an Indexed names a variable.
     if !ty.summary().any(Summary::INDEXED) {
         return;
     }
     if !is_big(ty) {
-        return checked_index_vars_node(ty, infer, seen, spine, in_contract, out);
+        return checked_index_vars_node(ty, infer, seen, spine, in_contract, params, out);
     }
     let key = (ById(ty.clone()), spine, in_contract);
     let mine = match seen.nodes.get(&key) {
         Some(done) => done.clone(),
         None => {
             let mut mine = BTreeMap::new();
-            checked_index_vars_node(ty, infer, seen, spine, in_contract, &mut mine);
+            checked_index_vars_node(ty, infer, seen, spine, in_contract, params, &mut mine);
             seen.nodes.insert(key, mine.clone());
             mine
         }
@@ -2742,44 +2732,53 @@ fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool,
     }
 }
 
-fn checked_index_vars_node(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool, in_contract: bool, out: &mut BTreeMap<String, bool>) {
+fn checked_index_vars_node(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool, in_contract: bool, params: Option<&dyn Fn(&str) -> bool>, out: &mut BTreeMap<String, bool>) {
     match ty {
         Type::Fun(param, _, ret) if spine => {
             let mut inner = BTreeMap::new();
-            checked_index_vars(ret, infer, seen, true, true, &mut inner);
+            checked_index_vars(ret, infer, seen, true, true, params, &mut inner);
             if let Some(own) = list_length_var(param, infer) {
                 inner.remove(&own);
             }
             for (name, repeatable) in inner {
                 *out.entry(name).or_insert(false) |= repeatable;
             }
+            // An untrusted site re-checks each call's argument, so the parameter's own variables are
+            // read too, when the site can give them a length (else the binder is the function's own).
+            if let Some(has_len) = params {
+                let mut read = BTreeMap::new();
+                checked_index_vars(param, infer, seen, false, true, params, &mut read);
+                for name in read.into_keys().filter(|n| has_len(n)) {
+                    out.insert(name, true);
+                }
+            }
         }
         Type::Union(alts) => {
             for alt in alts.iter() {
-                checked_index_vars(alt, infer, seen, spine, in_contract, out);
+                checked_index_vars(alt, infer, seen, spine, in_contract, params, out);
             }
         }
         Type::Rec(g, i) => {
             if seen.rec.insert((Rc::as_ptr(&g.0), *i)) {
                 seen.keep.push(g.clone());
-                checked_index_vars(&unfold(g, *i), infer, seen, spine, in_contract, out);
+                checked_index_vars(&unfold(g, *i), infer, seen, spine, in_contract, params, out);
             }
         }
         Type::Indexed(wrapped, index) => {
             for name in free_index_vars(index) {
                 *out.entry(name).or_insert(false) |= in_contract;
             }
-            checked_index_vars(wrapped, infer, seen, spine && !matches!(**wrapped, Type::List(_)), in_contract, out);
+            checked_index_vars(wrapped, infer, seen, spine && !matches!(**wrapped, Type::List(_)), in_contract, params, out);
         }
-        Type::List(elem) => checked_index_vars(elem, infer, seen, false, in_contract, out),
+        Type::List(elem) => checked_index_vars(elem, infer, seen, false, in_contract, params, out),
         Type::Tuple(items) => {
             for t in items.iter() {
-                checked_index_vars(t, infer, seen, false, in_contract, out);
+                checked_index_vars(t, infer, seen, false, in_contract, params, out);
             }
         }
         Type::Record(Row { entries: fields, .. }) => {
             for (_, t) in fields.iter() {
-                checked_index_vars(t, infer, seen, false, in_contract, out);
+                checked_index_vars(t, infer, seen, false, in_contract, params, out);
             }
         }
         _ => {}
@@ -3151,6 +3150,13 @@ impl<'a> CheckEnv<'a> {
 // A same-named TERM variable (`fun n: Int -> fun v: Vec(n)`) is never used:
 // the typechecker does not link a term `n` to the index `n`, so reading it
 // would let a wrong-length value through (or reject a right one).
+// Does the site hold a length for index variable `name`? Every variable left in `runtime_index`'s
+// reading of it has a witness (a binding to an unwitnessed variable would be a `NoValue` slot).
+fn has_len(env: &CheckEnv, name: &str) -> bool {
+    let vars: Vec<&str> = env.local.iter().copied().chain(env.infer.index_witness.iter()).map(|w| w.var.as_str()).collect();
+    free_index_vars(&runtime_index(&IndexExpr::Var(name.to_string()), env.infer, &vars, false)).iter().all(|v| vars.contains(&v.as_str()))
+}
+
 fn index_len_term(arena: &mut Arena, e: &IndexExpr, env: &CheckEnv) -> LenExpr {
     let mut go = |x: &IndexExpr| Box::new(index_len_term(arena, x, env));
     match e {
