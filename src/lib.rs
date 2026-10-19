@@ -9584,11 +9584,10 @@ g(len)").unwrap_err();
         let src = "let l: [Dyn] = [fun x: Int -> x + 1] in match l | [p] -> p(true) | _ -> 0";
         let r = std::panic::catch_unwind(|| run_source(src));
         assert!(matches!(&r, Ok(Err(e)) if e.contains("expected Int, found Bool")), "{src}: {r:?}");
-        // Still open: two function types in one literal join to `[Dyn]` before any leaf is typed, so the
-        // first function's parameter is not checked (the error is the arithmetic fallback's, not the contract's).
+        // Two function types in one literal join to `[Dyn]`; each arm is cast to that join in Check mode too.
         let two = "let l: [Dyn] = [fun x: Int -> x + 1, fun s: Str -> s] in match l | [p, q] -> p(true) | _ -> 0";
         let r = std::panic::catch_unwind(|| run_source(two));
-        assert!(!matches!(&r, Ok(Err(e)) if e.contains("expected Int, found Bool")), "{two}: now rejected cleanly; remove this pin");
+        assert!(matches!(&r, Ok(Err(e)) if e.contains("expected Int, found Bool")), "{two}: {r:?}");
     }
 
     #[test]

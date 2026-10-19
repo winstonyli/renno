@@ -5822,10 +5822,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             // against instead of a Dyn that would otherwise immediately
             // flatten the whole result.
             let elem_ty = elem_ty.unwrap_or_else(|| infer.fresh_var("elem"));
-            if matches!(mode, Mode::Synth) {
-                let item_spans: Vec<Span> = items.iter().map(|i| spans[*i]).collect();
-                cast_join_arms(arena, &mut refs, &item_tys, &item_spans, &elem_ty, infer);
-            }
+            let item_spans: Vec<Span> = items.iter().map(|i| spans[*i]).collect();
+            cast_join_arms(arena, &mut refs, &item_tys, &item_spans, &elem_ty, infer);
             // Case A construction (design spec 2026-09-20 sec 1): checked
             // against an Indexed(List(_), _) expected type, synthesize the
             // PRECISE length-indexed type instead of a plain List --
