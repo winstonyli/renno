@@ -145,7 +145,12 @@ pub(crate) fn vars_in(ty: &Type) -> BTreeSet<TyVar> {
             }
             Type::List(elem) => go(elem, out, seen),
             Type::Tuple(items) | Type::Union(items) => items.iter().for_each(|t| go(t, out, seen)),
-            Type::Record(Row { entries: fields, .. }) => fields.iter().for_each(|(_, t)| go(t, out, seen)),
+            Type::Record(row) => {
+                if let Tail::Var(name) = &row.tail {
+                    out.insert(TyVar::Row(name.clone()));
+                }
+                row.entries.iter().for_each(|(_, t)| go(t, out, seen));
+            }
             Type::Indexed(wrapped, index) => {
                 go(wrapped, out, seen);
                 out.extend(free_index_vars(index).into_iter().map(TyVar::Index));
@@ -290,7 +295,7 @@ impl<'a> Lowerer<'a> {
             }
             Type::List(elem) => self.ty(elem),
             Type::Tuple(items) | Type::Union(items) => items.iter().for_each(|t| self.ty(t)),
-            Type::Record(Row { entries: fields, .. }) => fields.iter().for_each(|(_, t)| self.ty(t)),
+            Type::Record(row) => self.row_value(row),
             Type::Indexed(wrapped, index) => {
                 self.ty(wrapped);
                 self.index(index);
@@ -314,8 +319,9 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    // A row's variables (payloads are Dyn in stage 1, so only the tail).
+    // A row's variables: its tail and what its payloads mention.
     fn row_value(&mut self, row: &Row) {
+        row.entries.iter().for_each(|(_, t)| self.ty(t));
         if let Tail::Var(name) = &row.tail {
             self.row(name);
         }
@@ -1024,6 +1030,17 @@ impl Rebuild for ResolveDeep<'_> {
                 }
                 Some(Some(Type::Fun(param2.map_or_else(|| param.clone(), Hc::new), row2.unwrap_or_else(|| row.clone()), ret2.map_or_else(|| ret.clone(), Hc::new))))
             }
+            Type::Record(row) if matches!(row.tail, Tail::Var(_)) => {
+                // Follow the bound tail (its entries join the record's), then resolve every payload.
+                let flat = self.infer.flattened(row);
+                let row = flat.as_ref().unwrap_or(row);
+                let walked: Vec<Option<Type>> = row.entries.iter().map(|(_, t)| self.walk(t)).collect();
+                if flat.is_none() && walked.iter().all(Option::is_none) {
+                    return Some(None);
+                }
+                let entries = row.entries.iter().zip(walked).map(|((l, t), w)| (l.clone(), w.unwrap_or_else(|| t.clone()))).collect();
+                Some(Some(Type::Record(Row::from_entries(entries, row.tail.clone()))))
+            }
             _ => None,
         }
     }
@@ -1042,7 +1059,8 @@ fn occurs_in(name: &str, ty: &Type, infer: &InferCtx) -> bool {
     // A node with no variable in it has nothing to find; a node already walked (this call, the
     // substitution constant meanwhile) found nothing, else the walk would have stopped there.
     fn go(name: &str, ty: &Type, infer: &InferCtx, seen: &mut Visited) -> bool {
-        if !ty.summary().any(Summary::VAR) || !seen.first(ty) {
+        let mask = Summary::VAR | if infer.row_subst.is_empty() { 0 } else { Summary::ROWVAR };
+        if !ty.summary().any(mask) || !seen.first(ty) {
             return false;
         }
         match infer.resolve(ty) {
@@ -1050,7 +1068,7 @@ fn occurs_in(name: &str, ty: &Type, infer: &InferCtx) -> bool {
             Type::List(elem) => go(name, &elem, infer, seen),
             Type::Fun(param, _row, ret) => go(name, &param, infer, seen) || go(name, &ret, infer, seen),
             Type::Tuple(items) | Type::Union(items) => items.iter().any(|t| go(name, t, infer, seen)),
-            Type::Record(Row { entries: fields, .. }) => fields.iter().any(|(_, t)| go(name, t, infer, seen)),
+            Type::Record(row) => infer.flatten_row(&row).entries.iter().any(|(_, t)| go(name, t, infer, seen)),
             Type::Dyn | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Token(_) | Type::RecVar(_) => false,
             Type::Rec(g, _) => g.0.bodies.iter().any(|b| go(name, b, infer, seen)),
             // Wraps one nested Type (the index expression is never itself a
@@ -1284,6 +1302,15 @@ pub(crate) fn unify_rows_with(r1: &Row, r2: &Row, infer: &mut InferCtx, pair: &m
             return false;
         }
     }
+    // A payload mentioning the variable it would be bound into is an infinite type.
+    let cyclic = match &plan {
+        RowPlan::Nothing => false,
+        RowPlan::Bind(name, row) => row_occurs(name, &row.entries, infer),
+        RowPlan::Split { a, b, only_a, only_b, .. } => row_occurs(a, only_b, infer) || row_occurs(b, only_a, infer),
+    };
+    if cyclic {
+        return false;
+    }
     match plan {
         RowPlan::Nothing => {}
         RowPlan::Bind(name, row) => infer.bind_row(&name, row),
@@ -1295,6 +1322,12 @@ pub(crate) fn unify_rows_with(r1: &Row, r2: &Row, infer: &mut InferCtx, pair: &m
         }
     }
     true
+}
+
+// Does row variable `name` occur in the payloads `entries` (resolved)?
+fn row_occurs(name: &str, entries: &[(String, Type)], infer: &InferCtx) -> bool {
+    let target = TyVar::Row(name.to_string());
+    entries.iter().any(|(_, t)| t.summary().any(Summary::ROWVAR) && vars_in(&infer.resolve_deep(t)).contains(&target))
 }
 
 // Could unify_rows make the two rows equal? Binds nothing (relate's effect-row test, 2.3).
@@ -1929,16 +1962,26 @@ impl<S: BuildHasher> Rebuild for SubstType<'_, S> {
                 }
                 Some(Some(Type::Fun(param2.map_or_else(|| param.clone(), Hc::new), row2, ret2.map_or_else(|| ret.clone(), Hc::new))))
             }
+            Type::Record(row) => {
+                let walked: Vec<Option<Type>> = row.entries.iter().map(|(_, t)| self.walk(t)).collect();
+                let changed = walked.iter().any(Option::is_some);
+                let entries = row.entries.iter().zip(walked).map(|((l, t), w)| (l.clone(), w.unwrap_or_else(|| t.clone()))).collect();
+                let renamed = rename_row(&Row { entries: Hc::new(entries), tail: row.tail.clone() }, self.row_subst);
+                if !changed && renamed == *row {
+                    return Some(None);
+                }
+                Some(Some(Type::Record(renamed)))
+            }
             _ => None,
         }
     }
 }
 
-// `row` with its variable tail replaced per `map` (the replacement's labels join `row`'s).
+// `row` with its variable tail replaced per `map` (the replacement's entries join `row`'s).
 fn rename_row<S: BuildHasher>(row: &Row, map: &HashMap<String, Row, S>) -> Row {
     match &row.tail {
         Tail::Var(name) => match map.get(name) {
-            Some(r) => Row::new(row.labels().chain(r.labels()).map(String::from).collect(), r.tail.clone()),
+            Some(r) => Row::from_entries(row.entries.iter().chain(r.entries.iter()).cloned().collect(), r.tail.clone()),
             None => row.clone(),
         },
         _ => row.clone(),

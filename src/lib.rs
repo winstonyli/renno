@@ -12160,6 +12160,23 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn record_tails_resolve_and_occurs_check() {
+        use crate::typecheck::{unify_rows, InferCtx, RowRank};
+        use types::{Row, Tail, Type};
+        let mut infer = InferCtx::new();
+        let r = infer.fresh_row(RowRank::User, "r");
+        let open = Type::Record(Row::from_entries(vec![("x".into(), Type::Int)], Tail::Var(r.clone())));
+        assert!(unify_rows(&Row::var(r.clone()), &Row::from_entries(vec![("y".into(), Type::Str)], Tail::Closed), &mut infer));
+        let closed = Type::Record(Row::from_entries(vec![("x".into(), Type::Int), ("y".into(), Type::Str)], Tail::Closed));
+        assert_eq!(infer.resolve_deep(&open), closed);
+        // {y: {.. | s}} cannot be bound into s.
+        let s = infer.fresh_row(RowRank::User, "s");
+        let inner = Type::Record(Row::from_entries(Vec::new(), Tail::Var(s.clone())));
+        let cyc = Row::from_entries(vec![("y".into(), inner)], Tail::Closed);
+        assert!(!unify_rows(&Row::var(s), &cyc, &mut infer));
+    }
+
+    #[test]
     fn row_unifier_split_keeps_extra_entry_types() {
         use crate::typecheck::{unify_rows, InferCtx, RowRank};
         use types::{Row, Tail, Type};
