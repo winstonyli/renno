@@ -1628,8 +1628,15 @@ fn concat_type_in(l_ty: &Type, r_ty: &Type, infer: &mut InferCtx, span: Span) ->
     Ok(result)
 }
 
-// The Dyn rule (wrong-value fixes spec, section 2b), written for any join site; only `++` calls
-// it. Walks `a` and `b` in parallel, resolving each node first, through lists, tuples of equal
+// The tolerant join of If, Match and list-literal arms: the Dyn rule, then `unify_trial`. The
+// walk's bindings stay when the trial fails (the join is then `Dyn`, which only loosens them).
+fn join_trial(a: &Type, b: &Type, infer: &mut InferCtx, span: Span) -> Result<(), Mismatch> {
+    dyn_walk(a, b, infer, span, &mut FxSet::default());
+    unify_trial(a, b, infer, span)
+}
+
+// The Dyn rule (wrong-value fixes spec, section 2b), written for any join site; `++`, the
+// joins above and `::` call it. Walks `a` and `b` in parallel, resolving each node first, through lists, tuples of equal
 // length and the fields two records share. Where a `Dyn` meets a subterm that is neither `Dyn`
 // nor a variable, that subterm's unbound type variables are bound to `Dyn`, so a value the `Dyn`
 // side supplies is not typed by a constraint it never met (`fun p -> [p] ++ d` is
@@ -5500,7 +5507,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 item_tys.push(item_ty.clone());
                 elem_ty = Some(match elem_ty {
                     None => item_ty,
-                    Some(t) => match unify_trial(&t, &item_ty, infer, spans[item]) {
+                    Some(t) => match join_trial(&t, &item_ty, infer, spans[item]) {
                         Ok(()) => infer.resolve_deep(&t),
                         Err(_) => Type::Dyn,
                     },
@@ -5783,6 +5790,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     // comment); the result is always a plain Type::List
                     // regardless, so there's nothing Indexed left to
                     // preserve past this point anyway.
+                    dyn_walk(&r_ty, &list_shape, infer, spans[r], &mut FxSet::default());
                     unify(&forget_index(&r_ty), &list_shape, infer, spans[r])?;
                     unify(&l_ty, &elem_ty, infer, spans[l])?;
                     let result_ty = Type::List(Hc::new(infer.resolve_deep(&elem_ty)));
@@ -5809,7 +5817,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 Mode::Synth => {
                     let (t_ty, t_row, t2) = elaborate(arena, t, ctx, spans, infer)?;
                     let (e_ty, e_row, e2) = elaborate(arena, e, ctx, spans, infer)?;
-                    let result_ty = match unify_trial(&t_ty, &e_ty, infer, spans[expr]) {
+                    let result_ty = match join_trial(&t_ty, &e_ty, infer, spans[expr]) {
                         Ok(()) => infer.resolve_deep(&t_ty),
                         Err(_) => Type::Dyn,
                     };
@@ -6122,7 +6130,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         arm_spans.push(spans[*body]);
                         result_ty = Some(match result_ty {
                             None => arm_ty,
-                            Some(t) => match unify_trial(&t, &arm_ty, infer, spans[expr]) {
+                            Some(t) => match join_trial(&t, &arm_ty, infer, spans[expr]) {
                                 Ok(()) => infer.resolve_deep(&t),
                                 Err(_) => Type::Dyn,
                             },

@@ -12432,4 +12432,16 @@ g(len)").unwrap_err();
         runs_to("let d: Dyn = [1, 2] in let ys: Dyn = \"bad\" :: d in len(ys)", "3");
         runs_to("let d: Dyn = 7 in match [1, d] | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0", "7");
     }
+
+    // ---- the `++` Dyn rule at the other join sites (PARKED j1/y3): a variable meeting `Dyn` in a join is `Dyn` ----
+    #[test]
+    fn the_dyn_rule_holds_at_if_match_cons_and_list_literal_joins() {
+        let want = "expected Int, found Str";
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> (if false then [p] else d) in match f(1) | h :: _ -> (let w: Int = h in w) | _ -> 0", want);
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> p :: d in match f(1) | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0", want);
+        fails_at_run_time("let d: Dyn = [\"s\"] in let g = fun p -> (match p | 1 -> [p] | _ -> d) in match g(2) | h :: _ -> (let w: Int = h in w) | _ -> 0", want);
+        fails_at_run_time("let d: Dyn = [\"s\"] in let f = fun p -> [[p], d] in match f(1) | _ :: t -> (match t | x :: _ -> (match x | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0) | _ -> 0", want);
+        // The right value still runs.
+        runs_to("let d: Dyn = [5] in let f = fun p -> p :: d in match f(1) | _ :: t -> (match t | h :: _ -> (let w: Int = h in w) | _ -> 0) | _ -> 0", "5");
+    }
 }
