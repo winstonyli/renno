@@ -37,3 +37,6 @@ U7 (2026-10-19): `u7-containers` and `-b` failed at launch (relative and quoted 
 
 
 U7b (2026-10-19): `u7b-vs-v050` (alternating best-of-5 against a v0.5.0 build, CPU 23-24%, Defender off): worst time x1.09 (`mono_uses_4000`, noise), new shape `cross_list_to_dyn_2000` x1.03 time x1.11 memory, every other shape within x1.03 or faster.
+| 2026-10-19-u7b-listlit-idle | bench | powershell -NoProfile -File docs/superpowers/plans/wrong-value-harness/bench.ps1 -Base C:\Users\WINSTO~1\AppData\Local\Temp\RENNO-~1\target\release\renno.exe -New C:\Users\WINSTO~1\DOCUME~1\GitHub\renno\target\release\renno.exe | fee0e8c | 2026-10-19T10:14:55 | 2026-10-19T10:15:20 | 0 | cpu 6%, defender realtime False, gpus [AMD Radeon RX 9060 XT + AMD Radeon(TM) 780M], live gpu leases 1, priority BelowNormal | worst ratio x1.11 over 20 shapes | %LOCALAPPDATA%\claude-runs\renno\2026-10-19-u7b-listlit-idle | 1.4 | wrapper pid 62080, child pid 51636 |
+
+U7b + list-literal join cast (2026-10-19): `u7b-listlit-idle` (v0.5.0 vs `fee0e8c`, alternating best-of-5, CPU 12%, Defender off): worst ratio x1.11 is memory on `cross_list_to_dyn_2000`; worst time x1.07 (`open_record_chain_2000`, the stage 3 miss already parked); every other shape x0.85-1.02. Gate x1.3 met.
