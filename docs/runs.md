@@ -33,3 +33,7 @@
 
 
 U7 (2026-10-19): `u7-containers` and `-b` failed at launch (relative and quoted paths; no data). `-c` (CPU 10%, Defender off) against `renno-rows2.exe`: worst ratios are `open_record_chain_2000` x1.58 and `pin_match_2000` x1.20, the stage 3 misses already in PARKED.md (against the pre-U7 build 0d1ab44 they read x0.91 and x0.96 in `-vs-main`, a contended run, CPU 52-86%). The new shapes `cross_list_fns_2000` x1.15 (11 vs 12 ms, noise) and `cross_fn_alt_2000` x0.98; all other shapes within x1.10. Launch the bench with 8.3 short paths (`cygpath -d`): the wrapper re-splits quoted paths with spaces.
+| 2026-10-19-u7b-vs-v050 | bench | powershell -NoProfile -File docs/superpowers/plans/wrong-value-harness/bench.ps1 -Base C:\Users\WINSTO~1\AppData\Local\Temp\RENNO-~1\target\release\renno.exe -New C:\Users\WINSTO~1\DOCUME~1\GitHub\renno\target\release\renno.exe | b12409c | 2026-10-19T09:49:51 | 2026-10-19T09:50:16 | 0 | cpu 26%, defender realtime False, gpus [AMD Radeon RX 9060 XT + AMD Radeon(TM) 780M], live gpu leases 1, priority BelowNormal | worst ratio x1.11 over 20 shapes | %LOCALAPPDATA%\claude-runs\renno\2026-10-19-u7b-vs-v050 | 1.4 | wrapper pid 34452, child pid 38696 |
+
+
+U7b (2026-10-19): `u7b-vs-v050` (alternating best-of-5 against a v0.5.0 build, CPU 23-24%, Defender off): worst time x1.09 (`mono_uses_4000`, noise), new shape `cross_list_to_dyn_2000` x1.03 time x1.11 memory, every other shape within x1.03 or faster.
