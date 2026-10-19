@@ -9968,7 +9968,7 @@ g(len)").unwrap_err();
 
     #[test]
     fn deep_arithmetic_fallback_names_the_type() {
-        rejects("let d: Dyn = [fun x -> true] in let fs: [(Int -> Int)] = d in match fs | [f] -> f(1) + 1 | _ -> 0", "type error: expected Int | Float, found Bool");
+        rejects("let d: Dyn = [fun x -> true] in let fs: [(Int -> Int)] = d in match fs | [f] -> f(1) + 1 | _ -> 0", "type error: expected Int, found Bool (function at [0])");
     }
 
     #[test]
@@ -11524,6 +11524,50 @@ g(len)").unwrap_err();
     }
 
     // ---- Semantic pins: green before and after seals; the texts are the main-4c58a36 ones ----
+
+    #[test]
+    fn functions_inside_containers_from_dyn_are_wrapped() {
+        for (src, path) in [
+            ("let d: Dyn = [fun x -> \"s\"] in let xs: [Int -> Int] = d in match xs | g :: _ -> g(1) | _ -> 0", "[0]"),
+            ("let d: Dyn = (fun x -> \"s\", 2) in let p: ((Int -> Int), Int) = d in match p | (g, _) -> g(1)", ".0"),
+            ("let d: Dyn = {f: fun x -> \"s\"} in let r: {f: Int -> Int} = d in r.f(1)", ".f"),
+            ("let d: Dyn = [[fun x -> \"s\"]] in let xs: [[Int -> Int]] = d in match xs | (g :: _) :: _ -> g(1) | _ -> 0", "[0][0]"),
+        ] {
+            let err = run_err(src);
+            assert!(err.contains("expected Int, found Str"), "{src}: {err}");
+            assert!(err.contains(&format!("(function at {path})")), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn wrapped_container_functions_keep_order_and_good_calls() {
+        let ok = "let d: Dyn = [fun x -> x + 1] in let xs: [Int -> Int] = d in match xs | g :: _ -> g(1) | _ -> 0";
+        assert_eq!(run_source(ok).unwrap().as_int(), 2);
+        let order = "let d: Dyn = [fun x -> x + 1, fun x -> x + 2, fun x -> x + 3] in let xs: [Int -> Int] = d in match xs | _ :: _ :: g :: _ -> g(1) | _ -> 0";
+        assert_eq!(run_source(order).unwrap().as_int(), 4);
+        let width = "let d: Dyn = {f: fun x -> x + 1, extra: 7} in let r: {f: Int -> Int} = d in r.f(1)";
+        assert_eq!(run_source(width).unwrap().as_int(), 2);
+    }
+
+    #[test]
+    fn a_function_free_container_is_not_rebuilt() {
+        machine::MAP_REBUILDS.with(|c| c.set(0));
+        let src = "let d: Dyn = [1, 2, 3] in let xs: [Int] = d in len(xs)";
+        assert_eq!(run_source_on_this_thread(src).expect("runs").as_int(), 3);
+        assert_eq!(machine::MAP_REBUILDS.with(|c| c.get()), 0);
+        let with_fns = "let d: Dyn = [fun x -> x] in let xs: [Int -> Int] = d in len(xs)";
+        run_source_on_this_thread(with_fns).expect("runs");
+        assert_eq!(machine::MAP_REBUILDS.with(|c| c.get()), 1);
+    }
+
+    #[test]
+    fn a_wrapped_function_rechecks_on_every_multi_shot_resume() {
+        let two_good = "let d: Dyn = [fun x -> perform ask(x)] in let xs: [Int -> Int] = d in match xs | g :: _ -> (handle g(0) with handler ask(p, k) -> k(1) + k(2)) | _ -> 0";
+        assert_eq!(run_source(two_good).unwrap().as_int(), 3);
+        let second_bad = "let d: Dyn = [fun x -> perform ask(x)] in let xs: [Int -> Int] = d in match xs | g :: _ -> (handle g(0) with handler ask(p, k) -> k(1) + (match k(\"s\") | _ -> 0)) | _ -> 0";
+        let err = run_err(second_bad);
+        assert!(err.contains("expected Int, found Str") && err.contains("(function at [0])"), "{err}");
+    }
 
     #[test]
     fn a_path_prints_root_first() {

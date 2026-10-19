@@ -4,7 +4,7 @@ use std::hash::BuildHasher;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::expr::{AnnotKind, AnnotSpec, Arena, assign_seals, BinOp, CheckSpec, Expr, ExprRef, Lazy, LenExpr, LenSlot, Lowered, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, assign_seals, BinOp, CheckSpec, Expr, ExprRef, Lazy, LenExpr, LenSlot, Lowered, MapShape, Pattern, ConformSpec, SpanMap, Test, Then, TypeSource};
 use crate::index_expr::{index_exprs_compare, IndexCmp, IndexExpr};
 use crate::machine::{eval_pure_in, pure_type, Pure, Stuck, ANNOTATION_FUEL};
 use crate::resolve::{group_kind, GroupKind, Resolved};
@@ -2584,7 +2584,7 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
     // (inside a contract) and whether every length slot mentioning it is exactly that
     // variable (a bare one: see Obligation::bare).
     let mut read: BTreeMap<String, (bool, bool)> = BTreeMap::new();
-    if matches!(lowered.then, Then::Done) {
+    if matches!(lowered.then, Then::Done | Then::Map(_)) {
         for slot in &lowered.slots {
             for name in free_index_vars(slot) {
                 let (_, bare) = read.entry(name).or_insert((false, true));
@@ -2775,7 +2775,10 @@ fn lower(lazy: &Lazy, env: &CheckEnv) -> Option<Rc<Lowered>> {
     let mut defs = Defs::default();
     let (mut test, to, mut then) = match boundary(ty, &mut visiting) {
         Boundary::None => return None,
-        Boundary::Shape(to) => (shape_test(&to, env, &mut defs, &Visiting::default()), to, Then::Done),
+        Boundary::Shape(to) => {
+            let then = map_shape(lazy, &to, &mut NodeMemo::default()).map_or(Then::Done, Then::Map);
+            (shape_test(&to, env, &mut defs, &Visiting::default()), to, then)
+        }
         Boundary::Fun(fun_ty, param, ret) => (Test::Fun, fun_ty, wrap(lazy, &param, &ret)),
         Boundary::Union(to) => {
             let then = pick(lazy, &to, env, &mut defs, &visiting);
@@ -2798,6 +2801,37 @@ fn wrap(lazy: &Lazy, param: &Hc<Type>, ret: &Hc<Type>) -> Then {
         return Then::Done;
     }
     Then::Wrap(lazy.child(Rc::new((**param).clone())), lazy.child(Rc::new((**ret).clone())))
+}
+
+// The function leaves of a container type, memoized by node identity (a type's shared sub-terms are
+// walked once). A leaf is a Fun that `wrap` would give a contract; Union, Rec, scalars and Dyn have
+// none (such a function stays unwrapped, as before; PARKED.md).
+fn map_shape(lazy: &Lazy, ty: &Type, memo: &mut NodeMemo<Option<Rc<MapShape>>>) -> Option<Rc<MapShape>> {
+    if let Type::Fun(param, _, ret) = ty {
+        return match wrap(lazy, param, ret) {
+            Then::Wrap(p, r) => Some(Rc::new(MapShape::Fun(p, r))),
+            _ => None,
+        };
+    }
+    let key = (ById(ty.clone()), 0);
+    if let Some(done) = memo.get(&key) {
+        return done.clone();
+    }
+    let shape = match ty {
+        Type::List(elem) => map_shape(lazy, elem, memo).map(|s| Rc::new(MapShape::List(s))),
+        Type::Indexed(wrapped, _) if matches!(**wrapped, Type::List(_)) => map_shape(lazy, wrapped, memo),
+        Type::Tuple(items) => {
+            let slots: Vec<Option<Rc<MapShape>>> = items.iter().map(|t| map_shape(lazy, t, memo)).collect();
+            slots.iter().any(Option::is_some).then(|| Rc::new(MapShape::Tuple(slots)))
+        }
+        Type::Record(row) => {
+            let fields: Vec<(String, Rc<MapShape>)> = row.entries.iter().filter_map(|(n, t)| Some((n.clone(), map_shape(lazy, t, memo)?))).collect();
+            (!fields.is_empty()).then(|| Rc::new(MapShape::Record(fields)))
+        }
+        _ => None,
+    };
+    memo.insert(key, shape.clone());
+    shape
 }
 
 // A union's alternatives as lower's Pick: each one's shape test

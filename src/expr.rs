@@ -591,6 +591,18 @@ pub enum Then {
     // slots), then what that alternative needs; none holds: the Lowered's
     // check fails.
     Pick(Vec<(Test, Then)>),
+    // A container whose function leaves each need the site's contract: rebuilt once.
+    Map(Rc<MapShape>),
+}
+
+// Where the function leaves of a container type are (typecheck::map_shape). `Tuple` has one slot per
+// position (None: no leaf there); `Record` lists only entries that have a leaf.
+#[derive(Debug)]
+pub enum MapShape {
+    Fun(Rc<Lazy>, Rc<Lazy>),
+    List(Rc<MapShape>),
+    Tuple(Vec<Option<Rc<MapShape>>>),
+    Record(Vec<(String, Rc<MapShape>)>),
 }
 
 #[derive(Debug)]

@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::cont::{Cont, Frame, Meta, Node};
 use crate::env::{Env, PRELUDE};
-use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, Length, LenExpr, Lowered, Pattern, ConformSpec, Seal, SpanMap, Test, Then, TypeSource};
+use crate::expr::{AnnotKind, AnnotSpec, Arena, BinOp, CheckSpec, Expr, ExprRef, Lazy, Len, Length, LenExpr, Lowered, MapShape, Pattern, ConformSpec, Seal, SpanMap, Test, Then, TypeSource};
 use crate::frame::Bindings;
 use crate::index_expr::IndexExpr;
 use crate::iterate::{step_shared, Iter, Next};
@@ -14,7 +14,7 @@ use crate::span::Span;
 use crate::text::Text;
 use crate::types::{first_free, fresh_rec_id, open_record_tail_under, Hc, RecVar, Row, Tail, Type};
 use crate::util::find_field;
-use crate::value::{Builtin, Contract, HandlerData, PathStep, SiteCtx, TypeCtor, Value};
+use crate::value::{Builtin, Contract, HandlerData, PathStep, SiteCtx, Step as PathKind, TypeCtor, Value};
 
 enum Control {
     Eval(ExprRef, Env),
@@ -911,6 +911,12 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    // How many times a container was rebuilt to wrap its function leaves (Then::Map).
+    pub(crate) static MAP_REBUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     // How many Lazy families conform_lazy has minted (memo misses) on this thread.
     pub(crate) static LAZY_MINTS: Cell<usize> = const { Cell::new(0) };
 }
@@ -959,7 +965,12 @@ fn conform(lazy: &Lazy, ctx: &Rc<SiteCtx>, value: Value) -> Value {
 fn conform_then(then: &Then, check: &CheckSpec, lens: &[Len], value: Value, ctx: &Rc<SiteCtx>) -> Value {
     match then {
         Then::Done => value,
-        Then::Wrap(param, ret) => Value::Contract(Rc::new(Contract { f: value, param: param.clone(), ret: ret.clone(), ctx: ctx.clone(), ret_ctx: ctx.clone() })),
+        Then::Wrap(param, ret) => wrap_function(param, ret, value, ctx.clone()),
+        Then::Map(shape) => {
+            #[cfg(test)]
+            MAP_REBUILDS.with(|c| c.set(c.get() + 1));
+            map_value(shape, value, ctx, &ctx.path)
+        }
         Then::Pick(alternatives) => {
             for (test, then) in alternatives {
                 if test_holds(test, &check.defs, lens, &value) {
@@ -969,6 +980,46 @@ fn conform_then(then: &Then, check: &CheckSpec, lens: &[Len], value: Value, ctx:
             }
             check_failed(check, lens, &value, &ctx.path)
         }
+    }
+}
+
+// `f` as a contract of this parameter and result at `ctx`.
+fn wrap_function(param: &Rc<Lazy>, ret: &Rc<Lazy>, f: Value, ctx: Rc<SiteCtx>) -> Value {
+    Value::Contract(Rc::new(Contract { f, param: param.clone(), ret: ret.clone(), ret_ctx: ctx.clone(), ctx }))
+}
+
+fn step(path: &Option<Rc<PathStep>>, step: PathKind) -> Option<Rc<PathStep>> {
+    Some(Rc::new(PathStep { step, parent: path.clone() }))
+}
+
+// A container that passed its test, rebuilt once with each function leaf wrapped (spec section 1).
+// A position the shape does not name is reused as is.
+fn map_value(shape: &MapShape, value: Value, ctx: &Rc<SiteCtx>, path: &Option<Rc<PathStep>>) -> Value {
+    match (shape, value) {
+        (MapShape::Fun(param, ret), f) => wrap_function(param, ret, f, Rc::new(ctx.with_path(path.clone()))),
+        (MapShape::List(inner), Value::List(items)) => {
+            Value::List(List::from_vec(items.iter().enumerate().map(|(i, x)| map_value(inner, x.clone(), ctx, &step(path, PathKind::Index(i)))).collect()))
+        }
+        (MapShape::Tuple(slots), Value::List(items)) => Value::List(List::from_vec(
+            items
+                .iter()
+                .zip(slots)
+                .enumerate()
+                .map(|(i, (x, slot))| match slot {
+                    Some(s) => map_value(s, x.clone(), ctx, &step(path, PathKind::Slot(i))),
+                    None => x.clone(),
+                })
+                .collect(),
+        )),
+        (MapShape::Record(fields), Value::Record(vals)) => Value::Record(Rc::new(
+            vals.iter()
+                .map(|(name, v)| match fields.iter().find(|(m, _)| m == name) {
+                    Some((_, s)) => (name.clone(), map_value(s, v.clone(), ctx, &step(path, PathKind::Field(name.clone())))),
+                    None => (name.clone(), v.clone()),
+                })
+                .collect(),
+        )),
+        (_, v) => panic!("internal: a map shape met {} after its test passed", v.type_name()),
     }
 }
 
