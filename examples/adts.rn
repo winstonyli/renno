@@ -13,7 +13,8 @@
 // down. See structural_types.rn for what real structural/nominal typing
 // (Type::Tuple, Type::Union, `opaque`) looks like instead.
 //
-// `l` itself is unannotated (Dyn) -- missing_case's Tuple/Union coverage
+// `l` itself is annotated Dyn (an unannotated parameter would be fixed to the
+// first arm's one-element Tuple, and the pair of arities would clash) -- missing_case's Tuple/Union coverage
 // rule only fires for a scrutinee whose type is statically known to BE a
 // Tuple/Union, so a Dyn scrutinee still needs an explicit wildcard arm to
 // typecheck, even though these two patterns cover every value this
@@ -21,7 +22,7 @@
 let Nil = ("Nil",) in
 let Cons = fun h -> fun t -> ("Cons", h, t) in
 
-let rec sum = fun l ->
+let rec sum = fun l: Dyn ->
   match l
   | ("Nil",) -> 0
   | ("Cons", h, t) -> h + sum(t)
