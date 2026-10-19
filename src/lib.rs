@@ -11645,7 +11645,7 @@ g(len)").unwrap_err();
         assert_eq!(run_source(int).unwrap().as_int(), 1);
         // The argument's type is checked, but an outer index variable inside a Union alternative is not
         // tied to the outer length (`checked_index_vars` treats a spine function's own parameter variable
-        // as its own binder), unlike the closure form and a container leaf. Open pin: remove when fixed.
+        // as its own binder), unlike the closure form; a container leaf behaves the same. Open pin: remove when fixed.
         let len = |arg: &str| format!("let f = fun v: Vec(n) -> (let u: Union(Int, (Vec(n) -> Int)) = fun w: Vec(n) -> len(w) in let d: Dyn = u in d) in f([1,2])({arg})");
         assert!(run_err(&len("\"s\"")).contains("found Str"));
         assert_eq!(run_source(&len("[3]")).unwrap().as_int(), 1, "now rejected: remove this pin");
