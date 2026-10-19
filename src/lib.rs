@@ -10437,13 +10437,16 @@ g(len)").unwrap_err();
         runs_to("let h = fun a: {y: Int} -> a.y in let f = fun r -> h(r) + r.x in f({x: 1, y: 2})", "3");
         runs_to("let h = fun a: {y: Int} -> a.y in let f = fun r -> r.x + h(r) in f({x: 1, y: 2})", "3");
         // D7: same-label-set record arms pin; tagged dispatch and a Union scrutinee do not.
-        fails_statically("let f = fun r -> match r | {x: v} -> v | _ -> 0 in f(5)", "expected {x: Dyn, ..e}, found Int");
+        fails_statically("let f = fun r -> match r | {x: v} -> v | _ -> 0 in f(5)", "expected {x: Int, ..e}, found Int");
         runs_to("let f = fun r -> match r | {x: a} -> a + 1 | _ -> 0 in f({x: 1})", "2");
         runs_to(
             "let f = fun r -> match r | {kind: \"a\", val: g} -> g(1) | {kind: \"b\", val: flag} -> if flag then 1 else 0 | _ -> 0 in [f({kind: \"a\", val: fun q -> q + 1}), f({kind: \"b\", val: true})]",
             "[2, 1]",
         );
         runs_to("let f = fun u: (Int | {x: Int}) -> match u | {x: v} -> v | _ -> 0 in [f(1), f({x: 4})]", "[0, 4]");
+        // pb: a payload is connected to compatible binders, so the wrong value is a static error.
+        fails_statically("let g = fun r -> (match r | {x: a} -> a | _ -> 0) in let z: Int = g({x: \"s\"}) in z", "Str");
+        runs_to("let g = fun r -> (match r | {x: a} -> a | _ -> 0) in let z: Int = g({x: 5}) in z", "5");
     }
 
     #[test]

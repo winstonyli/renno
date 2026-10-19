@@ -6169,6 +6169,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let mut new_arms = Vec::with_capacity(arms.len());
             let mut arm_tys = Vec::with_capacity(arms.len());
             let mut arm_spans = Vec::with_capacity(arms.len());
+            // D7 payloads: per label, the type each record arm's plain-variable binder got (None otherwise).
+            let mut binder_tys: FxMap<String, Vec<Option<Type>>> = FxMap::default();
             for (pat, (_, guard, body)) in pats.iter().copied().zip(arms.iter()) {
                 if !pattern_could_match(pat, &scrut_ty, &Visiting::default()) {
                     return Err(TypeError(
@@ -6212,6 +6214,15 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 // an arm proves intact.
                 restore_index_key(infer, &index_key, &prior_index_value);
                 let mut arm_ctx = bind_pattern_vars(ctx, pat, &scrut_ty, infer, spans[expr], &Visiting::default())?;
+                if let Pattern::Record(fields) = pat {
+                    for (label, sub) in fields {
+                        let ty = match sub {
+                            Pattern::Var(n) if n != "_" => arm_ctx.get(n).map(|s| s.ty.clone()),
+                            _ => None,
+                        };
+                        binder_tys.entry(label.clone()).or_default().push(ty);
+                    }
+                }
                 // Hypothesis injection (spec section 5): base case implies
                 // the scrutinee's own index is 0; step case mints a fresh
                 // index variable, re-types the self-referential
@@ -6356,7 +6367,21 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     _ => false,
                 };
                 if flexible {
-                    let entries = labels.into_iter().map(|l| (l, infer.fresh_var("f"))).collect();
+                    let mut entries = Vec::new();
+                    for label in labels {
+                        // Connected to the binders when every arm bound this label to a plain variable
+                        // and the binder types are already known and unify (a trial: a failure rolls back); else fresh, so
+                        // tagged dispatch keeps a different payload type per arm.
+                        let tys = binder_tys.remove(&label).unwrap_or_default();
+                        let connected = match tys.first() {
+                            Some(Some(first)) if tys.iter().all(|t| t.as_ref().is_some_and(|t| !matches!(infer.resolve(t), Type::Var(_)))) => {
+                                tys.iter().flatten().skip(1).all(|t| unify_trial(first, t, infer, spans[expr]).is_ok()).then(|| first.clone())
+                            }
+                            _ => None,
+                        };
+                        let payload = connected.unwrap_or_else(|| infer.fresh_var("f"));
+                        entries.push((label, payload));
+                    }
                     let open = Type::Record(Row::from_entries(entries, Tail::Var(infer.fresh_row(RowRank::Fresh, "e"))));
                     unify(&target, &open, infer, spans[scrutinee])?;
                 }
