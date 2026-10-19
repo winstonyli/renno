@@ -136,7 +136,7 @@ match p
 | (a, b, c) -> a   -- 1
 ```
 
-`(a, b, ...)` is a fixed-arity product — typed positionally (`Type::Tuple`), not widened to a common element type the way `List` elements are. `(a)` with no comma stays ordinary parenthesized grouping; `(a,)` with a trailing comma is the one-element tuple; a tuple pattern `(p, q)` is sugar over the list pattern `[p, q]`, since a tuple is a plain list at runtime.
+`(a, b, ...)` is a fixed-arity product — typed positionally (`Type::Tuple`), not widened to a common element type the way `List` elements are. `(a)` with no comma stays ordinary parenthesized grouping; `(a,)` with a trailing comma is the one-element tuple; a tuple pattern `(p, q)` matches exactly as the list pattern `[p, q]` does, since a tuple is a plain list at runtime. A binder is typed by what its scrutinee says; where that says nothing (a `Dyn` scrutinee, or a position behind an unfolded recursive type) the binder is `Dyn`, so its uses are checked, and a tuple or list pattern over an unannotated parameter fixes that parameter to a tuple or a list (so a function matching hand-rolled tagged tuples of different arities annotates its parameter `Dyn`).
 
 There's no dedicated ADT syntax — a same-arity tagged sum is just a tuple whose first element is a literal tag, matched by ordinary value comparison in pattern position:
 
