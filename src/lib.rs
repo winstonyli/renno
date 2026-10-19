@@ -11597,6 +11597,15 @@ g(len)").unwrap_err();
     }
 
     #[test]
+    fn a_leaf_function_s_own_index_variable_is_checked_inside_a_container() {
+        // `n` appears only inside the leaf's type: the result must still be checked against the caller's `n`.
+        let bad = "let f = fun v: Vec(n) -> (let d: Dyn = [fun x -> [7, 8, 9]] in let fs: [(Int -> Vec(n))] = d in match fs | g :: _ -> g(0) | _ -> v) in f([1, 2])";
+        assert!(run_err(bad).contains("expected"), "a length-3 result under Vec(n), n = 2, must be rejected");
+        let good = "let f = fun v: Vec(n) -> (let d: Dyn = [fun x -> [7, 8]] in let fs: [(Int -> Vec(n))] = d in match fs | g :: _ -> g(0) | _ -> v) in len(f([1, 2]))";
+        assert_eq!(run_source(good).unwrap().as_int(), 2);
+    }
+
+    #[test]
     fn a_path_prints_root_first() {
         use crate::value::{PathStep, Step};
         use std::rc::Rc;

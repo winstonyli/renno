@@ -2591,6 +2591,14 @@ fn build_boundary_check(arena: &mut Arena, e: ExprRef, to: &Type, env: &CheckEnv
                 *bare &= matches!(slot, IndexExpr::Var(_));
             }
         }
+        // A function leaf inside the container reads its own variables per call.
+        if let Then::Map(shape) = &lowered.then {
+            let mut names = BTreeMap::new();
+            map_leaf_vars(shape, env.infer, &mut Seen::default(), &mut names);
+            for (name, repeatable) in names {
+                read.entry(name).or_insert((repeatable, true));
+            }
+        }
     } else {
         let mut names = BTreeMap::new();
         checked_index_vars(&lazy.ty, env.infer, &mut Seen::default(), true, false, &mut names);
@@ -2645,6 +2653,25 @@ struct Seen {
     // map may differ from the first visit's (a Fun's own variable is dropped from its inner one),
     // so skipping the revisit would lose names.
     nodes: FxMap<(ById, bool, bool), BTreeMap<String, bool>>,
+}
+
+// The index variables a Map site's function leaves read per call, as `checked_index_vars` finds them for a bare function.
+fn map_leaf_vars(shape: &MapShape, infer: &InferCtx, seen: &mut Seen, out: &mut BTreeMap<String, bool>) {
+    match shape {
+        MapShape::Fun(param, ret) => {
+            let mut inner = BTreeMap::new();
+            checked_index_vars(&ret.ty, infer, seen, true, true, &mut inner);
+            if let Some(own) = list_length_var(&param.ty, infer) {
+                inner.remove(&own);
+            }
+            for (name, repeatable) in inner {
+                *out.entry(name).or_insert(false) |= repeatable;
+            }
+        }
+        MapShape::List(inner) => map_leaf_vars(inner, infer, seen, out),
+        MapShape::Tuple(slots) => slots.iter().flatten().for_each(|s| map_leaf_vars(s, infer, seen, out)),
+        MapShape::Record(fields) => fields.iter().for_each(|(_, s)| map_leaf_vars(s, infer, seen, out)),
+    }
 }
 
 fn checked_index_vars(ty: &Type, infer: &InferCtx, seen: &mut Seen, spine: bool, in_contract: bool, out: &mut BTreeMap<String, bool>) {
