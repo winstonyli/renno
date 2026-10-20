@@ -193,7 +193,9 @@ let g: ({x: Int, ..r} -> {x: Int, ..r}) = fun p -> p in
 g({x: 1, y: 2}).y   -- 2, the type remembers `y` rides along
 ```
 
-An unannotated parameter that is read with `.x` or matched with `{x: v}` is inferred the same way, so `let get = fun r -> r.x in get(5)` and `get({y: 1})` are static errors (the parameter's type is `{x: _, ..e}`); a `Dyn` argument still passes and `.x` keeps its run-time check. `..r` is a type-annotation form only (a record literal or pattern cannot carry one); `Record(({x: Int}, "r"))` builds the same open type as a value. A row variable written both as a record tail and as an effect row (`->{r}`) is an annotation error, and an open tail inside a `Union` or a recursive type is a construction error.
+An unannotated parameter that is read with `.x` or matched with `{x: v}` is inferred the same way, so `let get = fun r -> r.x in get(5)` and `get({y: 1})` are static errors (the parameter's type is `{x: _, ..e}`); a `Dyn` argument still passes and `.x` keeps its run-time check. `..r` in a type annotation is the open-record tail (a record pattern cannot carry one; a record literal ending in `..base` is an update, below); `Record(({x: Int}, "r"))` builds the same open type as a value. A row variable written both as a record tail and as an effect row (`->{r}`) is an annotation error, and an open tail inside a `Union` or a recursive type is a construction error.
+**Record update.** A record literal may end in `..base`: `{a: e, ..r}` is `r` with the listed fields replaced and every other field kept. Each listed label must already be a field of `r` (extension and merging are parked, see `PARKED.md`); a replaced field may change type (`{a: "s", ..{a: 1, b: true}}` is `{a: Str, b: Bool}`), and `fun r -> {a: 1, ..r}` is row polymorphic. A `Dyn` base is checked at run time (`expected {z: Dyn}, found ...`). The expression is a chain of `set_field` calls, so the order of evaluation is the base first, then the new values in label order (the record literal's own order), whatever order they are written in. `{..r}` (no field), `..r` anywhere but last and a repeated label are errors.
+
 
 ### First-class `opaque`
 
