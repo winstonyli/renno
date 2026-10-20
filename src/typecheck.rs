@@ -1137,9 +1137,8 @@ fn occurs_in_index(name: &str, e: &IndexExpr, infer: &InferCtx) -> bool {
 // this binds a BARE unbound variable to whatever it's compared
 // against (mirroring unify()'s own Type::Var arm exactly), and
 // recurses when both sides already share the same top-level shape.
-// It does NOT solve equations -- unifying `n+1` against `4` does NOT
-// infer `n=3` (that would need a real constraint solver, out of scope
-// per the spec's own Non-goals). Anything that doesn't hit one of
+// It solves one equation shape: `c*n + k` against a literal or (c = 1) another expression
+// (`solve_index_equation`); a general constraint solver is out of scope per the spec's Non-goals. Anything that doesn't hit one of
 // those two cases falls back to Phase 1's own index_exprs_equal
 // (SOP normalization), which still decides plenty on its own (e.g.
 // `m*n` against `n*m` with no unbound variable anywhere).
@@ -1193,6 +1192,10 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
             if cmp == Some(IndexCmp::Equal) {
                 return Rel::Proven;
             }
+            // Invert `c*n + k`: the one place the unifier solves an equation (spec 2026-10-19-index-solving-design).
+            if let Some(rel) = solve_index_equation(&a, &b, infer).or_else(|| solve_index_equation(&b, &a, infer)) {
+                return rel;
+            }
             let rel = match (&a, &b) {
                 (IndexExpr::Add(a1, a2), IndexExpr::Add(b1, b2))
                 | (IndexExpr::Sub(a1, a2), IndexExpr::Sub(b1, b2))
@@ -1207,6 +1210,39 @@ pub(crate) fn unify_index_expr(a: &IndexExpr, b: &IndexExpr, infer: &mut InferCt
             if cmp.is_none() && rel != Rel::Proven { undecided() } else { rel }
         }
     }
+}
+
+// `lhs = c*n + k` against `rhs`, `n` unbound and not rigid. `c == 1` binds `n := rhs - k` (after the
+// occurs check); otherwise `rhs` must be a literal that `c` divides after `- k`. A literal solution below
+// zero is refuted. `None` leaves the pair to the other arms.
+fn solve_index_equation(lhs: &IndexExpr, rhs: &IndexExpr, infer: &mut InferCtx) -> Option<Rel> {
+    let (n, c, k) = crate::index_expr::index_solve_unit(lhs)?;
+    if infer.rigid_index.contains(&n) || infer.index_subst.contains_key(&n) {
+        return None;
+    }
+    let no_solution = || Some(Rel::Refuted(Why::Index { msg: format!("index {lhs} cannot equal {rhs}: no non-negative integer solves it"), bare: false }));
+    let value = match crate::index_expr::index_const(rhs).map(IndexExpr::Lit).as_ref().unwrap_or(rhs) {
+        IndexExpr::Lit(l) => {
+            let diff = l.checked_sub(k)?;
+            if diff < 0 || diff % c != 0 {
+                return no_solution();
+            }
+            IndexExpr::Lit(diff / c)
+        }
+        _ if c == 1 => {
+            let r = IndexExpr::Sub(Rc::new(rhs.clone()), Rc::new(IndexExpr::Lit(k)));
+            if occurs_in_index(&n, &r, infer) {
+                return None;
+            }
+            r
+        }
+        _ => return None,
+    };
+    if let Some(l) = infer.levels.index.get(&n).copied() {
+        Lowerer::new(infer, l, &[]).index(&value);
+    }
+    infer.index_subst.insert_mut(n, value);
+    Some(Rel::Proven)
 }
 
 /// The checker could neither prove nor refute the equation.

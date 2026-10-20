@@ -8242,6 +8242,34 @@ g(len)").unwrap_err();
         assert!(matches!(unify_index_expr(&var("n"), &lit(3), &mut infer), Rel::Refuted(w) if w.message().contains("index variable n is fixed by the signature")));
     }
 
+    #[test]
+    fn unify_index_expr_inverts_a_linear_form() {
+        use crate::index_expr::IndexExpr;
+        use crate::typecheck::{unify_index_expr, Rel};
+        use std::rc::Rc;
+        let lit = IndexExpr::Lit;
+        let add = |a: IndexExpr, b: IndexExpr| IndexExpr::Add(Rc::new(a), Rc::new(b));
+        let mul = |a: IndexExpr, b: IndexExpr| IndexExpr::Mul(Rc::new(a), Rc::new(b));
+        let refuted = |r: Rel| matches!(r, Rel::Refuted(_));
+        let bound = |infer: &crate::typecheck::InferCtx, v: &str| infer.resolve_index_deep(&var(v));
+        let mut infer = rigid_infer(&[]);
+        assert_eq!(unify_index_expr(&add(var("n"), lit(1)), &lit(3), &mut infer), Rel::Proven);
+        assert_eq!(bound(&infer, "n"), lit(2));
+        assert_eq!(unify_index_expr(&var("n"), &lit(2), &mut infer), Rel::Proven);
+        assert!(refuted(unify_index_expr(&var("n"), &lit(3), &mut infer)));
+        let mut infer = rigid_infer(&[]);
+        assert_eq!(unify_index_expr(&mul(lit(2), var("n")), &lit(4), &mut infer), Rel::Proven);
+        assert_eq!(bound(&infer, "n"), lit(2));
+        let mut infer = rigid_infer(&[]);
+        assert!(refuted(unify_index_expr(&mul(lit(2), var("n")), &lit(3), &mut infer)));
+        assert!(refuted(unify_index_expr(&add(var("n"), lit(1)), &lit(0), &mut infer)));
+        let mut infer = rigid_infer(&[]);
+        assert_eq!(unify_index_expr(&add(var("n"), lit(1)), &add(var("m"), lit(3)), &mut infer), Rel::Proven);
+        assert!(!refuted(unify_index_expr(&var("n"), &var("n"), &mut infer)));
+        let mut infer = rigid_infer(&["n"]);
+        assert!(refuted(unify_index_expr(&add(var("n"), lit(1)), &lit(3), &mut infer)));
+    }
+
     fn capped_index() -> crate::index_expr::IndexExpr {
         use crate::index_expr::IndexExpr;
         use std::rc::Rc;

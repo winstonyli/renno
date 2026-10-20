@@ -145,6 +145,17 @@ pub fn index_exprs_compare(a: &IndexExpr, b: &IndexExpr) -> Option<IndexCmp> {
     Some(if diff.len() == 1 && diff.contains_key(&Vec::<String>::new()) { IndexCmp::NonzeroConst } else { IndexCmp::Other })
 }
 
+/// `e`'s value when it has no variable (`3 + 1` is 4); `None` otherwise, or past the caps.
+pub fn index_const(e: &IndexExpr) -> Option<i64> {
+    let mut p = normalize(e)?;
+    drop_zero_terms(&mut p);
+    if p.is_empty() {
+        return Some(0);
+    }
+    let c = p.remove(&Vec::<String>::new())?;
+    p.is_empty().then_some(c)
+}
+
 /// `e` as `c*var + k` (one variable, degree 1, `c > 0`); `None` for anything else, so a caller
 /// never treats an undecided form as solved.
 pub fn index_solve_unit(e: &IndexExpr) -> Option<(String, i64, i64)> {
