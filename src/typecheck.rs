@@ -1313,6 +1313,14 @@ fn unify_in(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut F
     Ok(())
 }
 
+// Whose rows: effect rows are sets (idempotent), record rows are fields (a label cannot repeat), so only
+// effect rows may absorb labels into a shared tail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowKind {
+    Effect,
+    Field,
+}
+
 // What making two rows equal takes (spec 2.1): None when it cannot be done. Shared by
 // unify_rows (applies it) and row_compatible (only asks), so the two cannot disagree.
 enum RowPlan {
@@ -1322,10 +1330,12 @@ enum RowPlan {
     // Two distinct flexible tails, at least one side with labels the other lacks: a fresh tail
     // named and ranked after `winner` takes both: a := {only_b | σ}, b := {only_a | σ}.
     Split { a: String, b: String, only_a: Vec<(String, Type)>, only_b: Vec<(String, Type)>, winner: String },
+    // One flexible tail on both sides, labels on either: `{a | e} = {e}` holds exactly when e contains a.
+    Absorb { tail: String, entries: Vec<(String, Type)> },
 }
 
 // The plan, and the payload pairs of the labels both (flattened) rows have.
-fn row_plan(r1: &Row, r2: &Row, infer: &InferCtx) -> Option<(RowPlan, Vec<(Type, Type)>)> {
+fn row_plan(r1: &Row, r2: &Row, kind: RowKind, infer: &InferCtx) -> Option<(RowPlan, Vec<(Type, Type)>)> {
     let (r1, r2) = (infer.flatten_row(r1), infer.flatten_row(r2));
     if r1.is_dyn() || r2.is_dyn() {
         return Some((RowPlan::Nothing, Vec::new()));
@@ -1337,16 +1347,21 @@ fn row_plan(r1: &Row, r2: &Row, infer: &InferCtx) -> Option<(RowPlan, Vec<(Type,
         .iter()
         .filter_map(|(l, t)| r2.entries.iter().find(|(l2, _)| l2 == l).map(|(_, t2)| (t.clone(), t2.clone())))
         .collect();
-    row_plan_tails(&r1, &r2, only1, only2, infer).map(|p| (p, common))
+    row_plan_tails(&r1, &r2, only1, only2, kind, infer).map(|p| (p, common))
 }
 
-fn row_plan_tails(r1: &Row, r2: &Row, only1: Vec<(String, Type)>, only2: Vec<(String, Type)>, infer: &InferCtx) -> Option<RowPlan> {
+fn row_plan_tails(r1: &Row, r2: &Row, only1: Vec<(String, Type)>, only2: Vec<(String, Type)>, kind: RowKind, infer: &InferCtx) -> Option<RowPlan> {
     let flexible = |n: &str| !infer.rigid_row.contains(n);
     match (&r1.tail, &r2.tail) {
         (Tail::Closed, Tail::Closed) => (only1.is_empty() && only2.is_empty()).then_some(RowPlan::Nothing),
         (Tail::Var(a), Tail::Closed) => (flexible(a) && only1.is_empty()).then(|| RowPlan::Bind(a.clone(), Row::from_entries(only2, Tail::Closed))),
         (Tail::Closed, Tail::Var(b)) => (flexible(b) && only2.is_empty()).then(|| RowPlan::Bind(b.clone(), Row::from_entries(only1, Tail::Closed))),
-        (Tail::Var(a), Tail::Var(b)) if a == b => (only1.is_empty() && only2.is_empty()).then_some(RowPlan::Nothing),
+        (Tail::Var(a), Tail::Var(b)) if a == b => if only1.is_empty() && only2.is_empty() {
+            Some(RowPlan::Nothing)
+        } else {
+            (kind == RowKind::Effect && flexible(a)).then(|| RowPlan::Absorb { tail: a.clone(), entries: only1.into_iter().chain(only2).collect() })
+        }
+        ,
         (Tail::Var(a), Tail::Var(b)) => match (flexible(a), flexible(b)) {
             (false, false) => None,
             (false, true) => only2.is_empty().then(|| RowPlan::Bind(b.clone(), Row::from_entries(only1, Tail::Var(a.clone())))),
@@ -1372,14 +1387,14 @@ fn row_winner<'a>(a: &'a str, b: &'a str, infer: &InferCtx) -> (&'a str, &'a str
 
 // Makes two rows equal, binding flexible tails; false (nothing bound) when it cannot.
 pub(crate) fn unify_rows(r1: &Row, r2: &Row, infer: &mut InferCtx) -> bool {
-    unify_rows_with(r1, r2, infer, &mut |_, _, _| true)
+    unify_rows_with(r1, r2, RowKind::Effect, infer, &mut |_, _, _| true)
 }
 
 // `unify_rows` for rows with typed entries: `pair` makes the payloads of each common label
 // equal (effect payloads are all `Dyn`, so `unify_rows` passes a no-op). Payloads are unified
 // before any tail is bound; the caller's snapshot undoes a partial failure.
-pub(crate) fn unify_rows_with(r1: &Row, r2: &Row, infer: &mut InferCtx, pair: &mut dyn FnMut(&Type, &Type, &mut InferCtx) -> bool) -> bool {
-    let Some((plan, common)) = row_plan(r1, r2, infer) else { return false };
+pub(crate) fn unify_rows_with(r1: &Row, r2: &Row, kind: RowKind, infer: &mut InferCtx, pair: &mut dyn FnMut(&Type, &Type, &mut InferCtx) -> bool) -> bool {
+    let Some((plan, common)) = row_plan(r1, r2, kind, infer) else { return false };
     for (a, b) in &common {
         if !pair(a, b, infer) {
             return false;
@@ -1389,6 +1404,7 @@ pub(crate) fn unify_rows_with(r1: &Row, r2: &Row, infer: &mut InferCtx, pair: &m
     let cyclic = match &plan {
         RowPlan::Nothing => false,
         RowPlan::Bind(name, row) => row_occurs(name, &row.entries, infer),
+        RowPlan::Absorb { tail, entries } => row_occurs(tail, entries, infer),
         RowPlan::Split { a, b, only_a, only_b, .. } => row_occurs(a, only_b, infer) || row_occurs(b, only_a, infer),
     };
     if cyclic {
@@ -1397,6 +1413,11 @@ pub(crate) fn unify_rows_with(r1: &Row, r2: &Row, infer: &mut InferCtx, pair: &m
     match plan {
         RowPlan::Nothing => {}
         RowPlan::Bind(name, row) => infer.bind_row(&name, row),
+        RowPlan::Absorb { tail, entries } => {
+            let rank = infer.levels.rank(&tail);
+            let sigma = infer.fresh_row(rank, &tail);
+            infer.bind_row(&tail, Row::from_entries(entries, Tail::Var(sigma)));
+        }
         RowPlan::Split { a, b, only_a, only_b, winner } => {
             let rank = infer.levels.rank(&winner);
             let sigma = infer.fresh_row(rank, &winner);
@@ -1415,7 +1436,7 @@ fn row_occurs(name: &str, entries: &[(String, Type)], infer: &InferCtx) -> bool 
 
 // Could unify_rows make the two rows equal? Binds nothing (relate's effect-row test, 2.3).
 pub(crate) fn row_compatible(r1: &Row, r2: &Row, infer: &InferCtx) -> bool {
-    row_plan(r1, r2, infer).is_some()
+    row_plan(r1, r2, RowKind::Effect, infer).is_some()
 }
 
 // The effects of running both of two sibling computations (spec 3.1, ruling D1(b)): precise,
@@ -1519,7 +1540,7 @@ fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: 
         // Rémy (spec 2.1): common labels unify their payloads, tails take the rest.
         (Type::Record(r1), Type::Record(r2)) => {
             let mut err = None;
-            let ok = unify_rows_with(r1, r2, infer, &mut |p, q, i| match unify_in(p, q, i, span, done) {
+            let ok = unify_rows_with(r1, r2, RowKind::Field, infer, &mut |p, q, i| match unify_in(p, q, i, span, done) {
                 Ok(()) => true,
                 Err(e) => {
                     err = Some(e);
@@ -1607,7 +1628,7 @@ fn fits_resolved(required: &Type, actual: &Type, infer: &mut InferCtx, span: Spa
             if req_row.tail != Tail::Closed {
                 // An open requirement: Rémy over both rows, directional on the payloads.
                 let mut err = None;
-                let ok = unify_rows_with(&req_row, &act_row, infer, &mut |p, q, i| match fits_in(p, q, i, span, done) {
+                let ok = unify_rows_with(&req_row, &act_row, RowKind::Field, infer, &mut |p, q, i| match fits_in(p, q, i, span, done) {
                     Ok(()) => true,
                     Err(e) => {
                         err = Some(e);

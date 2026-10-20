@@ -12435,10 +12435,16 @@ g(len)").unwrap_err();
         assert!(unify_rows(&row_of(&["x"], Tail::Var(f.clone())), &row_of(&["y"], Tail::Var(g.clone())), &mut infer));
         let Tail::Var(sigma) = infer.flatten_row(&Row::var(f)).tail else { panic!("tail") };
         assert_eq!(surface_name(&sigma), "ef");
-        // The same tail with different labels cannot unify, flexible or not; with equal labels it is a no-op.
+        // The same flexible tail with different labels: effect rows are sets, so `{x | h} = {y | h}` holds when h
+        // contains both (absorbed into a fresh tail); record rows cannot repeat a label, so it is refused.
         let h = infer.fresh_row(RowRank::User, "eh");
-        assert!(!row_compatible(&row_of(&["x"], Tail::Var(h.clone())), &row_of(&["y"], Tail::Var(h.clone())), &infer));
-        assert!(!unify_rows(&row_of(&["x"], Tail::Var(h.clone())), &row_of(&["y"], Tail::Var(h.clone())), &mut infer));
+        let (rx, ry) = (row_of(&["x"], Tail::Var(h.clone())), row_of(&["y"], Tail::Var(h.clone())));
+        assert!(row_compatible(&rx, &ry, &infer));
+        assert!(!crate::typecheck::unify_rows_with(&rx, &ry, crate::typecheck::RowKind::Field, &mut infer, &mut |_, _, _| true));
+        assert!(unify_rows(&rx, &ry, &mut infer));
+        let (fx, fy) = (infer.flatten_row(&rx), infer.flatten_row(&ry));
+        assert_eq!(fx, fy);
+        assert!(fx.has("x") && fx.has("y"), "{fx}");
         assert!(unify_rows(&row_of(&["x"], Tail::Var(h.clone())), &row_of(&["x"], Tail::Var(h.clone())), &mut infer));
         // Closed against rigid: nowhere for the rest to go, in either order, even when empty.
         let r = infer.fresh_row(RowRank::User, "er");
@@ -12531,12 +12537,12 @@ g(len)").unwrap_err();
         let sp = crate::span::Span { start: 0, end: 1 };
         let r1 = Row::from_entries(vec![("x".into(), a.clone())], Tail::Closed);
         let r2 = Row::from_entries(vec![("x".into(), Type::Int)], Tail::Closed);
-        assert!(unify_rows_with(&r1, &r2, &mut infer, &mut |p, q, i| unify(p, q, i, sp).is_ok()));
+        assert!(unify_rows_with(&r1, &r2, crate::typecheck::RowKind::Field, &mut infer, &mut |p, q, i| unify(p, q, i, sp).is_ok()));
         assert_eq!(infer.resolve_deep(&a), Type::Int);
         // A payload mismatch binds nothing.
         let b = infer.fresh_row(RowRank::User, "e");
         let r3 = Row::from_entries(vec![("x".into(), Type::Str)], Tail::Var(b.clone()));
-        assert!(!unify_rows_with(&r3, &r2, &mut infer, &mut |p, q, i| unify(p, q, i, sp).is_ok()));
+        assert!(!unify_rows_with(&r3, &r2, crate::typecheck::RowKind::Field, &mut infer, &mut |p, q, i| unify(p, q, i, sp).is_ok()));
         assert!(infer.flattened(&Row::var(b)).is_none());
     }
 
