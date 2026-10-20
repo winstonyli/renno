@@ -2374,9 +2374,6 @@ fn cast_now(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEn
     if !matches!(relate_cast(&from, &to, env.infer), Rel::Unknown(res, _) if !res.row_only()) {
         return e;
     }
-    if matches!(arena[e], Expr::Lambda(..)) {
-        return build_literal_cast(arena, e, &from, &to, env);
-    }
     build_boundary_check_at(arena, e, &contract_type(&from, &to, env.infer), env, false)
 }
 
@@ -2399,8 +2396,8 @@ fn join_arm(arena: &mut Arena, e: ExprRef, from: &Type, join: &Type, span: Span,
         return e;
     }
     let checked = coerce_check(arena, e, from, join, span, &CheckEnv::at(infer, span)).unwrap_or(e);
-    // The function cast keeps blaming the function's own parameter (no join span).
-    coerce_cast(arena, checked, from, join, &CheckEnv::new(infer))
+    // A function contract blames the arm's span.
+    coerce_cast(arena, checked, from, join, &CheckEnv::new(infer).with_span(span))
 }
 
 // Binder names a cast introduces (`__ca`): fresh and unlexable
@@ -3402,7 +3399,7 @@ enum PendingElab {
     // inferred/annotated type, row, and elaborated value), folding back
     // into a single Expr::LetRec.
     // `sites`: the members' kept annotations, evaluated before the group.
-    LetRec { bindings: Vec<(String, Type, Row, ExprRef)>, def: Rc<CheckDef>, sites: Vec<(String, Site)>, kind: GroupKind },
+    LetRec { bindings: Vec<(String, Type, Row, ExprRef)>, def: Rc<CheckDef>, sites: Vec<(String, Site)>, kind: GroupKind, coercions: Vec<(String, Type, Type, Span)> },
     // `witness`: this Lambda pushed an infer.index_witness entry (its
     // parameter is Vec(n)), popped when the frame unwinds. `site`: its
     // parameter's kept annotation; `direct`: it is a recursive group's value.
@@ -5077,12 +5074,19 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 let mut introduced = Vec::new();
                 let mut opened: Vec<Option<Type>> = Vec::with_capacity(bindings.len());
                 let mut sites = Vec::new();
+                let mut coerced: Vec<(String, Type, Span)> = Vec::new();
                 for (name, ann, val) in bindings.iter() {
                     opened.push(match ann {
                         Some(ann) => {
                             let annotation = annotation_type(arena, *ann, spans[*val], &cur_ctx, spans, infer)?;
                             sites.extend(annotation.site.map(|site| (name.clone(), site)));
-                            Some(open_annotation(&annotation.ty, &cur_ctx, is_signature(&annotation.ty), &mut introduced, spans[*val])?)
+                            let t = open_annotation(&annotation.ty, &cur_ctx, is_signature(&annotation.ty), &mut introduced, spans[*val])?;
+                            if kind == GroupKind::Functions && !is_signature(&t) && matches!(arena[*val], Expr::Lambda(..)) {
+                                coerced.push((name.clone(), t, spans[*val]));
+                                None
+                            } else {
+                                Some(t)
+                            }
                         }
                         None => None,
                     });
@@ -5150,9 +5154,17 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 introduced.retain(|(_, entry)| !entry.universal);
                 cur_ctx = cur_ctx.with_annot(&introduced, infer);
                 for (name, bound_ty, _, _) in elaborated.iter() {
-                    cur_ctx = extend_generalized(&cur_ctx, name, bound_ty.clone(), infer, Some(def.clone()));
+                    let outside = coerced.iter().find(|(n, _, _)| n == name).map(|(_, t, _)| t.clone()).unwrap_or_else(|| bound_ty.clone());
+                    cur_ctx = extend_generalized(&cur_ctx, name, outside, infer, Some(def.clone()));
                 }
-                pending.push(PendingElab::LetRec { bindings: elaborated, def, sites, kind });
+                let coercions: Vec<(String, Type, Type, Span)> = coerced
+                    .into_iter()
+                    .map(|(n, t, sp)| {
+                        let own = elaborated.iter().find(|(m, ..)| *m == n).unwrap().1.clone();
+                        (n, own, t, sp)
+                    })
+                    .collect();
+                pending.push(PendingElab::LetRec { bindings: elaborated, def, sites, kind, coercions });
                 cur_expr = body;
             }
             Expr::Lambda(param, ann, body) => {
@@ -5389,7 +5401,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 result_expr = arena.push(Expr::Let(var, Some(ann), val, body));
                 infer.splices.push(Splice { outer: result_expr, inner: body, what: Erasable::Binder(def) });
             }
-            PendingElab::LetRec { bindings, def, sites, kind } => {
+            PendingElab::LetRec { bindings, def, sites, kind, coercions } => {
                 // Matches the original LetRec arm: body's type propagates
                 // through unchanged, row is the union of every binding's
                 // plus body's.
@@ -5411,6 +5423,12 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                 }
                 if sites.iter().any(|(_, site)| site.conform.is_some()) {
                     def.used.set(true);
+                }
+                for (name, own, target, span) in coercions.iter().rev() {
+                    let var = arena.push(Expr::Var(name.clone()));
+                    let checked = coerce_check(arena, var, own, target, *span, &CheckEnv::at(infer, *span))?;
+                    let cast = coerce_cast(arena, checked, own, target, &CheckEnv::new(infer).with_span(*span));
+                    body = arena.push(Expr::Let(name.clone(), None, cast, body));
                 }
                 result_expr = arena.push(Expr::LetRec(Rc::new(group), body));
                 infer.splices.push(Splice { outer: result_expr, inner: body, what: Erasable::Binder(def) });
