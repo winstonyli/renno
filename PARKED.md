@@ -61,6 +61,7 @@ One list of deferred work. Each entry: what / why parked / trigger / evidence / 
 - **Persistent sequences (imbl RRB) as the list type:** 3-30x slower on cons/head/tail/index. Evidence: persistent-spike-report.md. Status: decided against.
 - **Generated chains over 2000 levels (else-if, `+`, `++`, `||`, `::`, parens) are rejected** by `parser::MAX_NESTING`. Documented in the README. Status: decided against lifting it.
 
+- **Unify `++` under one `append` builtin or overload `+` over Str/List:** `++` is already one `BinOp::Concat` with one `concat_type` rule; Str (`Text`) and List have separate fast runtime implementations, and `+` stays numeric (expr.rs comment on `Concat`). Nothing would be deleted. Evidence: `machine.rs` Concat arm, `typecheck.rs` `concat_type`, 2026-10-20. Status: decided against.
 
 ## Language features surveyed 2026-10-20 (none built; probed on main)
 - **IO as effects** (`perform read_line()`, `perform print(..)` with a default handler). Why parked: the most on-thesis feature but the default-handler design (who installs it, how rows see it) is the real work. Trigger: wanting programs that read input or run end to end. Evidence: nothing reads stdin or files; `print` is a builtin. Status: parked.
