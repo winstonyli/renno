@@ -1,4 +1,4 @@
-use renno::{parser, run_source};
+use renno::{parser, run_file_source, run_source};
 
 fn run_file(path: &str) {
     let src = match std::fs::read_to_string(path) {
@@ -8,7 +8,7 @@ fn run_file(path: &str) {
             std::process::exit(1);
         }
     };
-    match run_source(&src) {
+    match run_file_source(&src, std::path::Path::new(path)) {
         Ok(v) => println!("{v}"),
         Err(e) => {
             eprintln!("error: {e}");

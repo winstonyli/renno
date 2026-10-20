@@ -57,6 +57,16 @@ pub fn run_source(src: &str) -> Result<Outcome, String> {
     run_source_in(src, &cwd)
 }
 
+// `run_source` for the program in the file `path`: imports resolve against its directory, and a cycle back
+// through the file is reported with it in the chain.
+pub fn run_file_source(src: &str, path: &std::path::Path) -> Result<Outcome, String> {
+    let canon = path.canonicalize().map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let base = canon.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    let src = src.to_string();
+    on_big_stack(move || run_source_with(&src, &base, Some(canon)).map(|v| Outcome::from(&v)))
+        .unwrap_or_else(|_| Err("internal error: interpreter worker thread panicked".to_string()))
+}
+
 // `run_source` with imports resolved against `base`.
 pub fn run_source_in(src: &str, base: &std::path::Path) -> Result<Outcome, String> {
     let (src, base) = (src.to_string(), base.to_path_buf());
@@ -189,6 +199,20 @@ mod tests {
         assert!(e.contains("import cycle") && e.matches("a.rn").count() >= 2 && !e.contains("\\?\\"), "{e}");
         let e = run_source_in("import(\"gone.rn\")", &d).unwrap_err();
         assert!(e.contains("import \"gone.rn\""), "{e}");
+    }
+
+
+    #[test]
+    fn run_file_source_resolves_imports_against_the_file_and_reports_a_cycle_through_main() {
+        let d = fixture("rf", &[("main.rn", "import(\"sib.rn\")"), ("sib.rn", "7")]);
+        let main = d.join("main.rn");
+        let src = std::fs::read_to_string(&main).unwrap();
+        assert_eq!(run_file_source(&src, &main).unwrap().to_string(), "7");
+        let d = fixture("rfc", &[("main.rn", "import(\"a.rn\")"), ("a.rn", "import(\"main.rn\")")]);
+        let main = d.join("main.rn");
+        let src = std::fs::read_to_string(&main).unwrap();
+        let e = run_file_source(&src, &main).unwrap_err();
+        assert!(e.contains("import cycle") && e.lines().next().unwrap().matches("main.rn").count() == 2, "{e}");
     }
 
     #[test]
