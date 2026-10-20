@@ -64,12 +64,11 @@ fn expand_tree(arena: &mut Arena, spans: &mut SpanMap, root: ExprRef, sources: &
     let resolved = resolve::resolve(arena, root);
     let mut calls = Vec::new();
     for n in reachable(arena, root) {
-        if let Expr::App(f, a) = &arena[n] {
-            if let (Expr::Var(_), Expr::Str(p)) = (&arena[*f], &arena[*a]) {
-                if resolved.get(*f) == Some(VarRef::Prelude(import_idx)) {
-                    calls.push((n, p.clone()));
-                }
-            }
+        if let Expr::App(f, a) = &arena[n]
+            && let (Expr::Var(_), Expr::Str(p)) = (&arena[*f], &arena[*a])
+            && resolved.get(*f) == Some(VarRef::Prelude(import_idx))
+        {
+            calls.push((n, p.clone()));
         }
     }
     for (call, path) in calls {

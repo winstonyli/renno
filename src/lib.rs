@@ -96,6 +96,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     format!("internal error (please report): {text}")
 }
 
+#[cfg(test)]
 fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     run_source_with(src, &cwd, None)
@@ -5713,10 +5714,9 @@ g(len)").unwrap_err();
         // `{a: Int}` here is a record type, not a record value, so the read itself fails.
         assert!(run_source("let F = fun r -> r.a in let x: F({a: Int}) = 1 in x").unwrap_err().contains("get_field expects a record"));
         assert_eq!(run_source("let r = {a: Int} in let T = r.a in let x: T = 1 in x").unwrap(), Outcome::Int(1));
-        for src in ["let r = {a: Int} in let T = {a: Bool, ..r} in let x: T = 1 in x"] {
-            let err = run_source(src).unwrap_err();
-            assert!(err.contains("an annotation cannot read or update a record field"), "{src}: {err}");
-        }
+        let src = "let r = {a: Int} in let T = {a: Bool, ..r} in let x: T = 1 in x";
+        let err = run_source(src).unwrap_err();
+        assert!(err.contains("an annotation cannot read or update a record field"), "{src}: {err}");
     }
 
     // A let rec that is not a group of direct `fun`s evaluates its values in
