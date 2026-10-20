@@ -143,6 +143,10 @@ struct Budget {
     // A Rec target being unfolded: the source, and the group (kept, so its pointer stays
     // unique) and member.
     unfolding_rec: RefCell<Vec<(Type, RecRef, usize)>>,
+    // R2: the ordered pairs of unequal `Rec` nodes being compared (Amber's rule; the order matters because a
+    // parameter flips source and target). R3/R4: the `Rec` sources being unrolled against a `Union` target.
+    assumed: RefCell<Vec<(ById, ById)>>,
+    unrolling_src: RefCell<Vec<(RecRef, usize, ById)>>,
     ignore_rows: bool,
     // The decided pairs of big nodes, by (source, target, context): a shared node is related
     // once per context, not once per path to it. The context names the stack of recursive
@@ -160,6 +164,8 @@ impl Default for Budget {
         Budget {
             left: Cell::new(FUEL),
             unfolding_rec: RefCell::new(Vec::new()),
+            assumed: RefCell::new(Vec::new()),
+            unrolling_src: RefCell::new(Vec::new()),
             ignore_rows: false,
             pairs: RefCell::new(FxMap::default()),
             context: Cell::new(0),
@@ -234,6 +240,7 @@ fn decide(from: Type, to: Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Re
                 unknown(Residual::TEST)
             }
         }
+        (Type::Rec(g, i), Type::Union(_)) => rec_source(g, *i, &to, infer, fuel, d),
         (_, Type::Union(alts)) => {
             let mut rels = Vec::new();
             for a in alts.iter() {
@@ -259,7 +266,7 @@ fn decide(from: Type, to: Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Re
             } else if rows_only_differ(&f, &t, infer, &mut FxSet::default()) {
                 unknown(Residual::ROW)
             } else {
-                Rel::opaque("recursive: different types")
+                rec_pair(&f, &t, infer, fuel, d)
             }
         }
         (_, Type::Rec(g, i)) => {
@@ -295,6 +302,39 @@ fn decide(from: Type, to: Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Re
         _ => Rel::refuted("shape"),
     }
 }
+// Two unequal groups: related when their unrollings are, assuming the pair itself (R2). A pair met again
+// under its own unrolling holds. Each unrolling gets its own memo context, since the answer depends on the assumptions.
+#[inline(never)]
+fn rec_pair(f: &Type, t: &Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Rel {
+    let key = (ById(f.clone()), ById(t.clone()));
+    if fuel.assumed.borrow().contains(&key) {
+        return Rel::Proven;
+    }
+    let (Type::Rec(g, i), Type::Rec(h, j)) = (f, t) else { unreachable!("rec_pair takes two groups") };
+    fuel.assumed.borrow_mut().push(key);
+    let outer = fuel.context.replace(fuel.contexts.get() + 1);
+    fuel.contexts.set(fuel.contexts.get() + 1);
+    let r = go(&unfold(g, *i), &unfold(h, *j), infer, fuel, d);
+    fuel.context.set(outer);
+    fuel.assumed.borrow_mut().pop();
+    r
+}
+// A group source against a `Union` target: unrolled one step before the target splits (R4), so a group
+// relates to its own unrolling. A source met again under the same target is a degenerate group (R3).
+#[inline(never)]
+fn rec_source(g: &RecRef, i: usize, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Rel {
+    let key = ById(to.clone());
+    if fuel.unrolling_src.borrow().iter().any(|(h, k, t)| *k == i && std::rc::Rc::ptr_eq(&h.0, &g.0) && *t == key) {
+        return Rel::refuted("recursive: cyclic unfolding");
+    }
+    fuel.unrolling_src.borrow_mut().push((g.clone(), i, key));
+    let outer = fuel.context.replace(fuel.contexts.get() + 1);
+    fuel.contexts.set(fuel.contexts.get() + 1);
+    let r = go(&unfold(g, i), to, infer, fuel, d);
+    fuel.context.set(outer);
+    fuel.unrolling_src.borrow_mut().pop();
+    r
+}
 // Params contravariant, returns covariant; any Unknown component is a wrapper (Residual::FUN),
 // except an Undecided, which no wrapper can discharge and so propagates.
 fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) -> Rel {
@@ -311,6 +351,8 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
     match and([go(&a2, a, infer, fuel, d), go(b, &b2, infer, fuel, d)]) {
         // A pure ROW stays one: the unifier decides it, a wrapper would not help.
         Rel::Unknown(res, c) if res.row_only() => Rel::Unknown(res, c),
+        // R5: no wrapper can be built for a function inside a group being unrolled as a source.
+        Rel::Unknown(res, c) if !res.undecided() && (!fuel.assumed.borrow().is_empty() || !fuel.unrolling_src.borrow().is_empty()) => Rel::Unknown(Residual::UNDECIDED, c),
         Rel::Unknown(res, c) if !res.undecided() => Rel::Unknown(Residual::FUN, c),
         Rel::Refuted(Why::Shape(w)) => Rel::Refuted(Why::Opaque(w)),
         other => other,
@@ -589,7 +631,8 @@ mod tests {
         let (i, s) = (Type::Int, Type::Str);
         assert_eq!(relate(&i, &s, &infer), Rel::Refuted(Why::Shape("shape")));
         let m = Type::Rec(rec_group(vec![list(bound0())]), 0);
-        assert!(matches!(relate(&m, &l_ty(), &infer), Rel::Refuted(Why::Opaque(_))));
+        // Unrelated groups are refuted by their unrollings now (list against union), not by a blanket "different types".
+        assert!(matches!(relate(&m, &l_ty(), &infer), Rel::Refuted(_)));
         assert!(matches!(relate(&fun(i.clone(), i.clone()), &fun(s.clone(), i.clone()), &infer), Rel::Refuted(Why::Opaque(_))));
         let rigid = Why::Index { msg: "index variable n is fixed by the signature and cannot equal 3".into(), bare: true };
         assert_eq!(relate(&vec_n(iv("n")), &vec_n(lit(3)), &infer), Rel::Refuted(rigid));
@@ -655,6 +698,35 @@ mod tests {
         assert!(matches!(relate(&two, &l, &infer), Rel::Refuted(_)));
         let got = relate(&d, &l, &infer);
         assert!(matches!(got, Rel::Unknown(..)) && got.cause() == Some(Cause::Imprecise), "{got:?}");
+    }
+
+    #[test]
+    fn relate_relates_a_group_with_its_unrolling_and_with_other_groups() {
+        let infer = InferCtx::new();
+        let l = l_ty();
+        let Type::Rec(g, i) = &l else { unreachable!() };
+        let unrolled = unfold(g, *i);
+        // q1/q5: a group and its one-step unrolling relate both ways.
+        assert_eq!(relate(&l, &unrolled, &infer), Rel::Proven);
+        assert_eq!(relate(&unrolled, &l, &infer), Rel::Proven);
+        // Equal structure in a distinct node, and a covariant group (q3); the reverse is not Proven.
+        let l2 = Type::Rec(rec_group(vec![uni(&[tup(&[Type::Int, bound0()]), Type::Bool])]), 0);
+        assert_eq!(relate(&l, &l2, &infer), Rel::Proven);
+        let wide = Type::Rec(rec_group(vec![uni(&[tup(&[uni(&[Type::Int, Type::Str]), bound0()]), Type::Bool])]), 0);
+        assert_eq!(relate(&l, &wide, &infer), Rel::Proven);
+        assert_ne!(relate(&wide, &l, &infer), Rel::Proven);
+        // A different shape is never Proven (a union source with one fitting alternative is a run-time test).
+
+        let other = Type::Rec(rec_group(vec![uni(&[tup(&[Type::Str, bound0()]), Type::Bool])]), 0);
+        assert_ne!(relate(&l, &other, &infer), Rel::Proven);
+        // Orientation: a parameter flips source and target, so `G -> L` into `G -> wide` is covariant in
+        // the result only, and the flipped pair is not assumed.
+        let (fl, fw) = (fun(Type::Int, l.clone()), fun(Type::Int, wide.clone()));
+        assert!(!matches!(relate(&fl, &fw, &infer), Rel::Refuted(_)));
+        // R5: a function inside a group being unrolled needs a wrapper no one can build: undecided.
+        let fgroup = |param: Type| Type::Rec(rec_group(vec![fun(param, tup(&[Type::Int, bound0()]))]), 0);
+        let (f, g2) = (fgroup(uni(&[Type::Int, Type::Str])), fgroup(Type::Int));
+        assert!(relate(&g2, &f, &infer).kinds().contains("Undecided"), "{:?}", relate(&g2, &f, &infer));
     }
 
     #[test]

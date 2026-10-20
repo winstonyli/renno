@@ -5658,8 +5658,8 @@ g(len)").unwrap_err();
     fn two_evaluations_of_a_recursive_type_function_are_equal() {
         let src = format!("{REC_FN}let x: A(Int) = (1, true) in let y: A(Int) = x in y");
         assert_eq!(run_source(&src).unwrap().to_string(), "[1, true]");
-        // Different arguments give different types (the ambiguous message is parked).
-        rejects(&format!("{REC_FN}let x: A(Int) = (1, true) in let y: A(Str) = x in y"), "type mismatch: expected R, found R");
+        // Different arguments give different types; the walk now reports the element that differs.
+        rejects(&format!("{REC_FN}let x: A(Int) = (1, true) in let y: A(Str) = x in y"), "expected (Str, R) | Bool, found Int at element 0");
     }
 
     #[test]
@@ -5768,7 +5768,7 @@ g(len)").unwrap_err();
         assert!(run_source(&format!("{t}let f = fun x: (T -> T) -> x in let g: (U -> U) = fun u -> u in f(g)")).is_ok());
         // A different shape is still a mismatch.
         let s = "let rec T = Union(Tuple(Int, T), Bool) in let rec U = Union(Tuple(Str, U), Bool) in ";
-        rejects(&format!("{s}let f = fun x: T -> x in let y: U = (\"a\", true) in f(y)"), "type mismatch: expected T, found U");
+        rejects(&format!("{s}let f = fun x: T -> x in let y: U = (\"a\", true) in f(y)"), "expected (Int, T) | Bool, found Str at element 0");
     }
 
     #[test]
@@ -11701,10 +11701,14 @@ g(len)").unwrap_err();
         assert_eq!(run_source(members).unwrap().as_int(), 2);
         let closed = "let rec R = Union(Int, Fun((R,\"e\",Int))) in let rec P = Union(Int, Fun((P,Int))) in let f = fun g: P -> 1 in let h: R = 3 in f(h)";
         assert_eq!(run_source(closed).unwrap().as_int(), 1);
-        // A difference outside a row is still two different types (q3: covariance is not added here).
+        // q3: a function inside a group being unrolled is R5's `cannot tell`, never a wrapper).
+
         let q3 = "let rec L = Union(Int, Fun((L,\"e\",Int))) in let rec M = Union(Int, Str, Fun((M,\"e\",Int))) in let f = fun g: M -> 1 in let h: L = 3 in f(h)";
         let err = run_err(q3);
-        assert!(err.contains("expected M, found L"), "{err}");
+        assert!(err.contains("cannot tell statically or at run time whether L fits M"), "{err}");
+        // Covariance without a function in the group now relates (S1, R2+R4).
+        let cov = "let rec L = Union(Bool, Tuple(Int, L)) in let rec M = Union(Bool, Tuple(Union(Int, Str), M)) in let h: L = (1, true) in let f = fun m: M -> 1 in f(h)";
+        assert_eq!(run_source(cov).unwrap().as_int(), 1);
     }
 
     #[test]
