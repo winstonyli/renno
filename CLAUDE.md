@@ -1,7 +1,7 @@
 # renno
 
 kind: experiment
-version: `Cargo.toml` `version` (0.5.3, tag v0.5.3). Changelog: none; tag messages are the history (`git tag -n99`). No compatibility promise, CI or publishing.
+version: `Cargo.toml` `version` (0.6.0, tag v0.6.0). Changelog: none; tag messages are the history (`git tag -n99`). No compatibility promise, CI or publishing.
 
 Parked and deferred work lives in `PARKED.md`. Long runs, benchmarks and profiles go through `~/.claude/runs/run.ps1` (raw output in `%LOCALAPPDATA%\claude-runs\renno\`, rows in `docs/runs.md`).
 
