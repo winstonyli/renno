@@ -233,7 +233,7 @@ pub fn pure_type(outcome: Pure) -> Result<Rc<Type>, String> {
         Pure::Stuck(Stuck::Fuel) => Err(format!("annotation did not terminate within {ANNOTATION_FUEL} steps")),
         Pure::Stuck(Stuck::Effect) => Err("an annotation cannot perform an effect".to_string()),
         Pure::Stuck(Stuck::Builtin) => Err("an annotation can only call the type constructors".to_string()),
-        Pure::Stuck(Stuck::Field) => Err("an annotation cannot read a record field".to_string()),
+        Pure::Stuck(Stuck::Field) => Err("an annotation cannot read or update a record field".to_string()),
         Pure::Error(msg) => Err(msg),
     }
 }
@@ -458,18 +458,12 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                 // lib.rs's run_untyped) -- `.field` access simply isn't
                 // supported on that untyped path. eval_pure runs parsed
                 // trees, so in check mode it is stuck, not a bug.
-                Expr::RecordUpdate(..) => {
-                    if PURE {
-                        return Err(Stuck::Field);
-                    }
-                    unreachable!("Expr::RecordUpdate reached machine::run directly -- `{{a: e, ..r}}` needs typecheck::check first")
-                }
-                Expr::FieldAccess(..) => {
+                Expr::FieldAccess(..) | Expr::RecordUpdate(..) => {
                     if PURE {
                         return Err(Stuck::Field);
                     }
                     unreachable!(
-                        "Expr::FieldAccess reached machine::run directly -- `.field` needs typecheck::check first, see its own doc comment"
+                        "{expr:?} reached machine::run directly -- `.field` and `{{a: e, ..r}}` need typecheck::check first, see FieldAccess's doc comment"
                     )
                 }
                 Expr::ListLit(items) => {
@@ -663,7 +657,7 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                                 }
                                 Value::Builtin(b) => {
                                     if PURE && !matches!(b, Builtin::Ty(_)) {
-                                        return Err(if matches!(b, Builtin::GetField) { Stuck::Field } else { Stuck::Builtin });
+                                        return Err(if matches!(b, Builtin::GetField | Builtin::SetField) { Stuck::Field } else { Stuck::Builtin });
                                     }
                                     set_current_span(callee_span);
                                     control = enter(collect_builtin_arg(b, Vec::new(), value), &mut cont);

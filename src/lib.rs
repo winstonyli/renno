@@ -5049,7 +5049,7 @@ g(len)").unwrap_err();
             // The pattern `Int` binds a variable, here to 1.
             ("match 1 | Int -> let x: Int = 3 in x", "column 25: annotation did not evaluate to a type, found Int"),
             // Only the run time reaches the field read, so it is a run-time error.
-            ("let F = fun r -> r.t in (fun r -> let x: F(r) = 1 in x)({t: Int})", "column 42: an annotation cannot read a record field"),
+            ("let F = fun r -> r.t in (fun r -> let x: F(r) = 1 in x)({t: Int})", "column 42: an annotation cannot read or update a record field"),
         ] {
             let err = run_source(src).unwrap_err();
             assert!(err.contains(want), "{src}: {err}");
@@ -5581,7 +5581,7 @@ g(len)").unwrap_err();
         assert_eq!(run_source("let p = {x: 1, y: 2} in let rec s = (fun q -> q.x + q.y)(p) in s").unwrap(), Outcome::Int(3));
         for src in ["let F = fun r -> r.a in let x: F({a: Int}) = 1 in x", "let r = {a: Int} in let T = r.a in let x: T = 1 in x"] {
             let err = run_source(src).unwrap_err();
-            assert!(err.contains("an annotation cannot read a record field"), "{src}: {err}");
+            assert!(err.contains("an annotation cannot read or update a record field"), "{src}: {err}");
         }
     }
 

@@ -3443,8 +3443,41 @@ impl StackMemo {
     }
 }
 
+// What `.field` and `{a: e, ..r}` both ask of a record-valued `e`: it has every label in `labels`. Returns `e`'s
+// type resolved (a bound variable is its record, a record's bound tail followed) and `e`, wrapped in the run-time
+// shape check when the type alone does not guarantee the labels.
+// D3: an unbound variable, or a record whose flexible tail lacks a label, is pinned to an open record that has
+// them all. The run-time check stays on a pinned or `Dyn` `e`: a `Dyn` caller can still lie.
+fn require_labels(arena: &mut Arena, infer: &mut InferCtx, ty: &Type, e: ExprRef, labels: &[&str], span: Span) -> Result<(Type, ExprRef), TypeError> {
+    let flatten = |infer: &mut InferCtx, ty: &Type| match infer.resolve(ty) {
+        Type::Record(r) => Type::Record(infer.flatten_row(&r)),
+        other => other,
+    };
+    let mut ty = flatten(infer, ty);
+    let pinned = match &ty {
+        Type::Var(_) => true,
+        Type::Record(r) => {
+            matches!(&r.tail, Tail::Var(t) if !infer.rigid_row.contains(t)) && labels.iter().any(|n| find_field(&r.entries, n).is_none())
+        }
+        _ => false,
+    };
+    if pinned {
+        let tail = Tail::Var(infer.fresh_row(RowRank::Fresh, "e"));
+        let entries = labels.iter().map(|n| (n.to_string(), infer.fresh_var("f"))).collect();
+        unify(&ty, &Type::Record(Row::from_entries(entries, tail)), infer, span)?;
+        ty = flatten(infer, &ty);
+    }
+    let checked = if pinned || matches!(ty, Type::Dyn) {
+        let required = Type::record(labels.iter().map(|n| (n.to_string(), Type::Dyn)).collect());
+        build_boundary_check(arena, e, &required, &CheckEnv::at(infer, span))
+    } else {
+        e
+    };
+    Ok((ty, checked))
+}
+
 // `{a: e, ..r}`: `r` with the listed fields replaced (design spec 2026-10-20). Typed like a `.field` on `r` per
-// label (D3 pinning, run-time check on a pinned or Dyn base), then desugared to `#set_field(...)` calls: base
+// label (`require_labels`), then desugared to `#set_field(...)` calls: base
 // first, then the values in label order. Out of line so `elaborate_node`'s frame stays small for deep trees.
 #[inline(never)]
 fn elaborate_record_update(
@@ -3465,27 +3498,8 @@ fn elaborate_record_update(
         values.push((name.clone(), v2));
         value_tys.push((name.clone(), ty));
     }
-    let flatten = |infer: &mut InferCtx, ty: &Type| match infer.resolve(ty) {
-        Type::Record(r) => Type::Record(infer.flatten_row(&r)),
-        other => other,
-    };
-    let base_ty = flatten(infer, &base_ty);
-    let pinned = match &base_ty {
-        Type::Var(_) => true,
-        Type::Record(r) => {
-            matches!(&r.tail, Tail::Var(t) if !infer.rigid_row.contains(t))
-                && value_tys.iter().any(|(n, _)| find_field(&r.entries, n).is_none())
-        }
-        _ => false,
-    };
-    let base_ty = if pinned {
-        let tail = Tail::Var(infer.fresh_row(RowRank::Fresh, "e"));
-        let entries = value_tys.iter().map(|(n, _)| (n.clone(), infer.fresh_var("f"))).collect();
-        unify(&base_ty, &Type::Record(Row::from_entries(entries, tail)), infer, spans[base])?;
-        flatten(infer, &base_ty)
-    } else {
-        base_ty
-    };
+    let labels: Vec<&str> = value_tys.iter().map(|(n, _)| n.as_str()).collect();
+    let (base_ty, mut acc) = require_labels(arena, infer, &base_ty, base2, &labels, spans[base])?;
     let result_ty = match &base_ty {
         Type::Dyn => Type::Dyn,
         Type::Record(r) if record_shaped(&base_ty) => {
@@ -3500,12 +3514,6 @@ fn elaborate_record_update(
             Type::Record(Row::from_entries(entries, r.tail.clone()))
         }
         other => return Err(TypeError(format!("expected a record, found {}", other.brief()), spans[base])),
-    };
-    let mut acc = if pinned || matches!(base_ty, Type::Dyn) {
-        let required = Type::record(value_tys.iter().map(|(n, _)| (n.clone(), Type::Dyn)).collect());
-        build_boundary_check(arena, base2, &required, &CheckEnv::at(infer, spans[base]))
-    } else {
-        base2
     };
     for (name, v2) in values {
         let applied = build_str_call(arena, "set_field", acc, &name);
@@ -5938,36 +5946,11 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         // found Y" message.
         Expr::FieldAccess(target, name) => {
             let (target_ty, target_row, target2) = elaborate(arena, target, ctx, spans, infer)?;
-            // The target resolved first (a bound variable is its record); a record's bound tail is followed.
-            let target_ty = match infer.resolve(&target_ty) {
-                Type::Record(row) => Type::Record(infer.flatten_row(&row)),
-                other => other,
-            };
-            // D3: an unbound variable, or a record whose flexible tail lacks the field, is pinned to
-            // an open record that has it. The run-time check stays: a `Dyn` caller can still lie.
-            let pinned = match &target_ty {
-                Type::Var(_) => true,
-                Type::Record(row) => matches!(&row.tail, Tail::Var(t) if !infer.rigid_row.contains(t)) && find_field(&row.entries, &name).is_none(),
-                _ => false,
-            };
-            let field_ty = if pinned {
-                let payload = infer.fresh_var("f");
-                let tail = Tail::Var(infer.fresh_row(RowRank::Fresh, "e"));
-                let open = Type::Record(Row::from_entries(vec![(name.clone(), payload.clone())], tail));
-                unify(&target_ty, &open, infer, spans[target])?;
-                payload
-            } else {
-                match &target_ty {
-                    Type::Dyn => Type::Dyn,
-                    ty if record_shaped(ty) => record_field_type(ty, &name).ok_or_else(|| TypeError(format!("no field named `{name}`"), spans[expr]))?,
-                    other => return Err(TypeError(format!("expected a record, found {}", other.brief()), spans[target])),
-                }
-            };
-            let checked_target = if pinned || matches!(target_ty, Type::Dyn) {
-                let required = Type::record(vec![(name.clone(), Type::Dyn)]);
-                build_boundary_check(arena, target2, &required, &CheckEnv::at(infer, spans[target]))
-            } else {
-                target2
+            let (target_ty, checked_target) = require_labels(arena, infer, &target_ty, target2, &[name.as_str()], spans[target])?;
+            let field_ty = match &target_ty {
+                Type::Dyn => Type::Dyn,
+                ty if record_shaped(ty) => record_field_type(ty, &name).ok_or_else(|| TypeError(format!("no field named `{name}`"), spans[expr]))?,
+                other => return Err(TypeError(format!("expected a record, found {}", other.brief()), spans[target])),
             };
             let call = build_str_call(arena, "get_field", checked_target, &name);
             Ok((field_ty, target_row, call))
