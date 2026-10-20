@@ -458,6 +458,12 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                 // lib.rs's run_untyped) -- `.field` access simply isn't
                 // supported on that untyped path. eval_pure runs parsed
                 // trees, so in check mode it is stuck, not a bug.
+                Expr::RecordUpdate(..) => {
+                    if PURE {
+                        return Err(Stuck::Field);
+                    }
+                    unreachable!("Expr::RecordUpdate reached machine::run directly -- `{{a: e, ..r}}` needs typecheck::check first")
+                }
                 Expr::FieldAccess(..) => {
                     if PURE {
                         return Err(Stuck::Field);

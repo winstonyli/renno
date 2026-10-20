@@ -714,6 +714,9 @@ pub enum Expr {
     // reading one field needs no evaluation semantics beyond an ordinary
     // two-argument call.
     FieldAccess(ExprRef, String),
+    // `{a: e, ..r}` -- `r` with the listed fields replaced. Parser-emitted, checker-consumed like
+    // FieldAccess: elaborate_node rewrites it to a chain of set_field calls; machine.rs never evaluates one.
+    RecordUpdate(Rc<Vec<(String, ExprRef)>>, ExprRef),
     // Variable-arity, unlike every other node -- elaborate/machine handle
     // it with a loop over the Vec rather than a fixed-shape match.
     ListLit(Vec<ExprRef>),
@@ -814,6 +817,10 @@ impl Expr {
             Expr::MakeHandler { body, .. } => out.push(*body),
             Expr::Tuple(items) | Expr::ListLit(items) => out.extend(items),
             Expr::Record(fields) => out.extend(fields.iter().map(|(_, v)| *v)),
+            Expr::RecordUpdate(fields, base) => {
+                out.extend(fields.iter().map(|(_, v)| *v));
+                out.push(*base);
+            }
             Expr::App(a, b) | Expr::BinOp(_, a, b) => out.extend([*a, *b]),
             Expr::Let(_, ann, val, body) => {
                 out.extend(ann.filter(|_| annotations));
@@ -882,6 +889,9 @@ pub fn copy_tree(arena: &mut Arena, root: ExprRef, mut replace: impl FnMut(&mut 
             Expr::ListLit(items) => Expr::ListLit(items.iter().map(at).collect()),
             Expr::Record(fields) => Expr::Record(Rc::new(fields.iter().map(|(name, v)| (name.clone(), at(v))).collect())),
             Expr::FieldAccess(e, name) => Expr::FieldAccess(at(e), name.clone()),
+            Expr::RecordUpdate(fields, base) => {
+                Expr::RecordUpdate(Rc::new(fields.iter().map(|(n, v)| (n.clone(), at(v))).collect()), at(base))
+            }
             Expr::Lambda(param, ann, body) => Expr::Lambda(param.clone(), *ann, at(body)),
             Expr::App(f, a) => Expr::App(at(f), at(a)),
             Expr::Let(name, ann, val, body) => Expr::Let(name.clone(), *ann, at(val), at(body)),

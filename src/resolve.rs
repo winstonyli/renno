@@ -291,6 +291,12 @@ fn visit(
                 work.push(Work::Visit(*v));
             }
         }
+        Expr::RecordUpdate(fields, base) => {
+            work.push(Work::Visit(*base));
+            for (_, v) in fields.iter().rev() {
+                work.push(Work::Visit(*v));
+            }
+        }
         // A kept annotation runs in the scope of the binder it annotates.
         Expr::FieldAccess(target, _) | Expr::Annot(target, _) => work.push(Work::Visit(*target)),
         // A Conform's length slots are evaluated in its own scope, on entry,

@@ -13017,4 +13017,35 @@ g(len)").unwrap_err();
         assert_eq!(ra.tail, crate::types::Tail::Closed);
         assert_eq!(a.brief().to_string(), "{x: Int}");
     }
+
+    #[test]
+    fn a_record_update_misuses_are_rejected_at_parse() {
+        rejects("{..r}", "an update needs at least one field");
+        rejects("{a: 1, ..r, b: 2}", "expected `}`");
+        rejects("{a: 1, a: 2, ..r}", "field `a` given more than once");
+        rejects("fun p -> match p | {x: v, ..r} -> v", "only allowed in a record type or an update");
+        assert_eq!(run_source("let f = fun r: {x: Int, ..e} -> r.x in f({x: 1})").unwrap().as_int(), 1);
+    }
+
+    #[test]
+    fn a_record_update_replaces_fields_and_may_change_their_type() {
+        assert_eq!(run_source(r#"let r = {a: 1, b: true} in let s = {a: "x", ..r} in (s.a, s.b, r.a)"#).unwrap().to_string(), r#"[x, true, 1]"#);
+        assert_eq!(run_source("let f = fun r -> {a: 1, ..r} in (f({a: 5, c: 3})).c").unwrap().as_int(), 3);
+        assert_eq!(run_source("{b: 1, a: 2, ..{a: 0, b: 0, c: 7}}").unwrap().to_string(), "{a: 2, b: 1, c: 7}");
+    }
+
+    #[test]
+    fn a_record_update_checks_labels_and_the_base() {
+        rejects("let r = {a: 1} in {z: 1, ..r}", "no field named `z`");
+        rejects("{a: 1, ..5}", "expected a record, found Int");
+        let d = "let d: Dyn = {a: 1} in ";
+        assert_eq!(run_source(&format!("{d}{{a: 2, ..d}}")).unwrap().to_string(), "{a: 2}");
+        rejects(&format!("{d}{{z: 2, ..d}}"), "expected {z: Dyn}, found");
+    }
+
+    #[test]
+    fn a_record_update_evaluates_the_base_then_the_values_in_label_order() {
+        let src = r#"handle (let r = {a: "", b: ""} in let s = {b: perform t("b"), a: perform t("a"), ..(let x = perform t("base") in r)} in s.a ++ s.b) with deep(handler t(p, resume) -> p ++ resume(""))"#;
+        assert_eq!(run_source(src).unwrap().to_string(), "baseab");
+    }
 }

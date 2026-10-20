@@ -45,6 +45,14 @@ pub fn parse_type_string(src: &str) -> Result<Type, String> {
     crate::machine::eval_type(&p.arena, ty, &p.expr_spans)
 }
 
+// What may follow `, ..` in braces: nothing (a record pattern), a row
+// variable name (a record type) or a base expression (an update).
+enum RecordRest<'a, T> {
+    None,
+    Row(&'a mut Option<String>),
+    Base(&'a mut Option<T>),
+}
+
 struct Parser<'a> {
     tokens: Vec<Token>,
     tok_spans: Vec<Span>,
@@ -232,10 +240,13 @@ impl<'a> Parser<'a> {
         &mut self,
         parse_value: fn(&mut Self) -> Result<T, String>,
         default: Option<fn(&mut Self, String) -> T>,
-        tail: Option<&mut Option<String>>,
+        rest: RecordRest<T>,
     ) -> Result<Vec<(String, T)>, String> {
         if matches!(self.peek(), Some(Token::RBrace)) {
             return Err(self.err_at(self.span_before(), "a record needs at least one field".to_string()));
+        }
+        if matches!(self.peek(), Some(Token::DotDot)) && matches!(rest, RecordRest::Base(_)) {
+            return Err(self.err_at(self.span_at(), "an update needs at least one field".to_string()));
         }
         let mut fields: Vec<(String, T)> = Vec::new();
         loop {
@@ -270,12 +281,24 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 if matches!(self.peek(), Some(Token::DotDot)) {
-                    // `..r`: the row variable of an open record TYPE, last in the braces.
-                    let Some(slot) = tail else {
-                        return Err(self.err_at(self.span_at(), "`..r` is only allowed in a record type".to_string()));
-                    };
-                    self.bump();
-                    *slot = Some(self.ident()?);
+                    // `..r`: the row variable of an open record TYPE, or the base
+                    // of an UPDATE expression, last in the braces.
+                    match rest {
+                        RecordRest::Row(slot) => {
+                            self.bump();
+                            *slot = Some(self.ident()?);
+                        }
+                        RecordRest::Base(slot) => {
+                            self.bump();
+                            *slot = Some(parse_value(self)?);
+                        }
+                        RecordRest::None => {
+                            return Err(self.err_at(
+                                self.span_at(),
+                                "`..r` is only allowed in a record type or an update".to_string(),
+                            ))
+                        }
+                    }
                     break;
                 }
             } else {
@@ -447,7 +470,7 @@ impl<'a> Parser<'a> {
             // no value to pun with) and why the result comes back sorted.
             Some(Token::LBrace) => {
                 let mut tail = None;
-                let fields = self.parse_record_fields(Self::parse_union_type, None, Some(&mut tail))?;
+                let fields = self.parse_record_fields(Self::parse_union_type, None, RecordRest::Row(&mut tail))?;
                 let span = Span { start, end: self.span_before().end };
                 let record = self.push_spanned(Expr::Record(Rc::new(fields)), span);
                 // `{x: T, ..r}` is `#Record(({x: T}, "r"))`.
@@ -703,7 +726,7 @@ impl<'a> Parser<'a> {
                 // only because that's parse_record_fields' shared
                 // `default` parameter shape.
                 let fields =
-                    self.parse_record_fields(Self::pattern, Some(|_: &mut Self, name| Pattern::Var(name)), None)?;
+                    self.parse_record_fields(Self::pattern, Some(|_: &mut Self, name| Pattern::Var(name)), RecordRest::None)?;
                 Ok(Pattern::Record(fields))
             }
             // No case distinction: with `data`-declared constructors gone,
@@ -1206,15 +1229,21 @@ impl<'a> Parser<'a> {
                 // spanned at the identifier just consumed
                 // (parse_record_fields calls this right after
                 // `self.ident()`, before bumping anything else).
+                let mut base = None;
                 let fields = self.parse_record_fields(
                     Self::expr,
                     Some(|p: &mut Self, name: String| {
                         let span = p.span_before();
                         p.push_spanned(Expr::Var(name), span)
                     }),
-                    None,
+                    RecordRest::Base(&mut base),
                 )?;
-                Ok(self.push_spanned(Expr::Record(Rc::new(fields)), Span { start, end: self.span_before().end }))
+                let fields = Rc::new(fields);
+                let span = Span { start, end: self.span_before().end };
+                Ok(match base {
+                    Some(base) => self.push_spanned(Expr::RecordUpdate(fields, base), span),
+                    None => self.push_spanned(Expr::Record(fields), span),
+                })
             }
 
             // match <scrutinee> (| pattern -> expr)+  -- no "with": a literal

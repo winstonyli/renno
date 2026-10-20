@@ -3443,6 +3443,77 @@ impl StackMemo {
     }
 }
 
+// `{a: e, ..r}`: `r` with the listed fields replaced (design spec 2026-10-20). Typed like a `.field` on `r` per
+// label (D3 pinning, run-time check on a pinned or Dyn base), then desugared to `#set_field(...)` calls: base
+// first, then the values in label order. Out of line so `elaborate_node`'s frame stays small for deep trees.
+#[inline(never)]
+fn elaborate_record_update(
+    arena: &mut Arena,
+    expr: ExprRef,
+    fields: &[(String, ExprRef)],
+    base: ExprRef,
+    ctx: &Ctx,
+    spans: &SpanMap,
+    infer: &mut InferCtx,
+) -> Result<(Type, Row, ExprRef), TypeError> {
+    let (base_ty, mut row, base2) = elaborate(arena, base, ctx, spans, infer)?;
+    let mut values = Vec::with_capacity(fields.len());
+    let mut value_tys = Vec::with_capacity(fields.len());
+    for (name, v) in fields.iter() {
+        let (ty, r, v2) = elaborate(arena, *v, ctx, spans, infer)?;
+        row = union_rows(&row, &r, infer, spans[*v])?;
+        values.push((name.clone(), v2));
+        value_tys.push((name.clone(), ty));
+    }
+    let flatten = |infer: &mut InferCtx, ty: &Type| match infer.resolve(ty) {
+        Type::Record(r) => Type::Record(infer.flatten_row(&r)),
+        other => other,
+    };
+    let base_ty = flatten(infer, &base_ty);
+    let pinned = match &base_ty {
+        Type::Var(_) => true,
+        Type::Record(r) => {
+            matches!(&r.tail, Tail::Var(t) if !infer.rigid_row.contains(t))
+                && value_tys.iter().any(|(n, _)| find_field(&r.entries, n).is_none())
+        }
+        _ => false,
+    };
+    let base_ty = if pinned {
+        let tail = Tail::Var(infer.fresh_row(RowRank::Fresh, "e"));
+        let entries = value_tys.iter().map(|(n, _)| (n.clone(), infer.fresh_var("f"))).collect();
+        unify(&base_ty, &Type::Record(Row::from_entries(entries, tail)), infer, spans[base])?;
+        flatten(infer, &base_ty)
+    } else {
+        base_ty
+    };
+    let result_ty = match &base_ty {
+        Type::Dyn => Type::Dyn,
+        Type::Record(r) if record_shaped(&base_ty) => {
+            if let Some((missing, _)) = value_tys.iter().find(|(n, _)| find_field(&r.entries, n).is_none()) {
+                return Err(TypeError(format!("no field named `{missing}`"), spans[expr]));
+            }
+            let entries = r
+                .entries
+                .iter()
+                .map(|(n, t)| (n.clone(), find_field(&value_tys, n).cloned().unwrap_or_else(|| t.clone())))
+                .collect();
+            Type::Record(Row::from_entries(entries, r.tail.clone()))
+        }
+        other => return Err(TypeError(format!("expected a record, found {}", other.brief()), spans[base])),
+    };
+    let mut acc = if pinned || matches!(base_ty, Type::Dyn) {
+        let required = Type::record(value_tys.iter().map(|(n, _)| (n.clone(), Type::Dyn)).collect());
+        build_boundary_check(arena, base2, &required, &CheckEnv::at(infer, spans[base]))
+    } else {
+        base2
+    };
+    for (name, v2) in values {
+        let applied = build_str_call(arena, "set_field", acc, &name);
+        acc = arena.push(Expr::App(applied, v2));
+    }
+    Ok((result_ty, row, acc))
+}
+
 // A synthesized reference to the prelude builtin `name`. Spelled `#name`,
 // which no source text can bind or lex, and which `resolve` maps straight to
 // the prelude table: a user binding named like the builtin (a parameter
@@ -5901,6 +5972,8 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
             let call = build_str_call(arena, "get_field", checked_target, &name);
             Ok((field_ty, target_row, call))
         }
+
+        Expr::RecordUpdate(fields, base) => elaborate_record_update(arena, expr, &fields, base, ctx, spans, infer),
 
         Expr::ListLit(items) => {
             let item_count = items.len();
