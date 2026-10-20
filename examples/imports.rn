@@ -1,0 +1,3 @@
+let L = import("modules/list_utils.rn") in
+let total = fun xs: L.T -> L.sum(L.double(xs)) in
+total([1, 2, 3])

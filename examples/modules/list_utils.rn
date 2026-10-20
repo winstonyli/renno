@@ -1,0 +1,3 @@
+let sum = fun xs -> fold(fun a -> fun x -> a + x)(0)(xs) in
+let double = fun xs -> map(fun x -> x * 2)(xs) in
+{T: List(Int), sum: sum, double: double}
