@@ -1748,6 +1748,7 @@ fn dispatch_builtin(b: Builtin, mut args: Vec<Value>) -> Value {
                 _ => crate::run_error!("get_field expects a record and a string"),
             }
         }
+        Builtin::Import => crate::run_error!("import takes a string literal path"),
         Builtin::SetField => {
             let (value, name, record) = (args.pop(), args.pop(), args.pop());
             match (record, name, value) {

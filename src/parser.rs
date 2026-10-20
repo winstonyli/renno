@@ -32,6 +32,25 @@ pub fn parse(src: &str) -> Result<(Arena, SpanMap, ExprRef), String> {
     Ok((p.arena, p.expr_spans, root))
 }
 
+// Parses a module's text (its own line numbers) into the caller's arena; the caller shifts the new
+// nodes' spans to the module's place in the virtual source (imports::expand).
+pub fn parse_module(arena: &mut Arena, spans: &mut SpanMap, text: &str) -> Result<ExprRef, String> {
+    let (tokens, tok_spans): (Vec<Token>, Vec<Span>) = tokenize(text)?.into_iter().unzip();
+    let mut p = Parser { tokens, tok_spans, pos: 0, depth: 0, arena: std::mem::replace(arena, Arena::new()), expr_spans: std::mem::replace(spans, SpanMap::new()), src: text };
+    let result = (|| {
+        let root = p.expr()?;
+        if p.pos != p.tokens.len() {
+            let span = p.span_at();
+            return Err(p.err_at(span, format!("unexpected `{}` after the expression", span.text(text))));
+        }
+        p.check_tree_depth(root)?;
+        Ok(root)
+    })();
+    *arena = p.arena;
+    *spans = p.expr_spans;
+    result
+}
+
 // Test-only entry point: parses a single, standalone type expression
 // (not a full program) -- used by the Vec(...) syntax tests (see the
 // design spec's own §1/§2), which need to inspect a Type in isolation

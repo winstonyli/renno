@@ -65,6 +65,9 @@ pub enum Builtin {
     // (Dyn, Str, Dyn) -> Dyn -- a record with one named field replaced. What `{a: e, ..r}` desugars into (typecheck's
     // Expr::RecordUpdate arm), one call per label. The original record is untouched (copy on write).
     SetField,
+    // `import("path")`: a compile-time form that imports::expand splices out before the check. A call that
+    // survives to run time has a non-literal argument and is a run error.
+    Import,
     // (Type, Dyn) -> Bool: does the value satisfy the type, for user
     // programs. A Dyn boundary check is a native Expr::Conform instead; both
     // share machine::test_holds, and the type is lowered by
@@ -178,6 +181,7 @@ impl Builtin {
             | Builtin::Print
             | Builtin::ToStr
             | Builtin::Reverse
+            | Builtin::Import
             | Builtin::Ty(_) => 1,
             Builtin::Map
             | Builtin::Is

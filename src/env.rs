@@ -28,6 +28,7 @@ pub static PRELUDE: &[(&str, Builtin)] = &[
     // same "ordinary prelude builtin, not hidden" treatment.
     ("get_field", Builtin::GetField),
     ("set_field", Builtin::SetField),
+    ("import", Builtin::Import),
     ("print", Builtin::Print),
     ("to_str", Builtin::ToStr),
     ("filter", Builtin::Filter),

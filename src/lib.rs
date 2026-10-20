@@ -3,6 +3,7 @@ pub mod cont;
 pub mod env;
 pub mod expr;
 pub mod frame;
+pub mod imports;
 pub mod index_expr;
 pub mod iterate;
 pub mod lexer;
@@ -52,8 +53,14 @@ const WORKER_STACK_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 // makes that crossing possible without making the whole interpreter pay
 // Arc's atomic-refcount cost just for this one seam.
 pub fn run_source(src: &str) -> Result<Outcome, String> {
-    let src = src.to_string();
-    on_big_stack(move || run_source_on_this_thread(&src).map(|v| Outcome::from(&v)))
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    run_source_in(src, &cwd)
+}
+
+// `run_source` with imports resolved against `base`.
+pub fn run_source_in(src: &str, base: &std::path::Path) -> Result<Outcome, String> {
+    let (src, base) = (src.to_string(), base.to_path_buf());
+    on_big_stack(move || run_source_with(&src, &base, None).map(|v| Outcome::from(&v)))
         .unwrap_or_else(|_| Err("internal error: interpreter worker thread panicked".to_string()))
 }
 
@@ -80,8 +87,16 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    run_source_with(src, &cwd, None)
+}
+
+// `base` is the directory imports resolve against; `main` the main file's canonical path (for the cycle chain).
+fn run_source_with(src: &str, base: &std::path::Path, main: Option<std::path::PathBuf>) -> Result<Value, String> {
     let (mut arena, mut spans, root) = parser::parse(src)?;
-    let elaborated = typecheck::check(&mut arena, root, &spans).map_err(|e| e.1.format_error(src, &e.0))?;
+    let mut sources = imports::Sources::new(src);
+    imports::expand(&mut arena, &mut spans, root, &mut sources, base, main)?;
+    let elaborated = typecheck::check(&mut arena, root, &spans).map_err(|e| sources.format_error(e.1, &e.0))?;
     expr::fill_synthesized_spans(&arena, elaborated, &mut spans);
     // Unwind-safe in fact: the arena (whose annotation nodes hold a Cell) is dropped after a panic.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| machine::run(&arena, elaborated, Env::prelude(), &spans))).map_err(|payload| {
@@ -97,7 +112,7 @@ fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
         // leaves the bare message.
         let msg = panic_message(&*payload);
         match machine::current_span() {
-            Some(span) => span.format_error(src, &msg),
+            Some(span) => sources.format_error(span, &msg),
             None => msg,
         }
     })
@@ -107,6 +122,80 @@ fn run_source_on_this_thread(src: &str) -> Result<Value, String> {
 mod tests {
     use super::*;
     use types::Hc;
+
+    fn fixture(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("renno-imports-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (rel, text) in files {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn an_import_splices_the_module_value_at_each_site() {
+        let d = fixture("splice", &[("m.rn", "let inc = fun x -> x + 1 in {inc: inc}")]);
+        let out = run_source_in("(import(\"m.rn\")).inc(1) + (import(\"m.rn\")).inc(10)", &d).unwrap();
+        assert_eq!(out.to_string(), "13");
+    }
+
+    #[test]
+    fn an_import_path_is_relative_to_the_importing_file() {
+        let d = fixture("nested", &[("a.rn", "import(\"sub/b.rn\")"), ("sub/b.rn", "import(\"c.rn\")"), ("sub/c.rn", "42")]);
+        assert_eq!(run_source_in("import(\"a.rn\")", &d).unwrap().to_string(), "42");
+    }
+
+    #[test]
+    fn a_module_is_closed_over_the_prelude_only() {
+        let d = fixture("hygiene", &[("m.rn", "map(fun x -> x + 1)([1, 2])")]);
+        assert_eq!(run_source_in("let map = 0 in import(\"m.rn\")", &d).unwrap().to_string(), "[2, 3]");
+        let d = fixture("free", &[("m.rn", "y + 1")]);
+        let e = run_source_in("let y = 1 in import(\"m.rn\")", &d).unwrap_err();
+        assert!(e.contains("undefined name `y`") && e.contains("m.rn"), "{e}");
+    }
+
+    #[test]
+    fn a_user_binding_named_import_is_not_expanded() {
+        let d = fixture("shadow", &[]);
+        assert_eq!(run_source_in("let import = fun s -> s in import(\"nope.rn\")", &d).unwrap().to_string(), "nope.rn");
+    }
+
+    #[test]
+    fn a_non_literal_import_is_a_run_error() {
+        let d = fixture("dyn", &[]);
+        let e = run_source_in("let p = \"x\" in import(p)", &d).unwrap_err();
+        assert!(e.contains("import takes a string literal path"), "{e}");
+    }
+
+    #[test]
+    fn import_errors_blame_the_module_with_local_lines() {
+        let d = fixture("blame", &[("m.rn", "let a = 1 in\nlet b = (\n")]);
+        let e = run_source_in("import(\"m.rn\")", &d).unwrap_err();
+        assert!(e.contains("m.rn:line 3"), "{e}");
+        let d = fixture("tyerr", &[("m.rn", "let a = 1 in\n1 + true")]);
+        let e = run_source_in("import(\"m.rn\")", &d).unwrap_err();
+        assert!(e.contains("m.rn:line 2"), "{e}");
+        let d = fixture("runerr", &[("m.rn", "let a = 1 in\n[1][5]")]);
+        let e = run_source_in("import(\"m.rn\")", &d).unwrap_err();
+        assert!(e.contains("m.rn:line 2"), "{e}");
+    }
+
+    #[test]
+    fn import_cycles_and_missing_files_are_rejected() {
+        let d = fixture("cycle", &[("a.rn", "import(\"b.rn\")"), ("b.rn", "import(\"a.rn\")")]);
+        let e = run_source_in("import(\"a.rn\")", &d).unwrap_err();
+        assert!(e.contains("import cycle") && e.matches("a.rn").count() >= 2 && !e.contains("\\?\\"), "{e}");
+        let e = run_source_in("import(\"gone.rn\")", &d).unwrap_err();
+        assert!(e.contains("import \"gone.rn\""), "{e}");
+    }
+
+    #[test]
+    fn a_diamond_checks_each_site_independently() {
+        let d = fixture("diamond", &[("t.rn", "fun x: Int -> x"), ("l.rn", "import(\"t.rn\")"), ("r.rn", "import(\"t.rn\")")]);
+        assert_eq!(run_source_in("import(\"l.rn\")(1) + import(\"r.rn\")(2)", &d).unwrap().to_string(), "3");
+    }
 
     #[test]
     fn panic_message_tells_run_errors_from_interpreter_bugs() {
