@@ -62,6 +62,9 @@ pub enum Builtin {
     // Option: renno has no Option/Result in the prelude, and every other
     // Dyn-sourced shape mismatch already panics at the point of use.
     GetField,
+    // (Dyn, Str, Dyn) -> Dyn -- a record with one named field replaced. What `{a: e, ..r}` desugars into (typecheck's
+    // Expr::RecordUpdate arm), one call per label. The original record is untouched (copy on write).
+    SetField,
     // (Type, Dyn) -> Bool: does the value satisfy the type, for user
     // programs. A Dyn boundary check is a native Expr::Conform instead; both
     // share machine::test_holds, and the type is lowered by
@@ -184,7 +187,7 @@ impl Builtin {
             | Builtin::Sort
             | Builtin::Range
             | Builtin::Join => 2,
-            Builtin::Fold => 3,
+            Builtin::Fold | Builtin::SetField => 3,
         }
     }
 

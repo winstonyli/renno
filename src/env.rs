@@ -27,6 +27,7 @@ pub static PRELUDE: &[(&str, Builtin)] = &[
     // (typecheck::elaborate_node's Expr::FieldAccess arm) --
     // same "ordinary prelude builtin, not hidden" treatment.
     ("get_field", Builtin::GetField),
+    ("set_field", Builtin::SetField),
     ("print", Builtin::Print),
     ("to_str", Builtin::ToStr),
     ("filter", Builtin::Filter),

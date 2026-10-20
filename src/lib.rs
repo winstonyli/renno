@@ -178,6 +178,14 @@ mod tests {
     // Each call replays the captured continuation (`x + 100`) with a
     // different x, independently -- expect (1+100) + (2+100) = 203.
     #[test]
+    fn set_field_replaces_one_field_and_leaves_the_original() {
+        assert_eq!(run_source(r#"let r = {a: 1, b: 2} in let s = set_field(r)("a")(9) in (r.a, s.a, s.b)"#).unwrap().to_string(), "[1, 9, 2]");
+        expect_run_error("no field named `z`", || {
+            run_untyped(r#"set_field({a: 1})("z")(1)"#);
+        });
+    }
+
+    #[test]
     fn parses_and_runs_multi_shot_demo() {
         let src = r#"
             handle

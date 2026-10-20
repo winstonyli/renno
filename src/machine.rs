@@ -1748,6 +1748,19 @@ fn dispatch_builtin(b: Builtin, mut args: Vec<Value>) -> Value {
                 _ => crate::run_error!("get_field expects a record and a string"),
             }
         }
+        Builtin::SetField => {
+            let (value, name, record) = (args.pop(), args.pop(), args.pop());
+            match (record, name, value) {
+                (Some(Value::Record(mut fields)), Some(Value::Str(name)), Some(value)) => {
+                    match Rc::make_mut(&mut fields).iter_mut().find(|(n, _)| **n == *name) {
+                        Some(slot) => slot.1 = value,
+                        None => crate::run_error!("no field named `{name}`"),
+                    }
+                    Value::Record(fields)
+                }
+                _ => crate::run_error!("set_field expects a record, a string and a value"),
+            }
+        }
         // Echoes its argument back unchanged after printing it -- see
         // Builtin::Print's own doc comment.
         Builtin::Print => match args.pop() {
