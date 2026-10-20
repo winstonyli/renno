@@ -653,7 +653,7 @@ fn settled(arena: &Arena, mut n: ExprRef) -> ExprRef {
 // too. That decides the shape guard on a prelude constructor (`List` in
 // `List(Int)`) and leaves every check on a parameter or a `let` fallible.
 // `bound_names` comes from the parsed tree, so a binder elaboration adds
-// (`__ca`, `__cf`) looks closed; evaluated alone it is unbound,
+// (`__esc`, `__ix`) looks closed; evaluated alone it is unbound,
 // so such a check counts as fallible, which is the safe answer.
 // Each check is decided on its own: one inside a closed operand (in a function
 // body, say) did not necessarily run when the outer one passed.

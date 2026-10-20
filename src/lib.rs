@@ -8490,7 +8490,7 @@ g(len)").unwrap_err();
 
     // Known limitation (spec 2026-10-08 sec 7), pinned. `n` is monomorphic here (fixed by the
     // Dyn-to-Vec(n) check on `y`) and bound through a tuple-typed existential, so no witness in
-    // scope covers it: the closure form `d([1])` (a cast through Dyn) gets a fresh per-call
+    // scope covers it: the contract `d([1])` (a cast through Dyn) gets a fresh per-call
     // witness and checks list shape only, returning 1, while the direct call `f([1])` fails at
     // run time. The two forms should agree.
     #[test]
@@ -8822,7 +8822,7 @@ g(len)").unwrap_err();
         }
     }
 
-    // --- Fun-to-Dyn / Fun-to-Fun wrapping (spec 2026-10-08), closure form ---
+    // --- Fun-to-Dyn / Fun-to-Fun wrapping (spec 2026-10-08) ---
 
     #[test]
     fn a_typed_function_converted_to_dyn_is_wrapped() {
@@ -8983,7 +8983,7 @@ g(len)").unwrap_err();
         assert_eq!(run_source(sig).unwrap().as_int(), 0);
     }
 
-    // The error location of a rejected literal-form call: the first line is
+    // The error location of a rejected literal call: the first line is
     // "line L, column C: ..." (spec 8). `let d: Dyn = fun a: Int -> a + 1 in
     // d(true)` -> "line 1, column 14: type error: expected Int, found Bool",
     // the span of the cast site (the literal crossing into Dyn); it used to
@@ -9612,7 +9612,7 @@ g(len)").unwrap_err();
         // Probed empirically (spec 2026-10-08-join-to-dyn-casts, open item 4):
         // inside `fun v: Vec(n)` the outer witness `n` is visible at the join
         // site, so a wrong-length call through the join is rejected exactly as
-        // in the closure form (`let k = .. in let d: Dyn = k in d`), and the
+        // in the contract form (`let k = .. in let d: Dyn = k in d`), and the
         // right length is not rejected spuriously.
         let wrap = |body: &str, call: &str| format!("let f = fun v: Vec(n) -> {body} in {call}");
         let closure = "(let k = fun a: Vec(n) -> len(a) in let d: Dyn = k in d)";
@@ -9743,7 +9743,7 @@ g(len)").unwrap_err();
             "(fun g -> map(g)([1]))(fun x: Int -> x + 1)",
             "let ap = fun g -> perform op(g) in handle ap(fun x: Int -> x) with handler op(p, resume) -> resume(p)",
         ] {
-            // Literal lambdas are rebuilt in place (`__ca`), no `__cf` closure.
+            // A literal lambda at a Dyn sink is a contract like any bare function.
             assert!(elaborated_has_contract(src), "{src}");
         }
     }
@@ -11659,7 +11659,7 @@ g(len)").unwrap_err();
         assert_eq!(run_source(ok).unwrap().as_int(), 2);
         let int = "let u: Union(Int, (Int -> Int)) = 3 in let d: Dyn = u in match d | 3 -> 1 | _ -> 0";
         assert_eq!(run_source(int).unwrap().as_int(), 1);
-        // An outer index variable inside a Union alternative is tied to the outer length, as in the closure form.
+        // An outer index variable inside a Union alternative is tied to the outer length, as in the contract form.
         let len = |arg: &str| format!("let f = fun v: Vec(n) -> (let u: Union(Int, (Vec(n) -> Int)) = fun w: Vec(n) -> len(w) in let d: Dyn = u in d) in f([1,2])({arg})");
         assert!(run_err(&len("\"s\"")).contains("found Str"));
         assert!(run_err(&len("[3]")).contains("expected"));
