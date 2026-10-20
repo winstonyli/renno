@@ -145,9 +145,45 @@ pub fn index_exprs_compare(a: &IndexExpr, b: &IndexExpr) -> Option<IndexCmp> {
     Some(if diff.len() == 1 && diff.contains_key(&Vec::<String>::new()) { IndexCmp::NonzeroConst } else { IndexCmp::Other })
 }
 
+/// `e` as `c*var + k` (one variable, degree 1, `c > 0`); `None` for anything else, so a caller
+/// never treats an undecided form as solved.
+pub fn index_solve_unit(e: &IndexExpr) -> Option<(String, i64, i64)> {
+    let mut p = normalize(e)?;
+    drop_zero_terms(&mut p);
+    let k = p.remove(&Vec::<String>::new()).unwrap_or(0);
+    let mut terms = p.into_iter();
+    let (monomial, c) = terms.next()?;
+    if terms.next().is_some() || monomial.len() != 1 || c <= 0 {
+        return None;
+    }
+    Some((monomial.into_iter().next()?, c, k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn solves_a_linear_single_variable_form() {
+        let n = |e: &IndexExpr| index_solve_unit(e);
+        assert_eq!(n(&add(var("n"), lit(1))), Some(("n".into(), 1, 1)));
+        assert_eq!(n(&mul(lit(2), var("n"))), Some(("n".into(), 2, 0)));
+        assert_eq!(n(&add(mul(lit(2), var("n")), lit(3))), Some(("n".into(), 2, 3)));
+        assert_eq!(n(&add(lit(3), var("n"))), Some(("n".into(), 1, 3)));
+        assert_eq!(n(&var("n")), Some(("n".into(), 1, 0)));
+        assert_eq!(n(&sub(var("n"), lit(2))), Some(("n".into(), 1, -2)));
+    }
+
+    #[test]
+    fn declines_everything_else() {
+        let n = |e: &IndexExpr| index_solve_unit(e);
+        assert_eq!(n(&mul(lit(0), var("n"))), None);
+        assert_eq!(n(&mul(lit(-2), var("n"))), None);
+        assert_eq!(n(&mul(var("n"), var("n"))), None);
+        assert_eq!(n(&add(var("n"), var("m"))), None);
+        assert_eq!(n(&lit(4)), None);
+        assert_eq!(n(&mul(lit(i64::MAX), add(var("n"), lit(2)))), None);
+    }
 
     fn var(name: &str) -> IndexExpr {
         IndexExpr::Var(name.to_string())
