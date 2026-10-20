@@ -4993,6 +4993,10 @@ fn assert_no_closed_arrow_row(t: &Type) {
             debug_assert!(row.tail != Tail::Closed, "closed arrow row {row} reached a stored type: build it through arrow_row");
         }
         each_child(&t, &mut |c| todo.push(c.clone()));
+        // A group's bodies are not children (`each_child` skips them): the rows inside are checked too.
+        if let Type::Rec(g, _) = &t {
+            todo.extend(g.0.bodies.iter().cloned());
+        }
     }
 }
 
