@@ -8965,6 +8965,19 @@ g(len)").unwrap_err();
         assert_eq!(elaborated_let_rec_groups(&format!("{mixed}f(3)")), vec![resolve::GroupKind::Functions]);
         assert_eq!(run_source(&format!("{mixed}f(3)")).unwrap().as_int(), 0);
         assert_eq!(run_source(&format!("{mixed}g(3)")).unwrap().as_int(), 0);
+        // A member that escapes inside its own group (returned, stored, passed on) is contracted too.
+        for src in [
+            "let rec f: Dyn = fun x: Int -> f in f(1)(\"a\")",
+            "let rec f: Dyn = fun x: Int -> fun y: Int -> f in f(1)(2)(\"a\")",
+            "let rec f: Dyn = fun x: Int -> [f] in match f(1) | h :: t -> h(\"a\") | _ -> 0",
+            "let rec f: Dyn = fun x: Int -> f in let g = f(1) in g(\"a\")",
+            "let rec F = Fun(Dyn, F) in let rec g: F = fun x: Int -> g in g(1)(\"a\")",
+            "let h = fun k -> k(\"a\") in let rec f: Dyn = fun x: Int -> h(f) in f(1)",
+        ] {
+            assert_clean_rejection(src, "type error: expected Int, found Str");
+        }
+        // A valid escape still runs.
+        assert!(run_source("let rec f: Dyn = fun x: Int -> f in f(1)(2)(3)").is_ok());
         // A signature annotation keeps checking mode against it.
         let sig = "let rec f: (Int -> Int) = fun n -> if n < 1 then 0 else f(n - 1) in f(3)";
         assert_eq!(run_source(sig).unwrap().as_int(), 0);
