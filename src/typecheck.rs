@@ -2475,6 +2475,33 @@ fn join_arm(arena: &mut Arena, e: ExprRef, from: &Type, join: &Type, span: Span,
 // function result recurses with its own target, any other result is checked as the target promises.
 // None when neither the parameter nor the result needs a check: no wrapper at all.
 fn contract_type(from: &Type, to: &Type, infer: &InferCtx) -> Option<Type> {
+    contract_in(from, to, infer, &mut Vec::new())
+}
+
+// A (source group, target) pair met again while its contract is being built: the contract refers back to
+// itself through `id`, and the outermost call closes it into a `Rec`.
+struct Knot {
+    from: Type,
+    to: Type,
+    id: u64,
+    used: bool,
+}
+
+fn contract_in(from: &Type, to: &Type, infer: &InferCtx, knots: &mut Vec<Knot>) -> Option<Type> {
+    if let Type::Rec(g, i) = from {
+        if let Some(k) = knots.iter_mut().find(|k| k.from == *from && k.to == *to) {
+            k.used = true;
+            return Some(Type::RecVar(crate::types::RecVar::Free { id: k.id, name: Rc::from("contract") }));
+        }
+        let id = crate::types::fresh_rec_id();
+        knots.push(Knot { from: from.clone(), to: to.clone(), id, used: false });
+        let body = contract_in(&unfold(g, *i), to, infer, knots);
+        let knot = knots.pop().expect("pushed above");
+        return match body {
+            Some(b) if knot.used => crate::types::close_group(&[Rc::from("contract")], &[id], &[Some(b)]).ok()?.pop()?,
+            other => other,
+        };
+    }
     let Type::Fun(a, row, b) = from else { return Some(from.clone()) };
     let (a_target, b_target) = cast_targets(to);
     let param_free = relate_cast(&a_target, a, infer) == Rel::Proven;
@@ -2483,8 +2510,8 @@ fn contract_type(from: &Type, to: &Type, infer: &InferCtx) -> Option<Type> {
         // Proven is no check, but a result that carries a function (a recursive type holding the member, a
         // list of it) would let the function out unchecked: conform it to its own type.
         loses_function(b, &b_target, infer).then(|| (**b).clone())
-    } else if matches!(**b, Type::Fun(..)) {
-        contract_type(b, &b_target, infer)
+    } else if matches!(**b, Type::Fun(..)) || matches!(&**b, Type::Rec(g, i) if matches!(unfold(g, *i), Type::Fun(..))) {
+        contract_in(b, &b_target, infer, knots)
     } else {
         Some(b_target)
     };

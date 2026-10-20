@@ -8995,14 +8995,14 @@ g(len)").unwrap_err();
         ] {
             assert_clean_rejection(src, "type error: expected Int, found Str");
         }
-        // A member typed by a recursive alias whose parameter is looser than the member's own: R5 (a function inside a group
-        // being unrolled as a source cannot be wrapped) makes it a static `cannot tell`, where stage 3 ran it and
-        // rejected the call at run time. Same parameter (Dyn) runs: the t18 shape.
+        // A member typed by a recursive alias whose parameter is looser than the member's own: the result contract is a
+        // recursive contract type, so the call is rejected at run time. Same parameter (Dyn) runs: the t18 shape.
         // Passing the member on to code that misuses it is now a static mismatch (the member's type is known inside).
         let passed = run_err("let h = fun k -> k(\"a\") in let rec f: Dyn = fun x: Int -> h(f) in f(1)");
         assert!(passed.contains("type mismatch: expected Int, found Str") && !passed.contains("note:"), "{passed}");
         let loose = run_err("let rec F = Fun(Dyn, F) in let rec g: F = fun x: Int -> g in g(1)(\"a\")");
-        assert!(loose.contains("cannot tell statically or at run time"), "{loose}");
+        assert!(loose.contains("expected Int, found Str"), "{loose}");
+        assert!(run_source("let rec F = Fun(Dyn, F) in let rec g: F = fun x: Int -> g in g(1)(2)").is_ok());
         // A valid escape still runs.
         assert!(run_source("let rec f: Dyn = fun x: Int -> f in f(1)(2)(3)").is_ok());
         // A signature annotation keeps checking mode against it.
@@ -11728,7 +11728,7 @@ g(len)").unwrap_err();
         assert_eq!(run_source(members).unwrap().as_int(), 2);
         let closed = "let rec R = Union(Int, Fun((R,\"e\",Int))) in let rec P = Union(Int, Fun((P,Int))) in let f = fun g: P -> 1 in let h: R = 3 in f(h)";
         assert_eq!(run_source(closed).unwrap().as_int(), 1);
-        // q3: a function inside a group being unrolled is R5's `cannot tell`, never a wrapper).
+        // q3: a union with a function alternative whose parameter is the group stays a static `cannot tell`.
 
         let q3 = "let rec L = Union(Int, Fun((L,\"e\",Int))) in let rec M = Union(Int, Str, Fun((M,\"e\",Int))) in let f = fun g: M -> 1 in let h: L = 3 in f(h)";
         let err = run_err(q3);

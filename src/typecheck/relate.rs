@@ -351,8 +351,6 @@ fn fun_rel(from: &Type, to: &Type, infer: &InferCtx, fuel: &Budget, d: usize) ->
     match and([go(&a2, a, infer, fuel, d), go(b, &b2, infer, fuel, d)]) {
         // A pure ROW stays one: the unifier decides it, a wrapper would not help.
         Rel::Unknown(res, c) if res.row_only() => Rel::Unknown(res, c),
-        // R5: no wrapper can be built for a function inside a group being unrolled as a source.
-        Rel::Unknown(res, c) if !res.undecided() && (!fuel.assumed.borrow().is_empty() || !fuel.unrolling_src.borrow().is_empty()) => Rel::Unknown(Residual::UNDECIDED, c),
         Rel::Unknown(res, c) if !res.undecided() => Rel::Unknown(Residual::FUN, c),
         Rel::Refuted(Why::Shape(w)) => Rel::Refuted(Why::Opaque(w)),
         other => other,
@@ -723,10 +721,10 @@ mod tests {
         // the result only, and the flipped pair is not assumed.
         let (fl, fw) = (fun(Type::Int, l.clone()), fun(Type::Int, wide.clone()));
         assert!(!matches!(relate(&fl, &fw, &infer), Rel::Refuted(_)));
-        // R5: a function inside a group being unrolled needs a wrapper no one can build: undecided.
+        // A function inside a group being unrolled is a wrapper (a recursive contract is built for it), not undecided.
         let fgroup = |param: Type| Type::Rec(rec_group(vec![fun(param, tup(&[Type::Int, bound0()]))]), 0);
         let (f, g2) = (fgroup(uni(&[Type::Int, Type::Str])), fgroup(Type::Int));
-        assert!(relate(&g2, &f, &infer).kinds().contains("Undecided"), "{:?}", relate(&g2, &f, &infer));
+        assert!(relate(&g2, &f, &infer).kinds().contains("Fun") && !relate(&g2, &f, &infer).kinds().contains("Undecided"), "{:?}", relate(&g2, &f, &infer));
     }
 
     #[test]
