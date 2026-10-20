@@ -460,6 +460,8 @@ pub enum LenExpr {
     Mul(Box<LenExpr>, Box<LenExpr>),
     // Any length: an isolated unconstrained variable, so only "is a list".
     Any,
+    // Any list whose length is `k + c*m` for some `m >= 0`: an isolated variable met only as `c*m + k`.
+    Linear { c: i64, k: i64 },
     // An index variable nothing at run time holds: a list fails the check.
     NoValue(Rc<str>),
 }
@@ -476,7 +478,7 @@ impl LenExpr {
                 a.witnesses(out);
                 b.witnesses(out);
             }
-            LenExpr::Lit(_) | LenExpr::Any | LenExpr::NoValue(_) => {}
+            LenExpr::Lit(_) | LenExpr::Any | LenExpr::Linear { .. } | LenExpr::NoValue(_) => {}
         }
     }
 }
@@ -486,6 +488,8 @@ impl LenExpr {
 pub enum Len {
     Exact(usize),
     Any,
+    // Any list whose length is `k + c*m` for some `m >= 0`.
+    Linear { c: i64, k: i64 },
     // No list is this long: the term is negative or overflows.
     Never,
     NoValue(Rc<str>),

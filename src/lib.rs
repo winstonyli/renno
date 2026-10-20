@@ -3178,11 +3178,12 @@ g(len)").unwrap_err();
     // ---- P3 pins (docs/superpowers/plans/2026-10-16-p3-contract-node.md): boundary behavior the
     // one-node merge must keep exactly ----
 
-    // A single crossing whose index has no run-time value fails at the crossing for a
-    // compound index (`n + 1`), and passes for a bare one (`n`: the length IS the value).
+    // A single crossing over an isolated variable checks the list's length against the index: any list for a
+    // bare `n` (the length IS the value), `k + c*m` for a compound one (`n + 1`, `2 * n`).
     #[test]
-    fn p3_a_single_unbound_index_crossing_is_no_value_for_a_compound_index_and_passes_when_bare() {
-        rejects("let d: Dyn = [] in let y: Vec(n + 1) = d in 1", "type error: index variable n has no runtime value to check a length against");
+    fn p3_a_single_unbound_index_crossing_solves_a_compound_index_and_passes_when_bare() {
+        rejects("let d: Dyn = [] in let y: Vec(n + 1) = d in 1", "type error: expected [Dyn](n + 1), found List");
+        assert_eq!(run_source("let d: Dyn = [1, 2, 3] in let y: Vec(n + 1) = d in 1").unwrap().as_int(), 1);
         assert_eq!(run_source("let d: Dyn = [] in let y: Vec(n) = d in 1").unwrap().as_int(), 1);
         rejects("let d: Dyn = 5 in let y: Vec(n) = d in 1", "type error: expected [Dyn](n), found Int");
         // Two crossings sharing n: the first has no value to compare against.
@@ -8750,6 +8751,10 @@ g(len)").unwrap_err();
             // a union alternative's n is unconstrained the same way
             ("let x: Dyn = [1] in let y: Vec(n) | Int = x in 0", 0),
             ("let x: Dyn = [1, 2] in let y: Vec(n) | Bool = x in 7", 7),
+            // a compound index over an isolated variable accepts exactly the lengths k + c*m
+            ("let tail = fun v: Vec(n + 1) -> 1 in let d: Dyn = [1, 2, 3] in tail(d)", 1),
+            ("let f = fun v: Vec(2 * n) -> 1 in let d: Dyn = [1, 2, 3, 4] in f(d)", 1),
+            ("let f = fun v: Vec(2 * n) -> 1 in let d: Dyn = [] in f(d)", 1),
         ];
         for (src, want) in accepted {
             assert_eq!(run_source(src).unwrap().as_int(), want, "{src}");
@@ -8760,8 +8765,9 @@ g(len)").unwrap_err();
             ("let x: Dyn = 5 in let y: Vec(n) = x in 0", "type error: expected [Dyn](n), found"),
             // two crossings sharing n
             ("let x: Dyn = [1, 2] in let y: Vec(n) = x in let z: Vec(n) = x in 0", "index variable n has no runtime value"),
-            // a compound index over an unbound variable (no equation solving)
-            ("let f = fun v: Vec(n + 1) -> v in let x: Dyn = [1, 2] in len(f(x))", "has no runtime value"),
+            // a compound index over an isolated variable is solved: the length must be k + c*m
+            ("let f = fun v: Vec(n + 1) -> v in let x: Dyn = [] in len(f(x))", "expected [Dyn](n + 1), found List"),
+            ("let f = fun v: Vec(2 * n) -> v in let x: Dyn = [1, 2, 3] in len(f(x))", "expected [Dyn](2 * n), found List"),
             // two union crossings sharing n
             ("let x: Dyn = [1] in let y: Vec(n) | Int = x in let z: Vec(n) | Int = x in 0", "index variable n has no runtime value"),
         ];
@@ -10476,7 +10482,7 @@ g(len)").unwrap_err();
     #[test]
     fn variables_print_as_written() {
         // Checker bookkeeping (`n#0`, `e#0`) never reaches a message: the name is what the user wrote.
-        let src = "let f = fun v: Vec(n + 1) -> v in let x: Dyn = [1, 2] in len(f(x))";
+        let src = "let x: Dyn = [1, 2] in let y: Vec(n) = x in let z: Vec(n) = x in 0";
         let err = run_source(src).unwrap_err();
         assert!(err.contains("index variable n has no runtime value") && !err.contains('#'), "{err}");
         let src = "let f: ((Dyn ->{e} Dyn) -> Int) = fun cb -> 1 in let x: Int = f in x";

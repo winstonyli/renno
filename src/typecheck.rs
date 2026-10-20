@@ -2298,7 +2298,7 @@ struct Pending {
     e: ExprRef,
     from: Type,
     to: Type,
-    witnesses: Vec<(String, String, Option<(i64, i64)>)>,
+    witnesses: Vec<WitnessRecord>,
     repeatable: bool,
     span: Option<Span>,
 }
@@ -2662,14 +2662,24 @@ fn build_boundary_check_at(arena: &mut Arena, e: ExprRef, to: &Type, env: &Check
     // The index variables the check reads, each with whether it is read once per call
     // (inside a contract) and whether every length slot mentioning it is exactly that
     // variable (a bare one: see Obligation::bare).
-    let mut read: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+    let mut read: BTreeMap<String, (bool, Option<(i64, i64)>)> = BTreeMap::new();
     let has = |name: &str| has_len(env, name);
     let params: Option<&dyn Fn(&str) -> bool> = (!trusted).then_some(&has);
     if matches!(lowered.then, Then::Done | Then::Map(_)) {
         for slot in &lowered.slots {
+            let form = crate::index_expr::index_solve_unit(slot).map(|(_, c, k)| (c, k));
             for name in free_index_vars(slot) {
-                let (_, bare) = read.entry(name).or_insert((false, true));
-                *bare &= matches!(slot, IndexExpr::Var(_));
+                match read.entry(name) {
+                    std::collections::btree_map::Entry::Vacant(v) => {
+                        v.insert((false, form));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut o) => {
+                        let shape = &mut o.get_mut().1;
+                        if !(*shape == Some((1, 0)) && form == Some((1, 0))) {
+                            *shape = None;
+                        }
+                    }
+                }
             }
         }
         // A function leaf inside the container reads its own variables per call.
@@ -2677,21 +2687,21 @@ fn build_boundary_check_at(arena: &mut Arena, e: ExprRef, to: &Type, env: &Check
             let mut names = BTreeMap::new();
             map_leaf_vars(shape, env.infer, &mut Seen::default(), params, &mut names);
             for (name, repeatable) in names {
-                read.entry(name).or_insert((repeatable, true));
+                read.entry(name).or_insert((repeatable, Some((1, 0))));
             }
         }
     } else {
         let mut names = BTreeMap::new();
         checked_index_vars(&lazy.ty, env.infer, &mut Seen::default(), true, false, params, &mut names);
-        read.extend(names.into_iter().map(|(name, repeatable)| (name, (repeatable, true))));
+        read.extend(names.into_iter().map(|(name, repeatable)| (name, (repeatable, Some((1, 0))))));
     }
     let (mut index_names, mut lens) = (Vec::with_capacity(read.len()), Vec::with_capacity(read.len()));
-    for (name, (repeatable, bare)) in read {
+    for (name, (repeatable, form)) in read {
         let index = IndexExpr::Var(name.clone());
         let term = index_len_term(arena, &index, env);
         let slot = LenSlot::new(RefCell::new(term));
         if env.defer {
-            record_obligation(slot.clone(), &index, &CheckEnv { infer: env.infer, local: env.local.clone(), defer: env.defer, repeatable: env.repeatable || repeatable, span: env.span }, bare);
+            record_obligation(slot.clone(), &index, &CheckEnv { infer: env.infer, local: env.local.clone(), defer: env.defer, repeatable: env.repeatable || repeatable, span: env.span }, form);
         }
         index_names.push(name);
         lens.push(slot);
@@ -2962,6 +2972,9 @@ fn pick(lazy: &Lazy, to: &Type, env: &CheckEnv, defs: &mut Defs, visiting: &Visi
     Then::Pick(alts.iter().map(|alt| pick_one(alt, defs)).collect())
 }
 
+// An IndexWitness as a snapshot: the variable, its hidden alias, and its `(c, k)` solve.
+type WitnessRecord = (String, String, Option<(i64, i64)>);
+
 // A runtime value for an index variable: `hidden` is a variable bound by
 // synthesized code to the list itself (a Lambda's parameter, or a
 // contract's argument); a check reads the length of `hidden` (a Len::Witness slot) when it is entered, so
@@ -3006,14 +3019,14 @@ impl IndexWitness {
 struct Obligation {
     slot: LenSlot,
     index: IndexExpr,
-    witnesses: Vec<(String, String, Option<(i64, i64)>)>,
+    witnesses: Vec<WitnessRecord>,
     // The crossing sits inside a function body, so one site can produce many
     // values sharing its index variable.
     repeatable: bool,
     // Every length slot of the site that reads the variable is that variable
     // alone, so a lone unconstrained one may be `Any`. A variable inside a
     // compound index (`Vec(n + 1)`) has no length of its own to leave free.
-    bare: bool,
+    form: Option<(i64, i64)>,
 }
 
 impl Obligation {
@@ -3070,13 +3083,13 @@ fn runtime_index(e: &IndexExpr, infer: &InferCtx, witness_vars: &[&str], by_alia
 // holds that clean `NoValue` failure until resolved). Every witness in scope
 // is marked used: the resolved slot may read any of them, and their alias
 // binders are emitted (or not) before typechecking finishes.
-fn record_obligation(slot: LenSlot, index: &IndexExpr, env: &CheckEnv, bare: bool) {
-    if let Some(ob) = make_obligation(slot, index, env, bare) {
+fn record_obligation(slot: LenSlot, index: &IndexExpr, env: &CheckEnv, form: Option<(i64, i64)>) {
+    if let Some(ob) = make_obligation(slot, index, env, form) {
         env.infer.obligations.borrow_mut().push(ob);
     }
 }
 
-fn make_obligation(slot: LenSlot, index: &IndexExpr, env: &CheckEnv, bare: bool) -> Option<Obligation> {
+fn make_obligation(slot: LenSlot, index: &IndexExpr, env: &CheckEnv, form: Option<(i64, i64)>) -> Option<Obligation> {
     let in_scope: Vec<&IndexWitness> = env.infer.index_witness.iter().chain(env.local.iter().copied()).collect();
     let vars: Vec<&str> = in_scope.iter().map(|w| w.var.as_str()).collect();
     let index = runtime_index(index, env.infer, &vars, false);
@@ -3087,7 +3100,7 @@ fn make_obligation(slot: LenSlot, index: &IndexExpr, env: &CheckEnv, bare: bool)
         w.used.set(true);
     }
     let witnesses = in_scope.iter().map(|w| (w.var.clone(), w.hidden.clone(), w.solve)).collect();
-    Some(Obligation { slot, index, witnesses, repeatable: env.infer.repeatable_depth > 0 || env.repeatable, bare })
+    Some(Obligation { slot, index, witnesses, repeatable: env.infer.repeatable_depth > 0 || env.repeatable, form })
 }
 
 // Patches every obligation's length slot once inference has finished, so
@@ -3117,13 +3130,16 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
         let index = ob.current_index(infer);
         let unconstrained = matches!((&index, &ob.index), (IndexExpr::Var(name), IndexExpr::Var(orig))
             if name == orig
-                && ob.bare
+                && ob.form.is_some()
                 && !ob.repeatable
                 && !ob.witness_vars().contains(&name.as_str())
                 && mentions.get(name) == Some(&1)
                 && !infer.index_subst.values().any(|v| free_index_vars(v).contains(name)));
         if unconstrained {
-            *ob.slot.borrow_mut() = LenExpr::Any;
+            *ob.slot.borrow_mut() = match ob.form {
+                Some((c, k)) if (c, k) != (1, 0) => LenExpr::Linear { c, k },
+                _ => LenExpr::Any,
+            };
             continue;
         }
         let witnesses: Vec<IndexWitness> = ob
@@ -4644,7 +4660,7 @@ fn conform_spec(arena: &mut Arena, site: &str, names: &BTreeSet<String>, blame: 
         };
         let slot = LenSlot::new(RefCell::new(term));
         if let Some(index) = &bound {
-            record_obligation(slot.clone(), index, &env, true);
+            record_obligation(slot.clone(), index, &env, Some((1, 0)));
         }
         lens.push(slot);
     }

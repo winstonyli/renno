@@ -842,6 +842,7 @@ fn eval_len(term: &LenExpr, env: &Env, resolved: &Resolved) -> Result<i64, Len> 
         LenExpr::Sub(a, b) => arith(a, b, i64::checked_sub),
         LenExpr::Mul(a, b) => arith(a, b, i64::checked_mul),
         LenExpr::Any => Err(Len::Any),
+        LenExpr::Linear { c, k } => Err(Len::Linear { c: *c, k: *k }),
         LenExpr::NoValue(name) => Err(Len::NoValue(name.clone())),
     }
 }
@@ -1073,11 +1074,19 @@ fn map_value(shape: &MapShape, value: Value, ctx: &Rc<SiteCtx>, path: &Option<Rc
 // parameter binds `n` to the argument's length for the result, unless the
 // site already holds an exact length for `n` (the scope's, as the contract's result witness does).
 fn enter_contract(c: &Contract, arg: Value) -> (Value, Rc<SiteCtx>) {
-    let ret_ctx = match param_witness(&c.param.ty, &arg) {
-        Some((n, len)) if !matches!(c.ret_ctx.lookup(&n), Some(Len::Exact(_))) => Rc::new(c.ret_ctx.with_witness(n, len)),
+    let witness = param_witness(&c.param.ty, &arg);
+    let ret_ctx = match &witness {
+        Some((n, len)) if !matches!(c.ret_ctx.lookup(n), Some(Len::Exact(_))) => Rc::new(c.ret_ctx.with_witness(n.clone(), len.clone())),
         _ => c.ret_ctx.clone(),
     };
-    let arg = if c.ctx.spec.trusted { arg } else { conform(&c.param, &c.ctx, arg) };
+    // A compound `Vec(c*n + k)` parameter reads `n` from the argument too, so its own check holds the list to `c*n + k`
+    // (a bare `Vec(n)` is the length itself, so it needs no binding).
+    let compound = matches!(&*c.param.ty, Type::Indexed(_, index) if !matches!(&**index, IndexExpr::Var(_)));
+    let param_ctx = match &witness {
+        Some((n, len)) if compound && !matches!(c.ctx.lookup(n), Some(Len::Exact(_))) => Rc::new(c.ctx.with_witness(n.clone(), len.clone())),
+        _ => c.ctx.clone(),
+    };
+    let arg = if c.ctx.spec.trusted { arg } else { conform(&c.param, &param_ctx, arg) };
     (arg, ret_ctx)
 }
 
@@ -1288,11 +1297,12 @@ fn walk<'t, 'a, const TRACK: bool>(
                         Length::Slot(slot) => match &lens[*slot] {
                             Len::Exact(len) if items.len() == *len => {}
                             Len::Any => {}
+                            Len::Linear { c, k } if solve_len(items.len() as i64, *c, *k).is_ok() => {}
                             Len::NoValue(name) => {
                                 no_value.get_or_insert(&**name);
                                 break 'step here;
                             }
-                            Len::Exact(_) | Len::Never => break 'step here,
+                            Len::Exact(_) | Len::Never | Len::Linear { .. } => break 'step here,
                         },
                     }
                     // A tracked walk (the failure explanation) ignores seals.
@@ -2378,6 +2388,7 @@ mod tests {
                 Len::Exact(k) => Test::list_len(Box::new(go(t)), *k),
                 Len::Any => Test::list_of(Box::new(go(t))),
                 Len::NoValue(_) | Len::Never => Test::Never,
+                Len::Linear { .. } => unreachable!("test_lens holds no Linear slot"),
             },
             Test::Elems { elem: t, len: Length::Any, .. } => Test::list_of(Box::new(go(t))),
             Test::Elems { elem: t, len: Length::Exact(k), .. } => Test::list_len(Box::new(go(t)), *k),
