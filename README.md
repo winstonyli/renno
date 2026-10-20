@@ -197,6 +197,10 @@ An unannotated parameter that is read with `.x` or matched with `{x: v}` is infe
 **Record update.** A record literal may end in `..base`: `{a: e, ..r}` is `r` with the listed fields replaced and every other field kept. Each listed label must already be a field of `r` (extension and merging are parked, see `PARKED.md`); a replaced field may change type (`{a: "s", ..{a: 1, b: true}}` is `{a: Str, b: Bool}`), and `fun r -> {a: 1, ..r}` is row polymorphic. A `Dyn` base is checked at run time (`expected {z: Dyn}, found ...`). The expression is a chain of `set_field` calls, so the order of evaluation is the base first, then the new values in label order (the record literal's own order), whatever order they are written in. `{..r}` (no field), `..r` anywhere but last and a repeated label are errors.
 
 
+### Imports
+
+`import("path")` is an expression whose value is the value of the file's single expression, usually a record: `let L = import("lib/list.rn") in L.map(...)`. The argument must be a string literal; the path is relative to the importing file (to the working directory in the REPL). Each call site gets its own copy of the module, checked there. A module sees only the prelude: a free name is an error, and your bindings at the import site can neither capture nor be captured by the module's. Cycles are rejected with the chain of files. Errors inside a module name its file and its own line. A type can be read out of a module in an annotation (`fun x: L.T -> ...`, or `let T = L.T`). Not built: dedupe or hoisting of repeated imports, abstract (sealed) module types (`PARKED.md`).
+
 ### First-class `opaque`
 
 `opaque` is an expression in its own right, evaluating to a token unique to wherever it's written:
