@@ -534,7 +534,14 @@ impl<'a> Parser<'a> {
             // section 9.1).
             Some(Token::Ident(name)) => {
                 let span = Span { start, end: self.span_before().end };
-                let head = self.push_spanned(Expr::Var(name), span);
+                let mut head = self.push_spanned(Expr::Var(name), span);
+                // `M.T`: a type read out of a record (a module); typecheck evaluates it like `.field`.
+                while matches!(self.peek(), Some(Token::Dot)) && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(_))) {
+                    self.bump();
+                    let field = self.ident()?;
+                    let span = Span { start, end: self.span_before().end };
+                    head = self.push_spanned(Expr::FieldAccess(head, field), span);
+                }
                 self.type_apps(head, start)
             }
             // An Int is a value an applied type function may take (`Rep(2)`).

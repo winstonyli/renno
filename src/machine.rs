@@ -159,6 +159,7 @@ pub fn eval_pure_in(
         frame_values.push(v);
         Some(arena.push(Expr::Var(bound.last().expect("just pushed").clone())))
     });
+    desugar_field_reads(arena, expr);
     crate::resolve::resolve_into(arena, expr, &bound, resolved);
     let mut frame = Bindings::default();
     #[cfg(debug_assertions)]
@@ -175,12 +176,35 @@ pub fn eval_pure_in(
     out
 }
 
+// Check-time evaluation reads a field (`M.T` in an annotation) through the same `get_field` call the
+// checker rewrites `.field` into: each FieldAccess under `root` (a copy this evaluation owns) becomes
+// `#get_field(e)("name")`, in place. Run before resolve, so `#get_field` resolves to the prelude.
+fn desugar_field_reads(arena: &mut Arena, root: ExprRef) {
+    let (mut work, mut kids, mut found) = (vec![root], Vec::new(), Vec::new());
+    while let Some(n) = work.pop() {
+        if matches!(arena[n], Expr::FieldAccess(..)) {
+            found.push(n);
+        }
+        kids.clear();
+        arena[n].children(&mut kids);
+        work.extend(kids.iter().copied());
+    }
+    for n in found {
+        let Expr::FieldAccess(e, name) = arena[n].clone() else { unreachable!("collected as a FieldAccess") };
+        let getter = arena.push(Expr::Var("#get_field".to_string()));
+        let read = arena.push(Expr::App(getter, e));
+        let label = arena.push(Expr::Str(name));
+        arena[n] = Expr::App(read, label);
+    }
+}
+
 // The debug cross-check of `eval_pure_in`: `expr` run with nothing reused.
 #[cfg(debug_assertions)]
 #[allow(clippy::too_many_arguments)]
 fn assert_reuse_matches_inline(arena: &Arena, expr: ExprRef, names: &[String], values: Vec<Value>, resolved: &Resolved, spans: &SpanMap, fuel: u64, reused: &Pure) {
     let mut scratch = arena.clone();
     let copy = crate::expr::copy_tree(&mut scratch, expr, |_, _| None);
+    desugar_field_reads(&mut scratch, copy);
     // A clone: the closures in `values` run their bodies, which only the real
     // table has entries for, and the scratch nodes must not enter it.
     let mut table = resolved.clone();
@@ -656,8 +680,8 @@ fn run_loop<const PURE: bool>(arena: &Arena, mut control: Control, mut cont: Con
                                     control = Control::Apply(value);
                                 }
                                 Value::Builtin(b) => {
-                                    if PURE && !matches!(b, Builtin::Ty(_)) {
-                                        return Err(if matches!(b, Builtin::GetField | Builtin::SetField) { Stuck::Field } else { Stuck::Builtin });
+                                    if PURE && !matches!(b, Builtin::Ty(_) | Builtin::GetField) {
+                                        return Err(if matches!(b, Builtin::SetField) { Stuck::Field } else { Stuck::Builtin });
                                     }
                                     set_current_span(callee_span);
                                     control = enter(collect_builtin_arg(b, Vec::new(), value), &mut cont);

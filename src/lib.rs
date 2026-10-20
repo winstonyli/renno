@@ -215,6 +215,24 @@ mod tests {
         assert!(e.contains("import cycle") && e.lines().next().unwrap().matches("main.rn").count() == 2, "{e}");
     }
 
+
+    #[test]
+    fn a_module_type_names_an_annotation() {
+        let d = fixture("mt", &[("m.rn", "{T: Int, id: fun x: Int -> x}")]);
+        let ok = "let M = import(\"m.rn\") in let f = fun x: M.T -> x + 1 in f(1)";
+        assert_eq!(run_source_in(ok, &d).unwrap().to_string(), "2");
+        let e = run_source_in("let M = import(\"m.rn\") in let f = fun x: M.T -> x in f(true)", &d).unwrap_err();
+        assert!(e.contains("Int") && e.contains("Bool"), "{e}");
+        let via_let = "let M = import(\"m.rn\") in let T = M.T in let f = fun x: T -> x in f(2)";
+        assert_eq!(run_source_in(via_let, &d).unwrap().to_string(), "2");
+    }
+
+    #[test]
+    fn a_record_update_in_an_annotation_is_still_rejected() {
+        let e = run_source("let r = {T: Int} in let T = {T: Bool, ..r} in let f = fun x: T -> x in f").unwrap_err();
+        assert!(e.contains("cannot read or update a record field"), "{e}");
+    }
+
     #[test]
     fn a_diamond_checks_each_site_independently() {
         let d = fixture("diamond", &[("t.rn", "fun x: Int -> x"), ("l.rn", "import(\"t.rn\")"), ("r.rn", "import(\"t.rn\")")]);
@@ -5142,6 +5160,8 @@ g(len)").unwrap_err();
             ("match Int | t -> let x: t = 3 in x", "3"),
             ("handle (perform ask(Int)) with handler ask(p, k) -> let x: p = 1 in k(x)", "1"),
             ("let f = fun T -> fun x: T -> x in f(Dyn)(true)", "true"),
+            // A field read is pure, so an annotation may read a type out of a record.
+            ("let F = fun r -> r.t in (fun r -> let x: F(r) = 1 in x)({t: Int})", "1"),
             ("let F = fun r -> r.t in let g = fun r -> (let x: F(r) = 1 in x) in 0", "0"),
             // The annotation names the outer `T`; the parameter shadows it only in the body.
             ("(fun T -> fun T: T -> T)(Int)(1)", "1"),
@@ -5161,8 +5181,6 @@ g(len)").unwrap_err();
             ("(fun T -> fun T: T -> T)(Int)(true)", "column 18: type error: expected Int, found Bool"),
             // The pattern `Int` binds a variable, here to 1.
             ("match 1 | Int -> let x: Int = 3 in x", "column 25: annotation did not evaluate to a type, found Int"),
-            // Only the run time reaches the field read, so it is a run-time error.
-            ("let F = fun r -> r.t in (fun r -> let x: F(r) = 1 in x)({t: Int})", "column 42: an annotation cannot read or update a record field"),
         ] {
             let err = run_source(src).unwrap_err();
             assert!(err.contains(want), "{src}: {err}");
@@ -5692,7 +5710,10 @@ g(len)").unwrap_err();
     fn check_time_evaluation_is_stuck_on_field_access() {
         assert_eq!(run_source("let get = fun r -> r.a in let rec v = get({a: 1}) in v").unwrap(), Outcome::Int(1));
         assert_eq!(run_source("let p = {x: 1, y: 2} in let rec s = (fun q -> q.x + q.y)(p) in s").unwrap(), Outcome::Int(3));
-        for src in ["let F = fun r -> r.a in let x: F({a: Int}) = 1 in x", "let r = {a: Int} in let T = r.a in let x: T = 1 in x"] {
+        // `{a: Int}` here is a record type, not a record value, so the read itself fails.
+        assert!(run_source("let F = fun r -> r.a in let x: F({a: Int}) = 1 in x").unwrap_err().contains("get_field expects a record"));
+        assert_eq!(run_source("let r = {a: Int} in let T = r.a in let x: T = 1 in x").unwrap(), Outcome::Int(1));
+        for src in ["let r = {a: Int} in let T = {a: Bool, ..r} in let x: T = 1 in x"] {
             let err = run_source(src).unwrap_err();
             assert!(err.contains("an annotation cannot read or update a record field"), "{src}: {err}");
         }
