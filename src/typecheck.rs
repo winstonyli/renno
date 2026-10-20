@@ -2317,9 +2317,7 @@ impl Rebuild for EraseOpen<'_, '_> {
 
 // Wraps a Fun-typed `e` so that, seen as `to` (Dyn or a Fun), its argument is
 // re-checked against the parameter type it was really declared with and a
-// returned function is wrapped in turn. Closure form:
-// `let __cf#k = e in fun __ca#k: A' -> UP(__cf#k(DOWN(__ca#k)))`, fresh Var
-// nodes and fresh unlexable binder names each time (cast_binder). The body runs once per call (repeatable) and records no obligations.
+// returned function is wrapped in turn: one run-time contract (contract_type).
 // Returns `e` unchanged when no wrapper is needed.
 fn coerce_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
     let from = env.infer.resolve_deep(from);
@@ -2374,7 +2372,10 @@ fn cast_now(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEn
     if !matches!(relate_cast(&from, &to, env.infer), Rel::Unknown(res, _) if !res.row_only()) {
         return e;
     }
-    build_boundary_check_at(arena, e, &contract_type(&from, &to, env.infer), env, false)
+    match contract_type(&from, &to, env.infer) {
+        Some(ct) => build_boundary_check_at(arena, e, &ct, env, false),
+        None => e,
+    }
 }
 
 // Casts each Synth-joined arm from its own type to the FINAL joined type, so a
@@ -2400,29 +2401,27 @@ fn join_arm(arena: &mut Arena, e: ExprRef, from: &Type, join: &Type, span: Span,
     coerce_cast(arena, checked, from, join, &CheckEnv::new(infer).with_span(span))
 }
 
-// Binder names a cast introduces (`__ca`): fresh and unlexable
-// (`__ca#7`), so neither a user variable nor a nested cast's own binder can
-// capture or shadow them. Used by build_literal_cast.
-fn cast_binder(base: &str) -> String {
-    fresh_index_name(base)
-}
-
 // The type a bare function `from`, seen as `to`, is conformed to. Parameter: the target's when it fits
 // the source's (the argument then witnesses the target's index variables), else the source's own, which
 // is what the function really requires. Result: a result `relate_cast` proves is left unchecked (Dyn), a
 // function result recurses with its own target, any other result is checked as the target promises.
-fn contract_type(from: &Type, to: &Type, infer: &InferCtx) -> Type {
-    let Type::Fun(a, row, b) = from else { return from.clone() };
+// None when neither the parameter nor the result needs a check: no wrapper at all.
+fn contract_type(from: &Type, to: &Type, infer: &InferCtx) -> Option<Type> {
+    let Type::Fun(a, row, b) = from else { return Some(from.clone()) };
     let (a_target, b_target) = cast_targets(to);
-    let param = if relate_cast(&a_target, a, infer) == Rel::Proven { a_target } else { (**a).clone() };
+    let param_free = relate_cast(&a_target, a, infer) == Rel::Proven;
+    let param = if param_free { a_target } else { (**a).clone() };
     let ret = if relate_cast(b, &b_target, infer) == Rel::Proven {
-        Type::Dyn
+        None
     } else if matches!(**b, Type::Fun(..)) {
         contract_type(b, &b_target, infer)
     } else {
-        b_target
+        Some(b_target)
     };
-    Type::Fun(Hc::new(param), row.clone(), Hc::new(ret))
+    if param_free && ret.is_none() {
+        return None;
+    }
+    Some(Type::Fun(Hc::new(param), row.clone(), Hc::new(ret.unwrap_or(Type::Dyn))))
 }
 
 // The (parameter, result) types a cast aims at: those of a Fun target (a Rec one
@@ -2453,65 +2452,6 @@ fn index_has_value(i: &IndexExpr, env: &CheckEnv) -> bool {
     free_index_vars(&runtime_index(i, env.infer, &vars, false)).iter().all(|v| vars.contains(&v.as_str()))
 }
 
-// The literal form of the cast for a Lambda `e` (spec 2026-10-08 sec 5):
-// the Lambda is rebuilt in place,
-// `fun __ca#k: A' -> let p = DOWN(__ca#k) in UP(body)`,
-// so an annotated `let rec` binding stays a direct Lambda (is_direct_group)
-// and no closure is allocated. A witness binder (`let hidden = p in ...`) at
-// the top of the body is kept, and UP recurses into a Lambda body. Here a
-// parameter's index variables are never witnessed: DOWN is is_list only for
-// them, unless the variable is already witnessed by an enclosing scope
-// (parked, spec sec 7).
-fn build_literal_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &CheckEnv) -> ExprRef {
-    let Expr::Lambda(param, _, body) = arena[e].clone() else { unreachable!("build_literal_cast takes a Lambda") };
-    let Type::Fun(a, _, b) = from else { unreachable!("build_literal_cast takes a Fun source") };
-    let (a_target, b_target) = cast_targets(to);
-    let up_body = cast_up(arena, body, b, &b_target, env);
-    if relate_cast(&a_target, a, env.infer) == Rel::Proven {
-        let ann = type_lit(arena, a_target);
-        return arena.push(Expr::Lambda(param, Some(ann), up_body));
-    }
-    // The incoming value arrives under a fresh name and is checked outside the
-    // user's parameter scope, so a parameter of the same name cannot capture
-    // the value.
-    let ca = cast_binder("__ca");
-    let ca_ref = arena.push(Expr::Var(ca.clone()));
-    let checked = build_boundary_check(arena, ca_ref, &erase_open_indexed(a, env), env);
-    let body = arena.push(Expr::Let(param, None, checked, up_body));
-    let ann = type_lit(arena, a_target);
-    arena.push(Expr::Lambda(ca, Some(ann), body))
-}
-
-// UP for a literal's body: a Lambda body is rebuilt in turn (through a witness
-// binder `let hidden = <var> in ...`; the arm matches any `let y = a in ...`
-// too, which is harmless); any other body is conformed to its contract type (contract_type).
-fn literal_up(arena: &mut Arena, body: ExprRef, b: &Type, b_target: &Type, env: &CheckEnv) -> ExprRef {
-    match arena[body].clone() {
-        Expr::Lambda(..) => build_literal_cast(arena, body, b, b_target, env),
-        Expr::Let(hidden, None, val, inner) if matches!(arena[val], Expr::Var(_)) => {
-            let inner = literal_up(arena, inner, b, b_target, env);
-            arena.push(Expr::Let(hidden, None, val, inner))
-        }
-        _ => build_boundary_check_at(arena, body, &contract_type(b, b_target, env.infer), env, false),
-    }
-}
-
-// UP for a result `res` of type `b` seen as `b_target`: nothing when relate proves it; a function
-// result is cast in turn; any other result is checked against what the target promises (h03).
-// Runs once per call: repeatable, records no obligations.
-fn cast_up(arena: &mut Arena, res: ExprRef, b: &Type, b_target: &Type, env: &CheckEnv) -> ExprRef {
-    if relate_cast(b, b_target, env.infer) == Rel::Proven {
-        return res;
-    }
-    match b {
-        Type::Fun(..) => literal_up(arena, res, b, b_target, env),
-        _ => {
-            let body_env = CheckEnv { infer: env.infer, local: env.local.clone(), defer: false, repeatable: true, span: env.span };
-            let target = erase_open_indexed(b_target, &body_env);
-            build_boundary_check(arena, res, &target, &body_env)
-        }
-    }
-}
 
 
 // Like `coerce`, but the target is "Int or Float" rather than one fixed
@@ -3062,7 +3002,7 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
 // the index state (InferCtx, as of where the check is
 // spliced); `local` holds witnesses bound inside synthesized code
 // (a cast's parameter alias). `defer` is false inside a cast's synthesized body
-// (build_literal_cast, cast_up) and in resolve_obligations, which record no obligations.
+// (contract-building helpers) and in resolve_obligations, which record no obligations.
 struct CheckEnv<'a> {
     infer: &'a InferCtx,
     local: Vec<&'a IndexWitness>,

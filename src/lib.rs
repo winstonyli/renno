@@ -8824,20 +8824,6 @@ g(len)").unwrap_err();
 
     // --- Fun-to-Dyn / Fun-to-Fun wrapping (spec 2026-10-08), closure form ---
 
-    fn has_let_named(arena: &expr::Arena, root: expr::ExprRef, name: &str) -> bool {
-        tree_any(arena, root, &|n| match n {
-            expr::Expr::Lambda(param, ..) => param.starts_with(name),
-            expr::Expr::Let(var, ..) => var.starts_with(name),
-            _ => false,
-        })
-    }
-
-    fn elaborated_has_wrapper(src: &str) -> bool {
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let out = typecheck::check(&mut arena, root, &spans).unwrap();
-        has_let_named(&arena, out, "__cf#")
-    }
-
     #[test]
     fn a_typed_function_converted_to_dyn_is_wrapped() {
         for src in [
@@ -8961,18 +8947,27 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn a_literal_is_rebuilt_in_place_not_wrapped_in_a_closure() {
-        // Literal form: no `let __cf = ... in fun __ca` outer closure.
-        assert!(!elaborated_has_wrapper("let d: Dyn = fun a: Int -> fun b: Int -> a + b in d(1)(2)"));
-    }
-
-    #[test]
     fn an_annotated_let_rec_literal_at_dyn_stays_a_direct_recursive_group() {
         let src = "let rec f: Dyn = fun n: Int -> if n < 1 then 0 else f(n - 1) in ";
         assert_eq!(elaborated_let_rec_groups(&format!("{src}f(3)")), vec![resolve::GroupKind::Functions]);
         assert_eq!(run_source(&format!("{src}f(3)")).unwrap().as_int(), 0);
         let err = run_source(&format!("{src}f(true)")).expect_err("bad argument");
         assert!(err.contains("type error") && err.contains("expected Int, found Bool"), "{err}");
+    }
+
+    #[test]
+    fn an_annotated_let_rec_member_is_inferred_inside_its_group_and_coerced_outside() {
+        // A bad recursive call is still rejected (recursion inside a let rec is gradual, as for an unannotated member).
+        let err = run_source("let rec f: Dyn = fun n: Int -> if n < 1 then 0 else f(true) in f(3)").unwrap_err();
+        assert!(err.contains("type error"), "{err}");
+        // A mixed group: a coerced member and a signature member both run; the group stays direct.
+        let mixed = "let rec f: Dyn = fun n: Int -> if n < 1 then 0 else g(n - 1) and g: (Int -> Int) = fun m -> f(m) in ";
+        assert_eq!(elaborated_let_rec_groups(&format!("{mixed}f(3)")), vec![resolve::GroupKind::Functions]);
+        assert_eq!(run_source(&format!("{mixed}f(3)")).unwrap().as_int(), 0);
+        assert_eq!(run_source(&format!("{mixed}g(3)")).unwrap().as_int(), 0);
+        // A signature annotation keeps checking mode against it.
+        let sig = "let rec f: (Int -> Int) = fun n -> if n < 1 then 0 else f(n - 1) in f(3)";
+        assert_eq!(run_source(sig).unwrap().as_int(), 0);
     }
 
     // The error location of a rejected literal-form call: the first line is
@@ -8988,11 +8983,10 @@ g(len)").unwrap_err();
     }
 
     #[test]
-    fn a_literal_vec_n_lambda_at_dyn_only_checks_is_list_and_is_a_pinned_known_limitation() {
+    fn a_literal_vec_n_lambda_at_dyn_checks_the_length_across_calls() {
         let d = "let d: Dyn = fun a: Vec(n) -> fun b: Vec(n) -> len(b) in ";
-        // PINNED parked limitation (spec 7): the literal form never compares
-        // lengths, so mismatched lengths are accepted.
-        assert_eq!(run_source(&format!("{d}d([1])([1, 2])")).unwrap().as_int(), 2);
+        assert_clean_rejection(&format!("{d}d([1])([1, 2])"), "type error: expected [Dyn](n), found List");
+        assert_eq!(run_source(&format!("{d}d([1, 2])([3, 4])")).unwrap().as_int(), 2);
         assert!(run_source(&format!("{d}d(5)")).is_err());
         assert!(run_source(&format!("{d}d([1])(5)")).is_err());
     }
@@ -9066,7 +9060,7 @@ g(len)").unwrap_err();
             "let f = fun x: Int -> x in let apply = fun g -> g(1) in apply(f)",
             "map(fun x -> x + 1)([1,2])",
         ] {
-            assert!(!elaborated_has_wrapper(src), "{src}");
+            assert!(!elaborated_has_contract(src), "{src}");
         }
     }
 
@@ -9284,7 +9278,7 @@ g(len)").unwrap_err();
     #[test]
     fn an_annotated_callback_check_is_native_and_allocation_free() {
         let src = "map(fun x: Int -> x + 1)([1, 2])";
-        assert!(has_assert_check(src, expr::Test::Int));
+        assert!(elaborated_has_contract(src));
         assert!(!calls_a_check_predicate(src));
         assert_clean_rejection("map(fun x: Int -> x + 1)([true])", BAD_INT);
     }
@@ -9460,10 +9454,16 @@ g(len)").unwrap_err();
 
     // --- Join-to-Dyn arm casts (spec 2026-10-08-join-to-dyn-casts) ---
 
-    fn elaborated_has_cast(src: &str) -> bool {
-        let (mut arena, spans, root) = parser::parse(src).unwrap();
-        let out = typecheck::check(&mut arena, root, &spans).unwrap();
-        has_let_named(&arena, out, "__ca#")
+    // A function contract that checks something: a static Conform over a function type with a
+    // non-Dyn parameter or result (a bare `Dyn -> Dyn` test and operand checks do not count).
+    fn elaborated_has_contract(src: &str) -> bool {
+        use types::Type;
+        let (arena, root) = elaborated_tree(src);
+        tree_any(&arena, root, &|n| {
+            let expr::Expr::Conform(_, s) = n else { return false };
+            let expr::TypeSource::Static(l) = &s.source else { return false };
+            matches!(&*l.ty, Type::Fun(a, _, b) if !matches!(**a, Type::Dyn) || !matches!(**b, Type::Dyn))
+        })
     }
 
     fn assert_clean_rejection(src: &str, want: &str) {
@@ -9548,14 +9548,14 @@ g(len)").unwrap_err();
             "[1, \"a\"]",
             "if 1 < 2 then (fun x -> x) else (fun s -> s)",
         ] {
-            assert!(!elaborated_has_cast(src), "{src}");
+            assert!(!elaborated_has_contract(src), "{src}");
         }
         for src in [
             "[fun x: Int -> x, fun s: Str -> s]",
             "if 1 < 2 then (fun x: Int -> x) else (fun s: Str -> s)",
             "match 1 | 1 -> (fun x: Int -> x) | _ -> (fun s: Str -> s)",
         ] {
-            assert!(elaborated_has_cast(src), "{src}");
+            assert!(elaborated_has_contract(src), "{src}");
         }
     }
 
@@ -9722,7 +9722,7 @@ g(len)").unwrap_err();
             // A polymorphic use with no sink at all.
             "let apply = fun g -> g(1) in apply(fun x: Int -> x)",
         ] {
-            assert!(!elaborated_has_wrapper(src) && !elaborated_has_cast(src), "{src}");
+            assert!(!elaborated_has_contract(src), "{src}");
         }
         // The typed counterparts do carry the wrapper.
         for src in [
@@ -9731,7 +9731,7 @@ g(len)").unwrap_err();
             "let ap = fun g -> perform op(g) in handle ap(fun x: Int -> x) with handler op(p, resume) -> resume(p)",
         ] {
             // Literal lambdas are rebuilt in place (`__ca`), no `__cf` closure.
-            assert!(elaborated_has_cast(src), "{src}");
+            assert!(elaborated_has_contract(src), "{src}");
         }
     }
 
@@ -9740,7 +9740,7 @@ g(len)").unwrap_err();
         // Option (c) (bind the Var to Dyn) would turn these into Dyn results.
         let src = "let f = fun xs -> let n = len(xs) in xs in let ys: [Int] = f([1, 2]) in ys";
         assert_eq!(run_source(src).unwrap(), Outcome::List(vec![Outcome::Int(1), Outcome::Int(2)]));
-        assert!(!elaborated_has_wrapper(src) && !elaborated_has_cast(src));
+        assert!(!elaborated_has_contract(src));
         // The argument comes back with its own type: `g` stays a function.
         let id2 = "let id2 = fun g -> let r = map(g)([1]) in g in (id2(fun x: Int -> x + 1))(5)";
         assert_eq!(run_source(id2).unwrap().as_int(), 6);
@@ -9840,12 +9840,12 @@ g(len)").unwrap_err();
                  (k(fun x -> x)({h}))(fun x -> x)"
             );
             assert_eq!(run_source(&src).unwrap().as_int(), 1, "{src}");
-            assert!(!elaborated_has_cast(&src), "{src}");
+            assert!(!elaborated_has_contract(&src), "{src}");
         }
         let list = "let k = fun g -> fun h -> let r = map(g)([1]) in let j = [(g, 1), (h, true)] in h in \
                     (k(fun x -> x)(fun f: (Dyn -> Dyn) -> f(1)))(fun x -> x)";
         assert_eq!(run_source(list).unwrap().as_int(), 1, "{list}");
-        assert!(!elaborated_has_cast(list), "{list}");
+        assert!(!elaborated_has_contract(list), "{list}");
     }
 
     #[test]
@@ -10129,7 +10129,7 @@ g(len)").unwrap_err();
 
     #[test]
     fn a_literal_lambda_with_a_dyn_result_is_checked_against_the_target() {
-        // The literal (in-place) cast path: cast_up with `literal` set.
+        // A literal crossing is a contract: its result is checked against the target's promise.
         let src = "let apply = fun h: (Int -> Int) -> h(3) in apply(fun x: Int -> let d: Dyn = true in d)";
         let err = run_source(src).unwrap_err();
         assert!(err.contains("found Bool") && !err.contains("Int | Float"), "unexpected message: {err}");
