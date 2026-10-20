@@ -234,6 +234,19 @@ mod tests {
         assert!(e.contains("cannot read or update a record field"), "{e}");
     }
 
+
+    #[test]
+    fn a_modules_annotations_are_closed_over_the_prelude_too() {
+        let d = fixture("annhyg", &[("h1.rn", "let f = fun x: Int -> x + 1 in f"), ("h2.rn", "fun x: Vec(2) -> fun y: Dyn -> x"), ("h6.rn", "fun x: Secret -> x")]);
+        assert_eq!(run_source_in("let Int = Bool in import(\"h1.rn\")(1)", &d).unwrap().to_string(), "2");
+        assert_eq!(run_source_in("let Vec = 3 in let List = 4 in let Dyn = 5 in import(\"h2.rn\")([1, 2])(0)", &d).unwrap().to_string(), "[1, 2]");
+        let e = run_source_in("let Secret = Int in import(\"h6.rn\")(1)", &d).unwrap_err();
+        assert!(e.contains("undefined name `Secret`") && e.contains("h6.rn"), "{e}");
+        // A module's own type binding is visible to its own annotations.
+        let d = fixture("annown", &[("m.rn", "let T = Int in fun x: T -> x")]);
+        assert_eq!(run_source_in("import(\"m.rn\")(4)", &d).unwrap().to_string(), "4");
+    }
+
     #[test]
     fn a_diamond_checks_each_site_independently() {
         let d = fixture("diamond", &[("t.rn", "fun x: Int -> x"), ("l.rn", "import(\"t.rn\")"), ("r.rn", "import(\"t.rn\")")]);

@@ -119,9 +119,19 @@ pub fn resolve(arena: &Arena, root: ExprRef) -> Resolved {
 // names' values. A node `resolved` already holds must come out the same: it
 // does, because `eval_pure_in` walks only nodes its own copy made.
 pub fn resolve_into(arena: &Arena, root: ExprRef, outer: &[String], resolved: &mut Resolved) {
-    for (id, r) in walk(arena, root, outer) {
+    for (id, r) in walk(arena, root, outer, false) {
         resolved.insert(id, r);
     }
+}
+
+// `resolve`, also covering annotation expressions (each in the scope of the binder it annotates), which the
+// runtime table never holds: imports::expand uses it to find the prelude and unbound names a module annotates.
+pub fn resolve_annotated(arena: &Arena, root: ExprRef) -> Resolved {
+    let mut resolved = Resolved::default();
+    for (id, r) in walk(arena, root, &[], true) {
+        resolved.insert(id, r);
+    }
+    resolved
 }
 
 // The names `root` uses but does not bind (a prelude name counts as free; a
@@ -129,7 +139,7 @@ pub fn resolve_into(arena: &Arena, root: ExprRef, outer: &[String], resolved: &m
 // looks these up to find the `let`s an annotation depends on.
 pub fn free_vars(arena: &Arena, root: ExprRef) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for (id, r) in walk(arena, root, &[]) {
+    for (id, r) in walk(arena, root, &[], false) {
         let Expr::Var(name) = &arena[id] else { unreachable!("only Var nodes are resolved") };
         if !matches!(r, VarRef::Local { .. }) && !name.starts_with('#') && !out.contains(name) {
             out.push(name.clone());
@@ -139,9 +149,9 @@ pub fn free_vars(arena: &Arena, root: ExprRef) -> Vec<String> {
 }
 
 // Every Var node under `root` with where it lives, in visit order.
-fn walk(arena: &Arena, root: ExprRef, outer: &[String]) -> Vec<(ExprRef, VarRef)> {
+fn walk(arena: &Arena, root: ExprRef, outer: &[String], annotations: bool) -> Vec<(ExprRef, VarRef)> {
     let mut found: Vec<(ExprRef, VarRef)> = Vec::new();
-    let mut scopes = Scopes::default();
+    let mut scopes = Scopes { annotations, ..Scopes::default() };
     if !outer.is_empty() {
         scopes.push(outer.to_vec());
     }
@@ -193,6 +203,8 @@ fn prelude_ref(name: &str) -> VarRef {
 // on top, so a lookup is O(1) however deep the scope.
 #[derive(Default)]
 struct Scopes {
+    // Also visit annotation expressions, each in the scope of the binder it annotates (imports hygiene only).
+    annotations: bool,
     frames: Vec<Vec<String>>,
     index: HashMap<String, Vec<(usize, u32)>>,
 }
@@ -270,6 +282,13 @@ pub fn group_kind(arena: &Arena, bindings: &[(String, Option<ExprRef>, ExprRef)]
     }
 }
 
+// Queue an annotation expression to be visited in the scope current when this is processed (only for resolve_annotated).
+fn push_annotation(scopes: &Scopes, work: &mut Vec<Work>, ann: Option<ExprRef>) {
+    if let Some(a) = ann.filter(|_| scopes.annotations) {
+        work.push(Work::Visit(a));
+    }
+}
+
 fn visit(
     arena: &Arena,
     id: ExprRef,
@@ -309,16 +328,20 @@ fn visit(
                 work.push(Work::Visit(kid));
             }
         }
-        Expr::Lambda(param, _, body) => scoped(work, vec![param.clone()], *body),
+        Expr::Lambda(param, ann, body) => {
+            scoped(work, vec![param.clone()], *body);
+            push_annotation(scopes, work, *ann);
+        }
         Expr::App(f, a) => {
             work.push(Work::Visit(*a));
             work.push(Work::Visit(*f));
         }
         // `val` is resolved in the OUTER scope (plain let is non-recursive);
         // only `body` sees the new binder.
-        Expr::Let(var, _, val, body) => {
+        Expr::Let(var, ann, val, body) => {
             scoped(work, vec![var.clone()], *body);
             work.push(Work::Visit(*val));
+            push_annotation(scopes, work, *ann);
         }
         Expr::LetRec(bindings, body) => {
             let names: Vec<String> = bindings.iter().map(|(n, _, _)| n.clone()).collect();
@@ -333,6 +356,9 @@ fn visit(
                 for (_, _, v) in bindings.iter().rev() {
                     work.push(Work::Visit(*v));
                 }
+                for (_, ann, _) in bindings.iter() {
+                    push_annotation(scopes, work, *ann);
+                }
                 work.push(Work::Push(names));
                 return;
             }
@@ -346,10 +372,14 @@ fn visit(
                 work.push(Work::Pop);
                 work.push(Work::Visit(*body));
                 for (_, _, v) in bindings.iter().rev() {
-                    let Expr::Lambda(param, _, lbody) = &arena[*v] else { unreachable!("group checked above") };
+                    let Expr::Lambda(param, lann, lbody) = &arena[*v] else { unreachable!("group checked above") };
                     work.push(Work::Unextend);
                     work.push(Work::Visit(*lbody));
                     work.push(Work::Extend(param.clone()));
+                    push_annotation(scopes, work, *lann);
+                }
+                for (_, ann, _) in bindings.iter() {
+                    push_annotation(scopes, work, *ann);
                 }
                 work.push(Work::Push(names));
                 return;
@@ -358,6 +388,9 @@ fn visit(
             scoped(work, names, *body);
             for (_, _, v) in bindings.iter().rev() {
                 work.push(Work::Visit(*v));
+            }
+            for (_, ann, _) in bindings.iter() {
+                push_annotation(scopes, work, *ann);
             }
         }
         Expr::BinOp(_, l, r) => {

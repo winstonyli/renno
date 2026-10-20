@@ -91,7 +91,7 @@ fn expand_tree(arena: &mut Arena, spans: &mut SpanMap, root: ExprRef, sources: &
         expand_tree(arena, spans, mroot, sources, canon.parent().unwrap_or(dir), stack)?;
         stack.pop();
         // Hygiene: the module must be closed over the prelude; its prelude names become `#name`.
-        let mres = resolve::resolve(arena, mroot);
+        let mres = resolve::resolve_annotated(arena, mroot);
         for v in reachable(arena, mroot) {
             if let Expr::Var(name) = &arena[v] {
                 match mres.get(v) {
