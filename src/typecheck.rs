@@ -454,47 +454,6 @@ impl Ctx {
 // first demand, in a frame of the values of the definitions it reads
 // (def_value); an annotation that names the binder runs in a frame of the
 // values of the definitions it reads (annotation_type, eval_annotation).
-// A variable reference: its type, and a reference to a coerced `let rec` member that is not a direct call
-// is recorded as an escape of that member.
-#[inline(never)]
-fn lookup_var(ctx: &Ctx, name: &str, expr: ExprRef, infer: &mut InferCtx) -> Type {
-    let ty = lookup(ctx, name, infer);
-    if !infer.escapes.is_empty()
-        && infer.callee_var != Some(expr)
-        && let Some(def) = ctx.get(name).and_then(|s| s.def.clone())
-        && let Some(m) = infer.escapes.iter_mut().find(|m| m.name == name && Rc::ptr_eq(&m.def, &def))
-    {
-        m.slots.push(expr);
-    }
-    ty
-}
-
-// Rewrites each recorded escape of the group `def`'s coerced members to the member's contract (its own
-// inferred type seen as its annotation), so its recursion is checked wherever it travels.
-#[inline(never)]
-fn contract_escapes(arena: &mut Arena, def: &Rc<CheckDef>, coerced: &[(String, Type, Span)], elaborated: &[(String, Type, Row, ExprRef)], infer: &mut InferCtx) {
-    let (mine, rest): (Vec<Escape>, Vec<Escape>) = std::mem::take(&mut infer.escapes).into_iter().partition(|m| Rc::ptr_eq(&m.def, def));
-    infer.escapes = rest;
-    for m in mine {
-        let (_, target, span) = coerced.iter().find(|(n, _, _)| *n == m.name).unwrap();
-        let own = elaborated.iter().find(|(n, ..)| *n == m.name).unwrap().1.clone();
-        for slot in m.slots {
-            let var = arena.push(Expr::Var(m.name.clone()));
-            let cast = coerce_cast(arena, var, &own, target, &CheckEnv::new(infer).with_span(*span));
-            // A deferred cast is replaced in place later, so the slot points at it rather than copying it.
-            let tmp = fresh_index_name("__esc");
-            let use_tmp = arena.push(Expr::Var(tmp.clone()));
-            arena[slot] = Expr::Let(tmp, None, cast, use_tmp);
-        }
-    }
-}
-
-struct Escape {
-    name: String,
-    def: Rc<CheckDef>,
-    slots: Vec<ExprRef>,
-}
-
 pub(crate) struct CheckDef {
     // Its place in InferCtx::defs, which is creation order: a definition reads
     // only names bound before it, so every dependency has a smaller index.
@@ -730,6 +689,8 @@ pub(crate) struct InferCtx {
     // Row variables `unify_rows` must not bind: a let-annotated signature's while its value is
     // checked (D6), as `rigid_index` is for index variables.
     pub(crate) rigid_row: HashSet<String>,
+    // Set while a `let rec` member is tied to its own type: an occurs failure then closes a `Rec` (typed recursion).
+    pub(crate) recify: bool,
     // The level of every variable a scope has held (U8b), rolled back with the substitution by
     // unify_trial. Invariant: if a levelled variable (of any sort) is bound, everything its
     // solution mentions has a level at most its own (the match-arm hypotheses are the one
@@ -797,12 +758,6 @@ pub(crate) struct InferCtx {
     // `fun` must stay a direct Lambda (resolve::GroupKind::Functions), so a kept
     // parameter annotation goes inside it (the Fun fold).
     direct_value: Option<ExprRef>,
-    // The callee node of the `App` being elaborated: a reference there is a direct call, not an escape.
-    callee_var: Option<ExprRef>,
-    // Coerced `let rec` members (inferred inside their group, contracted outside) while their group
-    // elaborates, with the non-callee references to each (escapes), contracted once the member's own
-    // type is known.
-    escapes: Vec<Escape>,
     // The finished check-time evaluations and the nodes erasure may remove,
     // in the order they were made: settle_erasure decides them all once
     // inference has finished.
@@ -819,6 +774,7 @@ impl InferCtx {
             flat_rows: RefCell::new(FxMap::default()),
             resolve_memo: RefCell::new(NodeMemo::default()),
             rigid_row: HashSet::new(),
+            recify: false,
             levels: Levels::default(),
             rigid_index: HashSet::new(),
             index_witness: Vec::new(),
@@ -833,8 +789,6 @@ impl InferCtx {
             value_of: FxMap::default(),
             in_annotation: false,
             direct_value: None,
-            callee_var: None,
-            escapes: Vec::new(),
             proofs: Vec::new(),
             splices: Vec::new(),
         }
@@ -1488,11 +1442,55 @@ fn row_mismatch(expected: &Type, found: &Type, infer: &InferCtx, span: Span) -> 
     Mismatch::Expected { expected: infer.resolve_deep(expected), found: infer.resolve_deep(found), span }
 }
 
+// Ties a `let rec` member's pre-bound variable to its own type, so a recursive reference is typed, not free.
+// Only this unify may close a `Rec` from an occurs failure; a failure left over means the recursion disagrees
+// with the definition, most often a result that grows every call.
+#[inline(never)]
+fn tie_member(ctx: &Ctx, name: &str, val_ty: &Type, span: Span, infer: &mut InferCtx) -> Result<(), TypeError> {
+    let pre = lookup(ctx, name, infer);
+    infer.recify = true;
+    let r = unify(&pre, val_ty, infer, span);
+    infer.recify = false;
+    if r.is_ok() && grown_param(val_ty, infer) {
+        return Err(TypeError(format!("type mismatch: the parameter of `{name}` grows with every recursive call; annotate it, for example `acc: Dyn`"), span));
+    }
+    Ok(r?)
+}
+
+// A parameter of the member that tying turned into a recursive type holding no function (an accumulator
+// wrapped again at every call): nothing but `Dyn` could be passed, so it is reported at the definition.
+#[inline(never)]
+fn grown_param(val_ty: &Type, infer: &InferCtx) -> bool {
+    let mut cur = infer.resolve_deep(val_ty);
+    while let Type::Fun(p, _, r) = cur {
+        if matches!(&*p, Type::Rec(..)) && !loses_function(&p, &Type::Dyn, infer) {
+            return true;
+        }
+        cur = (*r).clone();
+    }
+    false
+}
+
+// The recursive type a variable and a shape containing it denote together: the variable becomes the group's
+// member and the shape its body (`let rec k = fun x -> k` ties `k` to `mu T. Dyn -> T`).
+#[inline(never)]
+fn recify_var(name: &str, other: &Type, infer: &InferCtx) -> Option<Type> {
+    let id = crate::types::fresh_rec_id();
+    let free = Type::RecVar(crate::types::RecVar::Free { id, name: Rc::from(name) });
+    let deep = infer.resolve_deep(other);
+    let body = subst_type(&deep, &HashMap::new(), &HashMap::from([(name.to_string(), free)]), &HashMap::new());
+    crate::types::close_group(&[Rc::from(name)], &[id], &[Some(body)]).ok()?.pop()?
+}
+
 fn unify_resolved(t1: &Type, t2: &Type, infer: &mut InferCtx, span: Span, done: &mut FxSet<(ById, ById)>) -> Result<(), Mismatch> {
     let mismatch = || Mismatch::Expected { expected: t2.clone(), found: t1.clone(), span };
     match (t1, t2) {
         (Type::Var(n1), Type::Var(n2)) if n1 == n2 => Ok(()),
         (Type::Var(name), other) | (other, Type::Var(name)) => {
+            if infer.recify && occurs_in(name, other, infer) && let Some(rec) = recify_var(name, other, infer) {
+                infer.recify = false;
+                return unify_resolved(&Type::Var(name.clone()), &rec, infer, span, done);
+            }
             if occurs_in(name, other, infer) {
                 return Err(Mismatch::Infinite { name: name.clone(), ty: other.clone(), span });
             }
@@ -2482,7 +2480,9 @@ fn contract_type(from: &Type, to: &Type, infer: &InferCtx) -> Option<Type> {
     let param_free = relate_cast(&a_target, a, infer) == Rel::Proven;
     let param = if param_free { a_target } else { (**a).clone() };
     let ret = if relate_cast(b, &b_target, infer) == Rel::Proven {
-        None
+        // Proven is no check, but a result that carries a function (a recursive type holding the member, a
+        // list of it) would let the function out unchecked: conform it to its own type.
+        loses_function(b, &b_target, infer).then(|| (**b).clone())
     } else if matches!(**b, Type::Fun(..)) {
         contract_type(b, &b_target, infer)
     } else {
@@ -5093,9 +5093,6 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                             let t = open_annotation(&annotation.ty, &cur_ctx, is_signature(&annotation.ty), &mut introduced, spans[*val])?;
                             if kind == GroupKind::Functions && !is_signature(&t) && matches!(arena[*val], Expr::Lambda(..)) {
                                 coerced.push((name.clone(), t, spans[*val]));
-                                if let Some(def) = &group {
-                                    infer.escapes.push(Escape { name: name.clone(), def: def.clone(), slots: Vec::new() });
-                                }
                                 None
                             } else {
                                 Some(t)
@@ -5151,15 +5148,13 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                         }
                         None => {
                             let (val_ty, val_row, val2) = elaborate(arena, *val, &val_ctx, spans, infer)?;
+                            if group.is_some() && kind != GroupKind::Plain {
+                                tie_member(&val_ctx, name, &val_ty, spans[*val], infer)?;
+                            }
                             (val_ty, val_row, val2)
                         }
                     };
                     elaborated.push((name.clone(), bound_ty, val_row, val3));
-                }
-                // A coerced member that escapes inside its own group (returned, stored, passed on) is
-                // contracted like the outside binding: its recursion is then checked wherever it travels.
-                if let Some(def) = &group {
-                    contract_escapes(arena, def, &coerced, &elaborated, infer);
                 }
                 let values = elaborated.iter().map(|(_, _, _, v)| *v).collect();
                 let def = infer.new_def(DefNode::Group(bindings.clone()), values, &cur_ctx);
@@ -5659,7 +5654,7 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         // (there is no type of types yet). The parser only puts one in an
         // annotation slot, which is never elaborated as a value.
         Expr::TypeLit(_) => Ok((Type::Dyn, Row::pure(), expr)),
-        Expr::Var(name) => Ok((lookup_var(ctx, &name, expr, infer), Row::pure(), expr)),
+        Expr::Var(name) => Ok((lookup(ctx, &name, infer), Row::pure(), expr)),
 
         // Per-position types, no widening -- unlike ListLit just below,
         // which exists for a genuinely variable-length, conceptually
@@ -5868,7 +5863,6 @@ fn elaborate_node(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
         }
 
         Expr::App(f, a) => {
-            infer.callee_var = Some(f);
             let (f_ty, f_row, f2) = elaborate(arena, f, ctx, spans, infer)?;
             let mut f_ty = infer.resolve(&f_ty);
             // A callee typed by a (recursive) alias is called through its body, one step.

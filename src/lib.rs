@@ -8955,11 +8955,32 @@ g(len)").unwrap_err();
         assert!(err.contains("type error") && err.contains("expected Int, found Bool"), "{err}");
     }
 
+    // S3: a recursive reference inside a `let rec` group is typed as the member's own type (a `Rec` when the
+    // type mentions itself), so recursion is no longer gradual.
+    #[test]
+    fn let_rec_recursion_is_typed() {
+        // The unannotated hole of stages 2 and 3 is closed; valid self-reference still runs.
+        rejects("let rec f = fun x: Int -> f in f(1)(\"a\")", "type mismatch: expected Int, found Str");
+        assert!(run_source("let rec f = fun x -> f in f(1)(2)(3)").is_ok());
+        runs_to("let rec f = fun x -> (f, 1) in match f(1) | (g, n) -> n | _ -> 0", "1");
+        // Mutual groups tie each member: a bad call through the sibling is static, valid ones run.
+        rejects("let rec f = fun x: Int -> g and g = fun y: Int -> f in f(1)(2)(\"a\")", "type mismatch: expected Int, found Str");
+        runs_to("let rec ev = fun n -> if n == 0 then true else od(n - 1) and od = fun n -> if n == 0 then false else ev(n - 1) in ev(10)", "true");
+        assert!(run_source("let rec f = fun x -> g and g = fun y -> f in f(1)(2)(3)").is_ok());
+        // A recursive result (a tree builder) is a recursive type and runs; a parameter that grows every call
+        // is reported at the definition, and an annotation fixes it.
+        runs_to("let rec build = fun n -> if n == 0 then [] else [build(n - 1)] in build(3)", "[[[[]]]]");
+        rejects("let rec nest = fun n -> fun acc -> if n == 0 then acc else nest(n - 1)([acc]) in nest(3)(1)", "the parameter of `nest` grows with every recursive call; annotate it, for example `acc: Dyn`");
+        runs_to("let rec nest = fun n -> fun acc: Dyn -> if n == 0 then acc else nest(n - 1)([acc]) in nest(3)(1)", "[[[1]]]");
+        // A recursive effectful function: the tie needs the effect-row fixpoint (S2).
+        assert!(static_error("let rec loop = fun n -> if n == 0 then 0 else perform a(n) + loop(n - 1) in loop(2)").is_some_and(|e| e.contains("unhandled effect: a")));
+    }
+
     #[test]
     fn an_annotated_let_rec_member_is_inferred_inside_its_group_and_coerced_outside() {
-        // A bad recursive call is still rejected (recursion inside a let rec is gradual, as for an unannotated member).
+        // A bad recursive call is a static mismatch: recursion inside a let rec is typed (S3).
         let err = run_source("let rec f: Dyn = fun n: Int -> if n < 1 then 0 else f(true) in f(3)").unwrap_err();
-        assert!(err.contains("type error"), "{err}");
+        assert!(err.contains("type mismatch: expected Int, found Bool"), "{err}");
         // A mixed group: a coerced member and a signature member both run; the group stays direct.
         let mixed = "let rec f: Dyn = fun n: Int -> if n < 1 then 0 else g(n - 1) and g: (Int -> Int) = fun m -> f(m) in ";
         assert_eq!(elaborated_let_rec_groups(&format!("{mixed}f(3)")), vec![resolve::GroupKind::Functions]);
@@ -8971,11 +8992,17 @@ g(len)").unwrap_err();
             "let rec f: Dyn = fun x: Int -> fun y: Int -> f in f(1)(2)(\"a\")",
             "let rec f: Dyn = fun x: Int -> [f] in match f(1) | h :: t -> h(\"a\") | _ -> 0",
             "let rec f: Dyn = fun x: Int -> f in let g = f(1) in g(\"a\")",
-            "let rec F = Fun(Dyn, F) in let rec g: F = fun x: Int -> g in g(1)(\"a\")",
-            "let h = fun k -> k(\"a\") in let rec f: Dyn = fun x: Int -> h(f) in f(1)",
         ] {
             assert_clean_rejection(src, "type error: expected Int, found Str");
         }
+        // A member typed by a recursive alias whose parameter is looser than the member's own: R5 (a function inside a group
+        // being unrolled as a source cannot be wrapped) makes it a static `cannot tell`, where stage 3 ran it and
+        // rejected the call at run time. Same parameter (Dyn) runs: the t18 shape.
+        // Passing the member on to code that misuses it is now a static mismatch (the member's type is known inside).
+        let passed = run_err("let h = fun k -> k(\"a\") in let rec f: Dyn = fun x: Int -> h(f) in f(1)");
+        assert!(passed.contains("type mismatch: expected Int, found Str") && !passed.contains("note:"), "{passed}");
+        let loose = run_err("let rec F = Fun(Dyn, F) in let rec g: F = fun x: Int -> g in g(1)(\"a\")");
+        assert!(loose.contains("cannot tell statically or at run time"), "{loose}");
         // A valid escape still runs.
         assert!(run_source("let rec f: Dyn = fun x: Int -> f in f(1)(2)(3)").is_ok());
         // A signature annotation keeps checking mode against it.
@@ -12126,7 +12153,7 @@ g(len)").unwrap_err();
     #[test]
     fn a_deeply_nested_value_converts_prints_and_drops() {
         let depth = 100_000;
-        let src = format!("let rec nest = fun n -> fun acc -> if n == 0 then acc else nest(n - 1)([acc]) in nest({depth})(1)");
+        let src = format!("let rec nest = fun n -> fun acc: Dyn -> if n == 0 then acc else nest(n - 1)([acc]) in nest({depth})(1)");
         let outcome = run_source(&src).expect("runs");
         let text = std::thread::Builder::new().stack_size(WORKER_STACK_SIZE).spawn(move || outcome.to_string()).unwrap().join().unwrap();
         assert_eq!(text, format!("{}1{}", "[".repeat(depth), "]".repeat(depth)));
