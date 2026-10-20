@@ -2298,7 +2298,7 @@ struct Pending {
     e: ExprRef,
     from: Type,
     to: Type,
-    witnesses: Vec<(String, String)>,
+    witnesses: Vec<(String, String, Option<(i64, i64)>)>,
     repeatable: bool,
     span: Option<Span>,
 }
@@ -2313,7 +2313,7 @@ fn defer_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Check
     }
     let vars: Vec<&str> = in_scope.iter().map(|w| w.var.as_str()).collect();
     let (from, to) = (snapshot_type(from, env.infer, &vars), snapshot_type(to, env.infer, &vars));
-    let witnesses = in_scope.iter().map(|w| (w.var.clone(), w.hidden.clone())).collect();
+    let witnesses = in_scope.iter().map(|w| (w.var.clone(), w.hidden.clone(), w.solve)).collect();
     let repeatable = env.infer.repeatable_depth > 0 || env.repeatable;
     env.infer.pendings.borrow_mut().push(Pending { slot, e, from, to, witnesses, repeatable, span: env.span });
     slot
@@ -2324,9 +2324,9 @@ fn defer_cast(arena: &mut Arena, e: ExprRef, from: &Type, to: &Type, env: &Check
 fn resolve_pendings(arena: &mut Arena, infer: &InferCtx) {
     for p in infer.pendings.take() {
         let witnesses: Vec<IndexWitness> =
-            p.witnesses.iter().map(|(var, hidden)| IndexWitness { var: var.clone(), hidden: hidden.clone(), used: Cell::new(true) }).collect();
+            p.witnesses.iter().map(|(var, hidden, solve)| IndexWitness { var: var.clone(), hidden: hidden.clone(), used: Cell::new(true), solve: *solve }).collect();
         let env = CheckEnv { infer, local: witnesses.iter().collect(), defer: true, repeatable: p.repeatable, span: p.span };
-        let vars: Vec<&str> = p.witnesses.iter().map(|(var, _)| var.as_str()).collect();
+        let vars: Vec<&str> = p.witnesses.iter().map(|(var, _, _)| var.as_str()).collect();
         let (from, to) = (snapshot_type(&p.from, infer, &vars), snapshot_type(&p.to, infer, &vars));
         let result = cast_now(arena, p.e, &from, &to, &env);
         let node = arena[result].clone();
@@ -2972,11 +2972,17 @@ struct IndexWitness {
     var: String,
     hidden: String,
     used: Cell<bool>,
+    // `Some((c, k))`: the variable is `(len(hidden) - k) / c` (a parameter typed `Vec(c*n + k)`), not the length itself.
+    solve: Option<(i64, i64)>,
 }
 
 impl IndexWitness {
     fn new(var: String, param: &str) -> IndexWitness {
-        IndexWitness { var, hidden: fresh_index_name(&format!("list_{param}")), used: Cell::new(false) }
+        IndexWitness { var, hidden: fresh_index_name(&format!("list_{param}")), used: Cell::new(false), solve: None }
+    }
+
+    fn solved(var: String, param: &str, c: i64, k: i64) -> IndexWitness {
+        IndexWitness { solve: Some((c, k)), ..IndexWitness::new(var, param) }
     }
 
     // `let hidden = list_var in body`: an alias, immune to later shadowing
@@ -3000,7 +3006,7 @@ impl IndexWitness {
 struct Obligation {
     slot: LenSlot,
     index: IndexExpr,
-    witnesses: Vec<(String, String)>,
+    witnesses: Vec<(String, String, Option<(i64, i64)>)>,
     // The crossing sits inside a function body, so one site can produce many
     // values sharing its index variable.
     repeatable: bool,
@@ -3012,7 +3018,7 @@ struct Obligation {
 
 impl Obligation {
     fn witness_vars(&self) -> Vec<&str> {
-        self.witnesses.iter().map(|(var, _)| var.as_str()).collect()
+        self.witnesses.iter().map(|(var, _, _)| var.as_str()).collect()
     }
 
     // The index under the bindings known now, as the check would read it.
@@ -3080,7 +3086,7 @@ fn make_obligation(slot: LenSlot, index: &IndexExpr, env: &CheckEnv, bare: bool)
     for w in &in_scope {
         w.used.set(true);
     }
-    let witnesses = in_scope.iter().map(|w| (w.var.clone(), w.hidden.clone())).collect();
+    let witnesses = in_scope.iter().map(|w| (w.var.clone(), w.hidden.clone(), w.solve)).collect();
     Some(Obligation { slot, index, witnesses, repeatable: env.infer.repeatable_depth > 0 || env.repeatable, bare })
 }
 
@@ -3123,7 +3129,7 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
         let witnesses: Vec<IndexWitness> = ob
             .witnesses
             .iter()
-            .map(|(var, hidden)| IndexWitness { var: var.clone(), hidden: hidden.clone(), used: Cell::new(true) })
+            .map(|(var, hidden, solve)| IndexWitness { var: var.clone(), hidden: hidden.clone(), used: Cell::new(true), solve: *solve })
             .collect();
         let env = CheckEnv { infer, local: witnesses.iter().collect(), defer: false, repeatable: false, span: None };
         let term = index_len_term(arena, &index, &env);
@@ -3158,6 +3164,16 @@ fn list_length_var(ty: &Type, infer: &InferCtx) -> Option<String> {
         },
         _ => None,
     }
+}
+
+// A parameter typed `Vec(c*n + k)` with `n` not yet witnessed: a witness that solves `n` from the list's length.
+fn solved_witness(ty: &Type, param: &str, infer: &InferCtx) -> Option<IndexWitness> {
+    let Type::Indexed(wrapped, index) = ty else { return None };
+    if !matches!(wrapped.as_ref(), Type::List(_)) {
+        return None;
+    }
+    let (n, c, k) = crate::index_expr::index_solve_unit(&infer.resolve_index_deep(index))?;
+    (!infer.index_witness.iter().any(|w| w.var == n)).then(|| IndexWitness::solved(n, param, c, k))
 }
 
 impl<'a> CheckEnv<'a> {
@@ -3201,7 +3217,11 @@ fn index_len_term(arena: &mut Arena, e: &IndexExpr, env: &CheckEnv) -> LenExpr {
             let witness = env.local.iter().rev().copied().chain(env.infer.index_witness.iter().rev()).find(|w| w.var == *name);
             if let Some(w) = witness {
                 w.used.set(true);
-                return LenExpr::Witness(arena.push(Expr::Var(w.hidden.clone())), name.as_str().into());
+                let list = arena.push(Expr::Var(w.hidden.clone()));
+                return match w.solve {
+                    Some((c, k)) => LenExpr::Derived { list, name: name.as_str().into(), c, k },
+                    None => LenExpr::Witness(list, name.as_str().into()),
+                };
             }
             match env.infer.index_subst.get(name) {
                 Some(bound) => index_len_term(arena, bound, env),
@@ -5302,7 +5322,7 @@ fn elaborate_mode(arena: &mut Arena, expr: ExprRef, ctx: &Ctx, spans: &SpanMap, 
                     _ => (ann.unwrap_or_else(|| infer.fresh_var(&param)), Mode::Synth),
                 };
                 cur_ctx = extend(&cur_ctx.with_annot(&introduced, infer), &param, param_ty.clone(), infer);
-                let witness = list_length_var(&param_ty, infer).map(|var| IndexWitness::new(var, &param));
+                let witness = list_length_var(&param_ty, infer).map(|var| IndexWitness::new(var, &param)).or_else(|| solved_witness(&param_ty, &param, infer));
                 let has_witness = witness.is_some();
                 infer.index_witness.extend(witness);
                 infer.repeatable_depth += 1;

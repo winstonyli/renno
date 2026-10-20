@@ -837,12 +837,23 @@ fn eval_len(term: &LenExpr, env: &Env, resolved: &Resolved) -> Result<i64, Len> 
             },
             other => panic!("internal: witness of {name} resolved to {other:?}"),
         },
+        LenExpr::Derived { list, name, c, k } => solve_len(eval_len(&LenExpr::Witness(*list, name.clone()), env, resolved)?, *c, *k),
         LenExpr::Add(a, b) => arith(a, b, i64::checked_add),
         LenExpr::Sub(a, b) => arith(a, b, i64::checked_sub),
         LenExpr::Mul(a, b) => arith(a, b, i64::checked_mul),
         LenExpr::Any => Err(Len::Any),
         LenExpr::NoValue(name) => Err(Len::NoValue(name.clone())),
     }
+}
+
+// The variable `m` with `len = c*m + k`: no list is that long when `c` does not divide `len - k`, `m` is
+// negative, or the subtraction overflows.
+fn solve_len(len: i64, c: i64, k: i64) -> Result<i64, Len> {
+    let diff = len.checked_sub(k).ok_or(Len::Never)?;
+    if diff < 0 || diff % c != 0 {
+        return Err(Len::Never);
+    }
+    Ok(diff / c)
 }
 
 // An index in a run-time type, valued by `value`: an Unknown site's table
@@ -895,12 +906,17 @@ fn done_lens(spec: &ConformSpec, lowered: &Lowered, env: &Env, resolved: &Resolv
 // check rejects it).
 fn param_witness(param: &Type, arg: &Value) -> Option<(String, Len)> {
     let Type::Indexed(list, index) = param else { return None };
-    let (Type::List(_), IndexExpr::Var(n)) = (&**list, &**index) else { return None };
+    let Type::List(_) = &**list else { return None };
+    // A bare `Vec(n)` is the list's length; `Vec(c*n + k)` solves `n` from it (a length nothing solves is Never).
+    let (n, c, k) = crate::index_expr::index_solve_unit(index)?;
     let len = match arg {
-        Value::List(items) => Len::Exact(items.len()),
+        Value::List(items) => match solve_len(i64::try_from(items.len()).ok()?, c, k) {
+            Ok(m) => Len::Exact(usize::try_from(m).ok()?),
+            Err(never) => never,
+        },
         _ => Len::NoValue(n.as_str().into()),
     };
-    Some((n.clone(), len))
+    Some((n, len))
 }
 
 #[cfg(test)]
@@ -2335,6 +2351,16 @@ mod tests {
                 Value::Record(Rc::new(fields))
             }
         }
+    }
+
+    #[test]
+    fn solve_len_inverts_c_m_plus_k_and_fails_closed() {
+        assert!(matches!(solve_len(3, 1, 1), Ok(2)));
+        assert!(matches!(solve_len(4, 2, 0), Ok(2)));
+        assert!(matches!(solve_len(7, 2, 3), Ok(2)));
+        assert!(matches!(solve_len(3, 2, 0), Err(Len::Never)));
+        assert!(matches!(solve_len(0, 1, 1), Err(Len::Never)));
+        assert!(matches!(solve_len(i64::MIN, 1, 1), Err(Len::Never)));
     }
 
     // The slot values the random tests' ListLenArg(_, 0..4) read: one of each kind.

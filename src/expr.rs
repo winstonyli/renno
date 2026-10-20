@@ -453,6 +453,8 @@ pub enum LenExpr {
     // The length of the list a hidden alias holds: an Expr::Var node naming
     // the alias, and the index variable it witnesses (for the message).
     Witness(ExprRef, Rc<str>),
+    // The index variable `name` solved from the length of the list `list` names: `(len - k) / c`.
+    Derived { list: ExprRef, name: Rc<str>, c: i64, k: i64 },
     Add(Box<LenExpr>, Box<LenExpr>),
     Sub(Box<LenExpr>, Box<LenExpr>),
     Mul(Box<LenExpr>, Box<LenExpr>),
@@ -469,7 +471,7 @@ impl LenExpr {
     // Appends the witness Var nodes this term reads to `out`.
     pub fn witnesses(&self, out: &mut Vec<ExprRef>) {
         match self {
-            LenExpr::Witness(var, _) => out.push(*var),
+            LenExpr::Witness(var, _) | LenExpr::Derived { list: var, .. } => out.push(*var),
             LenExpr::Add(a, b) | LenExpr::Sub(a, b) | LenExpr::Mul(a, b) => {
                 a.witnesses(out);
                 b.witnesses(out);

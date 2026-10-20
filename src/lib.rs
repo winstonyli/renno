@@ -8270,7 +8270,21 @@ g(len)").unwrap_err();
         assert!(refuted(unify_index_expr(&add(var("n"), lit(1)), &lit(3), &mut infer)));
     }
 
+    #[test]
+    fn a_derived_index_witness_solves_n_from_a_parameter_typed_with_a_compound_index() {
+        let body = "fun d: Dyn -> (let w: Vec(n) = d in 1)";
+        let ok = |src: &str| run_source(src).unwrap().as_int();
+        // Through a Dyn function: the contract's parameter solves n = len - 1.
+        assert_eq!(ok(&format!("let f = fun v: Vec(n + 1) -> {body} in let g: Dyn = f in g([1, 2, 3])([4, 5])")), 1);
+        assert_eq!(ok(&format!("let f = fun v: Vec(2 * n) -> {body} in let g: Dyn = f in g([1, 2, 3, 4])([4, 5])")), 1);
+        let err = run_source(&format!("let f = fun v: Vec(n + 1) -> {body} in let g: Dyn = f in g([1, 2, 3])([4, 5, 6])")).unwrap_err();
+        assert!(err.contains("expected [Dyn](n), found List"), "{err}");
+        // A static call binds n at the call (the unifier solves n + 1 = 3).
+        assert_eq!(ok(&format!("let f = fun v: Vec(n + 1) -> {body} in f([1, 2, 3])([4, 5])")), 1);
+    }
+
     fn capped_index() -> crate::index_expr::IndexExpr {
+
         use crate::index_expr::IndexExpr;
         use std::rc::Rc;
         let mut big = IndexExpr::Add(Rc::new(var("a")), Rc::new(var("b")));
