@@ -841,7 +841,6 @@ fn eval_len(term: &LenExpr, env: &Env, resolved: &Resolved) -> Result<i64, Len> 
         LenExpr::Add(a, b) => arith(a, b, i64::checked_add),
         LenExpr::Sub(a, b) => arith(a, b, i64::checked_sub),
         LenExpr::Mul(a, b) => arith(a, b, i64::checked_mul),
-        LenExpr::Any => Err(Len::Any),
         LenExpr::Linear { c, k } => Err(Len::Linear { c: *c, k: *k }),
         LenExpr::NoValue(name) => Err(Len::NoValue(name.clone())),
     }
@@ -867,7 +866,7 @@ fn index_len(index: &IndexExpr, value: &impl Fn(&str) -> Option<Len>) -> Result<
         IndexExpr::Var(name) => match value(name) {
             Some(Len::Exact(k)) => i64::try_from(k).map_err(|_| Len::Never),
             Some(other) => Err(other),
-            None => Err(Len::Any),
+            None => Err(Len::ANY),
         },
         IndexExpr::Lit(n) => Ok(*n),
         IndexExpr::Add(a, b) => arith(a, b, i64::checked_add),
@@ -1296,7 +1295,6 @@ fn walk<'t, 'a, const TRACK: bool>(
                         }
                         Length::Slot(slot) => match &lens[*slot] {
                             Len::Exact(len) if items.len() == *len => {}
-                            Len::Any => {}
                             Len::Linear { c, k } if solve_len(items.len() as i64, *c, *k).is_ok() => {}
                             Len::NoValue(name) => {
                                 no_value.get_or_insert(&**name);
@@ -2375,7 +2373,7 @@ mod tests {
 
     // The slot values the random tests' ListLenArg(_, 0..4) read: one of each kind.
     fn test_lens() -> Vec<Len> {
-        vec![Len::Exact(2), Len::Any, Len::NoValue(Rc::from("n")), Len::Never]
+        vec![Len::Exact(2), Len::ANY, Len::NoValue(Rc::from("n")), Len::Never]
     }
 
     // `test` with each ListLenArg replaced by what its slot means, for the
@@ -2386,9 +2384,9 @@ mod tests {
         match test {
             Test::Elems { elem: t, len: Length::Slot(slot), .. } => match &lens[*slot] {
                 Len::Exact(k) => Test::list_len(Box::new(go(t)), *k),
-                Len::Any => Test::list_of(Box::new(go(t))),
+                Len::Linear { c: 1, k: 0 } => Test::list_of(Box::new(go(t))),
                 Len::NoValue(_) | Len::Never => Test::Never,
-                Len::Linear { .. } => unreachable!("test_lens holds no Linear slot"),
+                Len::Linear { .. } => unreachable!("test_lens holds no other Linear slot"),
             },
             Test::Elems { elem: t, len: Length::Any, .. } => Test::list_of(Box::new(go(t))),
             Test::Elems { elem: t, len: Length::Exact(k), .. } => Test::list_len(Box::new(go(t)), *k),

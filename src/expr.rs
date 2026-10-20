@@ -458,8 +458,6 @@ pub enum LenExpr {
     Add(Box<LenExpr>, Box<LenExpr>),
     Sub(Box<LenExpr>, Box<LenExpr>),
     Mul(Box<LenExpr>, Box<LenExpr>),
-    // Any length: an isolated unconstrained variable, so only "is a list".
-    Any,
     // Any list whose length is `k + c*m` for some `m >= 0`: an isolated variable met only as `c*m + k`.
     Linear { c: i64, k: i64 },
     // An index variable nothing at run time holds: a list fails the check.
@@ -470,6 +468,9 @@ pub enum LenExpr {
 pub type LenSlot = Rc<std::cell::RefCell<LenExpr>>;
 
 impl LenExpr {
+    // Any list: an isolated variable met bare (`m >= 0`, length `m`).
+    pub const ANY: LenExpr = LenExpr::Linear { c: 1, k: 0 };
+
     // Appends the witness Var nodes this term reads to `out`.
     pub fn witnesses(&self, out: &mut Vec<ExprRef>) {
         match self {
@@ -478,7 +479,7 @@ impl LenExpr {
                 a.witnesses(out);
                 b.witnesses(out);
             }
-            LenExpr::Lit(_) | LenExpr::Any | LenExpr::Linear { .. } | LenExpr::NoValue(_) => {}
+            LenExpr::Lit(_) | LenExpr::Linear { .. } | LenExpr::NoValue(_) => {}
         }
     }
 }
@@ -487,12 +488,16 @@ impl LenExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Len {
     Exact(usize),
-    Any,
     // Any list whose length is `k + c*m` for some `m >= 0`.
     Linear { c: i64, k: i64 },
     // No list is this long: the term is negative or overflows.
     Never,
     NoValue(Rc<str>),
+}
+
+impl Len {
+    // Any list: an isolated variable met bare.
+    pub const ANY: Len = Len::Linear { c: 1, k: 0 };
 }
 
 // What the check-time evaluation of a kept annotation found (spec 11.2).

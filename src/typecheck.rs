@@ -3138,7 +3138,7 @@ fn resolve_obligations(arena: &mut Arena, infer: &InferCtx) {
         if unconstrained {
             *ob.slot.borrow_mut() = match ob.form {
                 Some((c, k)) if (c, k) != (1, 0) => LenExpr::Linear { c, k },
-                _ => LenExpr::Any,
+                _ => LenExpr::ANY,
             };
             continue;
         }
@@ -4656,7 +4656,7 @@ fn conform_spec(arena: &mut Arena, site: &str, names: &BTreeSet<String>, blame: 
         };
         let term = match &bound {
             Some(index) => index_len_term(arena, index, &env),
-            None => LenExpr::Any,
+            None => LenExpr::ANY,
         };
         let slot = LenSlot::new(RefCell::new(term));
         if let Some(index) = &bound {
