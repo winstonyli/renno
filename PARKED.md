@@ -59,3 +59,9 @@ One list of deferred work. Each entry: what / why parked / trigger / evidence / 
 - **Persistent sequences (imbl RRB) as the list type:** 3-30x slower on cons/head/tail/index. Evidence: persistent-spike-report.md. Status: decided against.
 - **Generated chains over 2000 levels (else-if, `+`, `++`, `||`, `::`, parens) are rejected** by `parser::MAX_NESTING`. Documented in the README. Status: decided against lifting it.
 
+
+## Language features surveyed 2026-10-20 (none built; probed on main)
+- **IO as effects** (`perform read_line()`, `perform print(..)` with a default handler). Why parked: the most on-thesis feature but the default-handler design (who installs it, how rows see it) is the real work. Trigger: wanting programs that read input or run end to end. Evidence: nothing reads stdin or files; `print` is a builtin. Status: parked.
+- **String builtins** (split, slice, char access, parse from string). Why parked: needs a ruling on Unicode semantics (bytes, chars or graphemes) before writing natives. Trigger: a program that processes text. Evidence: only `len`, `++`, `==`, `to_str` exist. Status: parked.
+- **Maps / dictionaries** as a library type. Why parked: records have fixed labels; dynamic keys need a new builtin type or key-indexed typing. Trigger: a use case that keys by value. Evidence: no map type. Status: parked.
+- **Modules / imports.** Why parked: large, changes resolution and the checker's top level; single-file programs only today. Trigger: wanting multi-file programs. Status: parked.
